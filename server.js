@@ -17,6 +17,7 @@ const xray = require('./lib/xray');
 const hysteria = require('./lib/hysteria');
 const sub = require('./lib/sub');
 const keys = require('./lib/keys');
+const cert = require('./lib/cert');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -331,6 +332,8 @@ function rotateUserToken(req, res, params) {
 const PROTOCOLS = ['vmess', 'vless', 'trojan', 'ss', 'hysteria2'];
 const NETWORKS = ['tcp', 'ws', 'grpc', 'httpupgrade'];
 const SECURITIES = ['none', 'tls', 'reality'];
+const CERT_MODES = ['path', 'content', 'self'];
+const FINGERPRINTS = ['', 'chrome', 'firefox', 'safari', 'randomized'];
 
 function normalizeNode(body, prev = {}) {
   // 部分更新时必须沿用未指定的字段，否则一次小改动会把独立节点降级成服务器节点
@@ -394,6 +397,31 @@ function normalizeNode(body, prev = {}) {
   // 独立节点的地址来源：自动上报模式下允许先不填地址
   node.ipMode =
     mode === 'standalone' && (body.ipMode === 'auto' || prev.ipMode === 'auto') ? 'auto' : 'manual';
+
+  // TLS 证书来源：path 用上面的 certFile/keyFile，content 粘贴 PEM，self 由 agent 现场自签
+  node.certMode = CERT_MODES.includes(body.certMode) ? body.certMode : prev.certMode || 'path';
+  node.certPem = String(body.certPem !== undefined ? body.certPem : prev.certPem || '');
+  node.keyPem = String(body.keyPem !== undefined ? body.keyPem : prev.keyPem || '');
+  node.selfCN = String(body.selfCN !== undefined ? body.selfCN : prev.selfCN || '');
+
+  // uTLS 指纹（客户端侧，空串表示不模拟）
+  const fpRaw = body.fp !== undefined ? body.fp : prev.fp;
+  node.fp = fpRaw === '' || FINGERPRINTS.includes(fpRaw) ? fpRaw : 'chrome';
+  // VLESS Encryption（Xray 25.6.0+，需服务端与客户端同时支持）
+  node.vlessEncryption =
+    body.vlessEncryption !== undefined ? !!body.vlessEncryption : !!prev.vlessEncryption;
+
+  // 中转入口
+  node.entries = Array.isArray(body.entries)
+    ? body.entries
+        .filter((e) => e && String(e.host || '').trim())
+        .map((e) => ({
+          id: e.id || store.uid(),
+          name: String(e.name || '').trim(),
+          host: String(e.host || '').trim(),
+          port: e.port ? Number(e.port) : null,
+        }))
+    : prev.entries || [];
 
   return node;
 }
@@ -722,7 +750,94 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
   });
 }
 
-/* -------------------------------- agent 接口 ------------------------------- */
+/* ------------------------------- 中转部署脚本 ------------------------------ */
+
+/**
+ * L4 中转脚本：把入口机器某端口的流量 DNAT 到节点所在机器。
+ * 入口不解析协议，因此 TLS / Reality / Hysteria2 全部适用，
+ * 且流量仍记在落地节点上（计费不受影响）。
+ */
+function buildRelayScript({ to, port, proto = 'both', label = '' }) {
+  const target = String(to || '').trim();
+  const listenPort = Number(port) || 443;
+  const protocols = proto === 'both' ? ['tcp', 'udp'] : [proto];
+
+  const dnatRules = protocols.map(
+    (p) => `add_rule PREROUTING -p ${p} --dport "\${LISTEN_PORT}" -j DNAT --to-destination "\${TARGET_HOST}:\${TARGET_PORT}"`,
+  );
+
+  return `#!/usr/bin/env bash
+# ${store.db().settings.siteName} · 中转部署脚本
+# ${label ? label + '\n# ' : ''}把本机 \${LISTEN_PORT} 的流量转发到 \${TARGET_HOST}:\${TARGET_PORT}
+# 生成时间：${new Date().toISOString()}
+set -euo pipefail
+
+TARGET_HOST="${target}"
+TARGET_PORT=${listenPort}
+LISTEN_PORT=${listenPort}
+
+if [ -z "$TARGET_HOST" ]; then
+  echo "✗ 未指定落地节点地址"
+  exit 1
+fi
+
+echo "→ 开启内核转发"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null; then
+  sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+else
+  echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+fi
+
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "✗ 未检测到 iptables，请先安装：apt install -y iptables"
+  exit 1
+fi
+
+# 幂等写入 NAT 规则（已存在则跳过）
+add_rule() {
+  iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"
+}
+
+add_rule POSTROUTING -d "$TARGET_HOST" -j MASQUERADE
+${dnatRules.join('\n')}
+
+echo ""
+echo "✓ 中转规则已生效"
+echo "  本机 :$LISTEN_PORT  →  $TARGET_HOST:$TARGET_PORT"
+echo ""
+echo "当前 NAT 规则："
+iptables -t nat -L PREROUTING -n --line-numbers | grep -E "DNAT|MASQUERADE" || true
+
+# 持久化（不同发行版命令不同，失败不影响本次生效）
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save && echo "✓ 规则已持久化"
+elif command -v iptables-save >/dev/null 2>&1; then
+  mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && echo "✓ 规则已保存到 /etc/iptables/rules.v4"
+else
+  echo "! 未找到持久化工具，重启后规则会丢失"
+fi
+
+echo ""
+echo "提示："
+echo "  · 流量仍记在落地节点（$TARGET_HOST）上，计费与统计不受影响"
+echo "  · 记得在入口机器放行 $LISTEN_PORT 端口"
+echo "  · 删除规则：iptables -t nat -L PREROUTING -n --line-numbers 找到行号后 -D"
+`;
+}
+
+function relayScript(req, res, params, body, session, ctx) {
+  const q = ctx.query;
+  const to = q.get('to') || '';
+  const port = Number(q.get('port')) || 443;
+  const proto = ['tcp', 'udp', 'both'].includes(q.get('proto')) ? q.get('proto') : 'both';
+  if (!to) return sendJson(res, 400, { error: '缺少落地节点地址（to）' });
+
+  const script = buildRelayScript({ to, port, proto, label: q.get('label') || '' });
+  sendText(res, 200, script, 'text/x-shellscript; charset=utf-8', {
+    'Content-Disposition': `inline; filename="relay.sh"`,
+  });
+}
 
 /** 记录 agent 上报的公网 IP（仅自动模式下生效，手填域名不会被覆盖） */
 function applyReportedIp(scope, ip) {
@@ -811,7 +926,24 @@ function buildAgentPayload(scope) {
     };
   });
 
-  const payloadForHash = JSON.stringify({ xray: xrayConfig, hysteria: hysteriaList.map((h) => h.yaml) });
+  // 需要 agent 落盘或生成的证书（Xray 与 Hysteria2 一视同仁）
+  const certs = [...xrayNodes, ...hyNodes]
+    .filter((n) => n.certMode === 'content' || n.certMode === 'self')
+    .map((n) => {
+      const paths = cert.pathsFor(n.id);
+      return {
+        nodeId: n.id,
+        name: n.name,
+        mode: n.certMode,
+        certPem: n.certPem || '',
+        keyPem: n.keyPem || '',
+        cn: n.selfCN || n.sni || n.host || 'nodepanel.local',
+        certPath: paths.certPath,
+        keyPath: paths.keyPath,
+      };
+    });
+
+  const payloadForHash = JSON.stringify({ xray: xrayConfig, hysteria: hysteriaList.map((h) => h.yaml), certs });
 
   return {
     ok: true,
@@ -821,6 +953,7 @@ function buildAgentPayload(scope) {
     userCount: active.length,
     xray: xrayConfig,
     hysteria: hysteriaList,
+    certs,
   };
 }
 
@@ -1042,6 +1175,7 @@ const ROUTES = [
   ['GET', '/api/servers/:id/install', installScript, false],
 
   ['POST', '/api/reality/keys', generateRealityKeys, true],
+  ['GET', '/api/relay/script', relayScript, true],
   ['POST', '/api/demo/traffic', demoTick, true],
 
   ['GET', '/api/settings', getSettings, true],

@@ -750,7 +750,9 @@ RENDERERS.nodes = async () => {
           (n) => `<tr>
         <td>
           <div class="cell-name">${esc(n.name)}</div>
-          <div class="cell-sub">${esc(n.serverName)}${n.host ? ' · ' + esc(n.host) : ''}</div>
+          <div class="cell-sub">${esc(n.serverName)}${n.host ? ' · ' + esc(n.host) : ''}${
+            n.entries && n.entries.length ? ' · ' + n.entries.length + ' 个中转入口' : ''
+          }</div>
         </td>
         <td>
           <span class="badge ${PROTO_BADGE[n.protocol] || 'badge-dim'}">${n.protocol}</span>
@@ -880,6 +882,29 @@ function nodeForm(node, servers) {
         </select>
       </div>
 
+      <div id="fp-box" class="hidden">
+        <div class="field">
+          <label>uTLS 指纹（客户端握手伪装）</label>
+          <select id="n-fp">
+            <option value="" ${n.fp === '' ? 'selected' : ''}>不模拟</option>
+            <option value="chrome" ${(n.fp || 'chrome') === 'chrome' ? 'selected' : ''}>chrome</option>
+            <option value="firefox" ${n.fp === 'firefox' ? 'selected' : ''}>firefox</option>
+            <option value="safari" ${n.fp === 'safari' ? 'selected' : ''}>safari</option>
+            <option value="randomized" ${n.fp === 'randomized' ? 'selected' : ''}>randomized</option>
+          </select>
+          <div class="hint">只影响客户端 TLS ClientHello 特征，服务端无需配置。Reality 建议 chrome。</div>
+        </div>
+      </div>
+
+      <label id="ve-box" class="hidden ve-label">
+        <input type="checkbox" id="n-ve" ${n.vlessEncryption ? 'checked' : ''} style="width:auto">
+        启用 VLESS Encryption（mlkem768x25519plus）
+      </label>
+      <p class="hint hidden" id="ve-hint">
+        需 Xray 25.6.0+ 且服务端与客户端都支持。它替代了 vision 流控解决的 TLS-in-TLS 问题，
+        与 Reality 二选一即可；同时开启在部分传输组合下有已知问题。
+      </p>
+
       <div id="ss-box" class="hidden">
         <div class="form-row">
           <div class="field">
@@ -894,20 +919,56 @@ function nodeForm(node, servers) {
         <p class="hint">Shadowsocks 入站为单用户模式，该节点所有用户共用同一密码，无法按用户计费。</p>
       </div>
 
-      <div id="tls-box">
+      <!-- 证书：TLS 与 Hysteria2 共用一套 -->
+      <div id="cert-box" class="hidden">
+        <div class="section-title">TLS 证书</div>
         <div class="field">
           <label>SNI / 域名</label>
           <input type="text" id="n-sni" value="${esc(n.sni || '')}" placeholder="hk1.example.com">
         </div>
-        <div class="form-row">
+        <div class="field">
+          <label>证书来源</label>
+          <select id="n-certmode">
+            <option value="path" ${(n.certMode || 'path') === 'path' ? 'selected' : ''}>服务器上的证书路径</option>
+            <option value="content" ${n.certMode === 'content' ? 'selected' : ''}>粘贴证书内容</option>
+            <option value="self" ${n.certMode === 'self' ? 'selected' : ''}>自动生成自签证书</option>
+          </select>
+        </div>
+
+        <div id="cert-path-box">
+          <div class="form-row">
+            <div class="field">
+              <label>证书路径</label>
+              <input type="text" id="n-cert" value="${esc(n.certFile || '')}" placeholder="/etc/ssl/x/fullchain.pem">
+            </div>
+            <div class="field">
+              <label>私钥路径</label>
+              <input type="text" id="n-key" value="${esc(n.keyFile || '')}" placeholder="/etc/ssl/x/privkey.pem">
+            </div>
+          </div>
+        </div>
+
+        <div id="cert-content-box" class="hidden">
           <div class="field">
-            <label>证书路径</label>
-            <input type="text" id="n-cert" value="${esc(n.certFile || '')}" placeholder="/etc/ssl/x/fullchain.pem">
+            <label>证书 PEM（含证书链）</label>
+            <textarea id="n-certpem" placeholder="-----BEGIN CERTIFICATE-----">${esc(n.certPem || '')}</textarea>
           </div>
           <div class="field">
-            <label>私钥路径</label>
-            <input type="text" id="n-key" value="${esc(n.keyFile || '')}" placeholder="/etc/ssl/x/privkey.pem">
+            <label>私钥 PEM</label>
+            <textarea id="n-keypem" placeholder="-----BEGIN PRIVATE KEY-----">${esc(n.keyPem || '')}</textarea>
           </div>
+          <p class="hint">agent 会把它写入 /etc/nodepanel/certs/&lt;节点ID&gt;/ 并在配置中引用，权限 0600。</p>
+        </div>
+
+        <div id="cert-self-box" class="hidden">
+          <div class="field">
+            <label>自签证书 CN</label>
+            <input type="text" id="n-selfcn" value="${esc(n.selfCN || '')}" placeholder="留空则取上面的 SNI">
+          </div>
+          <p class="hint">
+            agent 用 openssl 生成 10 年自签证书。自签证书无法通过客户端校验，
+            订阅会自动带上 allowInsecure / skip-cert-verify。
+          </p>
         </div>
       </div>
 
@@ -951,21 +1012,7 @@ function nodeForm(node, servers) {
 
     <div id="hy2-box" class="hidden">
       <div class="section-title">Hysteria2</div>
-      <div class="field">
-        <label>证书域名 / SNI</label>
-        <input type="text" id="h-sni" value="${esc(n.protocol === 'hysteria2' ? n.sni || '' : '')}" placeholder="hk2.example.com">
-        <div class="hint">Hysteria2 必须启用 TLS，需要真实证书</div>
-      </div>
-      <div class="form-row">
-        <div class="field">
-          <label>证书路径</label>
-          <input type="text" id="h-cert" value="${esc(n.protocol === 'hysteria2' ? n.certFile || '' : '')}" placeholder="/etc/ssl/x/fullchain.pem">
-        </div>
-        <div class="field">
-          <label>私钥路径</label>
-          <input type="text" id="h-key" value="${esc(n.protocol === 'hysteria2' ? n.keyFile || '' : '')}" placeholder="/etc/ssl/x/privkey.pem">
-        </div>
-      </div>
+      <p class="hint" style="margin:0 0 12px">Hysteria2 必须启用 TLS，证书与 SNI 在下方「TLS 证书」中统一配置。</p>
       <div class="form-row">
         <div class="field">
           <label>混淆 obfs</label>
@@ -996,6 +1043,14 @@ function nodeForm(node, servers) {
       </div>
     </div>
 
+    <div class="section-title">中转入口</div>
+    <div id="entries-list"></div>
+    <button class="btn btn-sm" id="entry-add" type="button" style="margin-top:9px">+ 添加入口</button>
+    <p class="hint" style="margin-top:9px">
+      客户端连接入口地址，流量经 L4 转发落到本节点所在机器，<b>一个入口发布为订阅里的一条节点</b>，
+      方便客户端自动选路与故障转移。不填任何入口 = 直连。入口机器上执行「节点 → 部署 → 中转脚本」即可。
+    </p>
+
     <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);cursor:pointer;margin-top:6px">
       <input type="checkbox" id="n-enabled" ${n.enabled === false ? '' : 'checked'} style="width:auto">
       启用该节点
@@ -1024,12 +1079,31 @@ function bindNodeForm(mask) {
     $('#n-address-hint', mask).textContent = nodeAuto
       ? '部署后由 agent 自动上报公网 IP，这里可留空'
       : '客户端实际连接的地址，必须是客户端能访问到的 IP 或域名';
-    $('#xray-box', mask).classList.toggle('hidden', proto === 'hysteria2');
-    $('#hy2-box', mask).classList.toggle('hidden', proto !== 'hysteria2');
-    $('#tls-box', mask).classList.toggle('hidden', security !== 'tls' || proto === 'ss');
-    $('#reality-box', mask).classList.toggle('hidden', security !== 'reality');
+
+    const isHy2 = proto === 'hysteria2';
+    $('#xray-box', mask).classList.toggle('hidden', isHy2);
+    $('#hy2-box', mask).classList.toggle('hidden', !isHy2);
     $('#ss-box', mask).classList.toggle('hidden', proto !== 'ss');
+    $('#reality-box', mask).classList.toggle('hidden', security !== 'reality' || isHy2);
     $('#wrap-path', mask).classList.toggle('hidden', net === 'tcp');
+
+    // uTLS 指纹：有 TLS/Reality 时才相关
+    const fpOn = !isHy2 && security !== 'none';
+    $('#fp-box', mask).classList.toggle('hidden', !fpOn);
+
+    // VLESS Encryption：仅 VLESS 可选
+    const veOn = proto === 'vless' && !isHy2;
+    $('#ve-box', mask).classList.toggle('hidden', !veOn);
+    $('#ve-hint', mask).classList.toggle('hidden', !veOn);
+
+    // 证书：TLS 或 Hysteria2 都需要
+    const needCert = isHy2 || security === 'tls';
+    $('#cert-box', mask).classList.toggle('hidden', !needCert);
+    const cm = $('#n-certmode', mask).value;
+    $('#cert-path-box', mask).classList.toggle('hidden', cm !== 'path');
+    $('#cert-content-box', mask).classList.toggle('hidden', cm !== 'content');
+    $('#cert-self-box', mask).classList.toggle('hidden', cm !== 'self');
+
     modeHint();
   };
 
@@ -1039,7 +1113,7 @@ function bindNodeForm(mask) {
     $$('#n-mode button', mask).forEach((b) => b.classList.toggle('on', b === btn));
     sync();
   });
-  ['#n-protocol', '#n-security', '#n-network'].forEach((sel) => {
+  ['#n-protocol', '#n-security', '#n-network', '#n-certmode'].forEach((sel) => {
     $(sel, mask).addEventListener('change', sync);
   });
 
@@ -1062,6 +1136,57 @@ function bindNodeForm(mask) {
     }
   });
 
+  /* 中转入口编辑器 */
+  const entries = (Array.isArray(state.editingNode && state.editingNode.entries)
+    ? state.editingNode.entries
+    : []
+  ).map((e) => ({ id: e.id || '', name: e.name || '', host: e.host || '', port: e.port || '' }));
+
+  const renderEntries = () => {
+    const box = $('#entries-list', mask);
+    if (!entries.length) {
+      box.innerHTML = '<div class="hint" style="margin:0 0 4px">尚未添加入口，订阅将使用节点自身地址。</div>';
+      return;
+    }
+    box.innerHTML = entries
+      .map(
+        (e, i) => `<div class="entry-row" data-i="${i}" style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+        <input type="text" class="e-name" value="${esc(e.name)}" placeholder="名称，如：广州中转" style="flex:0 0 130px">
+        <input type="text" class="e-host" value="${esc(e.host)}" placeholder="入口地址 1.2.3.4 或域名" style="flex:1">
+        <input type="number" class="e-port" value="${esc(e.port)}" placeholder="端口" style="flex:0 0 92px">
+        <button class="btn btn-sm btn-danger e-del" type="button" style="flex-shrink:0">删</button>
+      </div>`,
+      )
+      .join('');
+  };
+
+  $('#entry-add', mask).addEventListener('click', () => {
+    entries.push({ id: '', name: '', host: '', port: '' });
+    renderEntries();
+  });
+
+  $('#entries-list', mask).addEventListener('click', (e) => {
+    const del = e.target.closest('.e-del');
+    if (!del) return;
+    entries.splice(Number(del.closest('.entry-row').dataset.i), 1);
+    renderEntries();
+  });
+
+  $('#entries-list', mask).addEventListener('input', (e) => {
+    const row = e.target.closest('.entry-row');
+    if (!row) return;
+    const i = Number(row.dataset.i);
+    const field = e.target.classList.contains('e-name')
+      ? 'name'
+      : e.target.classList.contains('e-host')
+        ? 'host'
+        : 'port';
+    entries[i][field] = e.target.value.trim();
+  });
+
+  renderEntries();
+  state.entryDraft = entries;
+
   sync();
 }
 
@@ -1070,6 +1195,7 @@ function readNodeForm(mask) {
   const mode = $('#n-mode button.on', mask).dataset.mode;
   const protocol = v('#n-protocol');
   const security = protocol === 'hysteria2' ? 'tls' : v('#n-security');
+  const certMode = v('#n-certmode') || 'path';
 
   const payload = {
     name: v('#n-name'),
@@ -1080,15 +1206,22 @@ function readNodeForm(mask) {
     protocol,
     port: Number(v('#n-port')),
     enabled: $('#n-enabled', mask).checked,
+    fp: v('#n-fp'),
+    vlessEncryption: protocol === 'vless' ? $('#n-ve', mask).checked : false,
+    entries: (state.entryDraft || []).filter((e) => e.host),
+    certMode,
+    certFile: v('#n-cert'),
+    keyFile: v('#n-key'),
+    certPem: v('#n-certpem'),
+    keyPem: v('#n-keypem'),
+    selfCN: v('#n-selfcn'),
   };
 
   if (protocol === 'hysteria2') {
     Object.assign(payload, {
       network: 'tcp',
       security: 'tls',
-      sni: v('#h-sni'),
-      certFile: v('#h-cert'),
-      keyFile: v('#h-key'),
+      sni: v('#n-sni'),
       hy2: {
         obfs: v('#h-obfs'),
         obfsPassword: v('#h-obfs-pass'),
@@ -1107,7 +1240,7 @@ function readNodeForm(mask) {
       password: v('#n-password'),
     });
     if (security === 'tls') {
-      Object.assign(payload, { sni: v('#n-sni'), certFile: v('#n-cert'), keyFile: v('#n-key') });
+      Object.assign(payload, { sni: v('#n-sni') });
     } else if (security === 'reality') {
       Object.assign(payload, {
         sni: String(v('#r-names')).split(',')[0].trim(),
@@ -1127,6 +1260,8 @@ function readNodeForm(mask) {
 }
 
 async function nodeNewFlow() {
+  state.editingNode = null;
+  state.entryDraft = [];
   const mask = openModal({
     title: '新增节点',
     wide: true,
@@ -1146,6 +1281,8 @@ async function nodeNewFlow() {
 async function nodeEditFlow(id) {
   const n = state.data.nodes.find((x) => x.id === id);
   if (!n) return;
+  state.editingNode = n;
+  state.entryDraft = (n.entries || []).map((e) => ({ ...e }));
   const mask = openModal({
     title: '编辑节点 · ' + n.name,
     wide: true,
@@ -1207,8 +1344,69 @@ journalctl -u nodepanel-agent -f     # 查看日志
 ${n.protocol === 'hysteria2' ? 'systemctl status nodepanel-hysteria@node-' + n.id : 'systemctl status xray'}</div>
       <p class="hint" style="margin-top:14px">
         独立节点使用自己的 token 拉取配置，与服务器 agent 互不影响。修改节点后同样 60 秒内自动生效。
-      </p>`,
+      </p>
+      <div id="relay-box"></div>`,
   });
+
+  /* 中转入口：为每个入口生成 L4 转发脚本 */
+  const entries = (n.entries || []).filter((e) => e.host);
+  const box = $('#relay-box', modalEl);
+  if (entries.length) {
+    box.innerHTML = `
+      <div class="section-title">中转部署</div>
+      <p class="hint" style="margin:0 0 12px">
+        在入口机器上执行对应脚本，把该端口的流量 DNAT 到 <b>${esc(n.host || '本节点')}:${n.port}</b>。
+        入口不解析协议，TLS / Reality / Hysteria2 均适用，流量仍记在本节点上。
+      </p>
+      <div id="relay-list" style="display:flex;flex-direction:column;gap:8px">
+        ${entries
+          .map(
+            (e) => `<div style="display:flex;gap:8px;align-items:center">
+          <span class="chip" style="flex:0 0 108px">${esc(e.name || '入口')}</span>
+          <span class="mono" style="flex:1;font-size:12px;color:var(--text-dim)">${esc(e.host)}${e.port ? ':' + e.port : ''}</span>
+          <button class="btn btn-sm" data-relay="${esc(e.id)}" data-host="${esc(e.host)}" data-port="${e.port || n.port}">生成脚本</button>
+        </div>`,
+          )
+          .join('')}
+      </div>
+      <div id="relay-out" style="margin-top:12px"></div>`;
+
+    box.addEventListener('click', async (e) => {
+      const btn = e.target.closest('[data-relay]');
+      if (!btn) return;
+      const out = $('#relay-out', box);
+      out.innerHTML = '<div class="hint">正在生成…</div>';
+      try {
+        const q = new URLSearchParams({
+          to: n.host || '',
+          port: btn.dataset.port,
+          label: `${n.name} · ${btn.dataset.host}`,
+          proto: n.protocol === 'hysteria2' ? 'both' : 'tcp',
+        });
+        // 该接口返回纯文本脚本，不能走 api()
+        const res = await fetch('/api/relay/script?' + q.toString(), {
+          headers: { Authorization: 'Bearer ' + state.token },
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || '生成失败');
+        }
+        const script = await res.text();
+        out.innerHTML = `<div class="code-wrap">
+          <pre class="code">${esc(script)}</pre>
+          <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(script)}">复制</button>
+        </div>`;
+      } catch (err) {
+        out.innerHTML = `<div class="hint">生成失败：${esc(err.message)}</div>`;
+      }
+    });
+  } else {
+    box.innerHTML = `
+      <div class="section-title">中转部署</div>
+      <p class="hint" style="margin:0">
+        该节点还没有配置中转入口。在「编辑节点 → 中转入口」里添加入口地址后，这里会为每个入口生成转发脚本。
+      </p>`;
+  }
 }
 
 /* ============================== 服务器 ============================== */

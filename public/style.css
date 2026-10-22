@@ -271,7 +271,7 @@ select { cursor: pointer; appearance: none; background-image: linear-gradient(45
 .topbar h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
 .topbar .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
 
-.view { padding: 24px 30px 60px; max-width: 1280px; width: 100%; }
+.view { padding: 24px 30px 60px; width: 100%; }
 
 /* ------------------------------- 卡片 --------------------------------- */
 
@@ -324,7 +324,12 @@ select { cursor: pointer; appearance: none; background-image: linear-gradient(45
 .stat .value small { font-size: 13px; font-weight: 500; color: var(--text-dim); margin-left: 3px; }
 .stat .foot { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
 
-.grid-2 { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; }
+/* 两栏：宽屏按 1.35:1，窄于 1100px 自动堆叠，避免右栏被拉爆 */
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  gap: 16px;
+}
 .grid-3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
 
 /* ------------------------------- 表格 --------------------------------- */
@@ -652,6 +657,18 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.018); }
   color: #8fb4e0;
   line-height: 1.6;
 }
+
+/* 复选标签（VLESS Encryption 等） */
+.ve-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  margin-bottom: 10px;
+}
+.ve-label input { accent-color: var(--accent); }
 
 .section-title {
   font-size: 11.5px;

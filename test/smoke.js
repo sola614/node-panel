@@ -63,7 +63,26 @@ const json = (obj) => JSON.stringify(obj);
   }
   token = login.data.token;
 
-  /* ---------- 1.5 存量数据自检（防止种子数据缺 id 之类的结构问题） ---------- */
+  /* ---------- 0.5 清理上次崩溃的残留，保证测试可重复 ---------- */
+  {
+    const stale = async (path, key) => {
+      const r = await call(path);
+      const items = r.data.items || [];
+      for (const it of items) {
+        if (String(it.name || '').startsWith('SMOKE-')) {
+          await call(`${path}/${it.id}`, { method: 'DELETE' });
+        }
+      }
+      return items.length;
+    };
+    await stale('/api/users');
+    await stale('/api/nodes');
+    await stale('/api/servers');
+    await stale('/api/plans');
+    console.log('  · 已清理上次运行的残留数据');
+  }
+
+  /* ---------- 1. 存量数据自检（防止种子数据缺 id 之类的结构问题） ---------- */
   const allNodes = await call('/api/nodes');
   const allPlans = await call('/api/plans');
   const nodeIdSet = new Set(allNodes.data.items.map((n) => n.id));
@@ -301,6 +320,111 @@ const json = (obj) => JSON.stringify(obj);
   const subHy2 = await call(`/api/sub/${u2.token}`);
   const hy2ip = (subHy2.data.links || []).find((l) => l.name.includes('SMOKE-HY2'));
   ok('Hysteria2 链接使用上报的 IP', !!hy2ip && hy2ip.host === REPORTED_IP, `host=${hy2ip && hy2ip.host}`);
+
+  /* ---------- 11.6 证书 / uTLS / VLESS Encryption / 中转入口 ---------- */
+
+  // 粘贴证书内容
+  const nodeCert = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-CERT', mode: 'standalone', address: 'cert.example.com',
+      protocol: 'vless', port: 443, network: 'tcp', security: 'tls', sni: 'cert.example.com',
+      certMode: 'content',
+      certPem: '-----BEGIN CERTIFICATE-----\nSMOKE-CERT\n-----END CERTIFICATE-----\n',
+      keyPem: '-----BEGIN PRIVATE KEY-----\nSMOKE-KEY\n-----END PRIVATE KEY-----\n',
+      fp: 'firefox', enabled: true,
+    }),
+  });
+  ok('新增节点（粘贴证书内容）', nodeCert.status === 200 && nodeCert.data.item.certMode === 'content');
+  const nodeCertId = nodeCert.data.item.id;
+  cleanup.push(['/api/nodes/' + nodeCertId]);
+
+  // 自签证书
+  const nodeSelf = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-SELF', mode: 'standalone', address: 'self.example.com',
+      protocol: 'trojan', port: 443, network: 'tcp', security: 'tls',
+      certMode: 'self', selfCN: 'self.example.com', sni: 'self.example.com', enabled: true,
+    }),
+  });
+  ok('新增节点（自签证书）', nodeSelf.status === 200 && nodeSelf.data.item.certMode === 'self');
+  const nodeSelfId = nodeSelf.data.item.id;
+  cleanup.push(['/api/nodes/' + nodeSelfId]);
+
+  const subCert = await call(`/api/sub/${u2.token}`);
+  const certLink = (subCert.data.links || []).find((l) => l.name.includes('SMOKE-CERT'));
+  ok('粘贴证书的节点使用固定落地路径',
+    !!certLink && (await call(`/api/nodes/${nodeCertId}/preview`)).data.kind === 'xray');
+  const cfgCert = await call(`/api/agent/config?token=${nodeCert.data.item.token}&v=test`);
+  const certInbound = cfgCert.data.xray.inbounds.find((i) => i.tag === 'node-' + nodeCertId);
+  ok('content 模式证书指向 agent 落地路径',
+    !!certInbound && certInbound.streamSettings.tlsSettings.certificates[0].certificateFile.includes('/etc/nodepanel/certs/' + nodeCertId),
+    certInbound ? certInbound.streamSettings.tlsSettings.certificates[0].certificateFile : '');
+  ok('uTLS 指纹写入链接', !!certLink && certLink.uri.includes('fp=firefox'));
+  ok('证书 PEM 下发给 agent',
+    (cfgCert.data.certs || []).some((c) => c.nodeId === nodeCertId && c.certPem.includes('SMOKE-CERT') && c.keyPem.includes('SMOKE-KEY')));
+
+  const selfLink = (subCert.data.links || []).find((l) => l.name.includes('SMOKE-SELF'));
+  ok('自签证书链接带 allowInsecure', !!selfLink && selfLink.uri.includes('allowInsecure=1'));
+
+  // VLESS Encryption
+  const nodeVe = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-VE', mode: 'standalone', address: 've.example.com',
+      protocol: 'vless', port: 443, network: 'tcp', security: 'tls', sni: 've.example.com',
+      certMode: 'self', vlessEncryption: true, enabled: true,
+    }),
+  });
+  ok('新增节点（VLESS Encryption）', nodeVe.status === 200 && nodeVe.data.item.vlessEncryption === true);
+  const nodeVeId = nodeVe.data.item.id;
+  const nodeVeToken = nodeVe.data.item.token;
+  cleanup.push(['/api/nodes/' + nodeVeId]);
+
+  const cfgVe = await call(`/api/agent/config?token=${nodeVeToken}&v=test`);
+  const veInbound = cfgVe.data.xray.inbounds.find((i) => i.tag === 'node-' + nodeVeId);
+  ok('VLESS Encryption 写入服务端配置',
+    !!veInbound && veInbound.settings.encryption === 'mlkem768x25519plus' && veInbound.settings.decryption === undefined);
+
+  const subVe = await call(`/api/sub/${u2.token}`);
+  const veLink = (subVe.data.links || []).find((l) => l.name.includes('SMOKE-VE'));
+  ok('VLESS Encryption 写入订阅链接', !!veLink && veLink.uri.includes('encryption=mlkem768x25519plus'));
+
+  const clashVe = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  ok('Clash 订阅包含 encryption 与 client-fingerprint',
+    clashVe.includes('encryption: mlkem768x25519plus') && clashVe.includes('client-fingerprint'));
+
+  // 中转入口
+  const relayNode = await call('/api/nodes/' + node1Id, {
+    method: 'PUT',
+    body: json({ entries: [
+      { name: '入口A', host: 'relay-a.example.com' },
+      { name: '入口B', host: 'relay-b.example.com', port: 20443 },
+    ] }),
+  });
+  ok('节点可配置中转入口', relayNode.status === 200 && relayNode.data.item.entries.length === 2);
+
+  const subRelay = await call(`/api/sub/${u2.token}`);
+  const relayLinks = (subRelay.data.links || []).filter((l) => l.name.includes('SMOKE-TLS'));
+  ok('每个入口发布为一条订阅节点', relayLinks.length === 2, `(${relayLinks.map((l) => l.host + ':' + l.port).join(', ')})`);
+  ok('入口链接使用入口地址与端口',
+    relayLinks.some((l) => l.host === 'relay-a.example.com' && l.port === 20443) &&
+    relayLinks.some((l) => l.host === 'relay-b.example.com' && l.port === 20443));
+
+  const clashRelay = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  ok('Clash 订阅包含中转入口节点',
+    clashRelay.includes('relay-a.example.com') && clashRelay.includes('relay-b.example.com'));
+
+  const relayScript = await fetch(`${BASE}/api/relay/script?to=203.0.113.9&port=443&label=SMOKE`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const relayText = await relayScript.text();
+  ok('中转脚本可生成', relayScript.status === 200 && relayText.includes('DNAT'));
+  ok('中转脚本按协议生成规则', relayText.includes('PREROUTING -p tcp') && relayText.includes('PREROUTING -p udp'));
+
+  const relayBad = await fetch(`${BASE}/api/relay/script`, { headers: { Authorization: 'Bearer ' + token } });
+  ok('缺少落地地址时中转脚本报错', relayBad.status === 400);
 
   /* ---------- 12. 鉴权 ---------- */  ok('错误 token 无法拉配置', (await call('/api/agent/config?token=wrong-token')).status === 401);
 

@@ -36,6 +36,7 @@ const RELOAD_CMD = process.env.RELOAD_CMD || 'systemctl restart xray';
 const HYSTERIA_DIR = process.env.HYSTERIA_DIR || '/etc/hysteria';
 const HYSTERIA_BIN = process.env.HYSTERIA_BIN || '/usr/local/bin/hysteria';
 const HY_UNIT = 'nodepanel-hysteria';
+const CERTS_ROOT = process.env.CERTS_ROOT || '/etc/nodepanel/certs';
 const INTERVAL = Number(process.env.INTERVAL || 60) * 1000;
 const DRY_RUN = process.env.DRY_RUN === '1' || process.argv.includes('--dry');
 const ONCE = process.argv.includes('--once');
@@ -161,6 +162,7 @@ function syncXray(config) {
     return;
   }
 
+  rewriteConfigCertPaths(config);
   const text = JSON.stringify(config, null, 2);
   const changed = writeIfChanged(XRAY_CONFIG, text);
   if (DRY_RUN) {
@@ -197,7 +199,7 @@ function syncHysteria(list) {
 
   for (const [instance, h] of desired) {
     const file = path.join(HYSTERIA_DIR, instance + '.yaml');
-    const changed = writeIfChanged(file, h.yaml);
+    const changed = writeIfChanged(file, rewriteYamlCertPaths(h.yaml));
     if (DRY_RUN) {
       log(`  dry-run: 将写入 ${file}（端口 ${h.port}，${h.userCount} 位用户）`);
       continue;
@@ -295,6 +297,98 @@ async function report(users) {
   log(`↑ 上报 ${data.applied} 位用户，共 ${(data.bytes / 1048576).toFixed(1)} MB`);
 }
 
+/* ---------------------------------- 证书 ---------------------------------- */
+
+/**
+ * 证书路径以面板计算的根目录为准，但 agent 可以用 CERTS_ROOT 覆盖。
+ * 做法：从下发内容里推断面板的根目录，把配置中的路径整体替换成本地根目录，
+ * 保证「文件写在哪」和「配置引用哪」永远一致。
+ */
+let panelCertsRoot = null;
+
+function detectPanelCertsRoot(certs) {
+  if (panelCertsRoot || !Array.isArray(certs) || !certs.length) return;
+  const p = certs[0] && certs[0].certPath;
+  if (!p) return;
+  panelCertsRoot = path.posix.dirname(path.posix.dirname(p));
+  if (panelCertsRoot !== CERTS_ROOT) {
+    log(`证书根目录不一致：面板=${panelCertsRoot} 本机=${CERTS_ROOT}，将按本机路径重写引用`);
+  }
+}
+
+function localCertPath(p) {
+  if (!p || !panelCertsRoot) return p;
+  if (p.startsWith(panelCertsRoot + '/')) {
+    return path.join(CERTS_ROOT, p.slice(panelCertsRoot.length + 1));
+  }
+  return p;
+}
+
+function rewriteConfigCertPaths(config) {
+  if (!config || !Array.isArray(config.inbounds)) return config;
+  for (const ib of config.inbounds) {
+    const tls = ib.streamSettings && ib.streamSettings.tlsSettings;
+    if (!tls || !Array.isArray(tls.certificates)) continue;
+    for (const c of tls.certificates) {
+      if (c.certificateFile) c.certificateFile = localCertPath(c.certificateFile);
+      if (c.keyFile) c.keyFile = localCertPath(c.keyFile);
+    }
+  }
+  return config;
+}
+
+function rewriteYamlCertPaths(yaml) {
+  if (!panelCertsRoot || panelCertsRoot === CERTS_ROOT) return yaml;
+  return String(yaml).split(panelCertsRoot + '/').join(path.join(CERTS_ROOT, '') + '/');
+}
+
+/**
+ * 面板下发的证书处理：
+ *   content —— 把 PEM 写到固定路径（0600）
+ *   self    —— 文件不存在时用 openssl 现场生成自签证书
+ */
+function syncCerts(list) {
+  if (!Array.isArray(list) || !list.length) return;
+  detectPanelCertsRoot(list);
+  if (DRY_RUN) {
+    for (const c of list) log(`  dry-run: 证书 ${c.nodeId} (${c.mode}) → ${localCertPath(c.certPath)}`);
+    return;
+  }
+
+  for (const c of list) {
+    const certPath = localCertPath(c.certPath);
+    const keyPath = localCertPath(c.keyPath);
+    const dir = path.dirname(certPath);
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+      if (c.mode === 'content') {
+        const certChanged = !fs.existsSync(certPath) || fs.readFileSync(certPath, 'utf8') !== (c.certPem || '');
+        const keyChanged = !fs.existsSync(keyPath) || fs.readFileSync(keyPath, 'utf8') !== (c.keyPem || '');
+        if (certChanged || keyChanged) {
+          fs.writeFileSync(certPath, c.certPem || '', { mode: 0o600 });
+          fs.writeFileSync(keyPath, c.keyPem || '', { mode: 0o600 });
+          log(`证书已写入：${certPath}`);
+        }
+      } else if (c.mode === 'self') {
+        if (fs.existsSync(certPath) && fs.existsSync(keyPath)) continue;
+        if (!hasBinary('openssl')) {
+          log(`  ! 未检测到 openssl，无法为 ${c.name} 生成自签证书`);
+          continue;
+        }
+        const cmd = `openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes` +
+          ` -keyout "${keyPath}" -out "${certPath}"` +
+          ` -subj "/CN=${c.cn}" -addext "subjectAltName=DNS:${c.cn}"`;
+        const out = run(cmd, 60000);
+        if (out === null) log(`  ! 自签证书生成失败：${c.name}`);
+        else log(`已生成自签证书：${certPath}（CN=${c.cn}，客户端需关闭证书校验）`);
+      }
+    } catch (err) {
+      log(`  ! 证书处理失败 ${c.nodeId}：${err.message}`);
+    }
+  }
+}
+
 /* ---------------------------------- 主循环 --------------------------------- */
 
 let lastHash = '';
@@ -310,6 +404,7 @@ async function tick() {
     );
 
     if (data.hash !== lastHash) {
+      syncCerts(data.certs);
       syncXray(data.xray);
       syncHysteria(hy);
       lastHash = data.hash;

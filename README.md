@@ -82,18 +82,61 @@ PANEL_SEED=0 node server.js
 
 | 协议 | 传输 | 说明 |
 | --- | --- | --- |
-| VLESS | tcp / ws / grpc / httpupgrade | 支持 Reality + Vision 流控 |
+| VLESS | tcp / ws / grpc / httpupgrade | 支持 Reality + Vision 流控，可选 VLESS Encryption |
 | VMess | tcp / ws / grpc / httpupgrade | 兼容性好 |
 | Trojan | tcp / ws / grpc | 需 TLS |
 | Shadowsocks | tcp | 单用户模式，节点级共享密码 |
 | Hysteria2 | QUIC | 独立进程，每节点一个实例 |
 
-**Reality** 无需证书：新增节点时点「生成」按钮，面板会现场生成 x25519 密钥对和 shortId，
+#### Reality 与 uTLS
+
+Reality 无需证书：新增节点时点「生成」按钮，面板会现场生成 x25519 密钥对和 shortId，
 私钥只下发给服务器，公钥自动写进订阅的 `pbk` 参数。流控默认 `xtls-rprx-vision`，可关。
 
-**Hysteria2** 由独立的 `hysteria` 二进制承载，agent 会为每个节点写一份
-`/etc/hysteria/node-<id>.yaml` 并用 systemd 模板单元 `nodepanel-hysteria@node-<id>` 拉起实例。
-流量通过每实例的 `trafficStats` 接口按用户名归属。**一台机器可以跑多个 Hysteria2 节点**。
+**uTLS 是客户端侧能力**，服务端无从开启——它改的是客户端 TLS ClientHello 的指纹特征。
+面板能做的就是在订阅链接里带上正确的 `fp` 参数（chrome / firefox / safari / randomized / 关），
+Reality 下建议 chrome。VLESS Encryption（`mlkem768x25519plus`）则是服务端与客户端双向特性：
+
+- 需要 **Xray 25.6.0+**，两端都要支持
+- 它解决的正是 vision 流控当年解决的 TLS-in-TLS 问题，所以**与 Reality 二选一即可**
+- 同时开启在部分传输组合下有已知问题，默认关闭
+
+### Hysteria2
+
+由独立的 `hysteria` 二进制承载（不是 Xray 协议）。agent 会为每个节点写一份
+`/etc/hysteria/node-<id>.yaml`，并用 systemd 模板单元 `nodepanel-hysteria@node-<id>` 拉起独立实例，
+所以**一台机器可以跑多个 Hysteria2 节点**。流量通过每实例的 `trafficStats` 接口按用户名归属。
+部署脚本检测到 Hysteria2 节点时会顺带安装 hysteria。
+
+### TLS 证书的三种来源
+
+| 模式 | 说明 |
+| --- | --- |
+| 服务器路径 | 填服务器上已有的证书/私钥路径（原有行为） |
+| 粘贴证书内容 | 面板里贴 PEM，agent 落盘到 `/etc/nodepanel/certs/<节点ID>/`，权限 0600 |
+| 自动生成自签 | agent 用 openssl 生成 10 年自签证书，CN 取 SNI |
+
+自签证书无法通过客户端校验，订阅会自动带上 `allowInsecure=1` / Clash 的 `skip-cert-verify: true`。
+
+agent 可用 `CERTS_ROOT` 覆盖证书目录：面板下发的路径前缀与本机不一致时，
+agent 会自动重写配置里的引用，保证「文件写在哪」和「配置引用哪」永远一致。
+
+### 中转节点（入口）
+
+在节点上添加入口地址，**一个入口在订阅里发布为一条独立节点**，客户端可以自动选路与故障转移：
+
+```
+用户 ──▶ 入口 A:443 ──DNAT──▶ 节点所在机器 C:443
+       └─▶ 入口 B:8443 ─┘
+```
+
+入口机器上执行「节点 → 部署 → 中转脚本」，agent 会写好 iptables NAT 规则（幂等）并持久化。
+这是 **L4 层中转**：入口不解析协议，因此 TLS / Reality / Hysteria2 全部适用，
+而且**流量仍记在落地节点上**，计费与统计不受影响。
+
+如果需要在入口终止 TLS、加自己的认证或转发明文协议，那才需要 L7 中转
+（在入口上跑一个 Xray，inbound 对用户、outbound 指向落地节点），代价是双重加密，
+并且要在落地节点上为入口准备一个专用账号。
 
 ### 公网地址上报
 
@@ -236,6 +279,7 @@ POST /api/servers/:id/rotate               重置服务器 token
 GET  /api/servers/:id/install?token=       服务器部署脚本
 
 POST /api/reality/keys                     生成 Reality 密钥对
+GET  /api/relay/script?to=&port=&proto=    生成中转（L4 转发）部署脚本
 POST /api/demo/traffic                     注入演示流量
 GET/PUT /api/settings                      站点设置
 POST /api/admin/password                   修改管理员密码
@@ -253,8 +297,9 @@ node-panel/
 ├── server.js            HTTP 服务、路由、业务逻辑
 ├── lib/
 │   ├── store.js         数据层（JSON 文件 + 原子写入 + 版本迁移）
-│   ├── xray.js          节点 → Xray 配置（含 Reality / Vision 流控）
+│   ├── xray.js          节点 → Xray 配置（含 Reality / Vision 流控 / VLESS Encryption）
 │   ├── hysteria.js      节点 → Hysteria2 配置
+│   ├── cert.js          TLS 证书三种来源的路径解析
 │   ├── sub.js           分享链接 / Base64 / Clash 订阅生成
 │   ├── keys.js          x25519 密钥对生成
 │   └── yaml.js          YAML 序列化
@@ -283,13 +328,27 @@ node-panel/
 node test/smoke.js http://127.0.0.1:8080
 ```
 
-53 项断言，覆盖：健康检查 → 存量数据自检 → 建服务器 → 三种节点 → 套餐 → 三类用户 →
-订阅与配置双层套餐隔离 → Reality / Hysteria2 链接与配置 → 超额自动剔除 →
+71 项断言，覆盖：健康检查 → 残留清理 → 存量数据自检 → 建服务器 → 五种节点 → 套餐 → 三类用户 →
+订阅与配置双层套餐隔离 → Reality / Hysteria2 链接与配置 → VLESS Encryption → uTLS 指纹 →
+证书三态（路径 / 粘贴 / 自签）→ 中转入口多端点发布 → 超额自动剔除 →
 部署脚本与鉴权 → 公网 IP 上报（手动不覆盖 / 自动生效）→ 自动清理。
+
+测试是幂等的：启动时会先清理上次崩溃残留的 `SMOKE-*` 数据。
+
+## 九、界面适配
+
+管理台为宽屏优先设计，内容区不设上限，栅格自动流动：
+
+- 统计卡片 `auto-fit minmax(196px, 1fr)`，宽屏自动横向铺开
+- 两栏区在窄于约 1100px 时自动堆叠
+- 侧边栏可收起（状态存 localStorage），移动端强制展开并横向滚动
+- 表格区域横向滚动，不撑破布局
+
+用户订阅页为阅读优先，内容区限制在 680px 并居中。
 
 ---
 
-## 九、Docker 部署
+## 十、Docker 部署
 
 ```bash
 # 直接拉镜像
@@ -321,7 +380,7 @@ PR 只跑测试和构建，不推送。
 
 ---
 
-## 十、生产部署建议
+## 十一、生产部署建议
 
 ### systemd 常驻面板
 
@@ -374,7 +433,7 @@ server {
 
 ---
 
-## 十一、已知限制
+## 十二、已知限制
 
 1. **SS 节点是单用户模式**：Xray 的 shadowsocks 入站不支持多用户，所有用户共用同一密码，无法按用户计费。要精确计费请用 VLESS / VMess / Trojan。
 2. **流量上报是增量式**：上报请求丢了这一分钟的流量就丢了。要对账严格需改成累积值 + 服务端去重。
@@ -382,5 +441,7 @@ server {
 4. **单管理员**：没有多账号和权限体系。
 5. **TLS 证书要自己准备**：面板不签发证书，只把路径写进配置（Reality 除外）。
 6. **公网 IP 探测依赖外部服务**：agent 全部 provider 失败时会沿用上一次的结果；机器在 NAT 后且需要内网穿透时，请改回手动填写。
+7. **VLESS Encryption 需要两端都是 Xray 25.6.0+**：客户端不支持时该节点连不上，建议按需开启而不是全局打开。
+8. **证书路径默认由面板计算**：agent 用 `CERTS_ROOT` 可覆盖，但改完需要等下一轮配置同步才会重写引用。
 
 需要更多的话，往上加的方向：多管理员与审计日志、节点级限速、月结流量重置、在线 IP 数限制、Telegram 通知。
