@@ -1,0 +1,17 @@
+{
+  "name": "node-panel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "轻量节点管理面板：用户 / 节点 / 服务器 + 订阅与流量配额",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}

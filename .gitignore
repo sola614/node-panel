@@ -1,0 +1,9 @@
+# 依赖与运行时产物
+node_modules/
+data/
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

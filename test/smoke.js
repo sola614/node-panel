@@ -1,0 +1,324 @@
+'use strict';
+/**
+ * 端到端冒烟测试：node test/smoke.js [http://127.0.0.1:8080]
+ *
+ * 覆盖：
+ *   登录 → 建服务器 → 建节点（TLS / Reality / Hysteria2）→ 建套餐 → 建用户
+ *   → 套餐隔离（订阅 + 配置双层）→ 独立节点部署 → 流量超额自动剔除 → 清理
+ */
+
+const BASE = (process.argv[2] || 'http://127.0.0.1:8080').replace(/\/+$/, '');
+const ADMIN_USER = process.env.PANEL_ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.PANEL_ADMIN_PASSWORD || 'admin888';
+const GB = 1024 ** 3;
+
+let token = '';
+let pass = 0;
+let fail = 0;
+const cleanup = [];
+
+const ok = (name, cond, extra = '') => {
+  if (cond) {
+    pass++;
+    console.log(`  ✓ ${name}${extra ? '  ' + extra : ''}`);
+  } else {
+    fail++;
+    console.log(`  ✗ ${name}${extra ? '  ' + extra : ''}`);
+  }
+};
+
+async function call(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = await fetch(BASE + path, { ...opts, headers });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = text;
+  }
+  return { status: res.status, data };
+}
+
+const json = (obj) => JSON.stringify(obj);
+
+(async () => {
+  console.log(`\n▸ 目标面板：${BASE}\n`);
+
+  /* ---------- 0. 健康检查 ---------- */
+  const health = await fetch(`${BASE}/api/health`).then((r) => r.json());
+  ok('健康检查可用', health.ok === true, `schema v${health.version}`);
+
+  /* ---------- 1. 登录 ---------- */
+  const login = await call('/api/login', {
+    method: 'POST',
+    body: json({ username: ADMIN_USER, password: ADMIN_PASS }),
+  });
+  ok('管理员登录', login.status === 200 && !!login.data.token);
+  if (!login.data.token) {
+    console.log('\n登录失败，终止测试。请确认账号密码（默认 admin / admin888）\n');
+    process.exit(1);
+  }
+  token = login.data.token;
+
+  /* ---------- 1.5 存量数据自检（防止种子数据缺 id 之类的结构问题） ---------- */
+  const allNodes = await call('/api/nodes');
+  const allPlans = await call('/api/plans');
+  const nodeIdSet = new Set(allNodes.data.items.map((n) => n.id));
+  ok('所有节点都有 id', allNodes.data.items.every((n) => !!n.id), `共 ${allNodes.data.items.length} 个`);
+  ok('节点 id 唯一', nodeIdSet.size === allNodes.data.items.length);
+  ok('套餐引用的节点都存在',
+    allPlans.data.items.every((p) => (p.nodeIds || []).every((id) => nodeIdSet.has(id))));
+
+  /* ---------- 2. 服务器 + 节点 ---------- */
+  const server = await call('/api/servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-服务器', host: 'smoke.example.com', note: '自动化测试' }),
+  });
+  ok('新增服务器', server.status === 200);
+  const serverId = server.data.item.id;
+  const serverToken = server.data.item.token;
+  cleanup.push(['/api/servers/' + serverId]);
+
+  // 2.1 跟随服务器的普通节点
+  const node1 = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-TLS', mode: 'server', serverId, protocol: 'vless', port: 20443,
+      network: 'ws', path: '/smoke', security: 'tls', sni: 'smoke.example.com',
+      certFile: '/etc/ssl/smoke/fullchain.pem', keyFile: '/etc/ssl/smoke/privkey.pem', enabled: true,
+    }),
+  });
+  ok('新增节点（跟随服务器）', node1.status === 200);
+  const node1Id = node1.data.item.id;
+  cleanup.push(['/api/nodes/' + node1Id]);
+
+  // 2.2 Reality 密钥
+  const keyPair = await call('/api/reality/keys', { method: 'POST' });
+  ok('生成 Reality 密钥对', keyPair.status === 200 && keyPair.data.privateKey.length > 40,
+    `pub=${(keyPair.data.publicKey || '').slice(0, 10)}…`);
+
+  // 2.3 独立部署 + Reality
+  const node2 = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-REALITY', mode: 'standalone', address: 'sg.example.com',
+      protocol: 'vless', port: 443, network: 'tcp', security: 'reality',
+      reality: {
+        dest: 'www.microsoft.com:443', serverNames: 'www.microsoft.com',
+        privateKey: keyPair.data.privateKey, publicKey: keyPair.data.publicKey,
+        shortId: keyPair.data.shortId, flow: 'xtls-rprx-vision',
+      },
+      enabled: true,
+    }),
+  });
+  ok('新增节点（独立部署 + Reality）', node2.status === 200);
+  const node2Id = node2.data.item.id;
+  const node2Token = node2.data.item.token;
+  cleanup.push(['/api/nodes/' + node2Id]);
+
+  // 2.4 独立部署 + Hysteria2
+  const node3 = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-HY2', mode: 'standalone', address: 'hy.example.com',
+      protocol: 'hysteria2', port: 20843, security: 'tls', sni: 'hy.example.com',
+      certFile: '/etc/ssl/hy/fullchain.pem', keyFile: '/etc/ssl/hy/privkey.pem',
+      hy2: { obfs: 'salamander', obfsPassword: 'obfspass', upMbps: 50, downMbps: 500, maskUrl: 'https://example.com/' },
+      enabled: true,
+    }),
+  });
+  ok('新增节点（独立部署 + Hysteria2）', node3.status === 200);
+  const node3Id = node3.data.item.id;
+  const node3Token = node3.data.item.token;
+  cleanup.push(['/api/nodes/' + node3Id]);
+
+  /* ---------- 3. 套餐 ---------- */
+  const plan = await call('/api/plans', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-套餐', desc: '只含 SMOKE-TLS', nodeIds: [node1Id], color: '#4c8dff', sort: 99 }),
+  });
+  ok('新增套餐', plan.status === 200 && plan.data.item.nodeCount === 1);
+  const planId = plan.data.item.id;
+  cleanup.push(['/api/plans/' + planId]);
+
+  const emptyPlan = await call('/api/plans', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-空套餐', desc: '不含任何节点', nodeIds: [], sort: 100 }),
+  });
+  const emptyPlanId = emptyPlan.data.item.id;
+  cleanup.push(['/api/plans/' + emptyPlanId]);
+
+  /* ---------- 4. 用户 ---------- */
+  const mkUser = async (name, planId_, quotaGB) => {
+    const r = await call('/api/users', {
+      method: 'POST',
+      body: json({ name, planId: planId_, quotaGB, expireAt: new Date(Date.now() + 7 * 864e5).toISOString() }),
+    });
+    cleanup.push(['/api/users/' + r.data.item.id]);
+    return r.data.item;
+  };
+
+  const u1 = await mkUser('SMOKE-套餐用户', planId, 0.5);
+  const u2 = await mkUser('SMOKE-不限套餐', null, 100);
+  const u3 = await mkUser('SMOKE-空套餐用户', emptyPlanId, 100);
+  ok('新增用户（绑定套餐 / 不限 / 空套餐）', !!(u1.id && u2.id && u3.id));
+
+  /* ---------- 5. 订阅层套餐隔离 ---------- */
+  const sub1 = await call(`/api/sub/${u1.token}`);
+  const names1 = (sub1.data.links || []).map((l) => l.name);
+  ok('套餐用户只看到套餐内节点', names1.length === 1 && names1[0].includes('SMOKE-TLS'), `(${names1.join(',')})`);
+
+  const sub2 = await call(`/api/sub/${u2.token}`);
+  const names2 = (sub2.data.links || []).map((l) => l.name);
+  ok('不限套餐用户看到全部节点', names2.some((n) => n.includes('SMOKE-REALITY')) && names2.some((n) => n.includes('SMOKE-HY2')));
+
+  const sub3 = await call(`/api/sub/${u3.token}`);
+  ok('空套餐用户看不到任何节点', (sub3.data.links || []).length === 0);
+
+  /* ---------- 6. 链接格式 ---------- */
+  const realityLink = (sub2.data.links || []).find((l) => l.name.includes('SMOKE-REALITY'));
+  ok('Reality 链接带 pbk/sid/flow',
+    !!realityLink && realityLink.uri.includes('security=reality') &&
+    realityLink.uri.includes('pbk=') && realityLink.uri.includes('sid=') &&
+    realityLink.uri.includes('flow=xtls-rprx-vision'));
+
+  const hy2Link = (sub2.data.links || []).find((l) => l.name.includes('SMOKE-HY2'));
+  ok('Hysteria2 链接格式正确',
+    !!hy2Link && hy2Link.uri.startsWith('hysteria2://') &&
+    hy2Link.uri.includes('obfs=salamander') && hy2Link.uri.includes('obfs-password=obfspass'));
+
+  const clash = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  ok('Clash 订阅含 reality-opts 与 hysteria2',
+    clash.includes('reality-opts') && clash.includes('public-key') &&
+    clash.includes('type: hysteria2') && clash.includes('obfs-password'));
+
+  /* ---------- 7. 配置层套餐隔离（服务器 agent） ---------- */
+  const cfgServer = await call(`/api/agent/config?token=${serverToken}&v=test`);
+  const inbound = cfgServer.data.xray.inbounds.find((i) => i.tag === 'node-' + node1Id);
+  const emails = inbound ? inbound.settings.clients.map((c) => c.email) : [];
+  ok('服务器 agent 拉到自己名下的节点', !!inbound);
+  ok('套餐内用户被注入', emails.includes('u' + u1.id));
+  ok('不限套餐用户被注入', emails.includes('u' + u2.id));
+  ok('空套餐用户未被注入', !emails.includes('u' + u3.id));
+  ok('Reality 入站使用 reality 加密',
+    cfgServer.data.xray.inbounds.some((i) => i.streamSettings && i.streamSettings.security === 'reality') === false,
+    '（该服务器没有 Reality 节点，符合预期）');
+
+  /* ---------- 8. 独立节点 agent ---------- */
+  const cfgNode2 = await call(`/api/agent/config?token=${node2Token}&v=test`);
+  ok('独立节点用自己的 token 拉到配置', cfgNode2.status === 200 && cfgNode2.data.scope.type === 'node');
+  ok('独立节点只含自己', cfgNode2.data.nodes.length === 1 && cfgNode2.data.nodes[0].id === node2Id);
+
+  const realityInbound = cfgNode2.data.xray.inbounds.find((i) => i.tag === 'node-' + node2Id);
+  ok('Reality 入站包含 realitySettings',
+    !!realityInbound && realityInbound.streamSettings.security === 'reality' &&
+    realityInbound.streamSettings.realitySettings.privateKey === keyPair.data.privateKey);
+  ok('Reality 客户端启用 vision 流控',
+    realityInbound.settings.clients.every((c) => c.flow === 'xtls-rprx-vision'));
+
+  /* ---------- 9. Hysteria2 配置 ---------- */
+  const cfgNode3 = await call(`/api/agent/config?token=${node3Token}&v=test`);
+  const hy = (cfgNode3.data.hysteria || [])[0];
+  ok('Hysteria2 节点下发独立配置',
+    !!hy && (hy.yaml.includes('listen: :20843') || hy.yaml.includes('listen: ":20843"')), hy ? `端口 ${hy.port}` : '');
+  ok('Hysteria2 含 userpass 认证', !!hy && hy.yaml.includes('userpass') && hy.yaml.includes('u' + u2.id));
+  ok('Hysteria2 含带宽与混淆', !!hy && hy.yaml.includes('salamander') && hy.yaml.includes('mbps'));
+  ok('Hysteria2 带流量统计端口', !!hy && hy.statsPort > 9000 && !!hy.secret);
+
+  /* ---------- 10. 超额自动剔除 ---------- */
+  const report = await call(`/api/agent/report?token=${serverToken}`, {
+    method: 'POST',
+    body: json({ users: [{ email: 'u' + u1.id, up: 0.3 * GB, down: 0.3 * GB }] }),
+  });
+  ok('流量上报成功', report.status === 200 && report.data.applied === 1);
+
+  const usersAfter = await call('/api/users');
+  const me1 = usersAfter.data.items.find((u) => u.id === u1.id);
+  ok('用户状态变为「超量」', me1 && me1.status === 'over', `(${me1?.statusLabel})`);
+
+  const cfgAfter = await call(`/api/agent/config?token=${serverToken}&v=test`);
+  const inboundAfter = cfgAfter.data.xray.inbounds.find((i) => i.tag === 'node-' + node1Id);
+  const stillIn = inboundAfter && inboundAfter.settings.clients.some((c) => c.email === 'u' + u1.id);
+  ok('超量用户被移出节点配置', !stillIn);
+
+  const subAfter = await call(`/api/sub/${u1.token}`);
+  ok('超量用户订阅为空', (subAfter.data.links || []).length === 0);
+
+  /* ---------- 11. 部署脚本 ---------- */
+  const srvInstall = await fetch(`${BASE}/api/servers/${serverId}/install?token=${serverToken}`).then((r) => r.text());
+  ok('服务器部署脚本可下载', srvInstall.includes('#!/usr/bin/env bash') && srvInstall.includes(serverToken));
+  ok('脚本注册 agent 与 hysteria 模板单元',
+    srvInstall.includes('nodepanel-agent.service') && srvInstall.includes('nodepanel-hysteria@.service'));
+
+  const nodeInstall = await fetch(`${BASE}/api/nodes/${node3Id}/install?token=${node3Token}`).then((r) => r.text());
+  ok('独立节点部署脚本可下载', nodeInstall.includes('#!/usr/bin/env bash') && nodeInstall.includes(node3Token));
+  ok('Hysteria2 节点脚本会安装 hysteria', nodeInstall.includes('NEED_HYSTERIA="1"'));
+
+  const badInstall = await fetch(`${BASE}/api/nodes/${node3Id}/install?token=wrong`).then((r) => r.status);
+  ok('错误的节点 token 无法获取脚本', badInstall === 401);
+
+  const serverNodeInstall = await fetch(`${BASE}/api/nodes/${node1Id}/install?token=${serverToken}`).then((r) => r.status);
+  ok('跟随服务器的节点拒绝独立部署脚本', serverNodeInstall === 400);
+
+  /* ---------- 11.5 公网地址上报 ---------- */
+  const REPORTED_IP = '198.51.100.77';
+
+  // 服务器默认为手动模式，上报不应覆盖手填地址
+  const cfgWithIp = await call(`/api/agent/config?token=${serverToken}&v=test&ip=${REPORTED_IP}`);
+  ok('agent 拉配置时附带 IP 不影响手动模式', cfgWithIp.status === 200);
+  const srvAfter = (await call('/api/servers')).data.items.find((s) => s.id === serverId);
+  ok('手动模式下上报 IP 被忽略', srvAfter.reportedIp === '' && srvAfter.host === 'smoke.example.com',
+    `address=${srvAfter.address}(${srvAfter.addressSource})`);
+
+  // 切到自动模式
+  const switched = await call('/api/servers/' + serverId, {
+    method: 'PUT',
+    body: json({ ipMode: 'auto' }),
+  });
+  ok('服务器可切换为自动上报模式', switched.status === 200 && switched.data.item.ipMode === 'auto');
+
+  await call(`/api/agent/config?token=${serverToken}&v=test&ip=${REPORTED_IP}`);
+  const srvAuto = (await call('/api/servers')).data.items.find((s) => s.id === serverId);
+  ok('自动模式记录上报的 IP', srvAuto.reportedIp === REPORTED_IP, `reportedIp=${srvAuto.reportedIp}`);
+  ok('自动模式生效地址取上报 IP', srvAuto.address === REPORTED_IP && srvAuto.addressSource === '上报');
+
+  // 订阅链接应使用上报的 IP
+  const subIp = await call(`/api/sub/${u2.token}`);
+  const ipLink = (subIp.data.links || []).find((l) => l.name.includes('SMOKE-TLS'));
+  ok('订阅链接使用上报的 IP', !!ipLink && ipLink.host === REPORTED_IP, `host=${ipLink && ipLink.host}`);
+
+  // 独立节点同样支持上报
+  const node3Auto = await call('/api/nodes/' + node3Id, { method: 'PUT', body: json({ ipMode: 'auto', address: '' }) });
+  ok('独立节点可切换为自动上报模式',
+    node3Auto.status === 200 && node3Auto.data.item.ipMode === 'auto' && node3Auto.data.item.mode === 'standalone',
+    '（部分更新不应改变部署方式）');
+  await call(`/api/agent/config?token=${node3Token}&v=test&ip=${REPORTED_IP}`);
+  const node3After = (await call('/api/nodes')).data.items.find((n) => n.id === node3Id);
+  ok('独立节点记录上报的 IP', node3After.reportedIp === REPORTED_IP);
+  const subHy2 = await call(`/api/sub/${u2.token}`);
+  const hy2ip = (subHy2.data.links || []).find((l) => l.name.includes('SMOKE-HY2'));
+  ok('Hysteria2 链接使用上报的 IP', !!hy2ip && hy2ip.host === REPORTED_IP, `host=${hy2ip && hy2ip.host}`);
+
+  /* ---------- 12. 鉴权 ---------- */  ok('错误 token 无法拉配置', (await call('/api/agent/config?token=wrong-token')).status === 401);
+
+  const saved = token;
+  token = '';
+  ok('未登录访问管理接口被拒绝', (await call('/api/users')).status === 401);
+  token = saved;
+
+  /* ---------- 13. 清理 ---------- */
+  for (const [path] of cleanup.reverse()) {
+    await call(path, { method: 'DELETE' });
+  }
+  const left = await call('/api/servers');
+  ok('测试数据已清理', !left.data.items.some((s) => s.id === serverId));
+
+  console.log(`\n▸ 结果：${pass} 项通过，${fail} 项失败\n`);
+  process.exit(fail ? 1 : 0);
+})().catch((err) => {
+  console.error('\n测试异常：', err.message, '\n');
+  process.exit(1);
+});

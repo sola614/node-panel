@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>节点管理面板</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%234c8dff'/><circle cx='50' cy='50' r='16' fill='%23071018'/></svg>">
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="login" class="login-wrap hidden">
+  <div class="login-card">
+    <div class="brand">
+      <div class="brand-mark">N</div>
+      <div class="brand-text">
+        <b id="login-site">节点管理面板</b>
+        <span>Control Plane</span>
+      </div>
+    </div>
+    <form id="login-form">
+      <div class="field">
+        <label>管理员账号</label>
+        <input type="text" id="login-user" value="admin" autocomplete="username" placeholder="admin">
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input type="password" id="login-pass" autocomplete="current-password" placeholder="••••••••">
+      </div>
+      <button class="btn btn-primary btn-block" type="submit" style="margin-top:6px;padding:11px">登 录</button>
+    </form>
+    <p class="hint" style="text-align:center;margin-top:16px">
+      默认 admin / admin888 · 登录后请及时修改
+    </p>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="app" class="layout hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">N</div>
+      <div class="brand-text">
+        <b id="side-site">节点面板</b>
+        <span>Control Plane</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <div class="nav-item" data-view="dashboard" title="概览"><span class="ico">◈</span><span class="label">概览</span></div>
+      <div class="nav-item" data-view="users" title="用户"><span class="ico">☺</span><span class="label">用户</span></div>
+      <div class="nav-item" data-view="plans" title="套餐"><span class="ico">◇</span><span class="label">套餐</span></div>
+      <div class="nav-item" data-view="nodes" title="节点"><span class="ico">◆</span><span class="label">节点</span></div>
+      <div class="nav-item" data-view="servers" title="服务器"><span class="ico">▤</span><span class="label">服务器</span></div>
+      <div class="nav-item" data-view="settings" title="设置"><span class="ico">⚙</span><span class="label">设置</span></div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div id="side-user">—</div>
+      <a href="#" id="logout" style="color:var(--muted)">退出登录</a>
+    </div>
+
+    <button class="collapse-btn" id="collapse" title="收起菜单">
+      <span class="ico">«</span><span class="label">收起菜单</span>
+    </button>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">概览</h1>
+        <div class="sub" id="page-sub">—</div>
+      </div>
+      <div id="page-actions" style="display:flex;gap:8px"></div>
+    </header>
+    <div class="view" id="view"></div>
+  </main>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+<script src="/app.js"></script>
+</body>
+</html>
