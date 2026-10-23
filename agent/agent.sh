@@ -8,7 +8,7 @@
 #   · 不依赖 Node / Python / jq，只用 busybox 都有的 sh + sed + awk + base64
 #   · 不常驻内存：脚本本体常驻约 2MB，配置与流量采集都在子进程里做完即释放
 #   · 配置由面板编译成 shell 配置包下发（见 lib/agentBundle.js），本脚本只负责
-#     「比对 hash → 执行配置包 → 收敛服务 → 采流量上报」
+#     「比对 hash → 执行配置包 → 收敛服务 → 端口自检 → 采流量上报」
 #   · Hysteria2 用 pid 文件自己托管，不依赖 systemd / OpenRC 的模板单元
 #
 # 环境变量（写在同目录 agent.env，或用环境变量覆盖）：
@@ -17,6 +17,7 @@
 #   INTERVAL         轮询间隔秒数，默认 60
 #   XRAY_CONFIG      Xray 配置路径，默认 /usr/local/etc/xray/config.json
 #   RELOAD_CMD       重载 Xray 的命令，默认自动探测
+#   SOCK_CMD         端口自检用的命令，默认自动用 ss / netstat（每行「协议 本地地址」）
 #   HYSTERIA_DIR     Hysteria2 配置目录，默认 /etc/hysteria
 #   HYSTERIA_BIN     hysteria 可执行文件，默认 /usr/local/bin/hysteria
 #   STATE_DIR        状态目录，默认 /opt/nodepanel
@@ -31,7 +32,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.2'
+VERSION='0.1.3'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -45,15 +46,19 @@ RUN_ARGS="$*"
 ENV_FILE=${AGENT_ENV:-$SELF_DIR/agent.env}
 
 # 本轮「配置应用结果」的聚合状态，回执用。
-# 这三个变量由 reload_xray / hy_sync 写入，tick() 读完就重置。
+# 这几个变量由 reload_xray / hy_sync / probe_ports 写入，tick() 读完就重置。
 #   RC_OK    1=一切正常，0=有失败（面板上标红）
 #   RC_XRAY  ok / fail / skip
 #   RC_HY    「跑起来的实例数/期望实例数」，没有 Hysteria2 节点时为空
+#   BAD_PORTS 本轮没在监听的端口（tcp:42323,udp:8443），面板据此报「端口未监听」
 RC_OK=1
 RC_XRAY=''
 RC_HY=''
 RC_HY_FAIL=''
 RC_ERR=''
+BAD_PORTS=''
+# reload / start 之后端口 bind 需要一点时间，自检前先等一下
+NP_JUST_RESTARTED=0
 
 # 读 agent.env 里的 key=value，但**绝不 source 它**。
 # 原因：值里带空格时（RELOAD_CMD=systemctl restart xray），source 会把空格后面那截
@@ -69,7 +74,7 @@ env_read() {
 
 if [ -f "$ENV_FILE" ]; then
   for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
-                  HYSTERIA_BIN STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX ACME_SH REPORT_IP; do
+                  HYSTERIA_BIN STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX ACME_SH REPORT_IP SOCK_CMD; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
     # 赋值语境下不做分词，带空格的值能原样存进变量
@@ -311,6 +316,7 @@ reload_xray() {
   if [ $? -eq 0 ]; then
     log "✓ Xray 已重载"
     RC_XRAY=ok
+    NP_JUST_RESTARTED=1
     return 0
   fi
   log "✗ Xray 重载失败：$_cmd"
@@ -326,7 +332,156 @@ reload_xray() {
   return 1
 }
 
+# --------------------------- Xray 存活自愈 -----------------------------------
+# 为什么需要这一段：reload_xray 只在「配置内容变了」的时候执行。
+# 一旦机器重启过（xray 服务没 enable）、或进程被 OOM / 手动 kill 掉，
+# 磁盘上的配置和面板完全一致 → 每轮都判定「没变化」→ 永远不会再重启 Xray，
+# 端口就一直空着。而面板只看配置 hash，会一直显示「已同步」，只能靠 lsof 才发现。
+# 所以这里补一条兜底：配置没变也要确认 Xray 在跑，没跑就拉起来。
+
+# 从 RELOAD_CMD 里取服务名（systemctl restart xray → xray）
+xray_unit() {
+  _cmd=${RELOAD_CMD:-}
+  [ -n "$_cmd" ] || _cmd=$(detect_reload_cmd)
+  case "$_cmd" in
+    'systemctl restart '*) printf '%s' "${_cmd#systemctl restart }" ;;
+    'rc-service '*) printf '%s' "${_cmd#rc-service }" | sed 's/[[:space:]]*restart$//' ;;
+    *) printf '' ;;
+  esac
+}
+
+xray_running() {
+  _u=$(xray_unit)
+  if [ -n "$_u" ]; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$_u" 2>/dev/null; then
+      return 0
+    fi
+    if command -v rc-service >/dev/null 2>&1 && rc-service "$_u" status >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  # 没有服务单元（手动 nohup 起的 / 容器里）时退回看进程
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x xray >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+xray_ensure() {
+  [ "${NP_XRAY_NODES:-0}" -gt 0 ] 2>/dev/null || return 0
+  xray_running && { rm -f "$STATE_DIR/.xray-fail" 2>/dev/null; return 0; }
+
+  # 拉不起来时（多半是根本没装 Xray）不要每 60 秒往日志里灌一遍：
+  # 5 分钟内只报状态、不再重试，过了冷静期再试一次
+  _xf="$STATE_DIR/.xray-fail"
+  if [ -f "$_xf" ]; then
+    _ts=$(sed -n '1p' "$_xf" 2>/dev/null)
+    _msg=$(sed -n '2p' "$_xf" 2>/dev/null)
+    case "$_ts" in '' | *[!0-9]*) _ts=0 ;; esac
+    _now=$(date +%s)
+    if [ $((_now - _ts)) -lt 300 ]; then
+      RC_XRAY=fail
+      RC_OK=0
+      RC_ERR=${_msg:-Xray 未运行}
+      return 1
+    fi
+  fi
+
+  _u=$(xray_unit)
+  if [ -z "$_u" ]; then
+    log "! Xray 未运行，且没有可用的服务管理器：配置在 $XRAY_CONFIG，需要手动启动"
+    RC_XRAY=fail
+    RC_OK=0
+    RC_ERR='Xray 未运行，且本机没有可用的服务管理器'
+    printf '%s\n%s\n' "$(date +%s)" "$RC_ERR" > "$_xf" 2>/dev/null
+    return 1
+  fi
+
+  log "! Xray 未运行（$_u 不是 active），尝试拉起"
+  if command -v systemctl >/dev/null 2>&1; then
+    # 顺手 enable：否则下次重启又是同样的坑，而且没人会发现
+    systemctl enable "$_u" >/dev/null 2>&1
+    _err=$(systemctl start "$_u" 2>&1)
+  else
+    _err=$(rc-service "$_u" start 2>&1)
+  fi
+  if [ $? -eq 0 ]; then
+    log "✓ Xray 已启动"
+    rm -f "$_xf" 2>/dev/null
+    RC_XRAY=ok
+    NP_JUST_RESTARTED=1
+    return 0
+  fi
+
+  case "$_err" in
+    *'not found'* | *'not-found'* | *'No such file'*)
+      # 最容易踩的一种：机器上根本没有 Xray，装个节点却从来没装过服务
+      RC_ERR="未找到 $_u 服务：本机没有安装 Xray，或服务名不叫 $_u（装好后把 RELOAD_CMD 写进 $ENV_FILE）"
+      ;;
+    *)
+      RC_ERR="Xray 启动失败：$_u — $(printf '%s' "$_err" | sed -n '1p')"
+      ;;
+  esac
+  log "✗ $RC_ERR"
+  [ -n "$_err" ] && printf '%s\n' "$_err" | sed -n '1,3p' | sed 's/^/    /'
+  RC_XRAY=fail
+  RC_OK=0
+  printf '%s\n%s\n' "$(date +%s)" "$RC_ERR" > "$_xf" 2>/dev/null
+  return 1
+}
+
+# ----------------------------- 端口监听自检 ---------------------------------
+# 面板在 state.env 里下发「这台机器应该监听的端口」（NP_LISTEN_PORTS=tcp:42323 udp:8443）。
+# 配置落盘 ≠ 端口在听：进程崩了、配置被别的程序占着、Xray 起在别的配置文件上，
+# 都会让面板显示「已同步」而实际连不上。这里抓一次本机监听表核对。
+
+SOCK_LIST=''
+sock_list() {
+  [ -n "$SOCK_LIST" ] && { printf '%s\n' "$SOCK_LIST"; return 0; }
+  # SOCK_CMD 是给「既没有 ss 也没有 netstat」的机器（以及测试）留的把手：
+  # 只要输出「协议 本地地址」两列即可，例如 `ss -lntu | tail -n +2`
+  if [ -n "${SOCK_CMD:-}" ]; then
+    SOCK_LIST=$(sh -c "$SOCK_CMD" 2>/dev/null)
+  elif command -v ss >/dev/null 2>&1; then
+    SOCK_LIST=$(ss -lntu 2>/dev/null | sed -n '2,$p')
+  elif command -v netstat >/dev/null 2>&1; then
+    SOCK_LIST=$(netstat -lntu 2>/dev/null | sed -n '3,$p')
+  fi
+  printf '%s\n' "$SOCK_LIST"
+}
+
+# $1=协议(tcp/udp) $2=端口
+port_bound() {
+  sock_list | awk -v proto="$1" -v p="$2" '
+    {
+      if (tolower($1) !~ "^" proto) next
+      # 整行匹配「:端口」且后面不是数字，避免 4232 误命中 42323
+      if ($0 ~ (":" p "([^0-9]|$)")) { found = 1; exit }
+    }
+    END { exit(found ? 0 : 1) }'
+}
+
+probe_ports() {
+  [ -n "${NP_LISTEN_PORTS:-}" ] || return 0
+  BAD_PORTS=''
+  for _item in $NP_LISTEN_PORTS; do
+    _proto=${_item%%:*}
+    _port=${_item#*:}
+    case "$_port" in '' | *[!0-9]*) continue ;; esac
+    port_bound "$_proto" "$_port" && continue
+    BAD_PORTS="${BAD_PORTS}${BAD_PORTS:+,}${_proto}:${_port}"
+  done
+  [ -n "$BAD_PORTS" ] || return 0
+
+  log "! 端口未在监听：$BAD_PORTS（配置已落盘，但服务没把它监听起来）"
+  log "  排查：ss -lntup | grep -E 'xray|hysteria'；journalctl -u xray -n 50"
+  RC_OK=0
+  RC_ERR="${RC_ERR}${RC_ERR:+；}端口未监听：$BAD_PORTS"
+  return 1
+}
+
 hy_pidfile() { printf '%s/%s.pid' "$RUN_DIR" "$1"; }
+
 
 hy_stop() {
   _pidfile=$(hy_pidfile "$1")
@@ -373,6 +528,7 @@ hy_ensure() {
   nohup "$HYSTERIA_BIN" server -c "$_cfg" >> "$_log" 2>&1 &
   echo $! > "$_pidfile"
   log "已启动 Hysteria2 实例 $_inst"
+  NP_JUST_RESTARTED=1
 }
 
 # $1 = 需要重启的实例名（空格分隔，可为空）
@@ -485,6 +641,13 @@ apply_services() {
   else
     hy_sync ''
   fi
+
+  # 配置没变也要收敛：Xray 崩了 / 开机没自启时把它拉起来（否则端口永久空着）
+  xray_ensure
+
+  # 等服务把端口 bind 上再自检；每轮都跑一次 ss，开销可以忽略
+  [ "$NP_JUST_RESTARTED" = '1' ] && sleep 1 2>/dev/null
+  probe_ports
 }
 
 # ------------------------------- 流量采集 -----------------------------------
@@ -646,7 +809,7 @@ receipt_escape() {
 
 send_receipt() {
   # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发
-  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|$(printf '%s' "$RC_ERR" | tr '\n' ' ')"
+  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')"
   _last=''
   _ts=0
   if [ -f "$STATE_DIR/.receipt" ]; then
@@ -664,8 +827,8 @@ send_receipt() {
   [ "$RC_OK" = '1' ] && _ok=true
   mkdir -p "$RUN_DIR" "$STATE_DIR" 2>/dev/null
   _f="$RUN_DIR/receipt.$$.json"
-  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
-    "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-skip}" "${RC_HY:-0/0}" \
+  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","unbound":"%s","nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
+    "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-skip}" "${RC_HY:-0/0}" "${BAD_PORTS:-}" \
     "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
 
   if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" >/dev/null; then
@@ -775,6 +938,9 @@ tick() {
   RC_HY=''
   RC_HY_FAIL=''
   RC_ERR=''
+  BAD_PORTS=''
+  NP_JUST_RESTARTED=0
+  SOCK_LIST=''
   LAST_FETCH_OK=0
 
   if apply_bundle; then

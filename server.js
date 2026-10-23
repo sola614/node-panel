@@ -2203,6 +2203,8 @@ const SYNC_LABEL = {
   ok: '已同步',
   // 配置写对了、Xray 也重启了，但本机没有服务管理器，只能手动重启 —— 不能算「已同步」
   partial: '待重载',
+  // hash 对上了，但 agent 在本机监听表里找不到节点端口：进程没起来 / 起在别的配置上
+  unbound: '端口未监听',
   stale: '待同步',
   pending: '待同步',
   error: '同步失败',
@@ -2220,7 +2222,7 @@ function syncView(item, scope) {
   let state;
   if (!online) state = sync ? 'offline' : 'unknown';
   else if (!sync || !sync.at) state = 'pending';
-  else if (!sync.ok) state = 'error';
+  else if (!sync.ok) state = sync.unbound ? 'unbound' : 'error';
   else if (sync.hash && desired && sync.hash === desired) {
     // hash 对上了说明配置已经落盘；xray=skip 表示本机没有服务管理器、需要手动重启，
     // 这种情况报「已同步」会骗人，单独给一个状态
@@ -2236,6 +2238,7 @@ function syncView(item, scope) {
     error: sync ? sync.error || '' : '',
     xray: sync ? sync.xray || '' : '',
     hy: sync ? sync.hy || '' : '',
+    unbound: sync ? sync.unbound || '' : '',
     nodes: sync ? Number(sync.nodes) || 0 : 0,
     users: sync ? Number(sync.users) || 0 : 0,
     agentVersion: sync ? sync.agentVersion || '' : '',
@@ -2261,6 +2264,8 @@ function agentReceipt(req, res, params, body, session, ctx) {
     error: trim(body.error, 500),
     xray: trim(body.xray, 24),
     hy: trim(body.hy, 24),
+    // 本机没在监听的端口（tcp:42323,udp:8443）：配置对了但进程没起来时唯一能暴露问题的信号
+    unbound: trim(body.unbound, 200),
     nodes: Number(body.nodes) || 0,
     users: Number(body.users) || 0,
     agentVersion: trim(body.agentVersion || ctx.query.get('v'), 24),
