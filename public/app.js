@@ -41,6 +41,23 @@ function fmtAgo(iso) {
 
 const STATUS_BADGE = { active: 'badge-ok', over: 'badge-bad', expired: 'badge-warn', disabled: 'badge-dim' };
 
+/**
+ * 统一错误提示：后端与前端主动抛出的都是中文，
+ * 但 JS 内部错误（ReferenceError / TypeError 等）是英文的，
+ * 这类不该直接甩给用户，换成中文并保留线索在控制台。
+ */
+const TECH_ERROR = /is not defined|is not a function|Cannot read propert|Cannot set propert|undefined is not|null is not|Unexpected token|Failed to fetch|NetworkError|Load failed/i;
+
+function showError(err) {
+  const raw = String((err && err.message) || err || '');
+  if (TECH_ERROR.test(raw)) {
+    console.error('[界面错误]', err);
+    toast('操作失败，页面状态可能已过期，请刷新后重试', 'err');
+    return;
+  }
+  toast(raw || '操作失败，请重试', 'err');
+}
+
 const PROTO_BADGE = {
   vless: 'badge-blue',
   vmess: 'badge-purple',
@@ -140,7 +157,7 @@ function openModal({ title, body, wide, okText = '保存', cancelText = '取消'
         const keep = await onOk(mask);
         if (keep !== false) closeModal();
       } catch (err) {
-        toast(err.message, 'err');
+        showError(err);
       } finally {
         okBtn.disabled = false;
       }
@@ -192,7 +209,7 @@ $('#login-form').addEventListener('submit', async (e) => {
     localStorage.setItem('np_token', data.token);
     await boot();
   } catch (err) {
-    toast(err.message, 'err');
+    showError(err);
   } finally {
     btn.disabled = false;
   }
@@ -605,7 +622,7 @@ function moreMenu(u) {
       closeModal();
       render();
     } catch (err) {
-      toast(err.message, 'err');
+      showError(err);
     }
   });
 }
@@ -1185,14 +1202,16 @@ function bindNodeForm(mask) {
       $('#r-sid', mask).value = k.shortId;
       toast('已生成 Reality 密钥对', 'ok');
     } catch (err) {
-      toast(err.message, 'err');
+      showError(err);
     }
   });
 
   /* 套餐多选下拉框 */
-  const selectedPlans = new Set(
+  // 放在 state 上：readNodeForm 是独立函数，闭包变量在那里访问不到
+  state.planDraft = new Set(
     (Array.isArray(state.editingNode && state.editingNode.planIds) ? state.editingNode.planIds : []),
   );
+  const selectedPlans = state.planDraft;
   const allPlans = state.data.planList || [];
   const msToggle = $('.ms-toggle', mask);
   const msText = $('.ms-text', mask);
@@ -1242,13 +1261,19 @@ function bindNodeForm(mask) {
     renderMs();
   });
 
-  // 点击别处收起
-  document.addEventListener('click', (e) => {
-    if (!e.target.closest('#n-plans')) {
-      const panel = $('.ms-panel', mask);
-      if (panel) panel.remove();
+  // 点击别处收起节点套餐下拉。
+  // 只处理 #n-plans 自己的面板：早期版本会误删所有 .ms-panel，
+  // 把入口的下拉也一并删掉，导致 change 事件还没触发元素就没了。
+  const onDocClick = (e) => {
+    if (!document.body.contains(mask)) {
+      document.removeEventListener('click', onDocClick);
+      return;
     }
-  });
+    if (e.target.closest('#n-plans')) return;
+    const panel = $('#n-plans .ms-panel', mask);
+    if (panel) panel.remove();
+  };
+  document.addEventListener('click', onDocClick);
 
   renderMs();
 
@@ -1286,40 +1311,91 @@ function bindNodeForm(mask) {
       return;
     }
     box.innerHTML = entries
-      .map(
-        (e, i) => `<div class="entry-row" data-i="${i}" style="border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:9px">
+      .map((e, i) => {
+        const names = (e.planIds || []).map((pid) => planNames.get(pid)).filter(Boolean);
+        const label = names.length ? names.join('、') : '继承节点套餐';
+        return `<div class="entry-row" data-i="${i}" style="border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:9px">
         <div style="display:flex;gap:8px;align-items:center">
           <input type="text" class="e-name" value="${esc(e.name)}" placeholder="名称，如：广州中转" style="flex:0 0 130px">
           <input type="text" class="e-host" value="${esc(e.host)}" placeholder="入口地址 1.2.3.4 或域名" style="flex:1">
           <input type="number" class="e-port" value="${esc(e.port)}" placeholder="端口" style="flex:0 0 92px">
           <button class="btn btn-sm btn-danger e-del" type="button" style="flex-shrink:0">删</button>
         </div>
-        <div style="display:flex;gap:14px;align-items:center;margin-top:9px;flex-wrap:wrap">
+        <div style="display:flex;gap:12px;align-items:center;margin-top:9px;flex-wrap:wrap">
           <label class="ve-label" style="margin:0">
             <input type="checkbox" class="e-hidden" ${e.hidden ? 'checked' : ''} style="width:auto">
             <span style="font-size:12px">在订阅中隐藏此入口</span>
           </label>
-          <span style="font-size:11.5px;color:var(--muted)">套餐：</span>
-          <div class="chips e-plans">
-            ${
-              planOptions.length
-                ? planOptions
-                    .map(
-                      (pid) => `<label class="check-item" style="padding:4px 9px;font-size:11.5px">
-              <input type="checkbox" class="e-plan" value="${pid}" ${e.planIds.includes(pid) ? 'checked' : ''} style="width:auto;margin:0">
-              <span>${esc(planNames.get(pid) || pid)}</span>
-            </label>`,
-                    )
-                    .join('')
-                : '<span class="chip">暂无套餐</span>'
-            }
+          <div class="ms e-ms" style="flex:1;min-width:180px">
+            <button type="button" class="ms-toggle e-ms-toggle">
+              <span class="ms-text" style="color:${names.length ? 'var(--text)' : 'var(--muted)'}">${esc(label)}</span>
+              <span class="caret">▼</span>
+            </button>
           </div>
-          <span class="hint" style="margin:0">不选 = 继承节点套餐</span>
+          <span class="hint" style="margin:0;white-space:nowrap">不选 = 继承节点套餐</span>
         </div>
-      </div>`,
-      )
+      </div>`;
+      })
       .join('');
   };
+
+  /* 入口套餐多选下拉：面板按需插入，事件委托到 #entries-list */
+  const closeEntryPanels = () => {
+    $$('.e-ms-panel', mask).forEach((p) => p.remove());
+  };
+
+  const openEntryPanel = (row) => {
+    closeEntryPanels();
+    const i = Number(row.dataset.i);
+    const entry = entries[i];
+    const ms = $('.e-ms', row);
+    if (!planOptions.length) {
+      ms.insertAdjacentHTML('beforeend', '<div class="ms-panel e-ms-panel"><div class="ms-empty">还没有套餐</div></div>');
+      return;
+    }
+    ms.insertAdjacentHTML(
+      'beforeend',
+      `<div class="ms-panel e-ms-panel">${planOptions
+        .map(
+          (pid) => `<label class="check-item ${entry.planIds.includes(pid) ? 'on' : ''}">
+        <input type="checkbox" value="${pid}" ${entry.planIds.includes(pid) ? 'checked' : ''} style="width:auto;margin:0">
+        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(planNames.get(pid) || pid)}</span>
+      </label>`,
+        )
+        .join('')}</div>`,
+    );
+  };
+
+  $('#entries-list', mask).addEventListener('click', (e) => {
+    const toggle = e.target.closest('.e-ms-toggle');
+    if (toggle) {
+      e.stopPropagation();
+      const row = toggle.closest('.entry-row');
+      const hasPanel = $('.e-ms-panel', row);
+      closeEntryPanels();
+      if (!hasPanel) openEntryPanel(row);
+      return;
+    }
+    if (!e.target.closest('.e-ms-panel')) closeEntryPanels();
+  });
+
+  $('#entries-list', mask).addEventListener('change', (e) => {
+    if (!e.target.matches('.e-ms-panel input[type=checkbox]')) return;
+    const row = e.target.closest('.entry-row');
+    const i = Number(row.dataset.i);
+    const pid = e.target.value;
+    const set = new Set(entries[i].planIds);
+    if (e.target.checked) set.add(pid);
+    else set.delete(pid);
+    entries[i].planIds = [...set];
+
+    // 就地更新按钮文案，不重建整行（避免丢失面板状态）
+    const names = entries[i].planIds.map((x) => planNames.get(x)).filter(Boolean);
+    const txt = $('.e-ms-toggle .ms-text', row);
+    txt.textContent = names.length ? names.join('、') : '继承节点套餐';
+    txt.style.color = names.length ? 'var(--text)' : 'var(--muted)';
+    e.target.closest('.check-item').classList.toggle('on', e.target.checked);
+  });
 
   $('#entry-add', mask).addEventListener('click', () => {
     entries.push({ id: '', name: '', host: '', port: '', planIds: [], hidden: false });
@@ -1342,17 +1418,6 @@ function bindNodeForm(mask) {
     else if (t.classList.contains('e-host')) entries[i].host = t.value.trim();
     else if (t.classList.contains('e-port')) entries[i].port = t.value.trim();
     else if (t.classList.contains('e-hidden')) entries[i].hidden = t.checked;
-  });
-
-  $('#entries-list', mask).addEventListener('change', (e) => {
-    const row = e.target.closest('.entry-row');
-    if (!row || !e.target.classList.contains('e-plan')) return;
-    const i = Number(row.dataset.i);
-    const pid = e.target.value;
-    const set = new Set(entries[i].planIds);
-    if (e.target.checked) set.add(pid);
-    else set.delete(pid);
-    entries[i].planIds = [...set];
   });
 
   renderEntries();
@@ -1388,7 +1453,7 @@ function readNodeForm(mask) {
     fp: v('#n-fp'),
     vlessEncryption: protocol === 'vless' ? $('#n-ve', mask).checked : false,
     entries: draft.filter((e) => e.host),
-    planIds: [...selectedPlans],
+    planIds: [...(state.planDraft || [])],
     certMode,
     certFile: v('#n-cert'),
     keyFile: v('#n-key'),
@@ -1442,6 +1507,7 @@ function readNodeForm(mask) {
 async function nodeNewFlow() {
   state.editingNode = null;
   state.entryDraft = [];
+  state.planDraft = new Set();
   const mask = openModal({
     title: '新增节点',
     wide: true,
@@ -1965,7 +2031,7 @@ document.addEventListener('click', async (e) => {
       }
     }
   } catch (err) {
-    toast(err.message, 'err');
+    showError(err);
   }
 });
 
