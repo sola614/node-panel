@@ -57,6 +57,7 @@ const STATUS_BADGE = { active: 'badge-ok', over: 'badge-bad', expired: 'badge-wa
 const SYNC_BADGE = {
   ok: 'badge-ok',
   partial: 'badge-warn',
+  unbound: 'badge-bad',
   stale: 'badge-warn',
   pending: 'badge-dim',
   error: 'badge-bad',
@@ -66,6 +67,8 @@ const SYNC_BADGE = {
 
 const SYNC_STATE_LABEL = {
   ok: '已同步',
+  partial: '待重载',
+  unbound: '端口未监听',
   stale: '待同步',
   pending: '待同步',
   error: '同步失败',
@@ -91,9 +94,10 @@ function syncDetailFlow(sync, name) {
   openModal({
     title: '同步状态 · ' + name,
     body: `
-      <div class="alert ${sync.state === 'ok' ? 'alert-ok' : sync.state === 'error' ? 'alert-bad' : 'alert-warn'}" style="margin:0 0 14px">
+      <div class="alert ${sync.state === 'ok' ? 'alert-ok' : sync.state === 'error' || sync.state === 'unbound' ? 'alert-bad' : 'alert-warn'}" style="margin:0 0 14px">
         <b>${esc(sync.label || '')}</b>
         ${sync.state === 'error' ? '　这台机器的配置应用或服务重载失败了，下面有原始报错。' : ''}
+        ${sync.state === 'unbound' ? '　配置已经写进机器，但节点端口没有在监听，客户端一定连不上。通常是 Xray / Hysteria2 没启动、启动即崩溃，或端口被别的程序占着。' : ''}
         ${sync.state === 'stale' ? '　面板上的配置已经变了，等 agent 下一轮拉取就会自动生效（最多 60 秒）。' : ''}
         ${sync.state === 'partial' ? '　配置已经写进机器，但这台机器没有 systemd / OpenRC，需要手动重启一次 Xray 才会生效。' : ''}
         ${sync.state === 'ok' ? '　机器上的配置和面板完全一致。' : ''}
@@ -104,6 +108,7 @@ function syncDetailFlow(sync, name) {
       ${row('面板当前', sync.desired ? `<code>${esc(sync.desired)}</code>` : '—')}
       ${row('Xray 重载', { ok: '成功', fail: '失败', skip: '跳过（本机没有服务管理器）' }[sync.xray] || esc(sync.xray || '—'))}
       ${row('Hysteria2', sync.hy && sync.hy !== '0/0' ? esc(sync.hy) + ' 个实例在跑' : '无')}
+      ${sync.unbound ? row('未监听端口', `<span style="color:var(--bad)">${esc(sync.unbound)}</span>`) : ''}
       ${row('agent 版本', esc(sync.agentVersion || '—'))}
       ${sync.error ? row('错误详情', `<span style="color:var(--bad)">${esc(sync.error)}</span>`) : ''}
       <p class="hint" style="margin-top:14px">想立刻让它拉一次配置：在机器上执行 <code>sh /opt/nodepanel/agent.sh --once</code></p>`,

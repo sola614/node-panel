@@ -231,6 +231,31 @@ const runAgent = (box) =>
   );
   ok('也不会替换脚本', RE_PKG_VER.test(read(box3.agentPath)));
 
+  /* ------------------------- 4. 端口监听自检 ------------------------- */
+  // 面板下发「应该监听哪些端口」，agent 核对本机监听表后才敢回「已生效」。
+  // 这一节用 SOCK_CMD 喂一份假的监听表，免得测试依赖本机真实端口。
+  console.log('\n— 端口监听自检 —');
+  const box4 = makeSandbox(panel.port, '9.9.9');
+  const stateEnv = path.join(box4.stateDir, 'state.env');
+  fs.appendFileSync(stateEnv, `NP_LISTEN_PORTS='tcp:${panel.port}'\n`);
+  box4.env.SOCK_CMD = `printf 'tcp LISTEN 0 4096 0.0.0.0:${panel.port} 0.0.0.0:*\\n'`;
+
+  const n0 = panel.state.receipts.length;
+  const r5 = await runAgent(box4);
+  const rcOk = panel.state.receipts[n0] || {};
+  ok('端口在监听时回执成功', r5.status === 0 && rcOk.ok === true && !rcOk.unbound,
+    JSON.stringify({ ok: rcOk.ok, unbound: rcOk.unbound }));
+
+  // 把期望端口换成一个没人监听的，监听表喂空 → 必须报 ok=false + unbound
+  fs.writeFileSync(stateEnv, read(stateEnv).replace(/NP_LISTEN_PORTS=.*\n/, "NP_LISTEN_PORTS='tcp:1'\n"));
+  box4.env.SOCK_CMD = 'true';
+  const n1 = panel.state.receipts.length;
+  const r6 = await runAgent(box4);
+  const rcBad = panel.state.receipts[n1] || {};
+  ok('端口没监听时回执 ok=false', rcBad.ok === false, JSON.stringify({ ok: rcBad.ok }));
+  ok('回执点名没监听的端口', rcBad.unbound === 'tcp:1', String(rcBad.unbound));
+  ok('日志里也能直接看到', /端口未在监听：tcp:1/.test(r6.stdout + r6.stderr));
+
   panel.server.close();
   try {
     fs.rmSync(TMP, { recursive: true, force: true });
