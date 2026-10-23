@@ -1,14 +1,27 @@
 {
   "name": "node-panel",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.1.2",
+  "private": false,
   "description": "轻量节点管理面板：用户 / 节点 / 服务器 + 订阅与流量配额",
+  "keywords": [
+    "xray",
+    "vless",
+    "hysteria2",
+    "subscription",
+    "node-panel",
+    "self-hosted"
+  ],
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
     "test": "node test/smoke.js",
-    "test:ui": "node test/ui.js"
+    "test:renew": "node test/renew.js",
+    "test:security": "node test/security.js",
+    "test:notify": "node test/notify.js",
+    "test:agent": "node test/agent.js",
+    "test:ui": "node test/ui.js",
+    "test:browser": "node test/browser.js"
   },
   "engines": {
     "node": ">=22.13"

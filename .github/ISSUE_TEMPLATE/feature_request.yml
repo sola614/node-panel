@@ -1,0 +1,54 @@
+name: 功能建议
+description: 希望增加或改进某个能力
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个项目刻意保持「最小控制平面」，所以先说清楚**你要解决的场景**，比说清方案更有用。
+        支付、多租户、在线 IP 限制等属于明确的非目标，见 README。
+
+  - type: textarea
+    id: scene
+    attributes:
+      label: 使用场景
+      description: 你现在的做法是什么？哪一步最难受？
+      placeholder: 我和朋友合租，每个月都要手动统计谁用了多少……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望的方案
+      description: 界面长什么样、点一下发生什么。不用写实现
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案
+      description: 有没有现成工具能解决？为什么不想用？
+
+  - type: dropdown
+    id: scale
+    attributes:
+      label: 你的规模
+      description: 帮助判断这功能值不值得做
+      options:
+        - 自己一个人用
+        - 2–10 人小圈子
+        - 10–50 人合租
+        - 50 人以上
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 已看过 README 的「非目标」，这条不在其中
+          required: true

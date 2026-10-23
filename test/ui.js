@@ -8,8 +8,11 @@
  *   · 日间/夜间皮肤切换（管理台 + 订阅页，含刷新后保持）
  *   · 接口操作的 loading 锁（连点只发一次请求）
  *   · 「订阅对外域名」格式校验（填错不发请求）
- *   · 侧栏版本号
+ *   · 套餐自动续期表单（续期开关随有效期类型联动）
+ *   · 通知设置卡片（渠道表单随类型切换、测试发送真的打出 webhook）
+ *   · 侧栏版本号、拆分后各页渲染
  */
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
@@ -81,6 +84,11 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   });
   if (!login.token) {
     console.error('✗ 登录失败，请确认面板已启动且账号密码正确');
+    process.exit(1);
+  }
+  if (login.mustChangePassword) {
+    console.error('✗ 这个实例还在用出厂密码，前端会停在强制改密页。');
+    console.error('  先改掉密码，或用 PANEL_ADMIN_PASSWORD=你的密码 启动面板后再跑。');
     process.exit(1);
   }
   const T = login.token;
@@ -245,7 +253,458 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('留空可以保存', cleared.put && !cleared.err);
   dom5.window.close();
 
-  /* ============================ 5. 清理 ============================ */
+  /* ======================= 4.5 套餐自动续期表单 ======================= */
+  console.log('\n── 套餐自动续期表单 ──');
+  const dom6 = await openPage(BASE + '/', {
+    before: { np_token: T },
+    ready: (doc) => !doc.querySelector('#app').classList.contains('hidden'),
+  });
+  const w6 = dom6.window;
+  const d6 = w6.document;
+  const posted = [];
+  w6.fetch = (p, o = {}) => {
+    if (o.body && String(p).includes('/api/plans')) {
+      try { posted.push(JSON.parse(o.body)); } catch { /* 非 JSON 忽略 */ }
+    }
+    return fetch(String(p).startsWith('http') ? p : BASE + p, o);
+  };
+  d6.querySelector('.nav-item[data-view="plans"]').dispatchEvent(new w6.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => d6.querySelector('[data-act="plan-new"]'), '套餐页渲染');
+  click(d6.querySelector('[data-act="plan-new"]'), w6);
+  await waitFor(() => d6.querySelector('#p-autorenew'), '套餐弹窗出现');
+
+  const renewBox = d6.querySelector('#p-autorenew');
+  const vType = d6.querySelector('#p-vtype');
+  const setType = async (v) => {
+    vType.value = v;
+    vType.dispatchEvent(new w6.Event('change', { bubbles: true }));
+    await sleep(30);
+  };
+
+  ok('新增套餐默认勾选自动续期', renewBox.checked && !renewBox.disabled);
+  await setType('custom');
+  ok('自定义到期时续期开关禁用且取消勾选', renewBox.disabled && !renewBox.checked);
+  await setType('none');
+  ok('永久套餐同样不能续期', renewBox.disabled && !renewBox.checked);
+  await setType('month');
+  ok('切回按月恢复勾选与可编辑', renewBox.checked && !renewBox.disabled);
+
+  // 关掉后提交，提交体里 autoRenew 必须是 false
+  renewBox.checked = false;
+  d6.querySelector('#p-name').value = 'UI-续期测试';
+  click(d6.querySelector('.modal [data-ok]'), w6);
+  await sleep(400);
+  const body = posted.find((b) => b && b.name === 'UI-续期测试');
+  ok('关闭后续期开关按 false 提交', !!body && body.autoRenew === false, body ? JSON.stringify(body.autoRenew) : '(没发请求)');
+  ok('按月有效期照常提交', !!body && body.validity && body.validity.type === 'month');
+
+  await waitFor(() => /UI-续期测试/.test(d6.querySelector('#view').textContent), '套餐卡片刷新');
+  ok('套餐卡片标注「到期停用」', /到期停用/.test(d6.querySelector('#view').textContent));
+  dom6.window.close();
+
+  /* ======================= 4.6 通知设置与渠道表单 ======================= */
+  console.log('\n── 通知设置 ──');
+  // 起一个真的收包服务：新建渠道 → 点「测试」→ 校验面板发出的载荷
+  const sink = { hits: [] };
+  const sinkSrv = http.createServer((req, res) => {
+    let buf = '';
+    req.on('data', (c) => { buf += c; });
+    req.on('end', () => {
+      sink.hits.push({ url: req.url, body: buf, auth: req.headers.authorization || '' });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+  });
+  await new Promise((r) => sinkSrv.listen(0, '127.0.0.1', r));
+  const sinkUrl = `http://127.0.0.1:${sinkSrv.address().port}/hook`;
+
+  // 先把通知设置写成已知状态，免得被前面的用例（或其它测试）留下的值影响断言
+  await fetch(`${BASE}/api/notify/settings`, {
+    method: 'PUT',
+    headers: { Authorization: 'Bearer ' + T, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      enabled: false,
+      events: ['user.expiring', 'user.expired', 'user.over', 'server.offline', 'node.offline'],
+      leadDays: 3, offlineMin: 10, cooldownHours: 12, recovery: true,
+    }),
+  });
+
+  const dom8 = await openPage(BASE + '/', {
+    before: { np_token: T },
+    ready: (doc) => !doc.querySelector('#app').classList.contains('hidden'),
+  });
+  const w8 = dom8.window;
+  const d8 = w8.document;
+  const ntSeen = [];
+  w8.fetch = (p, o = {}) => {
+    ntSeen.push({ url: String(p), method: (o.method || 'GET').toUpperCase(), body: o.body });
+    return fetch(String(p).startsWith('http') ? p : BASE + p, o);
+  };
+  d8.querySelector('.nav-item[data-view="settings"]').dispatchEvent(new w8.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => d8.querySelector('#nt-enabled'), '通知卡片渲染');
+
+  ok('设置页有「消息通知」卡片', /消息通知/.test(d8.querySelector('#view').textContent));
+  ok('通知总开关存在', !!d8.querySelector('#nt-enabled'));
+  ok('六个事件都能勾选', d8.querySelectorAll('.nt-ev').length === 6,
+    `实际 ${d8.querySelectorAll('.nt-ev').length} 个`);
+  ok('默认关注五个事件', d8.querySelectorAll('.nt-ev:checked').length === 5,
+    `实际 ${d8.querySelectorAll('.nt-ev:checked').length} 个`);
+  ok('触发参数回填（到期前 3 天）', Number(d8.querySelector('#nt-lead').value) === 3,
+    `(${d8.querySelector('#nt-lead').value})`);
+
+  // 新建 webhook 渠道：默认就是 webhook，字段应含地址 / 格式 / 鉴权头
+  click(d8.querySelector('[data-act="notify-new"]'), w8);
+  await waitFor(() => d8.querySelector('#nc-type'), '渠道弹窗出现');
+  ok('新建弹窗默认渲染 webhook 三件套',
+    !!d8.querySelector('#nc-url') && !!d8.querySelector('#nc-format') && !!d8.querySelector('#nc-token'));
+
+  const typeSel = d8.querySelector('#nc-type');
+  const switchType = async (v) => {
+    typeSel.value = v;
+    typeSel.dispatchEvent(new w8.Event('change', { bubbles: true }));
+    await sleep(60);
+  };
+
+  await switchType('telegram');
+  ok('切到 Telegram 换成 Token / ChatID / 反代',
+    !!d8.querySelector('#nc-botToken') && !!d8.querySelector('#nc-chatId') && !!d8.querySelector('#nc-apiBase'));
+  ok('切类型后 webhook 字段消失', !d8.querySelector('#nc-url'));
+
+  await switchType('email');
+  ok('邮箱字段齐全（服务器 / 端口 / 加密 / 账号 / 收件人）',
+    !!d8.querySelector('#nc-host') && !!d8.querySelector('#nc-port') && !!d8.querySelector('#nc-secure') &&
+    !!d8.querySelector('#nc-user') && !!d8.querySelector('#nc-pass') && !!d8.querySelector('#nc-to'));
+  ok('端口默认 465，加密默认 TLS',
+    d8.querySelector('#nc-port').value === '465' && d8.querySelector('#nc-secure').value === 'tls',
+    `(${d8.querySelector('#nc-port').value}/${d8.querySelector('#nc-secure').value})`);
+
+  await switchType('webhook');
+  d8.querySelector('#nc-name').value = 'UI-钩子';
+  d8.querySelector('#nc-url').value = sinkUrl;
+  d8.querySelector('.nc-ev[value="user.over"]').checked = true;
+  ntSeen.length = 0;
+  click(d8.querySelector('.modal [data-ok]'), w8);
+  await sleep(600);
+  const created = ntSeen.find((r) => r.method === 'POST' && r.url.endsWith('/api/notify/channels'));
+  let cBody = null;
+  try { cBody = created ? JSON.parse(created.body) : null; } catch { /* 忽略 */ }
+  ok('新建渠道发出 POST', !!cBody);
+  ok('请求体带名称 / 类型 / 启用状态',
+    !!cBody && cBody.name === 'UI-钩子' && cBody.type === 'webhook' && cBody.enabled === true,
+    cBody ? `${cBody.name}/${cBody.type}` : '(没发请求)');
+  ok('只提交勾选的那一个事件', !!cBody && Array.isArray(cBody.events) && cBody.events.join() === 'user.over',
+    cBody ? `(${cBody.events.join()})` : '');
+  ok('配置里是地址 + 默认通用 JSON',
+    !!cBody && cBody.config && cBody.config.url === sinkUrl && cBody.config.format === 'json');
+
+  await waitFor(() => /UI-钩子/.test(d8.querySelector('#view').textContent), '渠道列表刷新');
+  const myRow = [...d8.querySelectorAll('#view table tbody tr')].find((tr) => /UI-钩子/.test(tr.textContent));
+  ok('渠道行显示中文事件标签', !!myRow && /用户流量超额/.test(myRow.textContent),
+    myRow ? `(${myRow.textContent.replace(/\s+/g, ' ').trim().slice(0, 30)})` : '(没找到行)');
+  ok('渠道行有测试 / 编辑 / 删除',
+    !!myRow && !!myRow.querySelector('[data-act="notify-test"]') &&
+    !!myRow.querySelector('[data-act="notify-edit"]') && !!myRow.querySelector('[data-act="notify-del"]'));
+
+  // 点「测试」→ 面板真的往 webhook 发一条
+  sink.hits.length = 0;
+  ntSeen.length = 0;
+  click(myRow.querySelector('[data-act="notify-test"]'), w8);
+  await sleep(900);
+  ok('点测试会请求 /api/notify/test',
+    ntSeen.some((r) => r.method === 'POST' && r.url.endsWith('/api/notify/test')));
+  const hit = sink.hits[0];
+  ok('webhook 收到一条 POST', !!hit, hit ? hit.url : '(什么都没收到)');
+  let hookBody = null;
+  try { hookBody = hit ? JSON.parse(hit.body) : null; } catch { /* 忽略 */ }
+  ok('载荷带 event / title / body / site',
+    !!hookBody && hookBody.event === 'test' && !!hookBody.title && !!hookBody.body && !!hookBody.site,
+    hookBody ? `(${Object.keys(hookBody).join(',')})` : '');
+  await waitFor(() => /测试通知/.test(d8.querySelector('#view').textContent), '发送记录刷新');
+  ok('发送记录里出现这条测试', /测试通知/.test(d8.querySelector('#view').textContent));
+  ok('发送记录标成成功', !!d8.querySelector('#view .badge-ok'));
+
+  // 保存通知设置：勾选状态 / 参数都要按当前表单提交
+  d8.querySelector('#nt-enabled').checked = true;
+  d8.querySelector('#nt-lead').value = '5';
+  d8.querySelector('#nt-cooldown').value = '6';
+  ntSeen.length = 0;
+  click(d8.querySelector('[data-act="notify-save"]'), w8);
+  await sleep(600);
+  const putEv = ntSeen.find((r) => r.method === 'PUT' && r.url.endsWith('/api/notify/settings'));
+  let sBody = null;
+  try { sBody = putEv ? JSON.parse(putEv.body) : null; } catch { /* 忽略 */ }
+  ok('保存设置发出 PUT', !!sBody);
+  ok('提交体里带上开关与参数',
+    !!sBody && sBody.enabled === true && sBody.leadDays === 5 && sBody.cooldownHours === 6,
+    sBody ? JSON.stringify({ e: sBody.enabled, l: sBody.leadDays, c: sBody.cooldownHours }) : '');
+  ok('事件按勾选提交（数组）', !!sBody && Array.isArray(sBody.events) && sBody.events.length === 5,
+    sBody ? `(${sBody.events.length} 个)` : '');
+
+  await waitFor(() => d8.querySelector('#nt-enabled') && d8.querySelector('#nt-lead').value === '5', '设置回填');
+  ok('保存后参数回填为 5 天', d8.querySelector('#nt-lead').value === '5');
+
+  // 「立即检查」在没告警时也要给出明确反馈
+  ntSeen.length = 0;
+  click(d8.querySelector('[data-act="notify-sweep"]'), w8);
+  await sleep(700);
+  ok('点「立即检查」请求 /api/notify/sweep',
+    ntSeen.some((r) => r.method === 'POST' && r.url.endsWith('/api/notify/sweep')));
+  dom8.window.close();
+  sinkSrv.close();
+
+  // 清理：删渠道、把通知参数还原（后面几节还要复用这套面板）
+  const ntList = await json('/api/notify/channels', {}, T);
+  for (const c of ntList.items || []) {
+    if (String(c.name).startsWith('UI-')) {
+      await fetch(`${BASE}/api/notify/channels/${c.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
+    }
+  }
+  await fetch(`${BASE}/api/notify/settings`, {
+    method: 'PUT',
+    headers: { Authorization: 'Bearer ' + T, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      enabled: false,
+      events: ['user.expiring', 'user.expired', 'user.over', 'server.offline', 'node.offline'],
+      leadDays: 3, offlineMin: 10, cooldownHours: 12, recovery: true,
+    }),
+  });
+
+  /* ==================== 4.5 检索 / 批量 / 邀请 / 回执 / 备份 / 审计 ==================== */
+  console.log('\n── 用户检索与批量操作 ──');
+
+  // 先备料：3 个用户 + 1 台服务器 1 个节点（回执徽标要有东西才画得出来）
+  // 名字带时间戳后缀：测试库可能残留上一轮的 UI-* 数据，靠固定名字会误判
+  const TAG = 'UI' + String(Date.now()).slice(-5);
+  const uiUsers = [];
+  for (const n of [TAG + '-甲', TAG + '-乙', TAG + '-丙']) {
+    const r = await json('/api/users', { method: 'POST', body: JSON.stringify({ name: n }) }, T);
+    uiUsers.push(r.item);
+  }
+  const uiSrv = await json('/api/servers', { method: 'POST', body: JSON.stringify({ name: 'UI-机器', host: '10.9.9.9' }) }, T);
+  const uiNode = await json('/api/nodes', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'UI-节点', serverId: uiSrv.item.id, protocol: 'vless', port: 443 }),
+  }, T);
+
+  const dom9 = await openPage(BASE + '/', {
+    before: { np_token: T },
+    ready: (doc) => !doc.querySelector('#app').classList.contains('hidden'),
+  });
+  const w9 = dom9.window;
+  const d9 = w9.document;
+
+  const typeInto = async (el, value) => {
+    el.value = value;
+    el.dispatchEvent(new w9.Event('input', { bubbles: true }));
+    await sleep(120);
+  };
+  const rowsOf = (doc) => [...doc.querySelectorAll('#u-tbody tr')];
+
+  click(d9.querySelector('.nav-item[data-view="users"]'), w9);
+  await waitFor(() => rowsOf(d9).length > 0, '用户表渲染');
+  const totalRows = rowsOf(d9).length;
+  ok('用户页有搜索框与筛选器', !!d9.querySelector('#u-q') && !!d9.querySelector('#u-status') && !!d9.querySelector('#u-plan'));
+  ok('列表每行带勾选框', d9.querySelectorAll('#u-tbody .u-pick').length === totalRows);
+  ok('顶部显示当前条数', /共\s*\d+\s*位|\d+\s*\/\s*\d+\s*位/.test(d9.querySelector('#u-count').textContent),
+    d9.querySelector('#u-count').textContent);
+
+  await typeInto(d9.querySelector('#u-q'), TAG + '-甲');
+  ok('搜索按名字过滤', rowsOf(d9).length === 1 && rowsOf(d9)[0].textContent.includes(TAG + '-甲'),
+    `剩 ${rowsOf(d9).length} 行`);
+  await typeInto(d9.querySelector('#u-q'), TAG);
+  ok('搜索支持前缀批量命中', rowsOf(d9).length === 3, `剩 ${rowsOf(d9).length} 行`);
+  await typeInto(d9.querySelector('#u-q'), '不存在的名字zzz');
+  ok('搜不到时给出空态', d9.querySelector('#u-tbody').textContent.includes('没有符合'));
+  await typeInto(d9.querySelector('#u-q'), '');
+
+  const stSel = d9.querySelector('#u-status');
+  stSel.value = 'disabled';
+  stSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  await sleep(120);
+  const disabledRows = rowsOf(d9).length;
+  stSel.value = 'all';
+  stSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  await sleep(120);
+  ok('状态筛选生效', disabledRows < rowsOf(d9).length, `停用 ${disabledRows} 行`);
+
+  // 勾选第一行 → 批量条浮出
+  const firstPick = d9.querySelector('#u-tbody .u-pick');
+  firstPick.checked = true;
+  firstPick.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  await sleep(120);
+  ok('勾选后批量操作条出现', !d9.querySelector('#u-bulkbar').classList.contains('hidden'));
+  ok('批量条显示选中数量', d9.querySelector('#u-selcount').textContent === '1');
+
+  const checkAll = d9.querySelector('#u-checkall');
+  checkAll.checked = true;
+  checkAll.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  await sleep(120);
+  ok('全选勾上当前筛选结果', d9.querySelector('#u-selcount').textContent === String(rowsOf(d9).length),
+    d9.querySelector('#u-selcount').textContent);
+
+  click(d9.querySelector('[data-act="user-bulk-clear"]'), w9);
+  await sleep(120);
+  ok('取消选择后批量条收起', d9.querySelector('#u-bulkbar').classList.contains('hidden'));
+
+  // 批量停用两个 UI- 用户
+  // 勾选会触发重绘，节点会失效，所以每勾一个都重新查一次
+  for (const name of [TAG + '-甲', TAG + '-乙']) {
+    const row = rowsOf(d9).find((tr) => tr.textContent.includes(name));
+    const box = row.querySelector('.u-pick');
+    box.checked = true;
+    box.dispatchEvent(new w9.Event('change', { bubbles: true }));
+    await sleep(120);
+  }
+  ok('连续勾选累加计数', d9.querySelector('#u-selcount').textContent === '2',
+    d9.querySelector('#u-selcount').textContent);
+  click(d9.querySelector('[data-act="user-bulk-act"][data-op="disable"]'), w9);
+  await sleep(700);
+  const afterBatch = await json('/api/users', {}, T);
+  ok('批量停用真的改了数据',
+    [TAG + '-甲', TAG + '-乙'].every((n) => afterBatch.items.find((u) => u.name === n).enabled === false));
+
+  /* ---- 邀请弹窗 ---- */
+  console.log('\n── 邀请链接弹窗 ──');
+  click(d9.querySelector('[data-act="invite-manage"]'), w9);
+  await waitFor(() => d9.querySelector('#inv-plan') && d9.querySelector('[data-inv-create]'), '邀请弹窗');
+  ok('邀请弹窗有套餐 / 名额 / 有效期', !!d9.querySelector('#inv-plan') && !!d9.querySelector('#inv-max') && !!d9.querySelector('#inv-expire'));
+
+  d9.querySelector('#inv-note').value = TAG + '-邀请';
+  d9.querySelector('#inv-max').value = '3';
+  click(d9.querySelector('[data-inv-create]'), w9);
+  await waitFor(() => /[a-f0-9]{6}/.test((d9.querySelector('#inv-tbody') || {}).textContent || ''), '邀请生成');
+  ok('生成后列表里出现邀请码', /[a-f0-9]{6}/.test(d9.querySelector('#inv-tbody').textContent));
+  ok('邀请行带复制/停用/删除操作',
+    !!d9.querySelector('#inv-tbody [data-copy]') && !!d9.querySelector('#inv-tbody [data-inv-toggle]') &&
+      !!d9.querySelector('#inv-tbody [data-inv-del]'));
+  const invList = await json('/api/invites', {}, T);
+  const uiInv = invList.items.find((x) => x.note === TAG + '-邀请');
+  ok('弹窗提交的数据落到后端（名额 3）', !!uiInv && uiInv.maxUses === 3, uiInv && String(uiInv.maxUses));
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(150);
+
+  /* ---- 节点同步徽标 ---- */
+  console.log('\n── 节点同步回执 ──');
+  click(d9.querySelector('.nav-item[data-view="nodes"]'), w9);
+  await waitFor(() => d9.querySelector('[data-act="sync-info"]'), '节点表与同步徽标');
+  ok('节点表新增「同步」列', d9.querySelector('#view').textContent.includes('同步'));
+  const badge = d9.querySelector('[data-act="sync-info"]');
+  ok('回执徽标带状态文案', /未回执|待同步|已同步|离线|同步失败/.test(badge.textContent), badge.textContent.trim());
+  click(badge, w9);
+  await waitFor(() => d9.querySelector('.modal'), '回执详情弹窗');
+  const syncModal = d9.querySelector('.modal').textContent;
+  ok('点开能看到 hash 与应用版本', syncModal.includes('应用版本') && syncModal.includes('面板当前'));
+  ok('详情里给出强制拉取命令', syncModal.includes('agent.sh --once'));
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(120);
+
+  /* ---- 备份卡片 ---- */
+  console.log('\n── 设置页备份卡片 ──');
+  click(d9.querySelector('.nav-item[data-view="settings"]'), w9);
+  await waitFor(() => d9.querySelector('#bk-body'), '备份卡片');
+  const bkRowsBefore = d9.querySelectorAll('#bk-body tbody tr').length;
+  ok('备份卡片列出已有备份或空态', bkRowsBefore >= 0 && !!d9.querySelector('[data-act="backup-now"]'));
+  ok('提供上传恢复入口', !!d9.querySelector('[data-act="backup-upload"]'));
+  click(d9.querySelector('[data-act="backup-now"]'), w9);
+  await waitFor(() => d9.querySelectorAll('#bk-body tbody tr').length !== bkRowsBefore, '备份完成');
+  ok('点「立即备份」后表格多出一行', d9.querySelectorAll('#bk-body tbody tr').length === bkRowsBefore + 1);
+  ok('备份行带下载 / 恢复 / 删除', !!d9.querySelector('#bk-body [data-act="backup-dl"]') &&
+    !!d9.querySelector('#bk-body [data-act="backup-restore"]'));
+
+  /* ---- 审计页 ---- */
+  console.log('\n── 审计日志页 ──');
+  click(d9.querySelector('.nav-item[data-view="audit"]'), w9);
+  await waitFor(() => d9.querySelector('#a-tbody tr'), '审计表渲染');
+  const aRows = [...d9.querySelectorAll('#a-tbody tr')];
+  ok('日志页有搜索与类型筛选', !!d9.querySelector('#a-q') && !!d9.querySelector('#a-group'));
+  ok('日志行显示动作徽标', aRows.length > 0 && !!aRows[0].querySelector('.badge'));
+  ok('日志里能读到中文动作名', /建号|登录|邀请|备份|修改|删除/.test(d9.querySelector('#a-tbody').textContent));
+  ok('显示保留条数', /共 \d+ 条/.test(d9.querySelector('#a-count').textContent), d9.querySelector('#a-count').textContent);
+
+  await typeInto(d9.querySelector('#a-q'), TAG + '-邀请');
+  await sleep(500);
+  const hitRows = [...d9.querySelectorAll('#a-tbody tr')];
+  ok('搜索过滤日志', hitRows.length > 0 && hitRows.every((r) => r.textContent.includes(TAG)),
+    `剩 ${hitRows.length} 行`);
+
+  // 计数必须跟着过滤走：以前 total 取全表，搜出 1 行却还写着「共 47 条」
+  const aCount = d9.querySelector('#a-count').textContent;
+  ok('过滤后计数改成「筛选出」并等于命中条数',
+    /筛选出/.test(aCount) && Number(/(\d+)/.exec(aCount)[1]) === hitRows.length,
+    `${aCount} / ${hitRows.length} 行`);
+
+  const groupSel = d9.querySelector('#a-group');
+  groupSel.value = 'backup';
+  groupSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  await sleep(500);
+  ok('按类型过滤日志', /备份/.test(d9.querySelector('#a-tbody').textContent) || d9.querySelector('#a-tbody').textContent.includes('没有匹配'));
+
+  /* ---- 邀请落地页 ---- */
+  console.log('\n── 邀请领取页 ──');
+  const landHtml = await fetch(`${BASE}/i/${uiInv.code}`).then((r) => r.text());
+  const dom10 = await openPage(`${BASE}/i/${uiInv.code}`, {
+    html: landHtml,
+    ready: (doc) => !!doc.querySelector('#claim-form'),
+  });
+  const d10 = dom10.window.document;
+  ok('落地页展示套餐与剩余名额', d10.querySelector('#root').textContent.includes('名额'));
+  ok('落地页带名字输入框', !!d10.querySelector('#c-name'));
+  d10.querySelector('#c-name').value = TAG + '-受邀者';
+  d10.querySelector('#claim-form').dispatchEvent(new dom10.window.Event('submit', { bubbles: true, cancelable: true }));
+  await waitFor(() => /领取成功/.test(d10.querySelector('#root').textContent), '领取成功');
+  ok('领取成功后给出订阅地址', /\/s\/[a-f0-9]{32}/.test(d10.querySelector('#root').textContent));
+  ok('领取成功后给出一键导入按钮', d10.querySelectorAll('.sub-actions .btn').length >= 2);
+  dom10.window.close();
+
+  const deadHtml = await fetch(`${BASE}/i/ffffff`).then((r) => r.text());
+  const dom11 = await openPage(`${BASE}/i/ffffff`, { html: deadHtml, ready: (doc) => !!doc.querySelector('#root') });
+  await sleep(400);
+  ok('无效邀请码显示「邀请链接无效」', /邀请链接无效/.test(dom11.window.document.querySelector('#root').textContent),
+    dom11.window.document.querySelector('#root').textContent.trim().slice(0, 40));
+  dom11.window.close();
+  dom9.window.close();
+
+  // 清理这一节造的数据
+  const allUsers = await json('/api/users', {}, T);
+  for (const u of allUsers.items) {
+    if (String(u.name).startsWith('UI-')) {
+      await fetch(`${BASE}/api/users/${u.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
+    }
+  }
+  await fetch(`${BASE}/api/nodes/${uiNode.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
+  await fetch(`${BASE}/api/servers/${uiSrv.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
+  const invAll = await json('/api/invites', {}, T);
+  for (const x of invAll.items) {
+    if (x.note === TAG + '-邀请') {
+      await fetch(`${BASE}/api/invites/${x.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
+    }
+  }
+
+  /* ==================== 5. 拆分后的脚本完整性（六页都能渲染） ==================== */
+  console.log('\n── 页面渲染（app.js 已拆成多个脚本） ──');
+  const dom7 = await openPage(BASE + '/', {
+    before: { np_token: T },
+    ready: (doc) => !doc.querySelector('#app').classList.contains('hidden'),
+  });
+  const w7 = dom7.window;
+  const d7 = w7.document;
+
+  // 顶层 const 在经典脚本里共享同一个全局词法环境，但不会挂到 window 上，所以用 eval 读
+  const keys = w7.eval('Object.keys(RENDERERS).sort().join(",")');
+  ok('九个脚本按序加载，八个渲染器都注册上了',
+    keys === 'audit,dashboard,nodes,plans,servers,settings,stats,users', `(${keys})`);
+  ok('跨文件的工具函数可见', w7.eval('typeof api === "function" && typeof fmtBytes === "function"'));
+
+  for (const view of ['users', 'plans', 'nodes', 'stats', 'servers', 'audit', 'settings', 'dashboard']) {
+    click(d7.querySelector(`.nav-item[data-view="${view}"]`), w7);
+    await sleep(400);
+    const text = d7.querySelector('#view').textContent || '';
+    ok(`「${view}」页渲染正常`, !/加载失败/.test(text) && text.trim().length > 0,
+      `(${text.trim().slice(0, 14)}…)`);
+  }
+  dom7.window.close();
+
+  /* ============================ 6. 清理 ============================ */
   await fetch(`${BASE}/api/users/${user.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
   await fetch(`${BASE}/api/plans/${plan.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
   await fetch(`${BASE}/api/settings`, {

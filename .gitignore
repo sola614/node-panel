@@ -3,8 +3,12 @@ node_modules/
 data/
 *.log
 
-# AI 代理的本地工作记忆（含调试笔记，不应进仓库）
+# AI 代理的本地工作记忆与调试笔记，不应进公开仓库
+.workbuddy/
 .workbuddy-ai/
+
+# 本地临时目录（测试实例、拆分脚本等）
+.tmp-*/
 
 # 编辑器
 .vscode/
