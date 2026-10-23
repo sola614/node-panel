@@ -1,0 +1,86 @@
+name: Bug 反馈
+description: 面板或 agent 的行为和预期不一致
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前先确认三件事，能省一轮来回：
+        1. 版本是最新的（面板侧栏底部有版本号）
+        2. 不是「非目标」里明确不做的功能（见 README）
+        3. 敏感信息（token、域名、IP、订阅链接）已经打码
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 面板侧栏底部，或 `GET /api/health` 返回的 `app` 字段
+      placeholder: v0.1.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 出问题的部分
+      options:
+        - 面板界面
+        - 订阅 / 客户端导入
+        - 节点配置下发
+        - agent 部署或运行
+        - 流量统计 / 额度
+        - 套餐与续期
+        - 其它
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: 部署方式
+      options:
+        - Docker（compose）
+        - Docker（docker run）
+        - 裸机 systemd
+        - 裸机其他方式
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 具体到点哪个按钮、填了什么。能稳定复现最好
+      placeholder: |
+        1. 在「节点」页新增一个 VLESS + Reality 节点
+        2. 执行部署命令
+        3. 面板显示离线，日志里出现 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expect
+    attributes:
+      label: 期望结果 vs 实际结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: |
+        agent 日志：`journalctl -u nodepanel-agent -n 100` 或 `tail -n 100 /var/log/nodepanel/agent.log`
+        面板日志：容器日志或 systemd journal
+      render: shell
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 已升级到最新 0.1.x 版本后仍然存在
+          required: true
+        - label: 已检查过 README 的「已知限制」与「非目标」
+          required: true

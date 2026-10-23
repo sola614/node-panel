@@ -29,11 +29,53 @@
 #   sh agent.sh --version
 # ============================================================================
 
-VERSION='2.1.0'
+# 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
+# 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
+VERSION='0.1.2'
 
 SELF_DIR=$(dirname "$0")
-[ -f "$SELF_DIR/agent.env" ] && . "$SELF_DIR/agent.env"
-[ -n "${AGENT_ENV:-}" ] && [ -f "$AGENT_ENV" ] && . "$AGENT_ENV"
+# 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
+SELF_PATH=$0
+case "$SELF_PATH" in
+  /*) : ;;
+  *) SELF_PATH=$(cd "$SELF_DIR" 2>/dev/null && pwd)/$(basename "$0") ;;
+esac
+# 自更新后 exec 重启要用同一批参数，函数里的 $@ 不是脚本参数
+RUN_ARGS="$*"
+ENV_FILE=${AGENT_ENV:-$SELF_DIR/agent.env}
+
+# 本轮「配置应用结果」的聚合状态，回执用。
+# 这三个变量由 reload_xray / hy_sync 写入，tick() 读完就重置。
+#   RC_OK    1=一切正常，0=有失败（面板上标红）
+#   RC_XRAY  ok / fail / skip
+#   RC_HY    「跑起来的实例数/期望实例数」，没有 Hysteria2 节点时为空
+RC_OK=1
+RC_XRAY=''
+RC_HY=''
+RC_HY_FAIL=''
+RC_ERR=''
+
+# 读 agent.env 里的 key=value，但**绝不 source 它**。
+# 原因：值里带空格时（RELOAD_CMD=systemctl restart xray），source 会把空格后面那截
+# 当成另一条命令去执行，日志里就会一直刷
+#   /opt/nodepanel/agent.sh: . /opt/nodepanel/agent.env: restart: not found
+# 而且 RELOAD_CMD 会被悄悄清空，Xray 再也重载不了。
+env_read() {
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$ENV_FILE" 2>/dev/null \
+    | tr -d '\r' \
+    | tail -n 1 \
+    | sed "s/[[:space:]]*$//; s/^'\(.*\)'$/\1/; s/^\"\(.*\)\"$/\1/"
+}
+
+if [ -f "$ENV_FILE" ]; then
+  for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
+                  HYSTERIA_BIN STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX ACME_SH REPORT_IP; do
+    _env_val=$(env_read "$_env_key")
+    [ -n "$_env_val" ] || continue
+    # 赋值语境下不做分词，带空格的值能原样存进变量
+    eval "$_env_key=\$_env_val"
+  done
+fi
 
 PANEL_URL=${PANEL_URL:-}
 AGENT_TOKEN=${AGENT_TOKEN:-}
@@ -46,6 +88,16 @@ RUN_DIR=${RUN_DIR:-/run/nodepanel}
 LOG_DIR=${LOG_DIR:-/var/log/nodepanel}
 HTTP_TIMEOUT=${HTTP_TIMEOUT:-15}
 LOG_MAX=${LOG_MAX:-5242880}
+# 关掉公网 IP 上报：面板在反代后面、或者只想手动填地址时用
+REPORT_IP=${REPORT_IP:-1}
+
+# 看版本不需要配置：装好没装好、装的是哪一版，先问这个最省事
+case "${1:-}" in
+  --version | -v)
+    echo "nodepanel-agent $VERSION (shell)"
+    exit 0
+    ;;
+esac
 
 if [ -z "$PANEL_URL" ] || [ -z "$AGENT_TOKEN" ]; then
   echo "✗ 缺少 PANEL_URL 或 AGENT_TOKEN，请检查 $SELF_DIR/agent.env" >&2
@@ -98,6 +150,18 @@ http_post() {
     curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: text/plain' --data-binary "@$_f" "$_u" 2>/dev/null
   else
     wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: text/plain' --post-file="$_f" "$_u" 2>/dev/null
+  fi
+}
+
+# 回执 / 其它结构化上报走 JSON；和 http_post 的唯一区别是 Content-Type
+http_post_json() {
+  _u=$1
+  _f=$2
+  [ -n "$HTTP" ] || return 1
+  if [ "$HTTP" = 'curl' ]; then
+    curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: application/json' --data-binary "@$_f" "$_u" 2>/dev/null
+  else
+    wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: application/json' --post-file="$_f" "$_u" 2>/dev/null
   fi
 }
 
@@ -196,25 +260,70 @@ ensure_acme_cert() {
 
 # ------------------------------ 服务收敛 ------------------------------------
 
+xray_bin() {
+  _b=$(command -v xray 2>/dev/null)
+  [ -n "$_b" ] || _b=/usr/local/bin/xray
+  printf '%s' "$_b"
+}
+
+# agent.env 没写 RELOAD_CMD 时现猜一个：服务名不一定叫 xray（xray-core / x-ui 都见过）
+detect_reload_cmd() {
+  if command -v systemctl >/dev/null 2>&1; then
+    for _u in xray xray-core x-ui; do
+      if systemctl list-unit-files 2>/dev/null | grep -q "^$_u\.service"; then
+        printf 'systemctl restart %s' "$_u"
+        return 0
+      fi
+    done
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    printf 'rc-service xray restart'
+    return 0
+  fi
+  printf ''
+}
+
 # 重载 Xray 前先自检，坏配置绝不顶掉线上正在跑的
 reload_xray() {
-  _bin=$(command -v xray 2>/dev/null)
-  [ -n "$_bin" ] || _bin=/usr/local/bin/xray
+  _bin=$(xray_bin)
   if [ -x "$_bin" ] && [ -f "$XRAY_CONFIG" ]; then
     if ! "$_bin" -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
       log "✗ Xray 配置自检未通过，放弃重载（线上配置保持不变）"
+      RC_XRAY=fail
+      RC_ERR='Xray 配置自检未通过，已放弃重载'
+      RC_OK=0
       return 1
     fi
   fi
-  if [ -z "${RELOAD_CMD:-}" ]; then
-    log "! 未配置 RELOAD_CMD，跳过 Xray 重载"
+
+  _cmd=${RELOAD_CMD:-}
+  [ -n "$_cmd" ] || _cmd=$(detect_reload_cmd)
+  if [ -z "$_cmd" ]; then
+    # 没有服务管理器 = 配置已落盘但需要人工重启。这不算「失败」：
+    # 把整轮标记成失败会让面板显示红标，掩盖真正的问题（配置自检不过 / 重载报错）
+    log "! 本机没有 systemd / OpenRC，跳过 Xray 重载（配置已写入 $XRAY_CONFIG，需手动重启）"
+    RC_XRAY=skip
     return 1
   fi
-  if sh -c "$RELOAD_CMD" >/dev/null 2>&1; then
+
+  # 服务管理器吐的错误一起打出来：只说「重载失败」等于让人去猜
+  _err=$(sh -c "$_cmd" 2>&1)
+  if [ $? -eq 0 ]; then
     log "✓ Xray 已重载"
-  else
-    log "✗ Xray 重载失败：$RELOAD_CMD"
+    RC_XRAY=ok
+    return 0
   fi
+  log "✗ Xray 重载失败：$_cmd"
+  [ -n "$_err" ] && printf '%s\n' "$_err" | sed -n '1,3p' | sed 's/^/    /'
+  log "  服务名不是 xray 时（x-ui / xray-core 等），把 RELOAD_CMD 写进 $ENV_FILE 再重启 agent"
+  RC_XRAY=fail
+  RC_OK=0
+  if [ -n "$_err" ]; then
+    RC_ERR="Xray 重载失败：$_cmd — $(printf '%s' "$_err" | sed -n '1p')"
+  else
+    RC_ERR="Xray 重载失败：$_cmd"
+  fi
+  return 1
 }
 
 hy_pidfile() { printf '%s/%s.pid' "$RUN_DIR" "$1"; }
@@ -285,20 +394,30 @@ hy_sync() {
   done
 
   # 2. 配置变过的先停，再统一确保在跑（没跑的就拉起来）
+  _ok=0
+  _total=0
   for _item in ${NP_HY2_LIST:-}; do
     _inst=${_item%%:*}
+    _total=$((_total + 1))
     case "$_restart" in
       *" $_inst "*) hy_stop "$_inst" ;;
     esac
-    hy_ensure "$_inst"
+    if hy_ensure "$_inst"; then
+      _ok=$((_ok + 1))
+    else
+      RC_HY_FAIL="${RC_HY_FAIL:-}${RC_HY_FAIL:+、}${_inst}"
+      RC_OK=0
+    fi
   done
+  [ "$_total" -gt 0 ] && RC_HY="$_ok/$_total"
 }
 
 # ------------------------------- 配置包 -------------------------------------
 
 fetch_bundle() {
   _url="$PANEL_URL/api/agent/bundle?token=$AGENT_TOKEN&v=$VERSION&hash=${NP_HASH:-}"
-  _ip=$(public_ip)
+  _ip=''
+  [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
   http_get "$_url"
 }
@@ -306,15 +425,22 @@ fetch_bundle() {
 # 返回 0 = 应用了配置，1 = 没变化或失败
 apply_bundle() {
   _out=$(fetch_bundle)
+  LAST_FETCH_OK=0
   if [ -z "$_out" ]; then
     log "✗ 无法连接面板：$PANEL_URL"
+    RC_ERR="无法连接面板 $PANEL_URL"
     return 1
   fi
+  # 能拿到内容就说明通道是通的，回执才有意义
+  LAST_FETCH_OK=1
 
   case "$_out" in
     '#UNCHANGED'*) return 1 ;;
     '#ERROR'*)
       log "✗ 面板拒绝：${_out#\#ERROR }"
+      LAST_FETCH_OK=0
+      RC_OK=0
+      RC_ERR="面板拒绝配置：${_out#\#ERROR }"
       return 1
       ;;
   esac
@@ -332,6 +458,9 @@ apply_bundle() {
 
   log "✗ 配置包执行失败，详见 $LOG_DIR/agent.log"
   rm -f "$_tmp"
+  LAST_FETCH_OK=1
+  RC_OK=0
+  RC_ERR="配置包执行失败，详见 $LOG_DIR/agent.log"
   return 1
 }
 
@@ -369,8 +498,7 @@ split_records() {
 
 collect_xray() {
   [ "${NP_XRAY_NODES:-0}" -gt 0 ] 2>/dev/null || return 0
-  _bin=$(command -v xray 2>/dev/null)
-  [ -n "$_bin" ] || _bin=/usr/local/bin/xray
+  _bin=$(xray_bin)
   [ -x "$_bin" ] || return 0
 
   "$_bin" api statsquery --server="${NP_STATS:-127.0.0.1:10085}" -pattern 'user>>>' -reset 2>/dev/null \
@@ -391,13 +519,51 @@ collect_xray() {
       }'
 }
 
+# 节点维度用量：Xray 每个入站都带 tag `node-<节点ID>`，入站计数器正好就是该节点的总流量。
+# 注意入站总数 ≠ 用户总和（可能有未认证流量），所以它只用于「哪台节点在跑量」的报表，
+# 不参与用户额度计算。
+collect_xray_nodes() {
+  [ "${NP_XRAY_NODES:-0}" -gt 0 ] 2>/dev/null || return 0
+  _bin=$(xray_bin)
+  [ -x "$_bin" ] || return 0
+
+  "$_bin" api statsquery --server="${NP_STATS:-127.0.0.1:10085}" -pattern 'inbound>>>' -reset 2>/dev/null \
+    | tr -d ' \r\n\t' \
+    | split_records \
+    | awk '
+      {
+        if (!match($0, /"name":"[^"]*"/)) next
+        nm = substr($0, RSTART + 8, RLENGTH - 9)
+        if (!match($0, /"value":[0-9]+/)) next
+        val = substr($0, RSTART + 8, RLENGTH - 8) + 0
+        if (val <= 0) next
+        n = split(nm, p, ">>>")
+        if (n != 4 || p[1] != "inbound" || p[3] != "traffic") next
+        if (p[4] == "uplink") print p[2], "uplink", val
+        else if (p[4] == "downlink") print p[2], "downlink", val
+      }' \
+    | awk '
+      { up[$1] += ($2 == "uplink" ? $3 : 0); down[$1] += ($2 == "downlink" ? $3 : 0); seen[$1] = 1 }
+      END {
+        for (t in seen) {
+          # 只认自家入站（node-<id>），api / metrics 之类的内部入站直接跳过
+          if (t !~ /^node-/) continue
+          id = substr(t, 6)
+          if (id == "") continue
+          printf "node:%s %d %d\n", id, up[t], down[t]
+        }
+      }'
+}
+
 collect_hysteria() {
   for _item in ${NP_HY2_LIST:-}; do
+    _inst=${_item%%:*}
     _rest=${_item#*:}
     _port=${_rest%%:*}
     _secret=${_rest#*:}
     _resp=$(http_get "http://127.0.0.1:$_port/traffic?clear=1" "Authorization: $_secret" 5)
     [ -n "$_resp" ] || continue
+    _rows="$RUN_DIR/hy.$$.rows"
     printf '%s' "$_resp" \
       | tr -d ' \r\n\t' \
       | sed 's/},"/}\
@@ -416,7 +582,14 @@ collect_hysteria() {
           if (match(rest, /"rx":[0-9]+/)) rx = substr(rest, RSTART + 5, RLENGTH - 5) + 0
           if (tx > 0) print email, "uplink", tx
           if (rx > 0) print email, "downlink", rx
-        }'
+        }' > "$_rows" 2>/dev/null
+    cat "$_rows" 2>/dev/null
+    # 一个 Hysteria2 实例就是一个节点：把该实例下所有用户的流量求和即为节点用量
+    awk -v nid="${_inst#node-}" '
+      { up += ($2 == "uplink" ? $3 : 0); down += ($2 == "downlink" ? $3 : 0) }
+      END { if (up + down > 0) printf "node:%s %d %d\n", nid, up, down }
+    ' "$_rows" 2>/dev/null
+    rm -f "$_rows"
   done
 }
 
@@ -424,11 +597,22 @@ collect_stats() {
   _raw="$RUN_DIR/stats.$$.raw"
   : > "$_raw"
   collect_xray >> "$_raw" 2>/dev/null
+  collect_xray_nodes >> "$_raw" 2>/dev/null
   collect_hysteria >> "$_raw" 2>/dev/null
 
+  # 用户行与节点行分开汇总：email up down / node:<id> up down
   awk '
-    { up[$1] += ($2 == "uplink" ? $3 : 0); down[$1] += ($2 == "downlink" ? $3 : 0); seen[$1] = 1 }
-    END { for (e in seen) printf "%s %d %d\n", e, up[e], down[e] }
+    {
+      if ($1 ~ /^node:/) {
+        nup[$1] += ($2 == "uplink" ? $3 : 0); ndown[$1] += ($2 == "downlink" ? $3 : 0); nseen[$1] = 1
+      } else {
+        up[$1] += ($2 == "uplink" ? $3 : 0); down[$1] += ($2 == "downlink" ? $3 : 0); seen[$1] = 1
+      }
+    }
+    END {
+      for (e in seen) printf "%s %d %d\n", e, up[e], down[e]
+      for (t in nseen) printf "%s %d %d\n", t, nup[t], ndown[t]
+    }
   ' "$_raw" > "$RUN_DIR/stats.agg" 2>/dev/null
   rm -f "$_raw"
 }
@@ -436,7 +620,8 @@ collect_stats() {
 report() {
   [ -s "$RUN_DIR/stats.agg" ] || return 0
   _url="$PANEL_URL/api/agent/report?token=$AGENT_TOKEN&v=$VERSION"
-  _ip=$(public_ip)
+  _ip=''
+  [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
 
   _res=$(http_post "$_url" "$RUN_DIR/stats.agg")
@@ -448,12 +633,149 @@ report() {
   fi
 }
 
+# -------------------------------- 同步回执 ----------------------------------
+# 「配置发出去了」不等于「配置生效了」。每轮把本机的实际结果报回面板：
+# 应用到的 hash + 服务重载成败 + 失败原文，面板据此显示「已同步 / 待同步 / 同步失败」。
+#
+# 只在结果变化、或距上次超过 10 分钟时才发 —— 否则每台机器每分钟都多一个请求，
+# 面板上的「最近回执时间」也没必要精确到秒。
+
+receipt_escape() {
+  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g' | tr -d '\r' | tr '\n' ' ' | cut -c1-400
+}
+
+send_receipt() {
+  # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发
+  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|$(printf '%s' "$RC_ERR" | tr '\n' ' ')"
+  _last=''
+  _ts=0
+  if [ -f "$STATE_DIR/.receipt" ]; then
+    _ts=$(sed -n '1p' "$STATE_DIR/.receipt" 2>/dev/null)
+    _last=$(sed -n '2p' "$STATE_DIR/.receipt" 2>/dev/null)
+  fi
+  case "$_ts" in '' | *[!0-9]*) _ts=0 ;; esac
+  _now=$(date +%s)
+  if [ "$_last" = "$_sig" ] && [ $((_now - _ts)) -lt 600 ]; then
+    return 0
+  fi
+
+  _err=$(printf '%s' "$RC_ERR" | receipt_escape)
+  _ok=false
+  [ "$RC_OK" = '1' ] && _ok=true
+  mkdir -p "$RUN_DIR" "$STATE_DIR" 2>/dev/null
+  _f="$RUN_DIR/receipt.$$.json"
+  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
+    "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-skip}" "${RC_HY:-0/0}" \
+    "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
+
+  if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" >/dev/null; then
+    printf '%s\n%s\n' "$_now" "$_sig" > "$STATE_DIR/.receipt" 2>/dev/null
+    if [ "$_ok" = 'true' ]; then
+      log "✓ 已回执：配置 ${NP_HASH:-（空）} 已生效"
+    else
+      log "✗ 已回执：$RC_ERR"
+    fi
+  else
+    log "! 回执上报失败（下一轮再试）"
+  fi
+  rm -f "$_f"
+}
+
+# -------------------------------- 自更新 ------------------------------------
+# 面板在配置包的 state.env 里下发 NP_AGENT_VERSION。本机 VERSION 与之不同时，
+# 从面板拉一份新脚本 → 语法检查 → 原子替换自身 → exec 重启。
+#
+# 为什么要做这件事：面板发版后如果 agent 脚本本身也改了，以前只能登每台机器
+# 重跑一遍部署命令。有了自更新，升级面板 = 升级全部机器。
+#
+# 失败计数挂在目标版本上：同一个版本连续失败 3 次就停手，等下一版再试。
+# 否则一个坏包会让每台机器每分钟都来拉一次，把面板和日志一起拖垮。
+
+agent_update_mark() {
+  printf '%s\n%s\n' "$1" "${2:-0}" > "$STATE_DIR/.agent-update" 2>/dev/null
+}
+
+agent_update_fail() {
+  # $1 = 目标版本，$2 = 当前已失败次数
+  log "✗ agent 自更新到 $1 失败（第 $(( $2 + 1 )) 次）"
+  agent_update_mark "$1" "$(( $2 + 1 ))"
+}
+
+agent_self_update() {
+  _want=${NP_AGENT_VERSION:-}
+  [ -n "$_want" ] || return 0
+  [ "$_want" = "$VERSION" ] && return 0
+
+  _cnt=0
+  _last=''
+  if [ -f "$STATE_DIR/.agent-update" ]; then
+    _last=$(sed -n '1p' "$STATE_DIR/.agent-update" 2>/dev/null)
+    _cnt=$(sed -n '2p' "$STATE_DIR/.agent-update" 2>/dev/null)
+    case "$_cnt" in '' | *[!0-9]*) _cnt=0 ;; esac
+    if [ "$_last" = "$_want" ] && [ "$_cnt" -ge 3 ]; then
+      return 0   # 这个版本已经试够次数了，安静等着
+    fi
+  fi
+  [ "$_last" = "$_want" ] || _cnt=0
+
+  log "发现新版本 agent $_want（当前 $VERSION），开始自更新"
+  _tmp="$STATE_DIR/agent.sh.new"
+  rm -f "$_tmp" 2>/dev/null
+  if ! http_get "$PANEL_URL/api/agent/script?token=$AGENT_TOKEN&v=$VERSION" '' 30 > "$_tmp" 2>/dev/null; then
+    agent_update_fail "$_want" "$_cnt"
+    return 1
+  fi
+
+  # 三道闸：shebang 对、语法过、版本号确实是想要的那个
+  if ! head -n 1 "$_tmp" 2>/dev/null | grep -q '^#!'; then
+    log "✗ 下载内容不是脚本（可能是错误页），放弃更新"
+    agent_update_fail "$_want" "$_cnt"
+    rm -f "$_tmp"
+    return 1
+  fi
+  if ! sh -n "$_tmp" 2>/dev/null; then
+    log "✗ 新脚本语法检查未通过，保留当前版本"
+    agent_update_fail "$_want" "$_cnt"
+    rm -f "$_tmp"
+    return 1
+  fi
+  if ! grep -q "^VERSION='$_want'\$" "$_tmp" 2>/dev/null; then
+    log "✗ 下载的脚本版本号不是 $_want，放弃更新"
+    agent_update_fail "$_want" "$_cnt"
+    rm -f "$_tmp"
+    return 1
+  fi
+
+  chmod 755 "$_tmp" 2>/dev/null
+  cp -p "$SELF_PATH" "$SELF_PATH.bak" 2>/dev/null
+  if ! mv "$_tmp" "$SELF_PATH" 2>/dev/null; then
+    log "✗ 无法写入 $SELF_PATH（权限不足？agent 需要以 root 运行）"
+    agent_update_fail "$_want" "$_cnt"
+    rm -f "$_tmp"
+    return 1
+  fi
+
+  rm -f "$STATE_DIR/.agent-update" 2>/dev/null
+  log "✓ agent 已更新到 $_want，重启进程"
+  # exec 在同一个 PID 上换成新脚本：systemd 看来服务没有中断，
+  # 也不会出现「旧进程还在跑、又被拉起一个新进程」的双跑
+  exec sh "$SELF_PATH" $RUN_ARGS
+}
+
 # --------------------------------- 主循环 -----------------------------------
 
 tick() {
   # 每轮都重新读一次状态，--once 模式下也能拿到上一轮的结果
   [ -f "$STATE_DIR/state.env" ] && . "$STATE_DIR/state.env"
   [ -f "$STATE_DIR/changed.env" ] && . "$STATE_DIR/changed.env"
+
+  # 回执状态按轮重置，避免上一轮的失败一直挂着
+  RC_OK=1
+  RC_XRAY=''
+  RC_HY=''
+  RC_HY_FAIL=''
+  RC_ERR=''
+  LAST_FETCH_OK=0
 
   if apply_bundle; then
     apply_services changed
@@ -463,16 +785,15 @@ tick() {
     apply_services same
   fi
 
+  # 只有和面板通上话才回执：离线时上报必然失败，没必要每分钟重试一次
+  [ "$LAST_FETCH_OK" = '1' ] && send_receipt
+
   collect_stats
   report
-}
 
-case "${1:-}" in
-  --version | -v)
-    echo "nodepanel-agent $VERSION (shell)"
-    exit 0
-    ;;
-esac
+  # 自更新放最后：这一轮的配置与流量都已经处理完，重启不会丢数据
+  agent_self_update
+}
 
 log "Node Panel Agent $VERSION 启动"
 log "面板：$PANEL_URL"

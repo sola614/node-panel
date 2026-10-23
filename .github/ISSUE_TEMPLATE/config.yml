@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题（请勿公开提交）
+    url: https://github.com/sola614/node-panel/security/policy
+    about: 漏洞请走私密报告渠道，不要开公开 Issue
+  - name: 部署与使用问题
+    url: https://github.com/sola614/node-panel#readme
+    about: 先把 README 的「快速开始」「升级」「已知限制」看完

@@ -22,7 +22,25 @@ jobs:
         with:
           node-version: '24'
 
-      - name: 启动面板并跑冒烟测试
+      # 单元 / 端到端（自带临时库，不需要先起服务）
+      - name: 续期与安全测试
+        run: |
+          node test/renew.js
+          node test/security.js
+
+      # 通知通道（假 SMTP + 假 HTTP）与 agent 自更新（假面板 + 真 agent.sh）
+      - name: 通知与 agent 测试
+        run: |
+          node test/notify.js
+          node test/agent.js
+
+      # 前端行为测试需要 jsdom；不想为它维护 lockfile，直接装到临时依赖里
+      - name: 安装 jsdom（仅测试用）
+        run: npm install jsdom --no-save --no-package-lock
+
+      - name: 启动面板并跑冒烟 + 前端测试
+        env:
+          PANEL_ADMIN_PASSWORD: ci-test-pass-123
         run: |
           node server.js &
           for i in $(seq 1 30); do
@@ -30,6 +48,7 @@ jobs:
             sleep 1
           done
           node test/smoke.js http://127.0.0.1:8080
+          node test/ui.js http://127.0.0.1:8080
 
   docker:
     needs: test

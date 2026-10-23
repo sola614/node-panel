@@ -7,6 +7,10 @@
  *   → 套餐隔离（订阅 + 配置双层）→ 独立节点部署 → 流量超额自动剔除 → 清理
  */
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 const BASE = (process.argv[2] || 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const ADMIN_USER = process.env.PANEL_ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.PANEL_ADMIN_PASSWORD || 'admin888';
@@ -50,7 +54,7 @@ const json = (obj) => JSON.stringify(obj);
   /* ---------- 0. 健康检查 ---------- */
   const health = await fetch(`${BASE}/api/health`).then((r) => r.json());
   ok('健康检查可用', health.ok === true, `schema v${health.version}`);
-  const pkgVersion = JSON.parse(require('fs').readFileSync(require('path').join(__dirname, '..', 'package.json'), 'utf8')).version;
+  const pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
   ok('健康检查带应用版本号', health.app === pkgVersion, `(${health.app}，package.json 是 ${pkgVersion})`);
 
   /* ---------- 1. 登录 ---------- */
@@ -61,6 +65,11 @@ const json = (obj) => JSON.stringify(obj);
   ok('管理员登录', login.status === 200 && !!login.data.token);
   if (!login.data.token) {
     console.log('\n登录失败，终止测试。请确认账号密码（默认 admin / admin888）\n');
+    process.exit(1);
+  }
+  if (login.data.mustChangePassword) {
+    console.log('\n这个实例还在用出厂密码，业务接口会被强制改密拦住。');
+    console.log('先登录面板改掉密码，或用环境变量启动：PANEL_ADMIN_PASSWORD=你的密码 node server.js\n');
     process.exit(1);
   }
   token = login.data.token;
@@ -178,6 +187,7 @@ const json = (obj) => JSON.stringify(obj);
   });
   ok('新增套餐（含额度与有效期）',
     plan.status === 200 && plan.data.item.nodeCount === 0 && plan.data.item.quotaGB === 0.5 && plan.data.item.days === 7);
+  ok('套餐默认开启自动续期', plan.data.item.autoRenew === true, `(${plan.data.item.autoRenewLabel})`);
   const planId = plan.data.item.id;
   cleanup.push(['/api/plans/' + planId]);
 
@@ -208,12 +218,72 @@ const json = (obj) => JSON.stringify(obj);
     u1.expireAt && Math.abs(new Date(u1.expireAt) - (new Date(u1.createdAt).getTime() + 7 * 864e5)) < 60000);
   ok('无套餐用户可手填额度', u2.quotaGB === 100);
   ok('额度继承标记为锁定', u1.quotaLocked === true && u2.quotaLocked === false);
+  ok('套餐用户可见自动续期状态', u1.autoRenew === true && u1.renewCount === 0);
+
+  // 给已有用户挂套餐：周期从此刻起算，不会按 createdAt 算成「早就到期」
+  const uSwitch = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-改套餐用户', quotaGB: 5 }) });
+  ok('无套餐用户默认不自动续期', uSwitch.data.item.autoRenew === false);
+  const switchedPlan = await call('/api/users/' + uSwitch.data.item.id, { method: 'PUT', body: json({ planId }) });
+  ok('新挂套餐从此刻起算一期',
+    switchedPlan.data.item.autoRenew === true &&
+      switchedPlan.data.item.renewCount === 0 &&
+      new Date(switchedPlan.data.item.expireAt).getTime() > Date.now(),
+    `(${switchedPlan.data.item.expireAt})`);
+  await call('/api/users/' + uSwitch.data.item.id, { method: 'DELETE' });
 
   // 改套餐额度，用户侧要跟着变
   const planUpdate = await call('/api/plans/' + planId, { method: 'PUT', body: json({ quotaGB: 2, days: 14 }) });
   ok('修改套餐额度', planUpdate.status === 200 && planUpdate.data.item.quotaGB === 2);
   const u1After = (await call('/api/users')).data.items.find((u) => u.id === u1.id);
   ok('套餐变更同步到用户', u1After.quotaGB === 2, `(${u1After.quotaGB}GB)`);
+
+  /* ---------- 3.5 套餐有效期：天 / 月 / 季度 / 年 / 自定义 ---------- */
+  const mkPlan = async (name, validity, sort) => {
+    const r = await call('/api/plans', { method: 'POST', body: json({ name, quotaGB: 20, validity, sort }) });
+    return r.data.item;
+  };
+
+  const monthPlan = await mkPlan('SMOKE-月付', { type: 'month', num: 3 }, 101);
+  ok('有效期支持「按月」', monthPlan.validity.type === 'month' && monthPlan.validityLabel === '3 个月', monthPlan.validityLabel);
+  ok('月付折算 days 供老接口使用', monthPlan.days === 90, `(${monthPlan.days})`);
+
+  const quarterPlan = await mkPlan('SMOKE-季付', { type: 'quarter', num: 2 }, 102);
+  ok('有效期支持「按季度」', quarterPlan.validityLabel === '2 个季度', quarterPlan.validityLabel);
+
+  const yearPlan = await mkPlan('SMOKE-年付', { type: 'year', num: 1 }, 103);
+  ok('有效期支持「按年」', yearPlan.validityLabel === '1 年' && yearPlan.days === 365, `(${yearPlan.validityLabel})`);
+
+  const customEnd = '2031-03-01T00:00:00.000Z';
+  const customPlan = await mkPlan('SMOKE-自定义到期', { type: 'custom', endAt: customEnd }, 104);
+  ok('有效期支持「自定义到期时间」', customPlan.validity.type === 'custom' && customPlan.validityLabel === '2031-03-01 到期',
+    customPlan.validityLabel);
+  ok('自定义到期不会自动续期', customPlan.autoRenew === false);
+
+  // 续期开关可以按套餐关掉
+  const renewOff = await call('/api/plans/' + planId, { method: 'PUT', body: json({ autoRenew: false }) });
+  ok('可以关闭套餐自动续期', renewOff.data.item.autoRenew === false, `(${renewOff.data.item.autoRenewLabel})`);
+  const renewOn = await call('/api/plans/' + planId, { method: 'PUT', body: json({ autoRenew: true }) });
+  ok('可以重新打开自动续期', renewOn.data.item.autoRenew === true);
+
+  // 自定义到期：所有归属用户共享同一个截止时间
+  const uCustom = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-自定义到期用户', planId: customPlan.id }) });
+  ok('自定义到期时间原样落到用户', uCustom.data.item.expireAt === customEnd, `(${uCustom.data.item.expireAt})`);
+  await call('/api/users/' + uCustom.data.item.id, { method: 'DELETE' });
+
+  // 月付：按自然月推算（不是 90 天）
+  const uMonth = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-月付用户', planId: monthPlan.id }) });
+  const expAt = new Date(uMonth.data.item.expireAt);
+  const crtAt = new Date(uMonth.data.item.createdAt);
+  const monthDiff = (expAt.getFullYear() - crtAt.getFullYear()) * 12 + (expAt.getMonth() - crtAt.getMonth());
+  ok('月付用户按自然月推算到期', monthDiff === 3, `(${uMonth.data.item.expireAt})`);
+  await call('/api/users/' + uMonth.data.item.id, { method: 'DELETE' });
+
+  // 老接口传 days 仍然等价于「N 天」
+  const legacy = await call('/api/plans/' + planId, { method: 'PUT', body: json({ days: 5 }) });
+  ok('老参数 days 仍等价于按天', legacy.data.item.validity.type === 'day' && legacy.data.item.validity.num === 5);
+
+  for (const p of [monthPlan, quarterPlan, yearPlan, customPlan]) await call('/api/plans/' + p.id, { method: 'DELETE' });
+  await call('/api/plans/' + planId, { method: 'PUT', body: json({ quotaGB: 2, days: 14 }) });
 
   // 节点加入套餐
   await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ planIds: [planId] }) });
@@ -308,6 +378,30 @@ const json = (obj) => JSON.stringify(obj);
   const subAfter = await call(`/api/sub/${u1.token}`);
   ok('超量用户订阅为空', (subAfter.data.links || []).length === 0);
 
+  /* ---------- 10.5 管理员手工改已用流量 ---------- */
+  const lowered = await call('/api/users/' + u1.id, { method: 'PUT', body: json({ usedGB: 0.5 }) });
+  ok('管理员可直接改小已用流量',
+    lowered.status === 200 && Math.abs(lowered.data.item.usedBytes - 0.5 * GB) < 1024,
+    `(${(lowered.data.item.usedBytes / GB).toFixed(2)}GB)`);
+  ok('改小后状态从超量回到正常', lowered.data.item.status === 'active', `(${lowered.data.item.statusLabel})`);
+  ok('改小后剩余可用按新值重算',
+    lowered.data.item.remainingBytes > 0 && lowered.data.item.remainingBytes < lowered.data.item.quotaBytes,
+    `(剩余 ${(lowered.data.item.remainingBytes / GB).toFixed(2)}GB / 共 ${lowered.data.item.quotaGB}GB)`);
+
+  const subRestored = await call(`/api/sub/${u1.token}`);
+  ok('改小后订阅恢复', (subRestored.data.links || []).length === 1);
+
+  const cfgRestored = await call(`/api/agent/config?token=${serverToken}&v=test`);
+  const inboundRestored = cfgRestored.data.xray.inbounds.find((i) => i.tag === 'node-' + node1Id);
+  ok('改小后用户重新注入节点配置',
+    !!inboundRestored && inboundRestored.settings.clients.some((c) => c.email === 'u' + u1.id));
+
+  const raised = await call('/api/users/' + u1.id, { method: 'PUT', body: json({ usedGB: 99 }) });
+  ok('改成超过额度立即转为超量', raised.data.item.status === 'over');
+
+  const negative = await call('/api/users/' + u1.id, { method: 'PUT', body: json({ usedGB: -1 }) });
+  ok('负数已用流量被拒绝', negative.status === 400);
+
   /* ---------- 11. 部署脚本 ---------- */
   const srvInstall = await fetch(`${BASE}/api/servers/${serverId}/install?token=${serverToken}`).then((r) => r.text());
   ok('服务器部署脚本可下载', srvInstall.startsWith('#!/bin/sh') && srvInstall.includes(serverToken));
@@ -322,6 +416,34 @@ const json = (obj) => JSON.stringify(obj);
 
   const badInstall = await fetch(`${BASE}/api/nodes/${node3Id}/install?token=wrong`).then((r) => r.status);
   ok('错误的节点 token 无法获取脚本', badInstall === 401);
+
+  ok('agent 版本号跟面板一致', srvInstall.includes(`VERSION='${pkgVersion}'`), `(期望 ${pkgVersion})`);
+  ok(
+    'agent.env 的值带引号（RELOAD_CMD 含空格不会被当命令执行）',
+    srvInstall.includes('RELOAD_CMD="$RELOAD_CMD"') && srvInstall.includes('PANEL_URL="$PANEL_URL"'),
+  );
+  ok('部署脚本按实际单元名探测 Xray 服务', srvInstall.includes('xray-core') && srvInstall.includes('x-ui'));
+
+  /* ---------- 11.1 卸载脚本 ---------- */
+  const srvUninstall = await fetch(`${BASE}/api/servers/${serverId}/uninstall?token=${serverToken}`).then((r) => r.text());
+  ok('服务器卸载脚本可下载', srvUninstall.startsWith('#!/bin/sh') && srvUninstall.includes('nodepanel-agent'));
+  ok(
+    '卸载脚本注销服务并清理目录',
+    srvUninstall.includes('systemctl disable nodepanel-agent') &&
+      srvUninstall.includes('rc-update del nodepanel-agent') &&
+      srvUninstall.includes('rm -rf "$AGENT_DIR" "$RUN_DIR"'),
+  );
+  ok('卸载脚本会停掉 agent 托管的 Hysteria2 实例', srvUninstall.includes('node-*.yaml') && srvUninstall.includes('RUN_DIR"/*.pid'));
+  ok('卸载脚本支持 --purge 深度清理', srvUninstall.includes('--purge') && srvUninstall.includes('nodepanel.bak'));
+
+  const nodeUninstall = await fetch(`${BASE}/api/nodes/${node3Id}/uninstall?token=${node3Token}`).then((r) => r.text());
+  ok('独立节点卸载脚本可下载', nodeUninstall.startsWith('#!/bin/sh') && nodeUninstall.includes('卸载脚本'));
+
+  const badUninstall = await fetch(`${BASE}/api/nodes/${node3Id}/uninstall?token=wrong`).then((r) => r.status);
+  ok('错误的 token 无法获取卸载脚本', badUninstall === 401);
+
+  const serverNodeUninstall = await fetch(`${BASE}/api/nodes/${node1Id}/uninstall?token=${serverToken}`).then((r) => r.status);
+  ok('跟随服务器的节点拒绝独立卸载脚本', serverNodeUninstall === 400);
 
   /* ---------- 11.2 agent 配置包（shell 协议） ---------- */
   const bundleRes = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}`);
@@ -348,6 +470,38 @@ const json = (obj) => JSON.stringify(obj);
 
   const serverNodeInstall = await fetch(`${BASE}/api/nodes/${node1Id}/install?token=${serverToken}`).then((r) => r.status);
   ok('跟随服务器的节点拒绝独立部署脚本', serverNodeInstall === 400);
+
+  /* ---------- 11.3 agent 自更新脚本 ---------- */
+  const agentSrc = await fetch(`${BASE}/api/agent/script?token=${serverToken}`).then((r) => r.text());
+  ok('agent 脚本可下载（自更新用）', agentSrc.startsWith('#!/bin/sh') && agentSrc.includes('/api/agent/bundle'));
+  const agentVer = /^VERSION='([^']+)'/m.exec(agentSrc);
+  ok('下发的 agent 版本号已替换成面板版本', !!agentVer && !/^VERSION='2\./m.test(agentSrc), agentVer ? agentVer[1] : '');
+  const bundleAgentVer = /NP_AGENT_VERSION='([^']*)'/.exec(bundle);
+  ok('配置包带 agent 目标版本', !!bundleAgentVer && !!agentVer && bundleAgentVer[1] === agentVer[1],
+    bundleAgentVer ? bundleAgentVer[1] : '');
+  const badAgentSrc = await fetch(`${BASE}/api/agent/script?token=wrong`).then((r) => r.text());
+  ok('错误 token 拿不到 agent 脚本', badAgentSrc.startsWith('#ERROR'));
+
+  /* ---------- 11.4 节点维度流量明细 ---------- */
+  const npUsersBefore = await call('/api/users');
+  const npUsedBefore = npUsersBefore.data.items.find((u) => u.id === u2.id).usedBytes;
+  const nodeReport = await fetch(`${BASE}/api/agent/report?token=${serverToken}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: `node:${node1Id} 300 700\n`,
+  }).then((r) => r.json());
+  const npUsersAfter = await call('/api/users');
+  const npUsedAfter = npUsersAfter.data.items.find((u) => u.id === u2.id).usedBytes;
+  const npStats = await call('/api/stats?days=7');
+  const npNodeRow = (npStats.data.nodes || []).find((n) => n.id === node1Id);
+  ok('节点维度上报被记录', nodeReport.nodeBytes === 1000 && !!npNodeRow && npNodeRow.total >= 1000,
+    JSON.stringify({ nodeBytes: nodeReport.nodeBytes, total: npNodeRow && npNodeRow.total }));
+  ok('节点上报不会重复计入用户额度', npUsedAfter === npUsedBefore, `${npUsedBefore}→${npUsedAfter}`);
+  ok('流量明细返回日期序列与用户/节点排行',
+    npStats.data.dates.length === 7 &&
+      npStats.data.users.length > 0 &&
+      Array.isArray(npStats.data.users[0].days),
+    `${npStats.data.dates.length} 天`);
 
   /* ---------- 11.5 公网地址上报 ---------- */
   const REPORTED_IP = '198.51.100.77';
@@ -607,7 +761,341 @@ const json = (obj) => JSON.stringify(obj);
   ok('未登录访问管理接口被拒绝', (await call('/api/users')).status === 401);
   token = saved;
 
-  /* ---------- 13. 清理 ---------- */
+  /* ---------- 13. 通知 ---------- */
+  const chList = await call('/api/notify/channels');
+  ok('通知渠道列表可读且带事件定义',
+    chList.status === 200 && Array.isArray(chList.data.items) && chList.data.events.length >= 6);
+
+  const chCreate = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-Webhook',
+      type: 'webhook',
+      events: ['user.over'],
+      config: { url: 'http://127.0.0.1:1/hook', format: 'json' },
+    }),
+  });
+  ok('创建通知渠道', chCreate.status === 200 && chCreate.data.item.name === 'SMOKE-Webhook',
+    chCreate.data.error || '');
+  const chId = chCreate.data.item && chCreate.data.item.id;
+
+  const badUrl = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({ name: 'x', type: 'webhook', config: { url: 'not-a-url' } }),
+  });
+  ok('非法 webhook 地址被拒', badUrl.status === 400);
+
+  const tgCh = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-TG', type: 'telegram', config: { botToken: 'secret-token', chatId: '1' } }),
+  });
+  ok('Telegram 渠道创建成功', tgCh.status === 200);
+  ok('密钥出接口时打码',
+    tgCh.data.item.config.botToken === '••••••' && tgCh.data.item.hasSecret.botToken === true);
+  const tgUpd = await call('/api/notify/channels/' + tgCh.data.item.id, {
+    method: 'PUT',
+    body: json({ config: { botToken: '••••••', chatId: '2' } }),
+  });
+  ok('打码值回写不会清空密钥（chatId 照常更新）',
+    tgUpd.status === 200 && tgUpd.data.item.config.chatId === '2' && tgUpd.data.item.config.botToken === '••••••');
+
+  const notifSet = await call('/api/notify/settings', {
+    method: 'PUT',
+    body: json({ enabled: true, events: ['user.over', 'server.offline'], leadDays: 5, offlineMin: 15, cooldownHours: 6, recovery: false }),
+  });
+  ok('保存通知设置',
+    notifSet.status === 200 && notifSet.data.settings.enabled === true &&
+      notifSet.data.settings.leadDays === 5 && notifSet.data.settings.events.length === 2,
+    JSON.stringify(notifSet.data.settings));
+  const dropped = await call('/api/notify/settings', { method: 'PUT', body: json({ events: ['nope', 'user.over'] }) });
+  ok('未知事件名被过滤掉', dropped.data.settings.events.length === 1 && dropped.data.settings.events[0] === 'user.over');
+
+  const sweep = await call('/api/notify/sweep', { method: 'POST' });
+  ok('手动巡检可用（发送失败也返回结果）', sweep.status === 200 && typeof sweep.data.fired === 'number',
+    JSON.stringify({ fired: sweep.data.fired, sent: sweep.data.sent }));
+
+  const chFinal = await call('/api/notify/channels');
+  ok('发送记录会留下（哪怕失败）', Array.isArray(chFinal.data.log) && chFinal.data.log.length > 0);
+
+  const testMissing = await call('/api/notify/test', { method: 'POST', body: json({ id: 'nope' }) });
+  ok('测试不存在的渠道返回 404', testMissing.status === 404);
+  const chDel = await call('/api/notify/channels/' + chId, { method: 'DELETE' });
+  ok('删除渠道', chDel.status === 200);
+
+  // 还原通知开关，避免影响后续手动使用测试库
+  await call('/api/notify/settings', { method: 'PUT', body: json({ enabled: false }) });
+  await call('/api/notify/channels/' + tgCh.data.item.id, { method: 'DELETE' });
+
+  /* ---------- 13. 批量建号与批量操作 ---------- */
+  const bulkCount = await call('/api/users/bulk', {
+    method: 'POST',
+    body: json({ count: 3, prefix: 'SMOKE-批量', startAt: 1, planId }),
+  });
+  const bulkNames = bulkCount.data.items.map((x) => x.name);
+  ok('批量建号（按数量）', bulkCount.status === 200 && bulkCount.data.items.length === 3,
+    bulkNames.join('、'));
+  ok('批量建号返回订阅链接', bulkCount.data.items.every((x) => /^https?:\/\/.+\/s\/[a-f0-9]{32}$/.test(x.subUrl)));
+  ok('批量建号自动补零', bulkNames[0] === 'SMOKE-批量01', bulkNames[0]);
+  ok('批量建号继承套餐', bulkCount.data.planName === 'SMOKE-套餐', bulkCount.data.planName);
+
+  const dupBulk = await call('/api/users/bulk', {
+    method: 'POST',
+    body: json({ names: 'SMOKE-甲,SMOKE-乙,SMOKE-甲,SMOKE-批量01' }),
+  });
+  ok('批量建号（按名单）去重', dupBulk.data.items.length === 2, `建了 ${dupBulk.data.items.length} 个`);
+  ok('批量建号跳过重复与同名', dupBulk.data.skipped.length === 2 &&
+    dupBulk.data.skipped.some((s) => /重复/.test(s.reason)) &&
+    dupBulk.data.skipped.some((s) => /已存在/.test(s.reason)),
+    dupBulk.data.skipped.map((s) => s.reason).join(' / '));
+
+  const tooLong = await call('/api/users/bulk', { method: 'POST', body: json({ names: 'X'.repeat(61) }) });
+  ok('超长名字被跳过而不是报错', tooLong.data.skipped.length === 1 && tooLong.data.skipped[0].reason.includes('60'));
+
+  const batchIds = bulkCount.data.items.map((x) => x.id);
+  const bDisable = await call('/api/users/batch', { method: 'POST', body: json({ ids: batchIds, action: 'disable' }) });
+  ok('批量停用', bDisable.status === 200 && bDisable.data.done === 3);
+  const userAfterDisable = (await call('/api/users')).data.items.find((u) => u.id === batchIds[0]);
+  ok('批量停用真的生效', userAfterDisable.enabled === false);
+  const bEnable = await call('/api/users/batch', { method: 'POST', body: json({ ids: batchIds, action: 'enable' }) });
+  ok('批量启用', bEnable.data.done === 3);
+  const bPlan = await call('/api/users/batch', { method: 'POST', body: json({ ids: batchIds, action: 'plan', planId: emptyPlanId }) });
+  ok('批量改套餐', bPlan.data.done === 3);
+  const bReset = await call('/api/users/batch', { method: 'POST', body: json({ ids: batchIds, action: 'reset' }) });
+  ok('批量重置用量', bReset.data.done === 3);
+
+  const adminId = (await call('/api/users')).data.items.find((u) => u.username === 'admin' || u.name === 'admin').id;
+  const bAdmin = await call('/api/users/batch', { method: 'POST', body: json({ ids: [adminId], action: 'delete' }) });
+  ok('批量删除保护默认管理员', bAdmin.data.done === 0 && bAdmin.data.skipped.length === 1,
+    bAdmin.data.skipped[0] && bAdmin.data.skipped[0].reason);
+
+  /* ---------- 13.1 邀请链接 ---------- */
+  const inv = await call('/api/invites', {
+    method: 'POST',
+    body: json({ planId, maxUses: 2, note: 'SMOKE 邀请' }),
+  });
+  ok('生成邀请链接', inv.status === 200 && /^[a-f0-9]{6}$/.test(inv.data.item.code), inv.data.item.code);
+  const invCode = inv.data.item.code;
+  cleanup.push(['/api/invites/' + inv.data.item.id]);
+
+  const invInfo = await call('/api/invite/' + invCode);
+  ok('邀请公开信息（无需登录）', invInfo.status === 200 && invInfo.data.remaining === 2 &&
+    invInfo.data.plan.name === 'SMOKE-套餐', JSON.stringify(invInfo.data.plan));
+  ok('邀请公开信息不泄露 token', JSON.stringify(invInfo.data).indexOf('token') === -1);
+
+  const claim1 = await call('/api/invite/' + invCode + '/claim', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-受邀者' }),
+  });
+  ok('用邀请码自助建号', claim1.status === 200 && claim1.data.name === 'SMOKE-受邀者' &&
+    !!claim1.data.subUrl, claim1.data.planName);
+  const claimed = (await call('/api/users')).data.items.find((u) => u.name === 'SMOKE-受邀者');
+  ok('受邀用户落到配置的套餐里', claimed && claimed.planName === 'SMOKE-套餐');
+  const claimDup = await call('/api/invite/' + invCode + '/claim', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-受邀者' }),
+  });
+  ok('重名领号返回 409', claimDup.status === 409);
+  const claim2 = await call('/api/invite/' + invCode + '/claim', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-受邀者2' }),
+  });
+  ok('第二个名额仍可领', claim2.status === 200 && claim2.data.remaining === 0);
+  const claim3 = await call('/api/invite/' + invCode + '/claim', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-第三人' }),
+  });
+  ok('名额用尽后拒绝领取', claim3.status === 410, JSON.stringify(claim3.data));
+  ok('名额用尽后信息接口也是 410', (await call('/api/invite/' + invCode)).status === 410);
+  ok('不存在的邀请码返回 404', (await call('/api/invite/ffffff')).status === 404);
+
+  const invOff = await call('/api/invites/' + inv.data.item.id, { method: 'PUT', body: json({ enabled: false }) });
+  ok('停用邀请', invOff.status === 200 && invOff.data.item.enabled === false);
+  ok('停用后无法领取', (await call('/api/invite/' + invCode)).status === 410);
+  ok('邀请列表需要登录', (await (async () => {
+    const t = token;
+    token = '';
+    const r = await call('/api/invites');
+    token = t;
+    return r;
+  })()).status === 401);
+
+  // 限流必须把失败尝试算进去：只数成功的话，脚本拿一个失效邀请码就能把 6 位码枚举一遍。
+  // 这里特意换一个来源 IP，免得把本机这个桶打满、影响后面的用例。
+  const FLOOD = { 'X-Forwarded-For': '203.0.113.77' };
+  let hit429 = 0;
+  for (let i = 0; i < 12; i++) {
+    const r = await call('/api/invite/' + invCode + '/claim', {
+      method: 'POST',
+      headers: FLOOD,
+      body: json({ name: 'SMOKE-刷号' + i }),
+    });
+    if (r.status === 429) { hit429 = i + 1; break; }
+  }
+  ok('连续失败尝试也会触发限流 429', hit429 > 0, `第 ${hit429} 次被拦`);
+  ok('限流按 IP 分桶（换个 IP 仍可领）',
+    (await call('/api/invite/' + invCode + '/claim', {
+      method: 'POST',
+      headers: { 'X-Forwarded-For': '203.0.113.88' },
+      body: json({ name: 'SMOKE-受邀者3' }),
+    })).status !== 429);
+
+  /* ---------- 13.2 节点回执 ---------- */
+  const syncBefore = (await call('/api/servers')).data.items.find((s) => s.id === serverId).sync;
+  ok('新机器没有回执时是「未回执」', syncBefore.state === 'unknown' || syncBefore.state === 'pending', syncBefore.state);
+
+  const rcpt = await call(`/api/agent/receipt?token=${serverToken}`, {
+    method: 'POST',
+    body: json({ hash: syncBefore.desired, ok: true, xray: 'ok', hy: '1/1', nodes: 1, users: 2, agentVersion: 'test' }),
+  });
+  const syncOk = (await call('/api/servers')).data.items.find((s) => s.id === serverId).sync;
+  ok('回执上传成功', rcpt.status === 200 && rcpt.data.desired === syncBefore.desired);
+  ok('hash 与面板一致 → 已同步', syncOk.state === 'ok' && syncOk.xray === 'ok', syncOk.state);
+  ok('回执带上重载与实例数', syncOk.hy === '1/1' && syncOk.nodes === 1 && syncOk.users === 2);
+
+  const nodeMove = await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ port: 8443 }) });
+  ok('改节点端口成功（为回执做准备）', nodeMove.status === 200);
+  const syncStale = (await call('/api/servers')).data.items.find((s) => s.id === serverId).sync;
+  ok('配置改了但 agent 还没拉 → 待同步', syncStale.state === 'stale', `${syncStale.state} ${syncStale.hash}→${syncStale.desired}`);
+
+  const rcptFail = await call(`/api/agent/receipt?token=${serverToken}`, {
+    method: 'POST',
+    body: json({ hash: 'badbadbad', ok: false, error: 'Xray 重载失败：status=failed', xray: 'fail' }),
+  });
+  const syncErr = (await call('/api/servers')).data.items.find((s) => s.id === serverId).sync;
+  ok('失败回执被记录', rcptFail.status === 200 && syncErr.state === 'error');
+  ok('失败原因原样保留', syncErr.error.includes('status=failed'), syncErr.error);
+  ok('回执校验 token', (await call('/api/agent/receipt?token=wrong-token', { method: 'POST', body: json({ hash: 'x' }) })).status === 401);
+
+  const nodeSync = (await call('/api/nodes')).data.items.find((n) => n.id === node1Id).sync;
+  ok('服务器下的节点继承服务器回执', nodeSync && nodeSync.state === 'error', nodeSync && nodeSync.state);
+
+  // 没有服务管理器：配置写了但没重载，不能报「已同步」（红标也会掩盖真正的问题）
+  const syncNeed = (await call('/api/servers')).data.items.find((s) => s.id === serverId).sync;
+  await call(`/api/agent/receipt?token=${serverToken}`, {
+    method: 'POST',
+    body: json({ hash: syncNeed.desired, ok: true, xray: 'skip', hy: '0/0' }),
+  });
+  const syncPartial = (await call('/api/servers')).data.items.find((s) => s.id === serverId).sync;
+  ok('xray=skip 时是「待重载」而不是「已同步」', syncPartial.state === 'partial', syncPartial.label);
+
+  /* ---------- 13.3 备份与恢复 ---------- */
+  const bk = await call('/api/backups', { method: 'POST' });
+  ok('立即备份', bk.status === 200 && /^panel-manual-[\d-]+\.db$/.test(bk.data.item.file), bk.data.item.file);
+  const bkFile = bk.data.item.file;
+  const bkList = await call('/api/backups');
+  ok('备份列表含刚建的一份', bkList.data.items.some((x) => x.file === bkFile) && bkList.data.dbSize > 0,
+    `${bkList.data.items.length} 份 · ${Math.round(bkList.data.dbSize / 1024)} KB`);
+
+  const dl = await fetch(`${BASE}/api/backups/${bkFile}/download`, { headers: { Authorization: 'Bearer ' + token } });
+  const dlBuf = Buffer.from(await dl.arrayBuffer());
+  ok('下载备份', dl.status === 200 && dlBuf.subarray(0, 16).toString('latin1') === 'SQLite format 3\u0000',
+    `${Math.round(dlBuf.length / 1024)} KB`);
+  ok('文件名做了校验（拒绝路径穿越）',
+    (await call('/api/backups/..%2Fpanel.db/download')).status === 400);
+
+  const userCountBeforeRestore = (await call('/api/users')).data.items.length;
+  await call('/api/users/bulk', { method: 'POST', body: json({ count: 2, prefix: 'SMOKE-待回滚' }) });
+  const userCountDirty = (await call('/api/users')).data.items.length;
+  ok('恢复前先造脏数据', userCountDirty === userCountBeforeRestore + 2);
+
+  const restored = await call('/api/backups/restore', { method: 'POST', body: json({ file: bkFile }) });
+  ok('从备份恢复', restored.status === 200 && !!restored.data.safety, `兜底：${restored.data.safety}`);
+  // 会话已清空，下面用重新登录后的 token 读列表
+  const relogin = await call('/api/login', { method: 'POST', body: json({ username: ADMIN_USER, password: ADMIN_PASS }) });
+  ok('恢复后旧会话失效，需要重新登录', relogin.status === 200 && !!relogin.data.token);
+  token = relogin.data.token;
+  ok('恢复前自动留了一份兜底备份',
+    (await call('/api/backups')).data.items.some((x) => x.file === restored.data.safety));
+
+  // 恢复会连同 audit_log 一起回滚到备份时点，所以「谁恢复的」这条必须写在新库里
+  const auditAfterRestore = await call('/api/audit?limit=50');
+  ok('恢复动作本身留在新库里', auditAfterRestore.data.items.some((x) => x.action === 'backup.restore'),
+    auditAfterRestore.data.items[0] && auditAfterRestore.data.items[0].action);
+
+  const userCountAfterRestore = (await call('/api/users')).data.items.length;
+  ok('恢复把数据退回到备份时点', userCountAfterRestore === userCountBeforeRestore,
+    `${userCountDirty} → ${userCountAfterRestore}`);
+
+  const badDb = await fetch(`${BASE}/api/backups/restore`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/octet-stream' },
+    body: Buffer.alloc(8192, 7),
+  });
+  ok('上传非 SQLite 文件被拒绝', badDb.status === 400);
+
+  // 「长得像 SQLite」但根本不是本面板的库：以前会 200 并把站点换成空库
+  const foreignFile = path.join(os.tmpdir(), 'np-foreign-' + Date.now() + '.db');
+  const { DatabaseSync } = require('node:sqlite');
+  const fdb = new DatabaseSync(foreignFile);
+  fdb.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, nickname TEXT)');
+  fdb.close();
+  const usersBeforeForeign = (await call('/api/users')).data.items.length;
+  const foreign = await fetch(`${BASE}/api/backups/restore`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/octet-stream' },
+    body: fs.readFileSync(foreignFile),
+  });
+  const foreignBody = await foreign.json();
+  ok('陌生 SQLite 库被拒绝（400）', foreign.status === 400, String(foreignBody.error || '').slice(0, 40));
+  ok('拒绝之后数据一个没少',
+    (await call('/api/users')).data.items.length === usersBeforeForeign, `${usersBeforeForeign} 位`);
+  try { fs.unlinkSync(foreignFile); } catch { /* 临时文件 */ }
+
+  // 时间戳精确到秒：连点两次「立即备份」不能生成同名文件互相覆盖
+  const bkA = await call('/api/backups', { method: 'POST' });
+  const bkB = await call('/api/backups', { method: 'POST' });
+  ok('同一秒内两次备份文件名不同', bkA.data.item.file !== bkB.data.item.file,
+    `${bkA.data.item.file} / ${bkB.data.item.file}`);
+  ok('两份都在列表里', (await call('/api/backups')).data.items
+    .filter((x) => [bkA.data.item.file, bkB.data.item.file].includes(x.file)).length === 2);
+
+  const uploadRestore = await fetch(`${BASE}/api/backups/restore`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/octet-stream' },
+    body: dlBuf,
+  });
+  ok('上传备份文件也能恢复', uploadRestore.status === 200,
+    JSON.stringify((await uploadRestore.json()).from));
+  token = (await call('/api/login', { method: 'POST', body: json({ username: ADMIN_USER, password: ADMIN_PASS }) })).data.token;
+
+  const bkDel = await call('/api/backups/' + restored.data.safety, { method: 'DELETE' });
+  ok('删除备份', bkDel.status === 200);
+  ok('删掉的备份不再出现',
+    !(await call('/api/backups')).data.items.some((x) => x.file === restored.data.safety));
+
+  /* ---------- 13.4 审计日志 ---------- */
+  const audit = await call('/api/audit?limit=200');
+  ok('审计日志可读', audit.status === 200 && audit.data.items.length > 0, `共 ${audit.data.total} 条`);
+  const acts = audit.data.items.map((x) => x.action);
+  ok('建号被记录', acts.includes('user.create') || acts.includes('user.bulk'));
+  ok('邀请领取被记录', acts.includes('invite.claim'));
+  // 说明：中间做过两次恢复，audit_log 会被备份内容覆盖，
+  // 只有「恢复之后」发生的动作才会留在新库里 —— 这是恢复语义决定的，不是漏记。
+  ok('恢复之后的备份操作照常被记录', acts.includes('backup.delete'));
+  ok('审计带操作者与 IP', audit.data.items.every((x) => x.actor && typeof x.ip === 'string'));
+  ok('审计动作分组清单', audit.data.groups.length >= 8, audit.data.groups.map((g) => g.label).join('、'));
+
+  const auditQ = await call('/api/audit?q=' + encodeURIComponent('SMOKE-受邀者'));
+  ok('审计支持关键字搜索', auditQ.data.items.length > 0 &&
+    auditQ.data.items.every((x) => JSON.stringify(x).includes('SMOKE-受邀者')));
+  const auditAct = await call('/api/audit?action=backup');
+  ok('审计支持按类型过滤', auditAct.data.items.length > 0 &&
+    auditAct.data.items.every((x) => x.action.startsWith('backup')));
+  // total 必须和过滤条件一致：以前取全表，搜出 1 行却写「共 47 条」
+  ok('过滤后的 total 与命中条数一致', auditAct.data.total === auditAct.data.items.length,
+    `total=${auditAct.data.total} items=${auditAct.data.items.length}`);
+  const auditNone = await call('/api/audit?q=' + encodeURIComponent('绝对搜不到的关键词zzz'));
+  ok('搜不到时 total 为 0', auditNone.data.total === 0 && auditNone.data.items.length === 0);
+
+  await call('/api/login', { method: 'POST', body: json({ username: ADMIN_USER, password: 'not-the-password' }) });
+  const auditFail = await call('/api/audit?q=login.fail');
+  ok('登录失败也进审计', auditFail.data.items.some((x) => x.action === 'login.fail'), `total=${auditFail.data.total}`);
+  const auditPage = await call('/api/audit?limit=2');
+  const auditMore = await call('/api/audit?limit=2&before=' + auditPage.data.items[1].id);
+  ok('审计支持翻页', auditMore.data.items.length > 0 &&
+    auditMore.data.items[0].id < auditPage.data.items[1].id);
+
+  /* ---------- 14. 清理 ---------- */
   for (const [path] of cleanup.reverse()) {
     await call(path, { method: 'DELETE' });
   }

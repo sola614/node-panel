@@ -49,6 +49,37 @@
   </div>
 </div>
 
+<!-- 强制改密：出厂密码还没改时，登录后必须先过这一关 -->
+<div id="force-pw" class="login-wrap hidden">
+  <button class="theme-btn login-theme" data-theme-toggle type="button" title="切换到日间模式" aria-label="切换到日间模式">
+    <span class="ico">☀</span>
+  </button>
+  <div class="login-card">
+    <div class="brand">
+      <div class="brand-mark">N</div>
+      <div class="brand-text">
+        <b>先设置一个新密码</b>
+        <span>Security</span>
+      </div>
+    </div>
+    <p class="hint" style="margin:0 0 14px">
+      当前账号还在使用出厂默认密码。这个面板可能暴露在公网，请先改掉再继续。
+    </p>
+    <form id="force-pw-form">
+      <div class="field">
+        <label>新密码</label>
+        <input type="password" id="fp-new" autocomplete="new-password" placeholder="至少 8 位，别用 admin888">
+      </div>
+      <div class="field">
+        <label>确认新密码</label>
+        <input type="password" id="fp-confirm" autocomplete="new-password" placeholder="再输一次">
+      </div>
+      <button class="btn btn-primary btn-block" type="submit" style="margin-top:6px;padding:11px">设置新密码</button>
+    </form>
+    <p class="hint" style="text-align:center;margin-top:16px">改完会用新密码重新登录一次</p>
+  </div>
+</div>
+
 <!-- 主界面 -->
 <div id="app" class="layout hidden">
   <aside class="sidebar">
@@ -65,7 +96,9 @@
       <div class="nav-item" data-view="users" title="用户"><span class="ico">☺</span><span class="label">用户</span></div>
       <div class="nav-item" data-view="plans" title="套餐"><span class="ico">◇</span><span class="label">套餐</span></div>
       <div class="nav-item" data-view="nodes" title="节点"><span class="ico">◆</span><span class="label">节点</span></div>
+      <div class="nav-item" data-view="stats" title="流量"><span class="ico">▦</span><span class="label">流量</span></div>
       <div class="nav-item" data-view="servers" title="服务器"><span class="ico">▤</span><span class="label">服务器</span></div>
+      <div class="nav-item" data-view="audit" title="日志"><span class="ico">≡</span><span class="label">日志</span></div>
       <div class="nav-item" data-view="settings" title="设置"><span class="ico">⚙</span><span class="label">设置</span></div>
     </nav>
 
@@ -99,9 +132,17 @@
   </main>
 </div>
 
-<div id="modal-root"></div>
 <div id="toast-root"></div>
 <script src="/theme.js"></script>
-<script src="/app.js"></script>
+<!-- 经典脚本按顺序加载：顶层声明共享全局词法环境，所以不需要打包器 -->
+<script src="/js/core.js"></script>
+<script src="/js/overview.js"></script>
+<script src="/js/users.js"></script>
+<script src="/js/plans.js"></script>
+<script src="/js/nodes.js"></script>
+<script src="/js/stats.js"></script>
+<script src="/js/servers.js"></script>
+<script src="/js/audit.js"></script>
+<script src="/js/main.js"></script>
 </body>
 </html>

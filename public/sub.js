@@ -63,6 +63,64 @@ function statusColor(status) {
   return 'var(--muted)';
 }
 
+/** base64：订阅地址里可能带非 ASCII（自定义域名被人手打过中文），先转 UTF-8 再编 */
+function b64(s) {
+  try {
+    return btoa(unescape(encodeURIComponent(s)));
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * 按 UA 猜客户端，给一个「最省事」的导入按钮。
+ * 猜错也不影响：下面还列着 Clash / v2rayNG / sing-box 三条固定入口。
+ */
+function recommendClient(d) {
+  const ua = navigator.userAgent;
+  const sub = encodeURIComponent(d.subUrl);
+  const clash = encodeURIComponent(d.clashUrl);
+
+  if (/iPhone|iPad|iPod/i.test(ua)) {
+    return {
+      name: 'Shadowrocket',
+      hint: 'iOS 上把小火箭装好后，点一下就能把订阅加进去',
+      actions: [
+        { label: '导入 Shadowrocket', href: 'sub://' + b64(d.subUrl), primary: true },
+        { label: '导入 sing-box', href: 'sing-box://import-remote-profile?url=' + sub },
+      ],
+    };
+  }
+  if (/Android/i.test(ua)) {
+    return {
+      name: 'v2rayNG',
+      hint: 'Android 装好 v2rayNG（或 Clash Meta），点一下直接订阅',
+      actions: [
+        { label: '导入 v2rayNG', href: 'v2rayng://install-config?url=' + sub, primary: true },
+        { label: '导入 Clash Meta', href: 'clash://install-config?url=' + clash },
+      ],
+    };
+  }
+  if (/Macintosh|Mac OS X/i.test(ua)) {
+    return {
+      name: 'ClashX',
+      hint: 'macOS 推荐 ClashX / Clash Verge，点一下导入配置',
+      actions: [
+        { label: '导入 Clash', href: 'clash://install-config?url=' + clash, primary: true },
+        { label: '导入 sing-box', href: 'sing-box://import-remote-profile?url=' + sub },
+      ],
+    };
+  }
+  return {
+    name: 'Clash（Windows / 其他）',
+    hint: 'Windows 推荐 Clash Verge / v2rayN，点一下导入，或直接下载配置文件',
+    actions: [
+      { label: '导入 Clash', href: 'clash://install-config?url=' + clash, primary: true },
+      { label: '导入 v2rayNG', href: 'v2rayng://install-config?url=' + sub },
+    ],
+  };
+}
+
 function render(d) {
   const u = d.user;
   const color = statusColor(u.status);
@@ -78,8 +136,21 @@ function render(d) {
   } else if (u.status === 'disabled') {
     alert = `<div class="alert alert-bad"><b>账号已停用</b>　请联系管理员恢复。</div>`;
   } else if (u.percent >= 85) {
-    alert = `<div class="alert alert-warn"><b>流量即将用尽</b>　已使用 ${Math.round(u.percent)}%，剩余 ${fmtBytes(u.remainingBytes)}。</div>`;
+    alert = `<div class="alert alert-warn"><b>流量即将用尽</b>　已使用 ${Math.round(u.percent)}%，剩余 ${fmtBytes(u.remainingBytes)}。用完前记得找管理员加量。</div>`;
+  } else if (u.daysLeft != null && u.daysLeft >= 0 && u.daysLeft <= 3) {
+    alert = `<div class="alert alert-warn"><b>还有 ${u.daysLeft} 天到期</b>　${
+      u.autoRenew ? '这个账号开了自动续期，到期会自动刷新流量与有效期。' : '这个账号没有自动续期，请及时联系管理员续费。'
+    }</div>`;
   }
+
+  const rec = recommendClient(d);
+
+  const recBtns = rec.actions
+    .map(
+      (a) =>
+        `<a class="btn ${a.primary ? 'btn-primary' : ''}" href="${esc(a.href)}">${esc(a.label)}</a>`,
+    )
+    .join('');
 
   const nodes = d.links.length
     ? d.links
@@ -96,7 +167,9 @@ function render(d) {
       </div>`,
         )
         .join('')
-    : `<div class="empty" style="padding:32px 20px"><b>暂无可用节点</b>${u.status === 'active' ? '管理员还未配置节点' : '订阅恢复后节点会自动出现'}</div>`;
+    : `<div class="empty" style="padding:32px 20px"><b>暂无可用节点</b>${
+        u.status === 'active' ? '管理员还没配置节点，或者你的套餐里暂时没有可用节点。' : '订阅恢复后节点会自动出现。'
+      }</div>`;
 
   const quotaLine = u.quotaBytes ? `${fmtBytes(u.usedBytes)} / ${fmtBytes(u.quotaBytes)}` : `${fmtBytes(u.usedBytes)} / 不限`;
 
@@ -132,7 +205,8 @@ function render(d) {
           <div><span>用户</span><b>${esc(u.name)}</b></div>
           <div><span>流量</span><b>${quotaLine}</b></div>
           <div><span>剩余流量</span><b>${u.remainingBytes == null ? '不限' : fmtBytes(u.remainingBytes)}</b></div>
-          <div><span>到期时间</span><b>${u.expireAt ? esc(u.expireAt.slice(0, 10)) : '永久'}${u.daysLeft != null && u.daysLeft >= 0 ? ` <span style="font-size:11px;color:var(--muted)">(剩 ${u.daysLeft} 天)</span>` : ''}</b></div>
+          <div><span>今日已用</span><b>${fmtBytes(u.todayBytes)}</b></div>
+          <div style="grid-column:1/-1"><span>到期时间</span><b>${u.expireAt ? esc(u.expireAt.slice(0, 10)) : '永久'}${u.daysLeft != null && u.daysLeft >= 0 ? ` <span style="font-size:11px;color:var(--muted)">(剩 ${u.daysLeft} 天)</span>` : ''}</b></div>
         </div>
       </div>
       ${alert}
@@ -147,20 +221,24 @@ function render(d) {
     </div>
 
     <div class="sub-card" style="margin-top:16px">
-      <div style="font-size:13px;font-weight:600;margin-bottom:12px">订阅导入</div>
+      <div style="font-size:13px;font-weight:600;margin-bottom:2px">一键导入</div>
+      <div class="hint" style="margin:0 0 12px">
+        看你的设备像是 <b>${esc(rec.name)}</b>，${esc(rec.hint)}
+      </div>
+      <div class="sub-actions" style="margin-top:0">
+        ${recBtns}
+        <a class="btn" href="${esc(d.clashUrl)}" target="_blank">下载 Clash 配置</a>
+        <button class="btn btn-ghost" data-copy="${esc(d.links.map((l) => l.uri).join('\n'))}">复制全部节点链接</button>
+      </div>
+
+      <div style="font-size:13px;font-weight:600;margin:20px 0 10px">订阅地址</div>
       <div class="code-wrap">
         <pre class="code" style="font-size:11.5px">${esc(d.subUrl)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(d.subUrl)}">复制</button>
       </div>
-      <div class="sub-actions">
-        <a class="btn btn-primary" href="clash://install-config?url=${encodeURIComponent(d.clashUrl)}">导入 Clash</a>
-        <a class="btn" href="v2rayng://install-config?url=${encodeURIComponent(d.subUrl)}">导入 v2rayNG</a>
-        <a class="btn" href="${esc(d.clashUrl)}" target="_blank">下载 Clash 配置</a>
-        <button class="btn btn-ghost" data-copy="${esc(d.links.map((l) => l.uri).join('\n'))}">复制全部链接</button>
-      </div>
       <p class="hint" style="margin-top:14px">
-        在客户端选择「从剪贴板导入」或「订阅设置 → 添加订阅」并粘贴上面的地址即可。
-        订阅内容会随管理员调整自动更新。
+        手动导入就在客户端选「订阅设置 → 添加订阅」粘贴地址。
+        这条链接是你的凭证，别转发给别人；节点变化后客户端更新订阅即可生效。
       </p>
     </div>
 
