@@ -50,6 +50,8 @@ const json = (obj) => JSON.stringify(obj);
   /* ---------- 0. 健康检查 ---------- */
   const health = await fetch(`${BASE}/api/health`).then((r) => r.json());
   ok('健康检查可用', health.ok === true, `schema v${health.version}`);
+  const pkgVersion = JSON.parse(require('fs').readFileSync(require('path').join(__dirname, '..', 'package.json'), 'utf8')).version;
+  ok('健康检查带应用版本号', health.app === pkgVersion, `(${health.app}，package.json 是 ${pkgVersion})`);
 
   /* ---------- 1. 登录 ---------- */
   const login = await call('/api/login', {
@@ -62,6 +64,7 @@ const json = (obj) => JSON.stringify(obj);
     process.exit(1);
   }
   token = login.data.token;
+  ok('登录返回应用版本号', login.data.token && login.data.appVersion === pkgVersion, `(${login.data.appVersion})`);
 
   /* ---------- 0.5 清理上次崩溃的残留，保证测试可重复 ---------- */
   {
@@ -293,16 +296,41 @@ const json = (obj) => JSON.stringify(obj);
 
   /* ---------- 11. 部署脚本 ---------- */
   const srvInstall = await fetch(`${BASE}/api/servers/${serverId}/install?token=${serverToken}`).then((r) => r.text());
-  ok('服务器部署脚本可下载', srvInstall.includes('#!/usr/bin/env bash') && srvInstall.includes(serverToken));
-  ok('脚本注册 agent 与 hysteria 模板单元',
-    srvInstall.includes('nodepanel-agent.service') && srvInstall.includes('nodepanel-hysteria@.service'));
+  ok('服务器部署脚本可下载', srvInstall.startsWith('#!/bin/sh') && srvInstall.includes(serverToken));
+  ok('部署脚本不再要求 Node 运行时', !srvInstall.includes('command -v node') && !srvInstall.includes('node /opt/nodepanel'));
+  ok('脚本内嵌 shell agent', srvInstall.includes('Node Panel Agent') && srvInstall.includes('NODEPANEL_AGENT_EOF'));
+  ok('脚本注册服务（systemd + OpenRC 双分支）',
+    srvInstall.includes('nodepanel-agent.service') && srvInstall.includes('/run/systemd/system') && srvInstall.includes('rc-update add nodepanel-agent'));
 
   const nodeInstall = await fetch(`${BASE}/api/nodes/${node3Id}/install?token=${node3Token}`).then((r) => r.text());
-  ok('独立节点部署脚本可下载', nodeInstall.includes('#!/usr/bin/env bash') && nodeInstall.includes(node3Token));
+  ok('独立节点部署脚本可下载', nodeInstall.startsWith('#!/bin/sh') && nodeInstall.includes(node3Token));
   ok('Hysteria2 节点脚本会安装 hysteria', nodeInstall.includes('NEED_HYSTERIA="1"'));
 
   const badInstall = await fetch(`${BASE}/api/nodes/${node3Id}/install?token=wrong`).then((r) => r.status);
   ok('错误的节点 token 无法获取脚本', badInstall === 401);
+
+  /* ---------- 11.2 agent 配置包（shell 协议） ---------- */
+  const bundleRes = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}`);
+  const bundle = await bundleRes.text();
+  ok('配置包可下发', bundleRes.status === 200 && bundle.startsWith('#!/bin/sh'));
+  ok('配置包以 base64 内嵌文件', bundle.includes('base64 -d') && bundle.includes("np_put '"));
+  ok('配置包写入 state.env 供 agent 读取', bundle.includes('NP_HY2_LIST=') && bundle.includes('NP_STATS='));
+
+  const bundleHash = /NP_HASH='([^']+)'/.exec(bundle);
+  ok('配置包带 hash', !!bundleHash);
+  const unchanged = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}&hash=${bundleHash[1]}`).then((r) => r.text());
+  ok('hash 未变时只回一行', unchanged.trim() === '#UNCHANGED');
+
+  const badBundle = await fetch(`${BASE}/api/agent/bundle?token=wrong`).then((r) => r.text());
+  ok('错误 token 拿不到配置包', badBundle.startsWith('#ERROR'));
+
+  // 纯文本上报（shell agent 用的格式）
+  const textReport = await fetch(`${BASE}/api/agent/report?token=${serverToken}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: `u${u2.id} 11 22\n# 注释行\n\nu${u3.id} 1 1\n`,
+  }).then((r) => r.json());
+  ok('纯文本上报可用（跳过注释与空行）', textReport.applied === 2 && textReport.bytes === 35, JSON.stringify(textReport));
 
   const serverNodeInstall = await fetch(`${BASE}/api/nodes/${node1Id}/install?token=${serverToken}`).then((r) => r.status);
   ok('跟随服务器的节点拒绝独立部署脚本', serverNodeInstall === 400);
@@ -513,6 +541,50 @@ const json = (obj) => JSON.stringify(obj);
   const subAcme = await call(`/api/sub/${u2.token}`);
   const acmeLink = (subAcme.data.links || []).find((l) => l.name.includes('SMOKE-ACME'));
   ok('ACME 证书不需要 allowInsecure', !!acmeLink && !acmeLink.uri.includes('allowInsecure'));
+
+  /* ---------- 11.9 设置 · 订阅对外域名校验 ---------- */
+  const baseBefore = (await call('/api/settings')).data.settings.subBase;
+
+  const nakedNumber = await call('/api/settings', { method: 'PUT', body: json({ subBase: '111' }) });
+  ok('裸数字（111）被拒绝', nakedNumber.status === 400, `(${nakedNumber.data.error || ''})`);
+  ok('非法值不会落盘', (await call('/api/settings')).data.settings.subBase === baseBefore);
+
+  const badBases = [
+    ['缺主机名', 'http://'],
+    ['非 http(s) 协议', 'ftp://sub.example.com'],
+    ['带路径', 'https://sub.example.com/sub'],
+    ['带查询参数', 'https://sub.example.com?a=1'],
+    ['带空格', 'sub example.com'],
+    ['端口越界', 'https://sub.example.com:99999'],
+  ];
+  for (const [label, bad] of badBases) {
+    const r = await call('/api/settings', { method: 'PUT', body: json({ subBase: bad }) });
+    ok(`拒绝非法地址：${label}`, r.status === 400, `(${bad} → ${r.data.error || ''})`);
+  }
+
+  const bare = await call('/api/settings', { method: 'PUT', body: json({ subBase: 'sub.example.com' }) });
+  ok('裸域名自动补全 https://',
+    bare.status === 200 && bare.data.settings.subBase === 'https://sub.example.com',
+    `(${bare.data.settings.subBase})`);
+
+  const withPort = await call('/api/settings', { method: 'PUT', body: json({ subBase: 'http://sub.example.com:8080/' }) });
+  ok('保留端口并去掉尾部斜杠',
+    withPort.status === 200 && withPort.data.settings.subBase === 'http://sub.example.com:8080',
+    `(${withPort.data.settings.subBase})`);
+
+  const ipBase = await call('/api/settings', { method: 'PUT', body: json({ subBase: 'https://203.0.113.7' }) });
+  ok('允许 IP 形式的域名', ipBase.status === 200 && ipBase.data.settings.subBase === 'https://203.0.113.7');
+
+  const subWithBase = await call(`/api/sub/${u2.token}`);
+  ok('订阅链接使用自定义域名',
+    String(subWithBase.data.subUrl || '').startsWith('https://203.0.113.7/s/'),
+    `(${subWithBase.data.subUrl || ''})`);
+
+  const cleared = await call('/api/settings', { method: 'PUT', body: json({ subBase: '' }) });
+  ok('留空表示自动跟随访问地址', cleared.status === 200 && cleared.data.settings.subBase === '');
+
+  // 还原测试前的设置
+  await call('/api/settings', { method: 'PUT', body: json({ subBase: baseBefore }) });
 
   /* ---------- 12. 鉴权 ---------- */  ok('错误 token 无法拉配置', (await call('/api/agent/config?token=wrong-token')).status === 401);
 

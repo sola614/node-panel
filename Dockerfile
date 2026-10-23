@@ -1,9 +1,15 @@
 # syntax=docker/dockerfile:1
-FROM node:20-alpine
+# node:sqlite 从 Node 22.13 起默认可用（无需 flag）。镜像跟随 Active LTS（24，维护到 2028-04），
+# 自建部署的最低版本写在 package.json 的 engines 里（>=22.13）
+FROM node:24-alpine
+
+# 版本号由 CI 从 package.json 读取后传进来，保证镜像 tag 与应用版本一致
+ARG APP_VERSION=0.1.0
 
 LABEL org.opencontainers.image.title="node-panel" \
       org.opencontainers.image.description="轻量节点管理面板：用户 / 套餐 / 节点 / 服务器 + 订阅与流量配额" \
       org.opencontainers.image.source="https://github.com/sola614/node-panel" \
+      org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
@@ -13,7 +19,7 @@ ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PANEL_DATA_DIR=/app/data
 
-# 零依赖项目，不需要 npm install，直接拷源码
+# 零 npm 依赖项目（SQLite 用 Node 内置的 node:sqlite），不需要 npm install
 COPY package.json ./
 COPY server.js ./
 COPY lib ./lib

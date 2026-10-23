@@ -18,12 +18,15 @@ const hysteria = require('./lib/hysteria');
 const sub = require('./lib/sub');
 const keys = require('./lib/keys');
 const cert = require('./lib/cert');
+const agentBundle = require('./lib/agentBundle');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const AGENT_FILE = path.join(__dirname, 'agent', 'agent.js');
+const AGENT_FILE = path.join(__dirname, 'agent', 'agent.sh');
 const STARTED_AT = Date.now();
+// 应用版本以 package.json 为准，镜像 tag 与侧栏显示的版本号都取它
+const APP_VERSION = require('./package.json').version;
 
 const sessions = new Map();
 const SESSION_TTL = 12 * 3600 * 1000;
@@ -72,6 +75,10 @@ function readBody(req) {
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8');
       if (!raw) return resolve({});
+      // agent 用纯文本上报流量（shell 里解析 JSON 太别扭），其它接口一律 JSON
+      if (!/application\/json/i.test(req.headers['content-type'] || '')) {
+        return resolve({ __text: raw });
+      }
       try {
         resolve(JSON.parse(raw));
       } catch {
@@ -87,6 +94,80 @@ function baseUrl(req) {
   if (cfg && cfg.trim()) return cfg.trim().replace(/\/+$/, '');
   const proto = req.headers['x-forwarded-proto'] || 'http';
   return `${proto}://${req.headers.host || 'localhost:' + PORT}`;
+}
+
+/* ---------------------------- 订阅对外域名校验 ---------------------------- */
+// 与前端 public/app.js 的 normalizeSubBase 保持同一套规则：
+// 前端负责即时提示，后端负责兜底（直接打 API 也绕不过去）。
+
+const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+const HOST_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+function isHostName(host) {
+  if (!host) return false;
+  if (IPV4_RE.test(host)) return true;
+  if (/^\[[0-9a-f:.]+\]$/i.test(host)) return true; // IPv6 字面量
+  if (host.length > 253) return false;
+
+  const labels = host.split('.');
+  // 至少两段：单段的 111 / abc 不是可用域名
+  if (labels.length < 2) return false;
+  if (!labels.every((l) => HOST_LABEL_RE.test(l))) return false;
+  return /^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i.test(labels[labels.length - 1]);
+}
+
+/**
+ * 从原始文本里抠出主机名。
+ * 不能只看 new URL().hostname：URL 规范会把 111 当成 IPv4 简写解析成 0.0.0.111，
+ * 于是「111」这种明显填错的值反而能过校验。所以数字写法要回到原文上判断。
+ */
+function rawHostOf(text) {
+  const noScheme = text.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  const authority = noScheme.split(/[/?#]/)[0];
+  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+  if (hostPort.startsWith('[')) {
+    const end = hostPort.indexOf(']');
+    return end === -1 ? hostPort : hostPort.slice(0, end + 1);
+  }
+  return hostPort.split(':')[0].replace(/\.$/, '');
+}
+
+/** 综合判断：纯数字写法必须是严格的四段 IPv4，其余交给 URL 规范化后的主机名 */
+function isValidHost(rawHost, normalizedHost) {
+  if (/^[\d.]+$/.test(rawHost)) return IPV4_RE.test(rawHost);
+  return isHostName(String(normalizedHost || '').replace(/\.$/, ''));
+}
+
+/**
+ * 规范化并校验「订阅对外域名」。
+ * 空串合法（自动跟随访问地址）；不合法直接抛中文错误。
+ */
+function normalizeSubBase(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) return '';
+
+  let url;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : 'https://' + text);
+  } catch {
+    throw new Error('订阅对外域名格式不正确，请填写完整地址，如 https://sub.example.com');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('订阅对外域名只支持 http:// 或 https:// 开头的地址');
+  }
+  if (url.username || url.password) {
+    throw new Error('订阅对外域名不能包含账号密码');
+  }
+  if (url.search || url.hash) {
+    throw new Error('订阅对外域名不能带 ? 查询参数或 # 片段');
+  }
+  if (url.pathname.replace(/\/+$/, '')) {
+    throw new Error('订阅对外域名只需填到域名（可带端口），不要带路径');
+  }
+  if (!isValidHost(rawHostOf(text), url.hostname)) {
+    throw new Error('订阅对外域名不合法：需要是 IP 或带点号的域名，如 sub.example.com');
+  }
+  return url.origin;
 }
 
 function sha256(text) {
@@ -116,7 +197,12 @@ async function login(req, res, params, body) {
   }
   const token = crypto.randomBytes(24).toString('hex');
   sessions.set(token, { username, expires: Date.now() + SESSION_TTL });
-  sendJson(res, 200, { token, username, expiresAt: new Date(Date.now() + SESSION_TTL).toISOString() });
+  sendJson(res, 200, {
+    token,
+    username,
+    expiresAt: new Date(Date.now() + SESSION_TTL).toISOString(),
+    appVersion: APP_VERSION,
+  });
 }
 
 function logout(req, res) {
@@ -131,12 +217,18 @@ function me(req, res, params, body, session) {
     username: session.username,
     settings: s,
     version: store.SCHEMA_VERSION,
+    appVersion: APP_VERSION,
     uptime: Date.now() - STARTED_AT,
   });
 }
 
 function health(req, res) {
-  sendJson(res, 200, { ok: true, uptime: Date.now() - STARTED_AT, version: store.SCHEMA_VERSION });
+  sendJson(res, 200, {
+    ok: true,
+    uptime: Date.now() - STARTED_AT,
+    version: store.SCHEMA_VERSION,
+    app: APP_VERSION,
+  });
 }
 
 function changePassword(req, res, params, body) {
@@ -621,92 +713,179 @@ function resetServerToken(req, res, params) {
 /* ------------------------------- 部署脚本生成 ------------------------------ */
 
 function buildInstallScript({ panelUrl, token, label, needHysteria, agentSrc }) {
-  return `#!/usr/bin/env bash
+  return `#!/bin/sh
 # ${store.db().settings.siteName} · 节点部署脚本
 # 目标：${label}
 # 生成时间：${new Date().toISOString()}
-set -euo pipefail
+#
+# 纯 shell 部署：不需要 Node / Python / jq，主流 Linux 装完即用。
+# 幂等：重复执行只会覆盖配置并重启 agent，不会重复堆积东西。
+set -u
 
 PANEL_URL="${panelUrl}"
 AGENT_TOKEN="${token}"
 NEED_HYSTERIA="${needHysteria ? '1' : '0'}"
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "✗ 未检测到 Node.js，请先安装 Node.js 18+ 后重试"
-  echo "  Debian/Ubuntu: curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt install -y nodejs"
+if [ "$(id -u)" != "0" ]; then
+  echo "✗ 请用 root 执行（需要写 /opt、/etc 与注册服务）"
   exit 1
 fi
 
-NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]")
-if [ "$NODE_MAJOR" -lt 18 ]; then
-  echo "✗ Node.js 版本过低（当前 $(node -v)），需要 18 及以上"
+# ------------------------------- 下载器 ------------------------------------
+if command -v curl >/dev/null 2>&1; then
+  DL='curl'
+elif command -v wget >/dev/null 2>&1; then
+  DL='wget'
+else
+  echo "✗ 需要 curl 或 wget 之一"
   exit 1
 fi
 
-echo "→ 安装 agent 到 /opt/nodepanel"
-mkdir -p /opt/nodepanel
+download() {
+  # $1=url $2=目标文件
+  if [ "$DL" = 'curl' ]; then
+    curl -fsSL -m 120 -o "$2" "$1"
+  else
+    wget -q -T 120 -O "$2" "$1"
+  fi
+}
 
-cat > /opt/nodepanel/agent.js <<'NODEPANEL_AGENT_EOF'
+# ------------------------------- 安装 agent --------------------------------
+echo "→ 安装 agent 到 /opt/nodepanel（纯 shell，无需 Node）"
+mkdir -p /opt/nodepanel /var/log/nodepanel /run/nodepanel
+
+cat > /opt/nodepanel/agent.sh <<'NODEPANEL_AGENT_EOF'
 ${agentSrc}
 NODEPANEL_AGENT_EOF
 
+chmod 755 /opt/nodepanel/agent.sh
+sh -n /opt/nodepanel/agent.sh || { echo "✗ agent 脚本语法检查失败"; exit 1; }
+
+# ---------------------------- 探测重载命令 ----------------------------------
+if command -v systemctl >/dev/null 2>&1; then
+  RELOAD_CMD='systemctl restart xray'
+elif command -v rc-service >/dev/null 2>&1; then
+  RELOAD_CMD='rc-service xray restart'
+else
+  RELOAD_CMD=''
+fi
+
 cat > /opt/nodepanel/agent.env <<EOF
-PANEL_URL=\${PANEL_URL}
-AGENT_TOKEN=\${AGENT_TOKEN}
+PANEL_URL=$PANEL_URL
+AGENT_TOKEN=$AGENT_TOKEN
+INTERVAL=60
 XRAY_CONFIG=/usr/local/etc/xray/config.json
-RELOAD_CMD=systemctl restart xray
+RELOAD_CMD=$RELOAD_CMD
 HYSTERIA_DIR=/etc/hysteria
 HYSTERIA_BIN=/usr/local/bin/hysteria
-INTERVAL=60
 EOF
+chmod 600 /opt/nodepanel/agent.env
 
-cat > /etc/systemd/system/nodepanel-agent.service <<'EOF'
+# ---------------------------- 注册开机自启 ----------------------------------
+if [ -d /run/systemd/system ]; then
+  echo "→ 检测到 systemd"
+  cat > /etc/systemd/system/nodepanel-agent.service <<'EOF'
 [Unit]
-Description=Node Panel Agent
-After=network.target
+Description=Node Panel Agent (shell)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=/opt/nodepanel/agent.env
-ExecStart=/usr/bin/env node /opt/nodepanel/agent.js
+ExecStart=/bin/sh /opt/nodepanel/agent.sh
 Restart=always
-RestartSec=5
+RestartSec=10
+# 只杀 agent 本体：停/重启 agent 不应该把正在跑的 Hysteria2 实例一起带走
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  systemctl daemon-reload
+  systemctl enable nodepanel-agent >/dev/null 2>&1
+  systemctl restart nodepanel-agent
+  STARTED='systemd'
+elif command -v rc-update >/dev/null 2>&1; then
+  echo "→ 检测到 OpenRC（Alpine 等）"
+  cat > /etc/init.d/nodepanel-agent <<'EOF'
+#!/sbin/openrc-run
+name="nodepanel-agent"
+description="Node Panel Agent (shell)"
+command="/bin/sh"
+command_args="/opt/nodepanel/agent.sh"
+command_background="yes"
+pidfile="/run/nodepanel-agent.pid"
+output_log="/var/log/nodepanel/agent.log"
+error_log="/var/log/nodepanel/agent.log"
 
-# Hysteria2 多实例：每个节点一个实例，配置在 /etc/hysteria/node-<id>.yaml
-cat > /etc/systemd/system/nodepanel-hysteria@.service <<'EOF'
-[Unit]
-Description=Hysteria2 Node (%i)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/%i.yaml
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+depend() {
+  need net
+  after firewall
+}
 EOF
-
-systemctl daemon-reload
-
-if [ "$NEED_HYSTERIA" = "1" ] && [ ! -x /usr/local/bin/hysteria ]; then
-  echo "→ 检测到 Hysteria2 节点，安装 hysteria"
-  bash -c "$(curl -fsSL https://get.hy2.sh/)" || echo "  ! hysteria 安装失败，请手动安装后重试"
+  chmod 755 /etc/init.d/nodepanel-agent
+  rc-update add nodepanel-agent default >/dev/null 2>&1
+  rc-service nodepanel-agent restart >/dev/null 2>&1
+  STARTED='openrc'
+elif command -v crontab >/dev/null 2>&1; then
+  echo "→ 没有 systemd / OpenRC，改用 crontab（每分钟一轮）"
+  ( crontab -l 2>/dev/null | grep -v 'nodepanel/agent.sh'
+    echo '* * * * * /bin/sh /opt/nodepanel/agent.sh --once >> /var/log/nodepanel/agent.log 2>&1' ) | crontab -
+  STARTED='cron'
+else
+  echo "! 未找到可用的服务管理器，请手动常驻：nohup sh /opt/nodepanel/agent.sh >/var/log/nodepanel/agent.log 2>&1 &"
+  STARTED='none'
 fi
 
-systemctl enable nodepanel-agent >/dev/null 2>&1 || true
-systemctl restart nodepanel-agent
+# ---------------------------- Hysteria2 -------------------------------------
+if [ "$NEED_HYSTERIA" = "1" ] && [ ! -x /usr/local/bin/hysteria ]; then
+  echo "→ 检测到 Hysteria2 节点，安装 hysteria（静态二进制）"
+  case "$(uname -m)" in
+    x86_64 | amd64) HARCH=amd64 ;;
+    aarch64 | arm64) HARCH=arm64 ;;
+    armv7l | armv7) HARCH=arm ;;
+    i386 | i686) HARCH=386 ;;
+    *) HARCH='' ;;
+  esac
+  if [ -n "$HARCH" ]; then
+    if download "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$HARCH" /usr/local/bin/hysteria.tmp; then
+      chmod 755 /usr/local/bin/hysteria.tmp
+      mv /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
+      echo "  ✓ hysteria 已安装"
+    else
+      rm -f /usr/local/bin/hysteria.tmp
+      echo "  ! 下载失败，请手动安装：https://v2.hysteria.network/zh/docs/getting-started/Installation/"
+    fi
+  else
+    echo "  ! 不支持的架构 $(uname -m)，请手动安装 hysteria"
+  fi
+fi
+
+# ---------------------------- 首次拉配置 ------------------------------------
+if [ "$STARTED" = 'cron' ]; then
+  /bin/sh /opt/nodepanel/agent.sh --once || true
+fi
 
 echo ""
-echo "✓ 部署完成，agent 已启动"
-echo "  查看日志：journalctl -u nodepanel-agent -f"
+echo "✓ 部署完成（agent: $STARTED）"
+case "$STARTED" in
+  systemd)
+    echo "  查看日志：journalctl -u nodepanel-agent -f"
+    echo "  重启 agent：systemctl restart nodepanel-agent"
+    ;;
+  openrc)
+    echo "  查看日志：tail -f /var/log/nodepanel/agent.log"
+    echo "  重启 agent：rc-service nodepanel-agent restart"
+    ;;
+  cron)
+    echo "  查看日志：tail -f /var/log/nodepanel/agent.log"
+    echo "  提示：cron 模式每分钟执行一轮，Hysteria2 实例由 agent 托管"
+    ;;
+esac
 echo "  配置文件：/usr/local/etc/xray/config.json"
-${needHysteria ? 'echo "  Hysteria2：/etc/hysteria/node-*.yaml（实例名 nodepanel-hysteria@node-xxx）"' : ''}
+echo "  状态文件：/opt/nodepanel/state.env"
+${needHysteria ? 'echo "  Hysteria2：/etc/hysteria/node-*.yaml（由 agent 托管，pid 在 /run/nodepanel/）"' : ''}
 `;
 }
 
@@ -1022,7 +1201,12 @@ function agentReport(req, res, params, body, session, ctx) {
   let applied = 0;
   let bytes = 0;
 
-  for (const row of body.users || []) {
+  // 两种上报格式：
+  //   JSON   { users: [{ email, up, down }] }   —— 老 agent / 调试
+  //   纯文本 每行「email 上行字节 下行字节」      —— shell agent
+  const rows = Array.isArray(body.users) ? body.users : parseTextReport(body.__text);
+
+  for (const row of rows) {
     const user = byEmail.get(String(row.email || ''));
     if (!user) continue;
     const delta = Math.max(0, Number(row.up) || 0) + Math.max(0, Number(row.down) || 0);
@@ -1036,6 +1220,51 @@ function agentReport(req, res, params, body, session, ctx) {
   store.save();
 
   sendJson(res, 200, { ok: true, applied, bytes });
+}
+
+/** 解析 agent 的纯文本上报：每行 `email up down`，空行与 # 注释忽略 */
+function parseTextReport(text) {
+  if (!text) return [];
+  const rows = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const [email, up, down] = t.split(/\s+/);
+    if (!email) continue;
+    rows.push({ email, up: Number(up) || 0, down: Number(down) || 0 });
+  }
+  return rows;
+}
+
+/* ----------------------------- agent 配置包 ------------------------------ */
+
+/**
+ * 把「agent 要落盘的一切」编译成一段可执行的 shell 脚本下发。
+ * agent 侧只做 base64 解码 + 写文件，不需要解析 JSON，也就不需要 jq / Node。
+ */
+function agentBundleHandler(req, res, params, body, session, ctx) {
+  const token = ctx.query.get('token');
+  const scope = resolveScope(token, ctx.query.get('ip'));
+  if (!scope) return sendText(res, 401, '#ERROR invalid token');
+
+  const payload = buildAgentPayload(scope);
+  store.save(); // 落盘 lastSeen / 上报的 IP
+
+  // 带上本地 hash 来问：没变就直接回一行，省掉整包传输
+  const known = ctx.query.get('hash');
+  if (known && known === payload.hash) {
+    return sendText(res, 200, '#UNCHANGED\n');
+  }
+
+  const script = agentBundle.buildBundle(payload, {
+    panelUrl: baseUrl(ctx.req),
+    siteName: store.db().settings.siteName,
+  });
+
+  sendText(res, 200, script, 'text/x-shellscript; charset=utf-8', {
+    'X-Panel-Hash': payload.hash,
+    'Cache-Control': 'no-store',
+  });
 }
 
 /** 演示用：手动注入流量 */
@@ -1062,9 +1291,21 @@ function getSettings(req, res) {
 
 function updateSettings(req, res, params, body) {
   const s = store.db().settings;
+
+  // 先校验再落盘：域名填错时整次保存回滚，不留半套配置
+  let nextSubBase = s.subBase;
+  if (body.subBase !== undefined) {
+    try {
+      nextSubBase = normalizeSubBase(body.subBase);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
   if (body.siteName !== undefined) s.siteName = String(body.siteName).trim() || s.siteName;
   if (body.notice !== undefined) s.notice = String(body.notice);
-  if (body.subBase !== undefined) s.subBase = String(body.subBase).trim();
+  s.subBase = nextSubBase;
+
   store.save();
   sendJson(res, 200, { ok: true, settings: s });
 }
@@ -1222,6 +1463,7 @@ const ROUTES = [
   ['PUT', '/api/settings', updateSettings, true],
 
   ['GET', '/api/agent/config', agentConfig, false],
+  ['GET', '/api/agent/bundle', agentBundleHandler, false],
   ['POST', '/api/agent/report', agentReport, false],
 
   ['GET', '/api/sub/:token', subApi, false],
@@ -1305,14 +1547,26 @@ function main() {
     const line = '─'.repeat(54);
     const db = store.db();
     console.log(`\n${line}`);
-    console.log(`  ${db.settings.siteName}   v${store.SCHEMA_VERSION}`);
+    console.log(`  ${db.settings.siteName}   v${APP_VERSION}  (schema v${store.SCHEMA_VERSION})`);
     console.log(`${line}`);
     console.log(`  管理面板  http://localhost:${PORT}/`);
     console.log(`  默认账号  ${db.admin.username} / ${process.env.PANEL_ADMIN_PASSWORD || 'admin888'}`);
-    console.log(`  套餐 ${db.plans.length} 个 · 节点 ${db.nodes.length} 个 · 用户 ${db.users.length} 位`);
+    console.log(`  数据库    ${store.DB_FILE}（SQLite）`);
+    console.log(`  套餐 ${db.plans.length} 个 · 服务器 ${db.servers.length} 台 · 节点 ${db.nodes.length} 个 · 用户 ${db.users.length} 位`);
+    if (!db.users.length) {
+      console.log('  提示      空库启动：先在「服务器」页添加机器并执行部署命令');
+    }
     const sample = db.users[0];
     if (sample) console.log(`  示例订阅  http://localhost:${PORT}/s/${sample.token}`);
     console.log(`${line}\n`);
+  });
+}
+
+// 退出时把 WAL 合并回主文件，避免留下 -wal/-shm 残留
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    store.close();
+    process.exit(0);
   });
 }
 
