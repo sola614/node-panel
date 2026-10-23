@@ -1077,7 +1077,82 @@ server {
 
 ---
 
-## 十五、已知限制
+## 十五、日志与排查
+
+面板、agent 都**只往 stdout / stderr 打日志**，不写文件 —— 轮转交给 systemd / journald / Docker。
+
+### 一行日志长什么样
+
+```
+2026-10-24 00:19:50.161 +08:00  WARN   http  请求被拒绝 rid=0470b8 method=GET path=/api/users status=401 ms=3 ip=127.0.0.1
+2026-10-24 00:23:18.770 +08:00  INFO   alerts 告警通知已触发 events=2 sent=2 kinds=server.offline,agent.old
+```
+
+- **时间带时区偏移**：看日志不用心算 UTC。
+- **级别**：`ERROR` / `WARN ` / `INFO ` / `DEBUG`。只有 `ERROR` 走 stderr，
+  所以 `journalctl -p err` 能干净地只捞出真出错的行（`PANEL_LOG_LEVEL` 详见下）。
+- **scope**：`http`（请求）/ `auth`（登录改密）/ `agent`（上报、回执、配置包）/
+  `data`（备份恢复、批量操作）/ `store`（数据库）/ `notify` / `alerts` / `bundle`。
+- **`rid`**：六位请求号。同一次请求里 handler、慢请求、异常三条日志靠它串起来，
+  排查时先 grep 一个 rid 就能看到完整链路。
+
+### 调级别
+
+```bash
+PANEL_LOG_LEVEL=debug node server.js          # 默认 info，debug 会打开请求级细节
+```
+
+也可以写数字 `0=error … 3=debug`。**不要**常态开 debug：每个请求都会多打一行。
+
+慢请求阈值默认 1000ms，可用 `PANEL_SLOW_MS=300` 调。
+
+### 会记什么
+
+| 场景 | 级别 | 关键字段 |
+| --- | --- | --- |
+| 请求 5xx / 4xx / 慢 | error / warn / warn | `rid` `path` `status` `ms` `ip` |
+| 登录失败、被限流、改密 | warn | `rid` `user` `ip` `left` |
+| 出厂密码未改，拦截业务请求 | warn | `rid` `path` `user` |
+| agent token 无效 | warn | `rid` `ip` `agentVersion` |
+| 配置包下发 / 回执状态变化 | info | `scope` `hash` `from` `nodes` `unbound` |
+| 流量上报一条都没匹配上 | warn | `scope` `rows` `sample` |
+| 备份 / 恢复每一步 | info / error | `from` `safety` `users` `ms` |
+| 续期、schema 升级前备份 | info / error | `users` `from` `to` |
+| 通知发送失败 | error | `channel` `type` `title` `error` |
+| 未捕获异常 / 未处理拒绝 | error | `err`（含堆栈首行） |
+
+刻意**不**高频记的东西：agent 心跳（只记「状态变了」）、每轮成功的回执、
+每次 `save()`（只在 >200ms 时 warn）。
+
+### 不会记什么
+
+每条日志在输出前都要过一遍脱敏（日志经常被整段贴进 issue）：
+
+- key 名命中 `token` / `password` / `secret` / `private` / `authorization` … → 整段 `***`
+- 值里嵌的 `token=xxx`、`Bearer xxx`、`"password":"xxx"` → 替换成 `***`
+- 订阅 / 邀请链接里的凭证段 → `/s/***`、`/i/***`
+
+所以**批量建号只记数量不记 token、邀请只记前 4 位码、默认不在启动横幅里打订阅链接**
+（要完整链接就 `PANEL_LOG_LEVEL=debug`）。加新日志时沿用同一条规矩：
+记「发生了什么」而不是「数据本身」。
+
+agent 侧同理：`state.env`、配置内容、私钥都不进日志，只记 hash 与变更项
+（`✓ 配置已更新（hash 496ce804…，变更：Xray）`）。
+
+### 常用排查命令
+
+```bash
+journalctl -u node-panel -p err -n 50              # 只看错误
+journalctl -u node-panel --since '10 min ago' | grep rid=9f2c1a
+journalctl -u node-panel --since today | grep -i 'unbound\|端口未监听'
+docker logs --tail 200 node-panel 2>&1 | grep WARN
+```
+
+端口不通这类问题另见 [docs/troubleshoot-port.md](docs/troubleshoot-port.md)。
+
+---
+
+## 十六、已知限制
 
 1. **SS 节点是单用户模式**：Xray 的 shadowsocks 入站不支持多用户，所有用户共用同一密码，无法按用户计费。要精确计费请用 VLESS / VMess / Trojan。
 2. **流量上报是增量式**：上报请求丢了这一分钟的流量就丢了。要对账严格需改成累积值 + 服务端去重。

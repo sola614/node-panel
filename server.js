@@ -22,9 +22,17 @@ const cert = require('./lib/cert');
 const agentBundle = require('./lib/agentBundle');
 const notify = require('./lib/notify');
 const alerts = require('./lib/alerts');
+const logger = require('./lib/log');
+
+const log = logger.create('http');
+const logAgent = logger.create('agent');
+const logAuth = logger.create('auth');
+const logData = logger.create('data');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
+// 超过这个耗时记一条 warn：慢请求往往是被忽略的性能问题的最早信号
+const SLOW_MS = Number(process.env.PANEL_SLOW_MS || 1000);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const AGENT_FILE = path.join(__dirname, 'agent', 'agent.sh');
 const STARTED_AT = Date.now();
@@ -305,6 +313,7 @@ async function login(req, res, params, body) {
   const wait = loginBlockedMs(ip);
   if (wait > 0) {
     const mins = Math.ceil(wait / 60000);
+    logAuth.warn('登录被限流', { rid: req.__rid, ip, retryAfterS: Math.ceil(wait / 1000) });
     return sendJson(
       res,
       429,
@@ -318,9 +327,11 @@ async function login(req, res, params, body) {
   if (!username || !password) return sendJson(res, 400, { error: '请输入账号和密码' });
   if (username !== admin.username || !store.checkPassword(password, admin.password)) {
     noteLoginFail(ip);
+    const left = LOGIN_MAX_FAIL - ((loginFails.get(ip) || {}).count || 0);
+    // 只记用户名与剩余次数，绝不记密码 / 密码长度
+    logAuth.warn('登录失败', { rid: req.__rid, user: String(username || ''), ip, left });
     // 只记用户名不记密码；限流已经把次数压住了，不会把日志刷爆
     auditAction('login.fail', String(username || ''), '账号或密码不正确', String(username || ''));
-    const left = LOGIN_MAX_FAIL - ((loginFails.get(ip) || {}).count || 0);
     return sendJson(res, 401, {
       error: left > 0 ? `账号或密码不正确，还可尝试 ${left} 次` : '账号或密码不正确',
     });
@@ -329,13 +340,15 @@ async function login(req, res, params, body) {
   loginFails.delete(ip);
   const token = crypto.randomBytes(24).toString('hex');
   sessions.set(token, { username, expires: Date.now() + SESSION_TTL });
+  const mustChange = needsPasswordChange();
+  logAuth.info('登录成功', { rid: req.__rid, user: username, ip, mustChangePassword: mustChange, ttlH: SESSION_TTL / 3600000 });
   auditAction('login.success', username, '登录管理台', username);
   sendJson(res, 200, {
     token,
     username,
     expiresAt: new Date(Date.now() + SESSION_TTL).toISOString(),
     appVersion: APP_VERSION,
-    mustChangePassword: needsPasswordChange(),
+    mustChangePassword: mustChange,
   });
 }
 
@@ -373,21 +386,31 @@ function changePassword(req, res, params, body) {
   // 否则会卡在强制改密页出不去）；正常阶段必须验原密码。
   const forced = needsPasswordChange();
   if (!forced && !store.checkPassword(oldPassword || '', admin.password)) {
+    logAuth.warn('修改密码失败：原密码不正确', { rid: req.__rid, user: admin.username, forced });
     return sendJson(res, 400, { error: '原密码不正确' });
   }
   const next = String(newPassword || '');
   if (next.length < 8) {
+    logAuth.warn('修改密码失败：新密码过短', { rid: req.__rid, user: admin.username, len: next.length });
     return sendJson(res, 400, { error: '新密码至少 8 位' });
   }
   if (next === String(oldPassword)) {
+    logAuth.warn('修改密码失败：新旧密码相同', { rid: req.__rid, user: admin.username });
     return sendJson(res, 400, { error: '新密码不能与原密码相同' });
   }
   if (next === store.DEFAULT_PASSWORD) {
+    logAuth.warn('修改密码失败：使用了出厂密码', { rid: req.__rid, user: admin.username });
     return sendJson(res, 400, { error: '不能使用出厂默认密码' });
   }
   admin.password = store.hashPassword(next);
   admin.updatedAt = store.iso();
   store.save();
+  logAuth.info('管理密码已更新', {
+    rid: req.__rid,
+    user: admin.username,
+    forced,
+    sessionsBefore: sessions.size,
+  });
   auditAction('admin.password', admin.username, forced ? '首次改密（出厂密码）' : '修改管理密码');
   // 改密即登出全部会话：万一是别人正在用旧密码登录，也一并踢掉
   sessions.clear();
@@ -405,7 +428,7 @@ function sweepRenewals() {
   try {
     return store.sweepRenewals();
   } catch (err) {
-    console.error('[renew] 自动续期失败：', err.message);
+    logData.error('自动续期失败', { err });
     return 0;
   }
 }
@@ -712,6 +735,16 @@ const BULK_MAX = 200;
  *   count  —— 按数量生成「前缀01、前缀02…」
  * 两种都走同一条 buildUser，和单个新增没有第二套规则。
  */
+/** 把 [{reason:'x'},…] 压成 `x×3，y×1`：日志里不需要一长串重复对象 */
+function summarizeReasons(list) {
+  const counts = new Map();
+  for (const item of list || []) {
+    const key = String((item && item.reason) || '其他');
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()].map(([k, n]) => `${k}×${n}`).join('，');
+}
+
 function bulkCreateUsers(req, res, params, body, session, ctx) {
   const rawNames = body.names;
   const list = Array.isArray(rawNames)
@@ -793,6 +826,14 @@ function bulkCreateUsers(req, res, params, body, session, ctx) {
     });
   }
   store.save();
+  // 只记数量与跳过原因分布，不记 token / 订阅地址（那是凭证）
+  logData.info('批量建号', {
+    rid: req.__rid,
+    created: created.length,
+    skipped: skipped.length,
+    plan: planName,
+    skipReasons: skipped.length ? summarizeReasons(skipped) : undefined,
+  });
   auditAction('user.bulk', planName, `批量创建 ${created.length} 个用户${skipped.length ? `，跳过 ${skipped.length} 个` : ''}`);
   sendJson(res, 200, { ok: true, items: created, skipped, planName });
 }
@@ -876,6 +917,15 @@ function batchUsers(req, res, params, body) {
     reset: '批量重置流量', plan: `批量改套餐${affectedPlan ? ' → ' + affectedPlan.name : ''}`, renew: '批量续期',
   };
   const extra = renewedExtra.length ? `，其中 ${renewedExtra.length} 个补齐了欠费周期` : '';
+  logData.info('批量用户操作', {
+    rid: req.__rid,
+    action,
+    requested: ids.length,
+    done: done.length,
+    skipped: skipped.length,
+    plan: affectedPlan ? affectedPlan.name : undefined,
+    skipReasons: skipped.length ? summarizeReasons(skipped) : undefined,
+  });
   auditAction(
     `user.batch.${action}`,
     ACTION_LABEL[action],
@@ -1043,6 +1093,13 @@ const CLAIM_WINDOW = 60 * 60 * 1000;
 const claimHits = new Map();
 let claimTicks = 0;
 
+/** 邀请码 / 订阅 token 这类凭证：日志里只留前 4 位，够定位就行 */
+function maskCode(code) {
+  const s = String(code || '');
+  if (!s) return '';
+  return s.length <= 4 ? s : s.slice(0, 4) + '***';
+}
+
 /** 顺手把过期记录清掉：这张表只增不减的话，跑上几个月就是一条内存泄漏 */
 function pruneClaimHits(now) {
   if (++claimTicks % 200 !== 0 && claimHits.size < 1000) return;
@@ -1055,6 +1112,8 @@ function claimInvite(req, res, params, body, session, ctx) {
   const ip = clientIp(ctx.req);
   const now = Date.now();
   pruneClaimHits(now);
+  // 邀请码是领取凭证，日志里只留前 4 位用于定位，不记全码
+  const code = maskCode(params.code);
 
   let rec = claimHits.get(ip);
   if (rec && now - rec.first >= CLAIM_WINDOW) {
@@ -1062,6 +1121,7 @@ function claimInvite(req, res, params, body, session, ctx) {
     rec = null;
   }
   if (rec && rec.count >= CLAIM_MAX) {
+    logData.warn('邀请领取被限流', { rid: ctx.rid, code, ip, hits: rec.count });
     return sendJson(res, 429, { error: '领取过于频繁，请一小时后再试' });
   }
   // 先记一笔再校验：无论后面是建号成功、重名 409 还是邀请失效 410，都算一次尝试
@@ -1074,12 +1134,16 @@ function claimInvite(req, res, params, body, session, ctx) {
   const db = store.db();
   const inv = db.invites.find((x) => x.code === params.code);
   const info = publicInviteInfo(params.code);
-  if (info.status !== 200) return sendJson(res, info.status, info.body);
+  if (info.status !== 200) {
+    logData.warn('邀请领取失败', { rid: ctx.rid, code, ip, status: info.status, reason: info.body && info.body.error });
+    return sendJson(res, info.status, info.body);
+  }
 
   const name = String(body.name || '').trim();
   if (!name) return sendJson(res, 400, { error: '请填写你的名字或昵称' });
   if (name.length > 40) return sendJson(res, 400, { error: '名字太长，40 字以内' });
   if (db.users.some((u) => u.name === name)) {
+    logData.warn('邀请领取失败：重名', { rid: ctx.rid, code, ip, name });
     return sendJson(res, 409, { error: '这个名字已经有人用了，换一个吧' });
   }
 
@@ -1093,6 +1157,17 @@ function claimInvite(req, res, params, body, session, ctx) {
   inv.lastUsedAt = store.iso();
   store.save();
 
+  const remaining = Math.max(0, Number(inv.maxUses) - Number(inv.usedCount));
+  logData.info('邀请领取成功', {
+    rid: ctx.rid,
+    code,
+    ip,
+    user: u.name,
+    userId: u.id,
+    used: inv.usedCount,
+    max: inv.maxUses,
+    remaining,
+  });
   auditAction('invite.claim', name, `通过邀请 ${inv.code} 领取`, name);
   const base = baseUrl(ctx.req);
   sendJson(res, 200, {
@@ -1101,7 +1176,7 @@ function claimInvite(req, res, params, body, session, ctx) {
     subUrl: `${base}/s/${u.token}`,
     clashUrl: `${base}/s/${u.token}?format=clash`,
     planName: info.body.plan.name,
-    remaining: Math.max(0, Number(inv.maxUses) - Number(inv.usedCount)),
+    remaining,
   });
 }
 
@@ -1947,8 +2022,9 @@ function applyReportedIp(scope, ip) {
   if (!target) return;
   if (target.ipMode !== 'auto') return;
   if (target.reportedIp === ip) return;
+  const prevIp = target.reportedIp || '';
   target.reportedIp = ip;
-  console.log(`[agent] ${scope.name} 上报公网地址 ${ip}`);
+  logAgent.info('agent 上报公网地址（自动模式）', { scope: scope.name, from: prevIp || '无', to: ip });
 }
 
 /** 解析 token：服务器 token 或独立节点 token */
@@ -2092,7 +2168,11 @@ function agentConfig(req, res, params, body, session, ctx) {
 
 function agentReport(req, res, params, body, session, ctx) {
   const scope = resolveScope(ctx.query.get('token'), ctx.query.get('ip'));
-  if (!scope) return sendJson(res, 401, { error: 'invalid token' });
+  if (!scope) {
+    // token 对不上是最常见的一类「节点一直离线」，记 ip 与版本便于定位是哪台机器
+    logAgent.warn('上报被拒绝：token 无效', { rid: ctx.rid, ip: clientIp(req), agentVersion: ctx.query.get('v') });
+    return sendJson(res, 401, { error: 'invalid token' });
+  }
 
   // agent 每 60 秒上报一次，借这个心跳顺手处理到期续期，面板没人打开也不会掉线
   sweepRenewals();
@@ -2132,8 +2212,22 @@ function agentReport(req, res, params, body, session, ctx) {
   if (bytes > 0) store.addDaily(bytes);
   store.save();
 
+  // 有数据却一条都没匹配上：说明 agent 报的 email 在库里找不到（用户被删 / 配置没下发到这台机器），
+  // 不报的话表现为「流量一直不涨」，很难查
+  if (rows.length && !applied) {
+    logAgent.warn('流量上报没有匹配到任何用户', {
+      rid: ctx.rid,
+      scope: scope.name,
+      rows: rows.length,
+      date,
+      sample: rows[0] && (rows[0].email || ('node:' + rows[0].nodeId)),
+    });
+  } else {
+    logAgent.debug('流量上报', { rid: ctx.rid, scope: scope.name, rows: rows.length, applied, bytes, nodeBytes });
+  }
+
   // 心跳顺手跑一次告警巡检：不 await，别让 SMTP 的超时拖慢 agent 的上报
-  alerts.sweep().catch((err) => console.error('[notify] 巡检异常：', err.message));
+  alerts.sweep().catch((err) => logAgent.error('告警巡检异常', { err }));
 
   sendJson(res, 200, { ok: true, applied, bytes, nodeBytes });
 }
@@ -2248,7 +2342,10 @@ function syncView(item, scope) {
 function agentReceipt(req, res, params, body, session, ctx) {
   // 不带 ip 参数：回执不参与地址发现，避免这里把「自动上报」的地址又改一遍
   const scope = resolveScope(ctx.query.get('token'), '');
-  if (!scope) return sendJson(res, 401, { error: 'invalid token' });
+  if (!scope) {
+    logAgent.warn('回执被拒绝：token 无效', { rid: ctx.rid, ip: clientIp(req), agentVersion: ctx.query.get('v') });
+    return sendJson(res, 401, { error: 'invalid token' });
+  }
 
   const db = store.db();
   const item = scope.type === 'server'
@@ -2256,6 +2353,7 @@ function agentReceipt(req, res, params, body, session, ctx) {
     : db.nodes.find((x) => x.id === scope.id);
   if (!item) return sendJson(res, 404, { error: 'not found' });
 
+  const prev = item.sync || null;
   const trim = (v, n) => String(v == null ? '' : v).slice(0, n);
   item.sync = {
     at: store.iso(),
@@ -2271,6 +2369,30 @@ function agentReceipt(req, res, params, body, session, ctx) {
     agentVersion: trim(body.agentVersion || ctx.query.get('v'), 24),
   };
   if (item.sync.agentVersion) item.agentVersion = item.sync.agentVersion;
+
+  // 每轮都回执会让日志变成心跳噪音，只在「结论变了」时记一条 info
+  const changed = !prev
+    || prev.hash !== item.sync.hash
+    || prev.ok !== item.sync.ok
+    || prev.xray !== item.sync.xray
+    || prev.hy !== item.sync.hy
+    || (prev.unbound || '') !== item.sync.unbound;
+  const ctxFields = {
+    rid: ctx.rid,
+    scope: scope.name,
+    hash: item.sync.hash,
+    ok: item.sync.ok,
+    xray: item.sync.xray,
+    hy: item.sync.hy,
+    unbound: item.sync.unbound || undefined,
+    agentVersion: item.sync.agentVersion,
+  };
+  if (changed) {
+    logAgent.info('回执状态变化', { ...ctxFields, error: item.sync.error || undefined });
+  } else {
+    logAgent.debug('回执无变化', ctxFields);
+  }
+
   store.save();
   sendJson(res, 200, { ok: true, desired: desiredHashOf(scope) });
 }
@@ -2286,7 +2408,15 @@ function agentReceipt(req, res, params, body, session, ctx) {
 function agentBundleHandler(req, res, params, body, session, ctx) {
   const token = ctx.query.get('token');
   const scope = resolveScope(token, ctx.query.get('ip'));
-  if (!scope) return sendText(res, 401, '#ERROR invalid token');
+  if (!scope) {
+    logAgent.warn('配置包请求被拒绝：token 无效', {
+      rid: ctx.rid,
+      ip: clientIp(req),
+      agentVersion: ctx.query.get('v'),
+      knownHash: ctx.query.get('hash') || undefined,
+    });
+    return sendText(res, 401, '#ERROR invalid token');
+  }
 
   const payload = buildAgentPayload(scope);
   store.save(); // 落盘 lastSeen / 上报的 IP
@@ -2294,12 +2424,25 @@ function agentBundleHandler(req, res, params, body, session, ctx) {
   // 带上本地 hash 来问：没变就直接回一行，省掉整包传输
   const known = ctx.query.get('hash');
   if (known && known === payload.hash) {
+    logAgent.debug('配置未变化', { rid: ctx.rid, scope: scope.name, hash: payload.hash });
     return sendText(res, 200, '#UNCHANGED\n');
   }
 
   const script = agentBundle.buildBundle(payload, {
     panelUrl: baseUrl(ctx.req),
     siteName: store.db().settings.siteName,
+  });
+
+  // 下发频率等于「配置变更频率」，不会刷屏；hash 是否对得上全靠这条
+  logAgent.info('下发配置包', {
+    rid: ctx.rid,
+    scope: scope.name,
+    hash: payload.hash,
+    from: known || 'none',
+    nodes: payload.nodes.length,
+    users: payload.userCount,
+    bytes: Buffer.byteLength(script),
+    agentVersion: ctx.query.get('v'),
   });
 
   sendText(res, 200, script, 'text/x-shellscript; charset=utf-8', {
@@ -2620,12 +2763,16 @@ function listBackups(req, res) {
 }
 
 function createBackup(req, res) {
+  const started = Date.now();
   try {
     const file = backupName('manual');
     store.backupTo(path.join(store.BACKUP_DIR, file));
-    auditAction('backup.create', file, `${Math.round(store.dbFileSize() / 1024)} KB`);
+    const size = store.dbFileSize();
+    logData.info('手动备份完成', { rid: req.__rid, file, kb: Math.round(size / 1024), ms: Date.now() - started });
+    auditAction('backup.create', file, `${Math.round(size / 1024)} KB`);
     sendJson(res, 200, { ok: true, item: backupView(file) });
   } catch (err) {
+    logData.error('手动备份失败', { rid: req.__rid, err, ms: Date.now() - started });
     sendJson(res, 500, { error: '备份失败：' + err.message });
   }
 }
@@ -2640,6 +2787,7 @@ function downloadBackup(req, res, params) {
     return sendJson(res, 404, { error: '备份不存在' });
   }
   const stat = fs.statSync(full);
+  logData.debug('下载备份', { rid: req.__rid, file, kb: Math.round(stat.size / 1024) });
   res.writeHead(200, {
     'Content-Type': 'application/octet-stream',
     'Content-Length': stat.size,
@@ -2659,8 +2807,10 @@ function deleteBackup(req, res, params) {
   try {
     fs.unlinkSync(full);
   } catch (err) {
+    logData.error('删除备份失败', { rid: req.__rid, file, err });
     return sendJson(res, 500, { error: '删除失败：' + err.message });
   }
+  logData.info('已删除备份', { rid: req.__rid, file });
   auditAction('backup.delete', file);
   sendJson(res, 200, { ok: true });
 }
@@ -2688,8 +2838,12 @@ async function restoreBackup(req, res, params, body, session, ctx) {
   }
 
   if (buf.length < 4096 || buf.subarray(0, 16).toString('latin1') !== 'SQLite format 3\u0000') {
+    logData.warn('恢复被拒绝：不是 SQLite 文件', { rid: ctx.rid, from, bytes: buf.length });
     return sendJson(res, 400, { error: '这不是有效的 SQLite 数据库文件' });
   }
+
+  const restoreStarted = Date.now();
+  logData.info('开始恢复数据库', { rid: ctx.rid, from, bytes: buf.length, usersBefore: store.db().users.length });
 
   // 只是「长得像 SQLite」还不够：随便一个别的 SQLite 库也能通过文件头检查，
   // 而 ensureSchema() 会把缺的表补出来 —— 结果就是站点被换成一个空库，界面还说「已恢复」。
@@ -2705,7 +2859,10 @@ async function restoreBackup(req, res, params, body, session, ctx) {
       try { fs.unlinkSync(probe); } catch { /* 清理失败不影响结论 */ }
     }
   })();
-  if (!verdict.ok) return sendJson(res, 400, { error: verdict.error });
+  if (!verdict.ok) {
+    logData.warn('恢复被拒绝：文件体检不通过', { rid: ctx.rid, from, reason: verdict.error });
+    return sendJson(res, 400, { error: verdict.error });
+  }
 
   // 1. 先给「现在」留个后路
   let safety = '';
@@ -2713,6 +2870,7 @@ async function restoreBackup(req, res, params, body, session, ctx) {
     safety = backupName('prerestore');
     store.backupTo(path.join(store.BACKUP_DIR, safety));
   } catch (err) {
+    logData.error('恢复前备份失败，已中止', { rid: ctx.rid, from, err });
     return sendJson(res, 500, { error: '恢复前备份失败，已中止：' + err.message });
   }
 
@@ -2720,6 +2878,7 @@ async function restoreBackup(req, res, params, body, session, ctx) {
   try {
     store.replaceDatabase(buf);
   } catch (err) {
+    logData.error('恢复失败', { rid: ctx.rid, from, safety, err, ms: Date.now() - restoreStarted });
     return sendJson(res, err.status || 500, {
       error: '恢复失败：' + err.message,
       safety,
@@ -2728,6 +2887,15 @@ async function restoreBackup(req, res, params, body, session, ctx) {
 
   // 3. 会话作废：新库里的管理员密码可能和刚才那个不一样
   sessions.clear();
+  logData.info('恢复完成', {
+    rid: ctx.rid,
+    from,
+    safety,
+    users: store.db().users.length,
+    servers: store.db().servers.length,
+    nodes: store.db().nodes.length,
+    ms: Date.now() - restoreStarted,
+  });
   auditAction('backup.restore', from, `恢复前已备份为 ${safety}`, 'admin');
   sendJson(res, 200, {
     ok: true,
@@ -3009,6 +3177,8 @@ function matchPath(pattern, pathname) {
 
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
+  // 请求号：同一次请求里 handler / catch / finish 三条日志靠它串起来
+  const rid = crypto.randomBytes(3).toString('hex');
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -3016,11 +3186,19 @@ const server = http.createServer(async (req, res) => {
     return sendText(res, 400, 'Bad Request');
   }
   const pathname = url.pathname;
+  const ip = clientIp(req);
+  // handler 里没有 rid 参数，挂在 req 上让业务日志也能和请求日志对上
+  req.__rid = rid;
 
   res.on('finish', () => {
-    if (pathname.startsWith('/api/') || pathname.startsWith('/s/')) {
-      console.log(`${req.method} ${pathname} → ${res.statusCode} (${Date.now() - started}ms)`);
-    }
+    const ms = Date.now() - started;
+    const status = res.statusCode;
+    // path 里的订阅 token / 邀请码由 log 模块统一打码（/s/abc123 → /s/***）
+    const ctx = { rid, method: req.method, path: pathname, status, ms, ip };
+    if (status >= 500) log.error('请求失败', ctx);
+    else if (status >= 400) log.warn('请求被拒绝', ctx);
+    else if (ms >= SLOW_MS) log.warn('慢请求', ctx);
+    else if (pathname.startsWith('/api/')) log.debug('请求完成', ctx);
   });
 
   try {
@@ -3043,10 +3221,14 @@ const server = http.createServer(async (req, res) => {
       let session = null;
       if (needAuth) {
         session = getSession(req);
-        if (!session) return sendJson(res, 401, { error: '登录已失效，请重新登录' });
+        if (!session) {
+          logAuth.debug('会话失效', { rid, path: pathname, ip });
+          return sendJson(res, 401, { error: '登录已失效，请重新登录' });
+        }
         // 出厂密码未改：只放过「看自己 / 改密码 / 登出」，其余一律拦下。
         // 拦在后端而不是只靠前端弹窗 —— 直接打 API 也得先改密码。
         if (needsPasswordChange() && !PASSWORD_EXEMPT.has(pattern)) {
+          logAuth.warn('出厂密码未修改，拦截业务请求', { rid, path: pathname, ip, user: session.username });
           return sendJson(res, 403, { error: '请先修改出厂默认密码', mustChangePassword: true });
         }
       }
@@ -3055,8 +3237,8 @@ const server = http.createServer(async (req, res) => {
       if (method !== 'GET' && method !== 'DELETE') {
         body = await readBody(req);
       }
-      return await reqContext.run({ session, req }, () =>
-        handler(req, res, params, body, session, { req, query: url.searchParams }),
+      return await reqContext.run({ session, req, rid }, () =>
+        handler(req, res, params, body, session, { req, query: url.searchParams, rid }),
       );
     }
 
@@ -3075,7 +3257,12 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     // 4xx 是我们自己判定的（请求体过大、恢复的文件不合法），不该冒充 500
     const status = Number(err.status) || 500;
-    if (status >= 500) console.error('[error]', err);
+    const ctx = { rid, method: req.method, path: pathname, status, ip };
+    if (status >= 500) {
+      log.error('请求异常', { ...ctx, err });
+    } else {
+      log.warn('请求参数有误', { ...ctx, reason: err.message });
+    }
     if (!res.headersSent) sendJson(res, status, { error: err.message || '服务器内部错误' });
   }
 });
@@ -3084,18 +3271,32 @@ const server = http.createServer(async (req, res) => {
 
 function main() {
   store.load();
+  // 出厂密码阶段：所有业务接口都返回 403，日志里先说清楚，免得别人以为面板坏了
+  if (needsPasswordChange()) {
+    log.warn('出厂默认密码未修改：业务接口已全部拦截', { admin: store.db().admin.username });
+  }
   // 即便没有 agent 心跳、也没人打开面板，到期续期也要照常发生
   const renewTimer = setInterval(() => sweepRenewals(), 60 * 1000);
   renewTimer.unref();
   // 告警巡检复用同一节奏；启动后先等 15 秒，避开启动瞬间的一堆初始化
   const alertTimer = setInterval(() => {
-    alerts.sweep().catch((err) => console.error('[notify] 巡检异常：', err.message));
+    alerts.sweep().catch((err) => log.error('告警巡检异常', { err }));
   }, 60 * 1000);
   alertTimer.unref();
   setTimeout(() => {
-    alerts.sweep().catch((err) => console.error('[notify] 巡检异常：', err.message));
+    alerts.sweep().catch((err) => log.error('告警巡检异常', { err }));
   }, 15000).unref();
   server.listen(PORT, HOST, () => {
+    log.info('面板已启动', {
+      version: APP_VERSION,
+      schema: store.SCHEMA_VERSION,
+      listen: `${HOST}:${PORT}`,
+      db: store.DB_FILE,
+      logLevel: log.levelName,
+      users: store.db().users.length,
+      nodes: store.db().nodes.length,
+      servers: store.db().servers.length,
+    });
     const line = '─'.repeat(54);
     const db = store.db();
     console.log(`\n${line}`);
@@ -3114,10 +3315,17 @@ function main() {
       console.log('  提示      空库启动：先在「服务器」页添加机器并执行部署命令');
     }
     if (adminUser) {
-      console.log(`  管理员自用订阅  http://localhost:${PORT}/s/${adminUser.token}（用户列表首行）`);
+      // 订阅链接里的 token 是凭证：默认只提示位置，需要完整链接时再开 debug
+      if (log.enabled('debug')) {
+        console.log(`  管理员自用订阅  http://localhost:${PORT}/s/${adminUser.token}（用户列表首行）`);
+      } else {
+        console.log('  管理员自用订阅  见用户列表首行（要在这里打印完整链接：PANEL_LOG_LEVEL=debug）');
+      }
     }
     const sample = db.users.find((u) => !u.isAdmin);
-    if (sample) console.log(`  示例订阅  http://localhost:${PORT}/s/${sample.token}`);
+    if (sample && log.enabled('debug')) {
+      console.log(`  示例订阅  http://localhost:${PORT}/s/${sample.token}`);
+    }
     const ns = db.settings.notifyEnabled === '1';
     const chCount = db.notify_channels.filter((c) => c.enabled).length;
     console.log(
@@ -3130,10 +3338,21 @@ function main() {
 // 退出时把 WAL 合并回主文件，避免留下 -wal/-shm 残留
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
+    log.info('收到退出信号，正在关闭', { signal: sig, uptimeS: Math.round((Date.now() - STARTED_AT) / 1000) });
     store.close();
     process.exit(0);
   });
 }
+
+// 进程级兜底：没被 try/catch 兜住的异常至少要在日志里留下痕迹 ——
+// 「Panel 突然不响应 / 重启了」时，journalctl 里没有堆栈就只能靠猜。
+// 不主动 exit：多数来源是单个定时器或某个遗留的 Promise，退出会让整站直接不可用。
+process.on('unhandledRejection', (reason) => {
+  log.error('未处理的 Promise 拒绝', { err: reason instanceof Error ? reason : { msg: String(reason) } });
+});
+process.on('uncaughtException', (err) => {
+  log.error('未捕获异常（进程继续运行，建议尽快排查）', { err });
+});
 
 main();
 

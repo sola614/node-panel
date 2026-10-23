@@ -32,7 +32,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.3'
+VERSION='0.1.4'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -604,11 +604,15 @@ apply_bundle() {
   _tmp="$RUN_DIR/bundle.$$.sh"
   printf '%s\n' "$_out" > "$_tmp" || return 1
   if sh "$_tmp" >> "$LOG_DIR/agent.log" 2>&1; then
-    log "✓ 配置已更新"
     rm -f "$_tmp"
     # state.env 给下一轮用；changed.env 记录这一轮哪些文件真的变了，决定要不要重载服务
     . "$STATE_DIR/state.env" 2>/dev/null
     . "$STATE_DIR/changed.env" 2>/dev/null
+    # 变更项写进日志：事后对时间线时，「这轮到底改了什么」比「更新了」有用得多
+    _what=''
+    [ "${NP_CHANGED_XRAY:-0}" = '1' ] && _what='Xray'
+    [ -n "${NP_CHANGED_HY:-}" ] && _what="${_what}${_what:+、}Hysteria2${NP_CHANGED_HY}"
+    log "✓ 配置已更新（hash ${NP_HASH:-?}，变更：${_what:-无}）"
     return 0
   fi
 
@@ -965,6 +969,9 @@ log "Node Panel Agent $VERSION 启动"
 log "面板：$PANEL_URL"
 log "HTTP：${HTTP:-未找到 curl/wget}"
 log "Xray：$XRAY_CONFIG · Hysteria2：$HYSTERIA_DIR"
+# 重载命令是「配置没生效」类问题的第一嫌疑，启动时先把它亮出来
+_detect_cmd=$(detect_reload_cmd)
+log "重载：${RELOAD_CMD:-${_detect_cmd:-无服务管理器，需手动重启}} · 轮询 ${INTERVAL}s"
 
 if [ "${1:-}" = '--once' ]; then
   tick
