@@ -596,7 +596,7 @@ RENDERERS.users = async () => {
           const quotaText = u.quotaBytes ? `${fmtBytes(u.usedBytes)} / ${fmtBytes(u.quotaBytes)}` : `${fmtBytes(u.usedBytes)} / 不限`;
           return `<tr>
         <td>
-          <div class="cell-name">${esc(u.name)}</div>
+          <div class="cell-name">${esc(u.name)}${u.isAdmin ? ' <span class="badge badge-purple">管理员</span>' : ''}</div>
           <div class="cell-sub">${u.note ? esc(u.note) : '创建于 ' + fmtDate(u.createdAt)}</div>
         </td>
         <td>
@@ -778,9 +778,13 @@ function moreMenu(u) {
         <button class="btn" data-mm="reset">重置已用流量</button>
         <button class="btn" data-mm="rotate">重新生成 UUID / 订阅链接</button>
         <button class="btn" data-mm="traffic">模拟 +200MB 流量（演示用）</button>
-        <button class="btn btn-danger" data-mm="del">删除该用户</button>
+        ${u.isAdmin
+          ? '<button class="btn btn-danger" disabled style="opacity:.5;cursor:not-allowed">删除该用户</button>'
+          : '<button class="btn btn-danger" data-mm="del">删除该用户</button>'}
       </div>
-      <p class="hint" style="margin-top:14px">重新生成后，旧订阅链接立即失效，客户端需重新导入。</p>`,
+      <p class="hint" style="margin-top:14px">${u.isAdmin
+        ? '默认管理员账号不可删除，如不使用可在编辑里取消「启用该用户」。'
+        : '重新生成后，旧订阅链接立即失效，客户端需重新导入。'}</p>`,
     footer: false,
   });
   $('.modal', modalEl).addEventListener('click', async (e) => {

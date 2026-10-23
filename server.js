@@ -430,6 +430,10 @@ function deleteUser(req, res, params) {
   const db = store.db();
   const i = db.users.findIndex((x) => x.id === params.id);
   if (i < 0) return sendJson(res, 404, { error: '用户不存在' });
+  // 默认管理员用户与登录账号同源，删掉它就又回到「列表里看不到管理员」的状态
+  if (db.users[i].isAdmin) {
+    return sendJson(res, 400, { error: '默认管理员账号不可删除，如不使用可在编辑里停用' });
+  }
   db.users.splice(i, 1);
   store.save();
   sendJson(res, 200, { ok: true });
@@ -1552,11 +1556,15 @@ function main() {
     console.log(`  管理面板  http://localhost:${PORT}/`);
     console.log(`  默认账号  ${db.admin.username} / ${process.env.PANEL_ADMIN_PASSWORD || 'admin888'}`);
     console.log(`  数据库    ${store.DB_FILE}（SQLite）`);
+    const adminUser = db.users.find((u) => u.isAdmin);
     console.log(`  套餐 ${db.plans.length} 个 · 服务器 ${db.servers.length} 台 · 节点 ${db.nodes.length} 个 · 用户 ${db.users.length} 位`);
-    if (!db.users.length) {
+    if (!db.plans.length && !db.servers.length && !db.nodes.length) {
       console.log('  提示      空库启动：先在「服务器」页添加机器并执行部署命令');
     }
-    const sample = db.users[0];
+    if (adminUser) {
+      console.log(`  管理员自用订阅  http://localhost:${PORT}/s/${adminUser.token}（用户列表首行）`);
+    }
+    const sample = db.users.find((u) => !u.isAdmin);
     if (sample) console.log(`  示例订阅  http://localhost:${PORT}/s/${sample.token}`);
     console.log(`${line}\n`);
   });
