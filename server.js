@@ -332,7 +332,7 @@ function rotateUserToken(req, res, params) {
 const PROTOCOLS = ['vmess', 'vless', 'trojan', 'ss', 'hysteria2'];
 const NETWORKS = ['tcp', 'ws', 'grpc', 'httpupgrade'];
 const SECURITIES = ['none', 'tls', 'reality'];
-const CERT_MODES = ['path', 'content', 'self'];
+const CERT_MODES = ['path', 'content', 'self', 'acme'];
 const FINGERPRINTS = ['', 'chrome', 'firefox', 'safari', 'randomized'];
 
 function normalizeNode(body, prev = {}) {
@@ -420,8 +420,13 @@ function normalizeNode(body, prev = {}) {
           name: String(e.name || '').trim(),
           host: String(e.host || '').trim(),
           port: e.port ? Number(e.port) : null,
+          planIds: Array.isArray(e.planIds) ? e.planIds.filter((p) => store.db().plans.some((x) => x.id === p)) : [],
+          hidden: !!e.hidden,
         }))
     : prev.entries || [];
+
+  // 订阅层显隐：只影响订阅，不影响 agent 是否监听（中转链路因此不受节点隐藏影响）
+  node.hidden = body.hidden !== undefined ? !!body.hidden : !!prev.hidden;
 
   return node;
 }
@@ -489,7 +494,7 @@ function nodePreview(req, res, params) {
   const db = store.db();
   const node = db.nodes.find((n) => n.id === params.id);
   if (!node) return sendJson(res, 404, { error: '节点不存在' });
-  const users = store.activeUsers().filter((u) => !u.planId || (store.planOf(u) || { nodeIds: [] }).nodeIds.includes(node.id));
+  const users = store.activeUsers().filter((u) => usersForNode(node, [u]).length > 0);
 
   if (node.protocol === 'hysteria2') {
     return sendJson(res, 200, {
@@ -889,11 +894,21 @@ function resolveScope(token, ip) {
   return null;
 }
 
-/** 某节点应向哪些用户开放（套餐过滤） */
+/**
+ * 某节点应向哪些用户开放。
+ * 除了节点自身套餐，还要算上「入口自有套餐」——否则中转把用户送进来，
+ * 节点却不认这个用户，链路是通的但连不上。
+ */
 function usersForNode(node, activeUsers) {
   const db = store.db();
+  const entryPlans = new Set();
+  for (const e of node.entries || []) {
+    if (Array.isArray(e.planIds)) e.planIds.forEach((p) => entryPlans.add(p));
+  }
+
   return activeUsers.filter((u) => {
     if (!u.planId) return true;
+    if (entryPlans.has(u.planId)) return true;
     const plan = db.plans.find((p) => p.id === u.planId);
     return plan ? plan.nodeIds.includes(node.id) : false;
   });
@@ -928,7 +943,7 @@ function buildAgentPayload(scope) {
 
   // 需要 agent 落盘或生成的证书（Xray 与 Hysteria2 一视同仁）
   const certs = [...xrayNodes, ...hyNodes]
-    .filter((n) => n.certMode === 'content' || n.certMode === 'self')
+    .filter((n) => n.certMode === 'content' || n.certMode === 'self' || n.certMode === 'acme')
     .map((n) => {
       const paths = cert.pathsFor(n.id);
       return {
@@ -1050,12 +1065,14 @@ function subscriptionPayload(user, req) {
   const pub = store.publicUser(user);
   const usable = pub.status === 'active';
 
-  const nodes = usable ? store.visibleNodes(user) : [];
+  // 只按 enabled 过滤（agent 是否监听），套餐与显隐交给订阅生成器按入口粒度判断
+  const nodes = usable ? db.nodes.filter((n) => n.enabled) : [];
   // 把「生效地址」算好再交给订阅生成器：独立节点用自身地址（可能是上报的 IP），
   // 跟随服务器的节点用服务器地址。不修改内存中的原始对象。
   const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
   const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
-  const links = sub.buildLinks(nodesForLinks, servers, user);
+  const isNodeVisible = (n) => store.nodeUsableBy(n, user);
+  const links = sub.buildLinks(nodesForLinks, servers, user, isNodeVisible);
 
   const base = baseUrl(req);
   return {
@@ -1105,10 +1122,11 @@ function subPage(req, res, params, body, session, ctx) {
 
   if (format === 'clash') {
     const db = store.db();
-    const nodes = store.visibleNodes(user);
+    // 与 JSON 订阅保持一致：只按 enabled 预过滤，套餐与显隐交给 toClash 按端点粒度判断
+    const nodes = db.nodes.filter((n) => n.enabled);
     const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
     const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
-    const yaml = sub.toClash(nodesForLinks, servers, user, db.settings.siteName);
+    const yaml = sub.toClash(nodesForLinks, servers, user, db.settings.siteName, (n) => store.nodeUsableBy(n, user));
     return sendText(res, 200, yaml, 'text/yaml; charset=utf-8', {
       'Content-Disposition': 'inline; filename="config.yaml"',
     });

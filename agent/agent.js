@@ -382,11 +382,68 @@ function syncCerts(list) {
         const out = run(cmd, 60000);
         if (out === null) log(`  ! 自签证书生成失败：${c.name}`);
         else log(`已生成自签证书：${certPath}（CN=${c.cn}，客户端需关闭证书校验）`);
+      } else if (c.mode === 'acme') {
+        ensureAcmeCert(c, certPath, keyPath);
       }
     } catch (err) {
       log(`  ! 证书处理失败 ${c.nodeId}：${err.message}`);
     }
   }
+}
+
+/* --------------------------------- ACME 证书 -------------------------------- */
+
+const ACME_SH = process.env.ACME_SH || `${process.env.HOME || '/root'}/.acme.sh/acme.sh`;
+let acmeChecked = 0;
+
+/** 安装 acme.sh（幂等，只在没有时执行一次） */
+function ensureAcmeSh() {
+  if (fs.existsSync(ACME_SH)) return true;
+  if (DRY_RUN) return false;
+  if (Date.now() - acmeChecked < 3600 * 1000) return false;
+  acmeChecked = Date.now();
+  log('  安装 acme.sh…');
+  const out = run('curl -fsSL https://get.acme.sh | sh -s email=admin@nodepanel.local', 180000);
+  if (out === null) {
+    log('  ! acme.sh 安装失败，请检查网络或手动安装');
+    return false;
+  }
+  return fs.existsSync(ACME_SH);
+}
+
+/**
+ * 用 acme.sh 申请并自动续期证书。
+ * 走 standalone 模式（占用 80 端口），申请成功后把证书安装到固定路径，
+ * 并由 acme.sh 的 cron 负责续期，续期命令里重启相关服务。
+ */
+function ensureAcmeCert(c, certPath, keyPath) {
+  if (DRY_RUN) {
+    log(`  dry-run: ACME 申请 ${c.cn} → ${certPath}`);
+    return;
+  }
+  if (!ensureAcmeSh()) return;
+
+  const domain = c.cn;
+  const installed = `${ACME_SH} --install-cert -d ${domain} --fullchain-file "${certPath}" --key-file "${keyPath}"` +
+    ` --reloadcmd "systemctl restart xray; systemctl restart nodepanel-agent"`;
+
+  // 已安装过就直接重装（会把最新证书铺到目标路径）
+  if (fs.existsSync(`${process.env.HOME || '/root'}/.acme.sh/${domain}_ecc`)) {
+    const out = run(installed, 60000);
+    if (out !== null) log(`ACME 证书已更新：${domain} → ${certPath}`);
+    else log(`  ! ACME 证书安装失败：${domain}`);
+    return;
+  }
+
+  log(`申请 ACME 证书：${domain}（需要 80 端口可用且域名已解析到本机）`);
+  const issue = run(`${ACME_SH} --issue -d ${domain} --standalone --keylength ec-256`, 180000);
+  if (issue === null) {
+    log(`  ! ACME 申请失败：${domain}。请确认域名解析到本机、80 端口未被占用`);
+    return;
+  }
+  const out = run(installed, 60000);
+  if (out !== null) log(`ACME 证书就绪：${certPath}（acme.sh 将自动续期）`);
+  else log(`  ! ACME 证书安装失败：${domain}`);
 }
 
 /* ---------------------------------- 主循环 --------------------------------- */

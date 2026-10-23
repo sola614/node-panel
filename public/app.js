@@ -738,9 +738,10 @@ async function planEditFlow(id) {
 /* ============================== 节点 ============================== */
 
 RENDERERS.nodes = async () => {
-  const d = await api('/api/nodes');
+  const [d, pd] = await Promise.all([api('/api/nodes'), api('/api/plans')]);
   state.data.nodes = d.items;
   state.data.serverList = d.servers;
+  state.data.planList = pd.items;
 
   $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="node-new">+ 新增节点</button>`;
 
@@ -772,6 +773,7 @@ RENDERERS.nodes = async () => {
         <td>
           <span class="badge ${n.online ? 'badge-ok' : 'badge-dim'}"><i class="dot"></i>${n.online ? '在线' : '离线'}</span>
           ${n.enabled ? '' : '<span class="badge badge-warn" style="margin-left:4px">停用</span>'}
+          ${n.hidden ? '<span class="badge badge-dim" style="margin-left:4px">直连隐藏</span>' : ''}
         </td>
         <td>
           <div class="row-actions">
@@ -932,6 +934,7 @@ function nodeForm(node, servers) {
             <option value="path" ${(n.certMode || 'path') === 'path' ? 'selected' : ''}>服务器上的证书路径</option>
             <option value="content" ${n.certMode === 'content' ? 'selected' : ''}>粘贴证书内容</option>
             <option value="self" ${n.certMode === 'self' ? 'selected' : ''}>自动生成自签证书</option>
+            <option value="acme" ${n.certMode === 'acme' ? 'selected' : ''}>ACME 自动申请（Let's Encrypt）</option>
           </select>
         </div>
 
@@ -960,15 +963,12 @@ function nodeForm(node, servers) {
           <p class="hint">agent 会把它写入 /etc/nodepanel/certs/&lt;节点ID&gt;/ 并在配置中引用，权限 0600。</p>
         </div>
 
-        <div id="cert-self-box" class="hidden">
+        <div id="cert-domain-box" class="hidden">
           <div class="field">
-            <label>自签证书 CN</label>
+            <label>证书域名 / CN</label>
             <input type="text" id="n-selfcn" value="${esc(n.selfCN || '')}" placeholder="留空则取上面的 SNI">
           </div>
-          <p class="hint">
-            agent 用 openssl 生成 10 年自签证书。自签证书无法通过客户端校验，
-            订阅会自动带上 allowInsecure / skip-cert-verify。
-          </p>
+          <p class="hint" id="cert-domain-hint"></p>
         </div>
       </div>
 
@@ -1051,10 +1051,20 @@ function nodeForm(node, servers) {
       方便客户端自动选路与故障转移。不填任何入口 = 直连。入口机器上执行「节点 → 部署 → 中转脚本」即可。
     </p>
 
-    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);cursor:pointer;margin-top:6px">
-      <input type="checkbox" id="n-enabled" ${n.enabled === false ? '' : 'checked'} style="width:auto">
-      启用该节点
-    </label>`;
+    <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:6px">
+      <label class="ve-label" style="margin:0">
+        <input type="checkbox" id="n-enabled" ${n.enabled === false ? '' : 'checked'} style="width:auto">
+        <span>启用该节点</span>
+      </label>
+      <label class="ve-label" style="margin:0">
+        <input type="checkbox" id="n-hidden" ${n.hidden ? 'checked' : ''} style="width:auto">
+        <span>在订阅中隐藏直连（不影响中转入口）</span>
+      </label>
+    </div>
+    <p class="hint" style="margin-top:7px">
+      「启用」决定服务是否监听，关闭后节点彻底不可用；「隐藏」只影响订阅里的直连条目，
+      已配置的中转入口依然可用——这样你可以只卖中转、不暴露落地 IP。
+    </p>`;
 }
 
 function bindNodeForm(mask) {
@@ -1102,7 +1112,12 @@ function bindNodeForm(mask) {
     const cm = $('#n-certmode', mask).value;
     $('#cert-path-box', mask).classList.toggle('hidden', cm !== 'path');
     $('#cert-content-box', mask).classList.toggle('hidden', cm !== 'content');
-    $('#cert-self-box', mask).classList.toggle('hidden', cm !== 'self');
+    const needDomain = cm === 'self' || cm === 'acme';
+    $('#cert-domain-box', mask).classList.toggle('hidden', !needDomain);
+    $('#cert-domain-hint', mask).textContent =
+      cm === 'acme'
+        ? 'agent 安装 acme.sh 并向 Let\'s Encrypt 申请证书，之后由 acme.sh 定时任务自动续期。前提：域名已解析到本机、80 端口可用、机器能访问外网。'
+        : 'agent 用 openssl 生成 10 年自签证书。自签证书无法通过客户端校验，订阅会自动带上 allowInsecure / skip-cert-verify，所以节点依然能连通，只是客户端要允许"不安全"。';
 
     modeHint();
   };
@@ -1140,7 +1155,17 @@ function bindNodeForm(mask) {
   const entries = (Array.isArray(state.editingNode && state.editingNode.entries)
     ? state.editingNode.entries
     : []
-  ).map((e) => ({ id: e.id || '', name: e.name || '', host: e.host || '', port: e.port || '' }));
+  ).map((e) => ({
+    id: e.id || '',
+    name: e.name || '',
+    host: e.host || '',
+    port: e.port || '',
+    planIds: Array.isArray(e.planIds) ? e.planIds.slice() : [],
+    hidden: !!e.hidden,
+  }));
+
+  const planOptions = (state.data.planList || []).map((p) => p.id);
+  const planNames = new Map((state.data.planList || []).map((p) => [p.id, p.name]));
 
   const renderEntries = () => {
     const box = $('#entries-list', mask);
@@ -1150,18 +1175,42 @@ function bindNodeForm(mask) {
     }
     box.innerHTML = entries
       .map(
-        (e, i) => `<div class="entry-row" data-i="${i}" style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
-        <input type="text" class="e-name" value="${esc(e.name)}" placeholder="名称，如：广州中转" style="flex:0 0 130px">
-        <input type="text" class="e-host" value="${esc(e.host)}" placeholder="入口地址 1.2.3.4 或域名" style="flex:1">
-        <input type="number" class="e-port" value="${esc(e.port)}" placeholder="端口" style="flex:0 0 92px">
-        <button class="btn btn-sm btn-danger e-del" type="button" style="flex-shrink:0">删</button>
+        (e, i) => `<div class="entry-row" data-i="${i}" style="border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:9px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" class="e-name" value="${esc(e.name)}" placeholder="名称，如：广州中转" style="flex:0 0 130px">
+          <input type="text" class="e-host" value="${esc(e.host)}" placeholder="入口地址 1.2.3.4 或域名" style="flex:1">
+          <input type="number" class="e-port" value="${esc(e.port)}" placeholder="端口" style="flex:0 0 92px">
+          <button class="btn btn-sm btn-danger e-del" type="button" style="flex-shrink:0">删</button>
+        </div>
+        <div style="display:flex;gap:14px;align-items:center;margin-top:9px;flex-wrap:wrap">
+          <label class="ve-label" style="margin:0">
+            <input type="checkbox" class="e-hidden" ${e.hidden ? 'checked' : ''} style="width:auto">
+            <span style="font-size:12px">在订阅中隐藏此入口</span>
+          </label>
+          <span style="font-size:11.5px;color:var(--muted)">套餐：</span>
+          <div class="chips e-plans">
+            ${
+              planOptions.length
+                ? planOptions
+                    .map(
+                      (pid) => `<label class="check-item" style="padding:4px 9px;font-size:11.5px">
+              <input type="checkbox" class="e-plan" value="${pid}" ${e.planIds.includes(pid) ? 'checked' : ''} style="width:auto;margin:0">
+              <span>${esc(planNames.get(pid) || pid)}</span>
+            </label>`,
+                    )
+                    .join('')
+                : '<span class="chip">暂无套餐</span>'
+            }
+          </div>
+          <span class="hint" style="margin:0">不选 = 继承节点套餐</span>
+        </div>
       </div>`,
       )
       .join('');
   };
 
   $('#entry-add', mask).addEventListener('click', () => {
-    entries.push({ id: '', name: '', host: '', port: '' });
+    entries.push({ id: '', name: '', host: '', port: '', planIds: [], hidden: false });
     renderEntries();
   });
 
@@ -1176,12 +1225,22 @@ function bindNodeForm(mask) {
     const row = e.target.closest('.entry-row');
     if (!row) return;
     const i = Number(row.dataset.i);
-    const field = e.target.classList.contains('e-name')
-      ? 'name'
-      : e.target.classList.contains('e-host')
-        ? 'host'
-        : 'port';
-    entries[i][field] = e.target.value.trim();
+    const t = e.target;
+    if (t.classList.contains('e-name')) entries[i].name = t.value.trim();
+    else if (t.classList.contains('e-host')) entries[i].host = t.value.trim();
+    else if (t.classList.contains('e-port')) entries[i].port = t.value.trim();
+    else if (t.classList.contains('e-hidden')) entries[i].hidden = t.checked;
+  });
+
+  $('#entries-list', mask).addEventListener('change', (e) => {
+    const row = e.target.closest('.entry-row');
+    if (!row || !e.target.classList.contains('e-plan')) return;
+    const i = Number(row.dataset.i);
+    const pid = e.target.value;
+    const set = new Set(entries[i].planIds);
+    if (e.target.checked) set.add(pid);
+    else set.delete(pid);
+    entries[i].planIds = [...set];
   });
 
   renderEntries();
@@ -1197,6 +1256,13 @@ function readNodeForm(mask) {
   const security = protocol === 'hysteria2' ? 'tls' : v('#n-security');
   const certMode = v('#n-certmode') || 'path';
 
+  const draft = state.entryDraft || [];
+  // 入口必须填地址：地址为空的条目会被服务端丢弃，这里提前拦下来并说清楚
+  const bad = draft.find((e) => !e.host);
+  if (bad) {
+    throw new Error(`中转入口「${bad.name || '未命名'}」还没有填地址，请补上或删除该行`);
+  }
+
   const payload = {
     name: v('#n-name'),
     mode,
@@ -1206,9 +1272,10 @@ function readNodeForm(mask) {
     protocol,
     port: Number(v('#n-port')),
     enabled: $('#n-enabled', mask).checked,
+    hidden: $('#n-hidden', mask).checked,
     fp: v('#n-fp'),
     vlessEncryption: protocol === 'vless' ? $('#n-ve', mask).checked : false,
-    entries: (state.entryDraft || []).filter((e) => e.host),
+    entries: draft.filter((e) => e.host),
     certMode,
     certFile: v('#n-cert'),
     keyFile: v('#n-key'),

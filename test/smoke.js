@@ -398,23 +398,65 @@ const json = (obj) => JSON.stringify(obj);
   // 中转入口
   const relayNode = await call('/api/nodes/' + node1Id, {
     method: 'PUT',
-    body: json({ entries: [
-      { name: '入口A', host: 'relay-a.example.com' },
-      { name: '入口B', host: 'relay-b.example.com', port: 20443 },
-    ] }),
+    body: json({
+      entries: [
+        { name: '入口A', host: 'relay-a.example.com' },
+        { name: '入口B', host: 'relay-b.example.com', port: 20443, planIds: [emptyPlanId] },
+        { name: '隐藏入口', host: 'relay-c.example.com', hidden: true },
+      ],
+    }),
   });
-  ok('节点可配置中转入口', relayNode.status === 200 && relayNode.data.item.entries.length === 2);
+  ok('节点可配置中转入口', relayNode.status === 200 && relayNode.data.item.entries.length === 3);
 
   const subRelay = await call(`/api/sub/${u2.token}`);
   const relayLinks = (subRelay.data.links || []).filter((l) => l.name.includes('SMOKE-TLS'));
-  ok('每个入口发布为一条订阅节点', relayLinks.length === 2, `(${relayLinks.map((l) => l.host + ':' + l.port).join(', ')})`);
+  // u2 不限套餐：能看到直连 + 继承节点套餐的入口A；入口B 自有套餐（空套餐）故不可见
+  ok('直连与继承套餐的入口照常发布', relayLinks.length === 2, `(${relayLinks.map((l) => l.host).join(', ')})`);
   ok('入口链接使用入口地址与端口',
-    relayLinks.some((l) => l.host === 'relay-a.example.com' && l.port === 20443) &&
-    relayLinks.some((l) => l.host === 'relay-b.example.com' && l.port === 20443));
+    relayLinks.some((l) => l.host === 'relay-a.example.com' && l.port === 20443));
+  // 服务器此前被切到自动上报模式，直连地址应为上报的 IP 而非手填 host
+  ok('直连使用节点自身（上报）地址', relayLinks.some((l) => !l.relay && l.host === REPORTED_IP),
+    `(${relayLinks.filter((l) => !l.relay).map((l) => l.host).join(',') || '无直连'})`);
+  ok('隐藏的入口不出现在订阅', !relayLinks.some((l) => l.host === 'relay-c.example.com'));
+
+  // 入口自有套餐：入口B 只归空套餐，空套餐用户应看到它，套餐用户不应看到
+  const subU3 = await call(`/api/sub/${u3.token}`);
+  const u3Links = (subU3.data.links || []).filter((l) => l.name.includes('SMOKE-TLS'));
+  ok('入口自有套餐优先于节点套餐', u3Links.length === 1 && u3Links[0].host === 'relay-b.example.com',
+    `(${u3Links.map((l) => l.host).join(', ')})`);
+
+  // 入口拿到访问权后，节点配置也必须服务该用户，否则中转过去连不上
+  const cfgRelay = await call(`/api/agent/config?token=${serverToken}&v=test`);
+  const inboundRelay = cfgRelay.data.xray.inbounds.find((i) => i.tag === 'node-' + node1Id);
+  ok('入口套餐用户被注入节点配置',
+    inboundRelay.settings.clients.some((c) => c.email === 'u' + u3.id));
+
+  // 原始节点隐藏：直连消失，中转入口仍在
+  await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ hidden: true }) });
+  const subHidden = await call(`/api/sub/${u2.token}`);
+  const hiddenLinks = (subHidden.data.links || []).filter((l) => l.name.includes('SMOKE-TLS'));
+  ok('节点隐藏后直连从订阅消失', !hiddenLinks.some((l) => !l.relay));
+  ok('节点隐藏后中转入口仍可用', hiddenLinks.length === 1 && hiddenLinks.every((l) => l.relay),
+    `(${hiddenLinks.map((l) => l.host).join(', ')})`);
+  const clashHidden = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  // 注意：smoke.example.com 同时还是该节点的 SNI，中转代理会继承它，
+  // 所以不能用它判断直连是否消失，要认直连代理的完整名字
+  const directProxyName = '"SMOKE-服务器 · SMOKE-TLS"';
+  ok('Clash 订阅同样只保留中转入口',
+    clashHidden.includes('relay-a.example.com') && !clashHidden.includes(directProxyName));
+
+  // 隐藏不影响 agent 配置（中转链路因此不受影响）
+  const cfgHidden = await call(`/api/agent/config?token=${serverToken}&v=test`);
+  const inboundHidden = cfgHidden.data.xray.inbounds.find((i) => i.tag === 'node-' + node1Id);
+  ok('节点隐藏不影响 agent 配置', !!inboundHidden && inboundHidden.settings.clients.length > 0);
+
+  await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ hidden: false }) });
 
   const clashRelay = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
-  ok('Clash 订阅包含中转入口节点',
-    clashRelay.includes('relay-a.example.com') && clashRelay.includes('relay-b.example.com'));
+  ok('Clash 订阅包含中转入口节点', clashRelay.includes('relay-a.example.com'));
+  const clashU3 = await fetch(`${BASE}/s/${u3.token}?format=clash`).then((r) => r.text());
+  ok('Clash 订阅遵循入口自有套餐',
+    clashU3.includes('relay-b.example.com') && !clashU3.includes('relay-a.example.com'));
 
   const relayScript = await fetch(`${BASE}/api/relay/script?to=203.0.113.9&port=443&label=SMOKE`, {
     headers: { Authorization: 'Bearer ' + token },
@@ -425,6 +467,27 @@ const json = (obj) => JSON.stringify(obj);
 
   const relayBad = await fetch(`${BASE}/api/relay/script`, { headers: { Authorization: 'Bearer ' + token } });
   ok('缺少落地地址时中转脚本报错', relayBad.status === 400);
+
+  // ACME 证书模式
+  const nodeAcme = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-ACME', mode: 'standalone', address: 'acme.example.com',
+      protocol: 'vless', port: 443, network: 'tcp', security: 'tls',
+      sni: 'acme.example.com', certMode: 'acme', selfCN: 'acme.example.com', enabled: true,
+    }),
+  });
+  ok('新增节点（ACME 证书）', nodeAcme.status === 200 && nodeAcme.data.item.certMode === 'acme');
+  const nodeAcmeId = nodeAcme.data.item.id;
+  cleanup.push(['/api/nodes/' + nodeAcmeId]);
+
+  const cfgAcme = await call(`/api/agent/config?token=${nodeAcme.data.item.token}&v=test`);
+  const acmeCert = (cfgAcme.data.certs || []).find((c) => c.nodeId === nodeAcmeId);
+  ok('ACME 模式下发给 agent 申请指令', !!acmeCert && acmeCert.mode === 'acme' && acmeCert.cn === 'acme.example.com');
+
+  const subAcme = await call(`/api/sub/${u2.token}`);
+  const acmeLink = (subAcme.data.links || []).find((l) => l.name.includes('SMOKE-ACME'));
+  ok('ACME 证书不需要 allowInsecure', !!acmeLink && !acmeLink.uri.includes('allowInsecure'));
 
   /* ---------- 12. 鉴权 ---------- */  ok('错误 token 无法拉配置', (await call('/api/agent/config?token=wrong-token')).status === 401);
 
