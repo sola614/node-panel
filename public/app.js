@@ -8,6 +8,8 @@ const state = {
   me: null,
   view: 'dashboard',
   data: { users: [], nodes: [], servers: [], plans: [], serverList: [], planList: [] },
+  // 节点列表里已展开的中转入口树（默认全部收起）
+  treeOpen: new Set(),
 };
 
 const esc = (s) =>
@@ -145,8 +147,10 @@ function openModal({ title, body, wide, okText = '保存', cancelText = '取消'
   document.body.appendChild(mask);
   modalEl = mask;
 
+  // 只允许通过按钮关闭：点击遮罩层不再收起弹窗，
+  // 避免编辑长表单时手滑点到外面，输入全部丢失
   mask.addEventListener('click', (e) => {
-    if (e.target === mask || e.target.hasAttribute('data-close')) closeModal();
+    if (e.target.closest('[data-close]')) closeModal();
   });
 
   const okBtn = $('[data-ok]', mask);
@@ -786,15 +790,37 @@ RENDERERS.nodes = async () => {
 
   $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="node-new">+ 新增节点</button>`;
 
+  const planChip = (pid) => {
+    const p = (state.data.planList || []).find((x) => x.id === pid);
+    return p
+      ? `<span class="chip" style="border-color:${p.color}55;color:${p.color}">${esc(p.name)}</span>`
+      : '';
+  };
+
   const rows = d.items.length
     ? d.items
-        .map(
-          (n) => `<tr>
+        .map((n) => {
+          // 只有配了地址的入口才进树，空行不会出现在订阅里
+          const entries = (n.entries || []).filter((e) => e.host);
+          const hasEntries = entries.length > 0;
+          const open = state.treeOpen.has(n.id);
+          const netLabel = n.protocol === 'hysteria2' ? 'quic' : esc(n.network);
+
+          const parent = `<tr>
         <td>
-          <div class="cell-name">${esc(n.name)}</div>
-          <div class="cell-sub">${esc(n.serverName)}${n.host ? ' · ' + esc(n.host) : ''}${
-            n.entries && n.entries.length ? ' · ' + n.entries.length + ' 个中转入口' : ''
-          }</div>
+          <div class="tree-cell">
+            ${
+              hasEntries
+                ? `<button class="tree-toggle ${open ? 'open' : ''}" data-act="node-toggle" data-id="${n.id}" title="展开 / 收起中转入口"><i class="caret"></i></button>`
+                : `<span class="tree-toggle is-leaf"><i class="caret"></i></span>`
+            }
+            <div style="min-width:0">
+              <div class="cell-name">${esc(n.name)}</div>
+              <div class="cell-sub">${esc(n.serverName)}${n.host ? ' · ' + esc(n.host) : ''}${
+                hasEntries ? ` · ${entries.length} 个中转入口` : ''
+              }</div>
+            </div>
+          </div>
         </td>
         <td>
           <span class="badge ${PROTO_BADGE[n.protocol] || 'badge-dim'}">${n.protocol}</span>
@@ -803,7 +829,7 @@ RENDERERS.nodes = async () => {
         </td>
         <td class="mono">${n.port}</td>
         <td>
-          <span class="badge badge-dim">${n.protocol === 'hysteria2' ? 'quic' : esc(n.network)}</span>
+          <span class="badge badge-dim">${netLabel}</span>
           ${n.path && n.protocol !== 'hysteria2' ? `<div class="cell-sub mono">${esc(n.path)}</div>` : ''}
         </td>
         <td>
@@ -824,8 +850,45 @@ RENDERERS.nodes = async () => {
             <button class="btn btn-sm btn-danger" data-act="node-del" data-id="${n.id}">删</button>
           </div>
         </td>
-      </tr>`,
-        )
+      </tr>`;
+
+          const children = entries
+            .map((e) => {
+              const port = e.port || n.port;
+              const plans = (e.planIds || []).length
+                ? e.planIds.map(planChip).join('')
+                : '<span class="chip" style="color:var(--muted)">继承节点套餐</span>';
+              return `<tr class="tree-child ${open ? '' : 'collapsed'}" data-parent="${n.id}">
+          <td>
+            <div class="tree-cell tree-child-cell">
+              <span class="tree-guide"></span>
+              <div style="min-width:0">
+                <div class="cell-name">${esc(e.name || '未命名入口')}</div>
+                <div class="cell-sub mono">${esc(e.host)}:${port}</div>
+              </div>
+            </div>
+          </td>
+          <td><span class="badge badge-purple">中转</span></td>
+          <td class="mono">${port}</td>
+          <td><span class="badge badge-dim">${netLabel}</span></td>
+          <td><div class="chips">${plans}</div></td>
+          <td>${
+            e.hidden
+              ? '<span class="badge badge-warn">订阅隐藏</span>'
+              : '<span class="badge badge-ok"><i class="dot"></i>订阅可见</span>'
+          }</td>
+          <td>
+            <div class="row-actions">
+              <button class="btn btn-sm btn-ghost" data-act="entry-script" data-id="${n.id}" data-entry="${esc(e.id)}">中转脚本</button>
+              <button class="btn btn-sm btn-ghost" data-act="node-edit" data-id="${n.id}">编辑</button>
+            </div>
+          </td>
+        </tr>`;
+            })
+            .join('');
+
+          return parent + children;
+        })
         .join('')
     : `<tr><td colspan="7" class="empty"><b>还没有节点</b>节点可以跟随服务器部署，也可以独立部署</td></tr>`;
 
@@ -1978,6 +2041,52 @@ document.addEventListener('click', async (e) => {
       case 'node-deploy':
         await nodeDeployFlow(id);
         break;
+      case 'node-toggle': {
+        // 纯 DOM 切换，不整页重渲染 —— 否则滚动位置会跳回顶部
+        const nowOpen = !state.treeOpen.has(id);
+        if (nowOpen) state.treeOpen.add(id);
+        else state.treeOpen.delete(id);
+        $$(`tr.tree-child[data-parent="${id}"]`).forEach((tr) => {
+          tr.classList.toggle('collapsed', !nowOpen);
+        });
+        btn.classList.toggle('open', nowOpen);
+        break;
+      }
+      case 'entry-script': {
+        const node = state.data.nodes.find((x) => x.id === id);
+        const entry = node && (node.entries || []).find((e) => e.id === btn.dataset.entry);
+        if (!node || !entry) throw new Error('入口不存在，请刷新后重试');
+        const port = entry.port || node.port;
+        const q = new URLSearchParams({
+          to: node.host || '',
+          port,
+          label: `${node.name} · ${entry.name || entry.host}`,
+          proto: node.protocol === 'hysteria2' ? 'both' : 'tcp',
+        });
+        // 该接口返回纯文本脚本，不能走 api()
+        const res = await fetch('/api/relay/script?' + q.toString(), {
+          headers: { Authorization: 'Bearer ' + state.token },
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || '生成失败');
+        }
+        const script = await res.text();
+        openModal({
+          title: '中转脚本 · ' + (entry.name || entry.host),
+          wide: true,
+          footer: false,
+          body: `<p class="hint" style="margin:0 0 12px">
+            在 <b>${esc(entry.host)}</b> 上以 root 执行，把本机 :${port} 的流量 DNAT 到
+            <b>${esc(node.host || '落地节点')}:${node.port}</b>。入口不解析协议，流量仍记在落地节点。
+          </p>
+          <div class="code-wrap">
+            <pre class="code">${esc(script)}</pre>
+            <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(script)}">复制</button>
+          </div>`,
+        });
+        break;
+      }
       case 'node-del':
         confirmDialog('删除节点', '删除后该节点将从服务器配置中移除，相关订阅链接失效。', async () => {
           await api('/api/nodes/' + id, { method: 'DELETE' });
