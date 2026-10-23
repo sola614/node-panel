@@ -26,8 +26,12 @@ COPY lib ./lib
 COPY public ./public
 COPY agent ./agent
 
+# 入口脚本负责把数据目录属主修好再降权运行，su-exec 是 Alpine 上的 gosu 等价物
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh \
+    && apk add --no-cache su-exec
+
 RUN mkdir -p /app/data && chown -R node:node /app
-USER node
 
 VOLUME ["/app/data"]
 EXPOSE 8080
@@ -36,4 +40,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
+# 以 root 启动，由入口脚本降权到 node：这样绑定挂载的数据目录也能被修好属主
+USER root
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "server.js"]

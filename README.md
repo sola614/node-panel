@@ -383,6 +383,7 @@ node-panel/
 │   └── ui.js           前端行为测试（皮肤切换 / loading 锁 / 域名校验，需要 jsdom）
 ├── .github/workflows/   GitHub Actions：测试 → 多架构构建 → 推 ghcr.io
 ├── Dockerfile
+├── docker-entrypoint.sh 容器入口：修数据目录属主后降权到 node 用户
 ├── docker-compose.yml
 └── data/panel.db        运行时生成，全部数据都在这里（SQLite）
 ```
@@ -469,6 +470,46 @@ PANEL_IMAGE_TAG=0.1.1 docker compose up -d
 数据持久化在 `/app/data` 卷里（`panel.db` + WAL）。镜像已内置 `/api/health` 探针。
 镜像基线是 `node:24-alpine`（Active LTS，维护到 2028-04）。
 自建部署需要 **Node.js 22.13+**（内置 `node:sqlite` 从该版本起免 flag 可用）。
+
+#### 数据目录：命名卷 vs 绑定挂载
+
+两种写法都可以，入口脚本会自行处理属主，不必手动 chown：
+
+```bash
+# 命名卷：最省心，Docker 自动沿用镜像里的属主
+docker run -d -v node-panel-data:/app/data ...
+
+# 绑定挂载：数据落在宿主机 ./data，方便直接 sqlite3 备份
+mkdir -p ./data
+docker run -d -v "$PWD/data:/app/data" ...
+```
+
+绑定挂载有个坑：Docker **不会**把镜像里的属主复制到宿主机目录，`./data` 会是 root 所有，
+而容器默认以 `node` 用户运行，于是 SQLite 报 `unable to open database file`。
+所以 `docker-entrypoint.sh` 会以 root 起步，把数据目录 chown 给 node 后再用 `su-exec` 降权跑面板
+（官方 postgres/mysql 镜像也是这个套路）。如果你用 `--user` 覆盖了运行身份、导致目录不可写，
+入口脚本会直接给出可操作提示，而不是甩一句看不懂的 SQLite 报错。
+
+#### 排错：`unable to open database file`
+
+就是这个属主问题。三种解法：
+
+```bash
+# 1. 让入口脚本自己修（推荐，换个带 docker-entrypoint.sh 的镜像版本即可）
+docker compose pull && docker compose up -d
+
+# 2. 手动把宿主机目录交给容器里的 node 用户（uid 1000）
+mkdir -p ./data && sudo chown -R 1000:1000 ./data
+
+# 3. 改用命名卷，属主由 Docker 自动处理
+```
+
+可以用这条命令确认容器里的实际身份和目录权限：
+
+```bash
+docker run --rm -v "$PWD/data:/app/data" --entrypoint sh ghcr.io/sola614/node-panel:0.1 \
+  -c 'id; ls -ld /app/data; touch /app/data/.w && echo "可写 ✓"'
+```
 
 ### 镜像版本号
 

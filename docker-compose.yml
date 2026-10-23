@@ -14,7 +14,12 @@ services:
       PANEL_SEED_DEMO: ${PANEL_SEED_DEMO:-}
       TZ: Asia/Shanghai
     volumes:
+      # 两种写法都可以，入口脚本会自行修好数据目录属主：
+      #   命名卷 —— Docker 自动沿用镜像里的属主，最省心
+      #   绑定挂载 —— 数据落在宿主机 ./data，方便直接 sqlite3 备份；
+      #                Docker 不会复制属主，入口脚本会把它 chown 给 node 用户
       - panel-data:/app/data
+      # - ./data:/app/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
