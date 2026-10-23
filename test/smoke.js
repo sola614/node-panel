@@ -66,6 +66,20 @@ const json = (obj) => JSON.stringify(obj);
   token = login.data.token;
   ok('登录返回应用版本号', login.data.token && login.data.appVersion === pkgVersion, `(${login.data.appVersion})`);
 
+  /* ---------- 1.1 默认管理员账号必须在用户列表里 ---------- */
+  {
+    const r = await call('/api/users');
+    const items = (r.data && r.data.items) || [];
+    const adminUser = items.find((u) => u.isAdmin);
+    ok('用户列表包含默认管理员账号', !!adminUser, adminUser ? `(${adminUser.name})` : `（共 ${items.length} 位用户）`);
+    ok('默认管理员账号与登录账号同名', !!adminUser && adminUser.name === ADMIN_USER);
+    ok('默认管理员账号状态正常', !!adminUser && adminUser.status === 'active', adminUser ? `(${adminUser.statusLabel})` : '');
+    if (adminUser) {
+      const del = await call('/api/users/' + adminUser.id, { method: 'DELETE' });
+      ok('默认管理员账号不可删除', del.status === 400, del.data && del.data.error ? `(${del.data.error})` : '');
+    }
+  }
+
   /* ---------- 0.5 清理上次崩溃的残留，保证测试可重复 ---------- */
   {
     const stale = async (path, key) => {
