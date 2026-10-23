@@ -591,6 +591,54 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.018); }
 .seg button:hover { color: var(--text); }
 .seg button.on { background: rgba(76, 141, 255, 0.16); color: #fff; box-shadow: inset 0 0 0 1px rgba(76, 141, 255, 0.28); }
 
+/* 多选下拉框（节点选套餐） */
+.ms { position: relative; }
+.ms-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: #0a0f16;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 13.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.16s, box-shadow 0.16s;
+}
+.ms-toggle:hover { border-color: #2a3a4d; }
+.ms-toggle:focus { border-color: rgba(76, 141, 255, 0.65); box-shadow: 0 0 0 3px rgba(76, 141, 255, 0.13); outline: none; }
+.ms-toggle .caret { color: var(--muted); font-size: 10px; }
+.ms-panel {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  background: #131c27;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 20px 44px -14px rgba(0, 0, 0, 0.9);
+  max-height: 220px;
+  overflow-y: auto;
+}
+.ms-panel .check-item { border: none; padding: 8px 10px; border-radius: 7px; }
+.ms-panel .check-item:hover { background: rgba(255, 255, 255, 0.04); }
+.ms-panel .check-item.on { background: rgba(76, 141, 255, 0.1); }
+.ms-empty { padding: 12px; text-align: center; color: var(--muted); font-size: 12.5px; }
+
+/* 生成按钮组 */
+.gen-group { display: flex; gap: 8px; align-items: center; }
+.gen-group input { flex: 1; }
+
+/* 只读字段（继承自套餐） */
+input[readonly] { color: var(--text-dim); background: #0a0f16; cursor: not-allowed; }
+input[readonly]:focus { border-color: var(--line); box-shadow: none; }
+
 /* ------------------------------- 套餐卡片 ------------------------------- */
 
 .plan-card { padding: 18px; position: relative; overflow: hidden; }
@@ -657,6 +705,58 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.018); }
   color: #8fb4e0;
   line-height: 1.6;
 }
+
+/* ------------------------------ 多选下拉框 ------------------------------- */
+
+.ms { position: relative; }
+
+.ms-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: #0a0f16;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 13.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.ms-trigger:hover { border-color: #2a3a4d; }
+.ms-trigger.open { border-color: rgba(76, 141, 255, 0.6); }
+.ms-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ms-caret { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+
+.ms-panel {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 5px);
+  left: 0;
+  right: 0;
+  background: #141d29;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 5px;
+  box-shadow: 0 20px 44px -14px rgba(0, 0, 0, 0.92);
+  max-height: 210px;
+  overflow-y: auto;
+}
+
+.ms-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.ms-item:hover { background: rgba(255, 255, 255, 0.05); }
+.ms-item input { width: auto; margin: 0; accent-color: var(--accent); }
 
 /* 复选标签（VLESS Encryption 等） */
 .ve-label {

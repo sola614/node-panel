@@ -154,23 +154,24 @@ const json = (obj) => JSON.stringify(obj);
   const node3Token = node3.data.item.token;
   cleanup.push(['/api/nodes/' + node3Id]);
 
-  /* ---------- 3. 套餐 ---------- */
+  /* ---------- 3. 套餐（只定义额度与有效期） ---------- */
   const plan = await call('/api/plans', {
     method: 'POST',
-    body: json({ name: 'SMOKE-套餐', desc: '只含 SMOKE-TLS', nodeIds: [node1Id], color: '#4c8dff', sort: 99 }),
+    body: json({ name: 'SMOKE-套餐', desc: '只含 SMOKE-TLS', quotaGB: 0.5, days: 7, color: '#4c8dff', sort: 99 }),
   });
-  ok('新增套餐', plan.status === 200 && plan.data.item.nodeCount === 1);
+  ok('新增套餐（含额度与有效期）',
+    plan.status === 200 && plan.data.item.nodeCount === 0 && plan.data.item.quotaGB === 0.5 && plan.data.item.days === 7);
   const planId = plan.data.item.id;
   cleanup.push(['/api/plans/' + planId]);
 
   const emptyPlan = await call('/api/plans', {
     method: 'POST',
-    body: json({ name: 'SMOKE-空套餐', desc: '不含任何节点', nodeIds: [], sort: 100 }),
+    body: json({ name: 'SMOKE-空套餐', desc: '不含任何节点', quotaGB: 0, days: 0, sort: 100 }),
   });
   const emptyPlanId = emptyPlan.data.item.id;
   cleanup.push(['/api/plans/' + emptyPlanId]);
 
-  /* ---------- 4. 用户 ---------- */
+  /* ---------- 4. 用户（额度与到期继承套餐） ---------- */
   const mkUser = async (name, planId_, quotaGB) => {
     const r = await call('/api/users', {
       method: 'POST',
@@ -184,6 +185,21 @@ const json = (obj) => JSON.stringify(obj);
   const u2 = await mkUser('SMOKE-不限套餐', null, 100);
   const u3 = await mkUser('SMOKE-空套餐用户', emptyPlanId, 100);
   ok('新增用户（绑定套餐 / 不限 / 空套餐）', !!(u1.id && u2.id && u3.id));
+
+  ok('用户额度继承套餐', u1.quotaGB === 0.5, `(${u1.quotaGB}GB)`);
+  ok('用户到期按套餐天数推算',
+    u1.expireAt && Math.abs(new Date(u1.expireAt) - (new Date(u1.createdAt).getTime() + 7 * 864e5)) < 60000);
+  ok('无套餐用户可手填额度', u2.quotaGB === 100);
+  ok('额度继承标记为锁定', u1.quotaLocked === true && u2.quotaLocked === false);
+
+  // 改套餐额度，用户侧要跟着变
+  const planUpdate = await call('/api/plans/' + planId, { method: 'PUT', body: json({ quotaGB: 2, days: 14 }) });
+  ok('修改套餐额度', planUpdate.status === 200 && planUpdate.data.item.quotaGB === 2);
+  const u1After = (await call('/api/users')).data.items.find((u) => u.id === u1.id);
+  ok('套餐变更同步到用户', u1After.quotaGB === 2, `(${u1After.quotaGB}GB)`);
+
+  // 节点加入套餐
+  await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ planIds: [planId] }) });
 
   /* ---------- 5. 订阅层套餐隔离 ---------- */
   const sub1 = await call(`/api/sub/${u1.token}`);
@@ -245,12 +261,21 @@ const json = (obj) => JSON.stringify(obj);
     !!hy && (hy.yaml.includes('listen: :20843') || hy.yaml.includes('listen: ":20843"')), hy ? `端口 ${hy.port}` : '');
   ok('Hysteria2 含 userpass 认证', !!hy && hy.yaml.includes('userpass') && hy.yaml.includes('u' + u2.id));
   ok('Hysteria2 含带宽与混淆', !!hy && hy.yaml.includes('salamander') && hy.yaml.includes('mbps'));
-  ok('Hysteria2 带流量统计端口', !!hy && hy.statsPort > 9000 && !!hy.secret);
+  ok('Hysteria2 带流量统计端口', !!hy && hy.statsPort >= 9000 && hy.statsPort < 9900 && !!hy.secret,
+    `port=${hy && hy.statsPort}`);
+
+  // 同一台机器上多个 Hysteria2 实例的统计端口不得碰撞（否则流量串号）
+  const hy2All = cfgNode3.data.hysteria || [];
+  ok('同机多实例统计端口不碰撞', new Set(hy2All.map((x) => x.statsPort)).size === hy2All.length,
+    `(${hy2All.map((x) => x.statsPort).join(',')})`);
+  ok('统计端口在 YAML 中一致',
+    hy2All.every((x) => x.yaml.includes(`127.0.0.1:${x.statsPort}`)));
 
   /* ---------- 10. 超额自动剔除 ---------- */
   const report = await call(`/api/agent/report?token=${serverToken}`, {
     method: 'POST',
-    body: json({ users: [{ email: 'u' + u1.id, up: 0.3 * GB, down: 0.3 * GB }] }),
+    // 套餐额度已被上文改成 2GB，上报 3GB 必然超限
+    body: json({ users: [{ email: 'u' + u1.id, up: 1.5 * GB, down: 1.5 * GB }] }),
   });
   ok('流量上报成功', report.status === 200 && report.data.applied === 1);
 

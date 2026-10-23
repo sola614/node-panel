@@ -1,5 +1,3 @@
-'use strict';
-
 /* ============================== 基础工具 ============================== */
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -9,7 +7,7 @@ const state = {
   token: localStorage.getItem('np_token') || '',
   me: null,
   view: 'dashboard',
-  data: { users: [], nodes: [], servers: [], plans: [], serverList: [], planList: [], nodeList: [] },
+  data: { users: [], nodes: [], servers: [], plans: [], serverList: [], planList: [] },
 };
 
 const esc = (s) =>
@@ -460,19 +458,20 @@ function userForm(user) {
       <input type="text" id="f-name" value="${esc(u.name || '')}" placeholder="如：张三 / 客户编号">
     </div>
     <div class="field">
-      <label>套餐（权限组）</label>
+      <label>套餐</label>
       <select id="f-plan">${planOpts}</select>
-      <div class="hint">决定该用户能看到哪些节点，在「套餐」页维护</div>
+      <div class="hint" id="f-plan-hint"></div>
     </div>
     <div class="form-row">
       <div class="field">
         <label>流量额度（GB）</label>
         <input type="number" id="f-quota" min="0" step="1" value="${u.quotaGB != null ? u.quotaGB : 100}">
-        <div class="hint">填 0 表示不限流量</div>
+        <div class="hint" id="f-quota-hint">填 0 表示不限流量</div>
       </div>
       <div class="field">
         <label>到期时间</label>
         <input type="date" id="f-expire" value="${expire}">
+        <div class="hint" id="f-expire-hint"></div>
       </div>
     </div>
     <div class="field">
@@ -483,6 +482,38 @@ function userForm(user) {
       <input type="checkbox" id="f-enabled" ${u.enabled === false ? '' : 'checked'} style="width:auto">
       启用该用户
     </label>`;
+}
+
+function bindUserForm(mask) {
+  const sync = () => {
+    const pid = $('#f-plan', mask).value;
+    const plan = (state.data.planList || []).find((p) => p.id === pid);
+    const quota = $('#f-quota', mask);
+    const expire = $('#f-expire', mask);
+
+    if (plan) {
+      quota.value = plan.quotaGB || 0;
+      quota.readOnly = true;
+      $('#f-quota-hint', mask).textContent = '继承自套餐，不可修改';
+      const days = Number(plan.days) || 0;
+      if (days > 0) {
+        const from = (mask.dataset.createdAt && new Date(mask.dataset.createdAt)) || new Date();
+        from.setDate(from.getDate() + days);
+        expire.value = from.toISOString().slice(0, 10);
+      }
+      expire.readOnly = true;
+      $('#f-expire-hint', mask).textContent = days > 0 ? `继承自套餐：加入后 ${days} 天到期` : '继承自套餐：永久有效';
+      $('#f-plan-hint', mask).textContent = '额度与有效期由套餐决定';
+    } else {
+      quota.readOnly = false;
+      $('#f-quota-hint', mask).textContent = '填 0 表示不限流量';
+      expire.readOnly = false;
+      $('#f-expire-hint', mask).textContent = '';
+      $('#f-plan-hint', mask).textContent = '不选套餐则手动配置额度与到期';
+    }
+  };
+  $('#f-plan', mask).addEventListener('change', sync);
+  sync();
 }
 
 function readUserForm(mask) {
@@ -497,38 +528,42 @@ function readUserForm(mask) {
 }
 
 async function createUserFlow() {
-  openModal({
+  const mask = openModal({
     title: '新增用户',
     body: userForm(),
     okText: '创建',
-    onOk: async (mask) => {
-      const payload = readUserForm(mask);
+    onOk: async (m) => {
+      const payload = readUserForm(m);
       if (!payload.name) throw new Error('请填写用户名称');
       await api('/api/users', { method: 'POST', body: JSON.stringify(payload) });
       toast('用户已创建', 'ok');
       render();
     },
   });
+  bindUserForm(mask);
 }
 
 async function editUserFlow(id) {
   const u = state.data.users.find((x) => x.id === id);
   if (!u) return;
-  openModal({
+  const mask = openModal({
     title: '编辑用户 · ' + u.name,
     body: userForm(u) + `
       <div class="code-wrap" style="margin-top:16px">
         <pre class="code">订阅地址 ${esc(u.subUrl)}
 Clash   ${esc(u.clashUrl)}</pre>
       </div>`,
-    onOk: async (mask) => {
-      const payload = readUserForm(mask);
+    onOk: async (m) => {
+      const payload = readUserForm(m);
       if (!payload.name) throw new Error('请填写用户名称');
       await api('/api/users/' + id, { method: 'PUT', body: JSON.stringify(payload) });
       toast('已保存', 'ok');
       render();
     },
   });
+  // 到期时间按「加入套餐的日期 + 有效期」推算，需要 createdAt
+  mask.dataset.createdAt = u.createdAt || '';
+  bindUserForm(mask);
 }
 
 function moreMenu(u) {
@@ -580,7 +615,6 @@ function moreMenu(u) {
 RENDERERS.plans = async () => {
   const d = await api('/api/plans');
   state.data.plans = d.items;
-  state.data.nodeList = d.nodes;
 
   $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="plan-new">+ 新增套餐</button>`;
 
@@ -596,8 +630,9 @@ RENDERERS.plans = async () => {
           <span class="badge badge-dim">${p.userCount} 位用户</span>
         </div>
         <div class="plan-meta">
-          <div><span>包含节点</span><b>${p.nodeCount}</b></div>
-          <div><span>排序</span><b>${p.sort}</b></div>
+          <div><span>流量额度</span><b>${p.quotaGB ? p.quotaGB + ' GB' : '不限'}</b></div>
+          <div><span>有效期</span><b>${p.days ? p.days + ' 天' : '永久'}</b></div>
+          <div><span>归属节点</span><b>${p.nodeCount}</b></div>
         </div>
         <div class="chips" style="margin-bottom:14px">
           ${
@@ -606,7 +641,7 @@ RENDERERS.plans = async () => {
                   .slice(0, 6)
                   .map((n) => `<span class="chip">${esc(n.name)}</span>`)
                   .join('')
-              : '<span class="chip" style="color:var(--warn)">未包含任何节点</span>'
+              : '<span class="chip" style="color:var(--warn)">还没有节点加入</span>'
           }
           ${p.nodes.length > 6 ? `<span class="chip">+${p.nodes.length - 6}</span>` : ''}
         </div>
@@ -617,7 +652,7 @@ RENDERERS.plans = async () => {
       </div>`,
         )
         .join('')
-    : `<div class="card"><div class="empty"><b>还没有套餐</b>套餐决定用户能看到哪些节点，是订阅的内容边界</div></div>`;
+    : `<div class="card"><div class="empty"><b>还没有套餐</b>套餐定义用户的流量额度与有效期，是订阅的内容边界</div></div>`;
 
   $('#view').innerHTML = `
     <div class="grid-3">${cards}</div>
@@ -626,13 +661,14 @@ RENDERERS.plans = async () => {
       <div class="card-body">
         <div style="display:flex;flex-direction:column;gap:13px">
           ${[
-            ['① 勾选节点', '一个节点可以同时属于多个套餐，比如香港节点在标准版和旗舰版里都出现'],
-            ['② 用户绑定套餐', '在「用户」页给用户选择套餐；不选则表示不限，可见全部节点'],
-            ['③ 三层过滤', '订阅只输出套餐内节点 → 节点配置只注入套餐内用户 → 超额用户再被剔除'],
+            ['① 套餐定义额度', '套餐只配置名称、流量额度、有效期；用户的额度与到期自动继承，用户侧不可修改'],
+            ['② 节点加入套餐', '在「节点」页用多选下拉把节点加入一个或多个套餐'],
+            ['③ 用户绑定套餐', '在「用户」页给用户选套餐；不选则表示不限，可见全部节点'],
+            ['④ 三层过滤', '订阅只输出套餐内节点 → 节点配置只注入套餐内用户 → 超额用户再被剔除'],
           ]
             .map(
               ([t, s]) => `<div style="display:flex;gap:11px;align-items:flex-start">
-              <div style="font-size:12.5px;font-weight:600;color:var(--accent);flex-shrink:0;min-width:88px">${t}</div>
+              <div style="font-size:12.5px;font-weight:600;color:var(--accent);flex-shrink:0;min-width:110px">${t}</div>
               <div style="font-size:12.5px;color:var(--text-dim);line-height:1.6">${s}</div>
             </div>`,
             )
@@ -642,23 +678,8 @@ RENDERERS.plans = async () => {
     </div>`;
 };
 
-function planForm(plan, nodes) {
-  const p = plan || { color: '#4c8dff', nodeIds: [] };
-  const selected = new Set(p.nodeIds || []);
-  const items = nodes.length
-    ? nodes
-        .map(
-          (n) => `<label class="check-item ${selected.has(n.id) ? 'on' : ''}" data-node="${n.id}">
-        <input type="checkbox" ${selected.has(n.id) ? 'checked' : ''} value="${n.id}">
-        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-          ${esc(n.name)}
-          <span style="color:var(--muted);font-size:11px"> · ${n.protocol}${n.mode === 'standalone' ? ' · 独立' : ''}</span>
-        </span>
-      </label>`,
-        )
-        .join('')
-    : '<div class="hint">还没有节点，请先去「节点」页添加</div>';
-
+function planForm(plan) {
+  const p = plan || { color: '#4c8dff', quotaGB: 100, days: 30, sort: 1 };
   return `
     <div class="form-row">
       <div class="field">
@@ -674,22 +695,22 @@ function planForm(plan, nodes) {
       <label>描述</label>
       <input type="text" id="p-desc" value="${esc(p.desc || '')}" placeholder="一句话说明这个套餐适合谁">
     </div>
+    <div class="form-row">
+      <div class="field">
+        <label>流量额度（GB）</label>
+        <input type="number" id="p-quota" value="${p.quotaGB != null ? p.quotaGB : 100}" min="0">
+        <div class="hint">归属该套餐的用户共用此额度，用户侧不可修改</div>
+      </div>
+      <div class="field">
+        <label>有效期（天）</label>
+        <input type="number" id="p-days" value="${p.days != null ? p.days : 30}" min="0">
+        <div class="hint">用户加入套餐后按此计算到期时间，填 0 表示永久</div>
+      </div>
+    </div>
     <div class="field">
       <label>排序</label>
       <input type="number" id="p-sort" value="${p.sort || 1}" min="1">
-    </div>
-    <div class="field">
-      <label>包含节点</label>
-      <div class="check-grid" id="p-nodes">${items}</div>
-      <div class="hint">勾选的节点才会出现在该套餐用户的订阅里</div>
     </div>`;
-}
-
-function bindPlanForm(mask) {
-  $('#p-nodes', mask).addEventListener('change', (e) => {
-    const label = e.target.closest('.check-item');
-    if (label) label.classList.toggle('on', e.target.checked);
-  });
 }
 
 function readPlanForm(mask) {
@@ -697,42 +718,45 @@ function readPlanForm(mask) {
     name: $('#p-name', mask).value.trim(),
     desc: $('#p-desc', mask).value.trim(),
     color: $('#p-color', mask).value,
+    quotaGB: Number($('#p-quota', mask).value) || 0,
+    days: Number($('#p-days', mask).value) || 0,
     sort: Number($('#p-sort', mask).value) || 1,
-    nodeIds: $$('#p-nodes input:checked', mask).map((i) => i.value),
   };
 }
 
 async function planNewFlow() {
-  const mask = openModal({
+  openModal({
     title: '新增套餐',
-    body: planForm(null, state.data.nodeList || []),
+    body: planForm(),
     okText: '创建',
-    onOk: async (m) => {
-      const payload = readPlanForm(m);
+    onOk: async (mask) => {
+      const payload = readPlanForm(mask);
       if (!payload.name) throw new Error('请填写套餐名称');
       await api('/api/plans', { method: 'POST', body: JSON.stringify(payload) });
-      toast('套餐已创建', 'ok');
+      toast('套餐已创建，去「节点」页把节点加入这个套餐', 'ok');
       render();
     },
   });
-  bindPlanForm(mask);
 }
 
 async function planEditFlow(id) {
   const p = state.data.plans.find((x) => x.id === id);
   if (!p) return;
-  const mask = openModal({
+  openModal({
     title: '编辑套餐 · ' + p.name,
-    body: planForm(p, state.data.nodeList || []),
-    onOk: async (m) => {
-      const payload = readPlanForm(m);
+    body: planForm(p) + `
+      <p class="hint" style="margin-top:14px">
+        当前 ${p.nodeCount} 个节点归属此套餐，${p.userCount} 位用户在用。
+        修改额度或有效期会立即同步到这些用户。
+      </p>`,
+    onOk: async (mask) => {
+      const payload = readPlanForm(mask);
       if (!payload.name) throw new Error('请填写套餐名称');
-      await api('/api/plans/' + id, { method: 'PUT', body: JSON.stringify(payload) });
-      toast('已保存', 'ok');
+      const r = await api('/api/plans/' + id, { method: 'PUT', body: JSON.stringify(payload) });
+      toast(r.synced ? `已保存，${r.synced} 位用户的额度/到期已同步` : '已保存', 'ok');
       render();
     },
   });
-  bindPlanForm(mask);
 }
 
 /* ============================== 节点 ============================== */
@@ -1023,7 +1047,10 @@ function nodeForm(node, servers) {
         </div>
         <div class="field">
           <label>混淆密码</label>
-          <input type="text" id="h-obfs-pass" value="${esc(h.obfsPassword || '')}" placeholder="混淆开启时必填">
+          <div class="gen-group">
+            <input type="text" id="h-obfs-pass" value="${esc(h.obfsPassword || '')}" placeholder="混淆开启时必填">
+            <button class="btn btn-sm" id="gen-obfs" type="button" style="flex-shrink:0">生成</button>
+          </div>
         </div>
       </div>
       <div class="form-row">
@@ -1041,6 +1068,17 @@ function nodeForm(node, servers) {
         <input type="text" id="h-mask" value="${esc(h.maskUrl || '')}" placeholder="https://news.ycombinator.com/">
         <div class="hint">未通过认证的访问会跳转到这个网站</div>
       </div>
+    </div>
+
+    <div class="section-title">归属套餐</div>
+    <div class="field">
+      <label>套餐（可多选）</label>
+      <div class="ms" id="n-plans">
+        <button type="button" class="ms-toggle">
+          <span class="ms-text">未选择套餐</span><span class="caret">▼</span>
+        </button>
+      </div>
+      <div class="hint">决定哪些套餐的用户能看到这个节点；不选则只有「不限套餐」的用户可用。</div>
     </div>
 
     <div class="section-title">中转入口</div>
@@ -1150,6 +1188,80 @@ function bindNodeForm(mask) {
       toast(err.message, 'err');
     }
   });
+
+  /* 套餐多选下拉框 */
+  const selectedPlans = new Set(
+    (Array.isArray(state.editingNode && state.editingNode.planIds) ? state.editingNode.planIds : []),
+  );
+  const allPlans = state.data.planList || [];
+  const msToggle = $('.ms-toggle', mask);
+  const msText = $('.ms-text', mask);
+
+  const renderMs = () => {
+    const names = allPlans.filter((p) => selectedPlans.has(p.id)).map((p) => p.name);
+    msText.textContent = names.length ? names.join('、') : '未选择套餐';
+    msText.style.color = names.length ? 'var(--text)' : 'var(--muted)';
+  };
+
+  const renderMsPanel = () => {
+    const old = $('.ms-panel', mask);
+    if (old) old.remove();
+    if (!allPlans.length) {
+      $('.ms', mask).insertAdjacentHTML(
+        'beforeend',
+        '<div class="ms-panel"><div class="ms-empty">还没有套餐，请先到「套餐」页创建</div></div>',
+      );
+      return;
+    }
+    $('.ms', mask).insertAdjacentHTML(
+      'beforeend',
+      `<div class="ms-panel">${allPlans
+        .map(
+          (p) => `<label class="check-item ${selectedPlans.has(p.id) ? 'on' : ''}">
+        <input type="checkbox" value="${p.id}" ${selectedPlans.has(p.id) ? 'checked' : ''} style="width:auto;margin:0">
+        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)}</span>
+        <span class="hint" style="margin:0 0 0 auto">${p.quotaGB ? p.quotaGB + 'GB' : '不限'} / ${p.days ? p.days + '天' : '永久'}</span>
+      </label>`,
+        )
+        .join('')}</div>`,
+    );
+  };
+
+  msToggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const panel = $('.ms-panel', mask);
+    if (panel) panel.remove();
+    else renderMsPanel();
+  });
+
+  $('#n-plans', mask).addEventListener('change', (e) => {
+    if (!e.target.matches('input[type=checkbox]')) return;
+    if (e.target.checked) selectedPlans.add(e.target.value);
+    else selectedPlans.delete(e.target.value);
+    e.target.closest('.check-item').classList.toggle('on', e.target.checked);
+    renderMs();
+  });
+
+  // 点击别处收起
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#n-plans')) {
+      const panel = $('.ms-panel', mask);
+      if (panel) panel.remove();
+    }
+  });
+
+  renderMs();
+
+  /* Hysteria2 混淆密码生成 */
+  const genObfs = $('#gen-obfs', mask);
+  if (genObfs) {
+    genObfs.addEventListener('click', () => {
+      const arr = new Uint8Array(12);
+      crypto.getRandomValues(arr);
+      $('#h-obfs-pass', mask).value = [...arr].map((b) => b.toString(16).padStart(2, '0')).join('');
+      toast('已生成随机混淆密码', 'ok');
+    });
+  }
 
   /* 中转入口编辑器 */
   const entries = (Array.isArray(state.editingNode && state.editingNode.entries)
@@ -1276,6 +1388,7 @@ function readNodeForm(mask) {
     fp: v('#n-fp'),
     vlessEncryption: protocol === 'vless' ? $('#n-ve', mask).checked : false,
     entries: draft.filter((e) => e.host),
+    planIds: [...selectedPlans],
     certMode,
     certFile: v('#n-cert'),
     keyFile: v('#n-key'),

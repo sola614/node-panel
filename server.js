@@ -207,9 +207,6 @@ function listPlans(req, res) {
       .slice()
       .sort((a, b) => (a.sort || 0) - (b.sort || 0))
       .map(store.publicPlan),
-    nodes: db.nodes.map((n) => ({
-      id: n.id, name: n.name, protocol: n.protocol, mode: n.mode, enabled: n.enabled,
-    })),
   });
 }
 
@@ -221,7 +218,8 @@ function createPlan(req, res, params, body) {
     name,
     desc: String(body.desc || ''),
     color: String(body.color || '#4c8dff'),
-    nodeIds: Array.isArray(body.nodeIds) ? body.nodeIds.filter((id) => store.db().nodes.some((n) => n.id === id)) : [],
+    quotaGB: Number(body.quotaGB) || 0,
+    days: Number(body.days) || 0,
     sort: Number(body.sort) || store.db().plans.length + 1,
     createdAt: store.iso(),
   };
@@ -237,11 +235,18 @@ function updatePlan(req, res, params, body) {
   if (body.desc !== undefined) plan.desc = String(body.desc);
   if (body.color !== undefined) plan.color = String(body.color);
   if (body.sort !== undefined) plan.sort = Number(body.sort) || plan.sort;
-  if (body.nodeIds !== undefined) {
-    plan.nodeIds = (body.nodeIds || []).filter((id) => store.db().nodes.some((n) => n.id === id));
-  }
+  if (body.quotaGB !== undefined) plan.quotaGB = Number(body.quotaGB) || 0;
+  if (body.days !== undefined) plan.days = Number(body.days) || 0;
+
+  // 套餐额度/有效期变更要同步到所有归属用户（用户侧不可修改）
+  const db = store.db();
+  let synced = 0;
+  db.users.forEach((u) => {
+    if (u.planId !== plan.id) return;
+    if (store.applyPlanToUser(u)) synced++;
+  });
   store.save();
-  sendJson(res, 200, { ok: true, item: store.publicPlan(plan) });
+  sendJson(res, 200, { ok: true, item: store.publicPlan(plan), synced });
 }
 
 function deletePlan(req, res, params) {
@@ -284,12 +289,14 @@ function createUser(req, res, params, body) {
     token: store.rnd(16),
     planId: body.planId || null,
     enabled: body.enabled !== false,
-    quotaGB: Number(body.quotaGB) || 0,
+    // 有套餐时额度与到期由套餐决定；无套餐才允许手填
+    quotaGB: body.planId ? 0 : Number(body.quotaGB) || 0,
     usedBytes: 0,
-    expireAt: body.expireAt ? new Date(body.expireAt).toISOString() : store.daysFromNow(30),
+    expireAt: body.planId ? null : body.expireAt ? new Date(body.expireAt).toISOString() : store.daysFromNow(30),
     note: String(body.note || ''),
     createdAt: store.iso(),
   };
+  store.applyPlanToUser(u);
   store.db().users.push(u);
   store.save();
   sendJson(res, 200, { ok: true, item: store.publicUser(u) });
@@ -299,12 +306,30 @@ function updateUser(req, res, params, body) {
   const u = store.db().users.find((x) => x.id === params.id);
   if (!u) return sendJson(res, 404, { error: '用户不存在' });
   if (body.name !== undefined) u.name = String(body.name).trim() || u.name;
-  if (body.quotaGB !== undefined) u.quotaGB = Number(body.quotaGB) || 0;
-  if (body.expireAt !== undefined) u.expireAt = body.expireAt ? new Date(body.expireAt).toISOString() : null;
   if (body.enabled !== undefined) u.enabled = !!body.enabled;
   if (body.note !== undefined) u.note = String(body.note);
-  if (body.planId !== undefined) u.planId = body.planId || null;
   if (body.resetTraffic) u.usedBytes = 0;
+
+  const planChanged = body.planId !== undefined && body.planId !== u.planId;
+  if (planChanged) {
+    u.planId = body.planId || null;
+    // 无套餐时才接受手填的额度与到期
+    if (!u.planId) {
+      if (body.quotaGB !== undefined) u.quotaGB = Number(body.quotaGB) || 0;
+      u.expireAt = body.expireAt !== undefined
+        ? (body.expireAt ? new Date(body.expireAt).toISOString() : null)
+        : store.daysFromNow(30);
+    }
+  } else if (!u.planId) {
+    if (body.quotaGB !== undefined) u.quotaGB = Number(body.quotaGB) || 0;
+    if (body.expireAt !== undefined) {
+      u.expireAt = body.expireAt ? new Date(body.expireAt).toISOString() : null;
+    }
+  }
+
+  // 有套餐：额度与到期永远跟随套餐
+  if (u.planId) store.applyPlanToUser(u);
+
   store.save();
   sendJson(res, 200, { ok: true, item: store.publicUser(u) });
 }
@@ -394,6 +419,11 @@ function normalizeNode(body, prev = {}) {
 
   if (mode === 'standalone' && !node.token) node.token = store.rnd(20);
 
+  // 节点归属套餐（多选）：空数组表示不归任何套餐，只有不限套餐的用户能用
+  node.planIds = Array.isArray(body.planIds)
+    ? body.planIds.filter((id) => store.db().plans.some((p) => p.id === id))
+    : prev.planIds || [];
+
   // 独立节点的地址来源：自动上报模式下允许先不填地址
   node.ipMode =
     mode === 'standalone' && (body.ipMode === 'auto' || prev.ipMode === 'auto') ? 'auto' : 'manual';
@@ -441,9 +471,10 @@ function listNodes(req, res) {
       host: store.nodeHost(n),
       addressSource: n.mode === 'standalone' ? store.addressSource(n) : '',
       label: store.nodeLabel(n),
-      plans: db.plans.filter((p) => p.nodeIds.includes(n.id)).map((p) => ({ id: p.id, name: p.name, color: p.color })),
+      plans: db.plans.filter((p) => (n.planIds || []).includes(p.id)).map((p) => ({ id: p.id, name: p.name, color: p.color })),
     })),
     servers: db.servers.map((s) => ({ id: s.id, name: s.name, host: s.host })),
+    plans: db.plans.map((p) => ({ id: p.id, name: p.name, color: p.color, quotaGB: p.quotaGB, days: p.days })),
   });
 }
 
@@ -483,9 +514,6 @@ function deleteNode(req, res, params) {
   const i = db.nodes.findIndex((n) => n.id === params.id);
   if (i < 0) return sendJson(res, 404, { error: '节点不存在' });
   db.nodes.splice(i, 1);
-  db.plans.forEach((p) => {
-    p.nodeIds = p.nodeIds.filter((id) => id !== params.id);
-  });
   store.save();
   sendJson(res, 200, { ok: true });
 }
@@ -576,12 +604,8 @@ function deleteServer(req, res, params) {
   const db = store.db();
   const i = db.servers.findIndex((x) => x.id === params.id);
   if (i < 0) return sendJson(res, 404, { error: '服务器不存在' });
-  const removed = db.nodes.filter((n) => n.serverId === params.id).map((n) => n.id);
   db.servers.splice(i, 1);
   db.nodes = db.nodes.filter((n) => n.serverId !== params.id);
-  db.plans.forEach((p) => {
-    p.nodeIds = p.nodeIds.filter((id) => !removed.includes(id));
-  });
   store.save();
   sendJson(res, 200, { ok: true });
 }
@@ -894,13 +918,9 @@ function resolveScope(token, ip) {
   return null;
 }
 
-/**
- * 某节点应向哪些用户开放。
- * 除了节点自身套餐，还要算上「入口自有套餐」——否则中转把用户送进来，
- * 节点却不认这个用户，链路是通的但连不上。
- */
 function usersForNode(node, activeUsers) {
   const db = store.db();
+  const nodePlans = new Set(node.planIds || []);
   const entryPlans = new Set();
   for (const e of node.entries || []) {
     if (Array.isArray(e.planIds)) e.planIds.forEach((p) => entryPlans.add(p));
@@ -908,9 +928,8 @@ function usersForNode(node, activeUsers) {
 
   return activeUsers.filter((u) => {
     if (!u.planId) return true;
-    if (entryPlans.has(u.planId)) return true;
-    const plan = db.plans.find((p) => p.id === u.planId);
-    return plan ? plan.nodeIds.includes(node.id) : false;
+    // 节点套餐或任一入口的自有套餐命中即可
+    return nodePlans.has(u.planId) || entryPlans.has(u.planId);
   });
 }
 
@@ -921,6 +940,9 @@ function buildAgentPayload(scope) {
 
   const xrayNodes = nodes.filter((n) => n.protocol !== 'hysteria2');
   const hyNodes = nodes.filter((n) => n.protocol === 'hysteria2');
+
+  // 同一作用域内统一分配统计端口，避免节点间碰撞导致流量串号
+  const statsPorts = hysteria.allocateStatsPorts(hyNodes);
 
   const usersResolver = (node) => usersForNode(node, active);
 
@@ -934,9 +956,9 @@ function buildAgentPayload(scope) {
       nodeId: n.id,
       name: n.name,
       port: Number(n.port),
-      statsPort: hysteria.statsPortFor(n),
+      statsPort: statsPorts.get(n.id),
       secret: hysteria.secretFor(n),
-      yaml: hysteria.toYamlFile(n, users, db.settings.siteName),
+      yaml: hysteria.toYamlFile(n, users, db.settings.siteName, statsPorts.get(n.id)),
       userCount: users.length,
     };
   });
