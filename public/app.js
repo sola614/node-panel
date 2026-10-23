@@ -94,6 +94,171 @@ async function copyText(text) {
   toast('已复制到剪贴板', 'ok');
 }
 
+/* ============================== 加载态控制 ============================== */
+
+/**
+ * 所有会打到后端的按钮都套一层 withLoading：
+ * 点击瞬间锁定按钮（禁用 + 转圈），请求返回后才解锁。
+ * 这样连点、手抖、网络慢时的重复提交都被挡在入口。
+ */
+const BUSY = new WeakSet();
+
+function lockBtn(btn, label) {
+  if (!btn || BUSY.has(btn) || btn.disabled) return false;
+  BUSY.add(btn);
+
+  const width = btn.offsetWidth;
+  btn.dataset.rawHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.classList.add('is-loading');
+  // 换成「转圈 + 文案」时锁住原宽度，避免按钮抽动导致旁边元素跳位
+  if (label) {
+    if (width) btn.style.minWidth = width + 'px';
+    btn.innerHTML = `<i class="spinner"></i>${esc(label)}`;
+  }
+  return true;
+}
+
+function unlockBtn(btn) {
+  if (!btn || !BUSY.has(btn)) return;
+  BUSY.delete(btn);
+  btn.disabled = false;
+  btn.classList.remove('is-loading');
+  if (btn.dataset.rawHtml != null) {
+    btn.innerHTML = btn.dataset.rawHtml;
+    delete btn.dataset.rawHtml;
+  }
+  if (btn.style.minWidth) btn.style.minWidth = '';
+}
+
+async function withLoading(btn, fn, label = '') {
+  if (!lockBtn(btn, label)) return; // 已在请求中，本次点击直接丢弃
+  try {
+    return await fn();
+  } finally {
+    unlockBtn(btn);
+  }
+}
+
+/* ============================== 订阅域名校验 ============================== */
+
+const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+function isHostName(host) {
+  if (!host) return false;
+  if (IPV4_RE.test(host)) return true;
+  if (/^\[[0-9a-f:.]+\]$/i.test(host)) return true; // IPv6 字面量
+  if (host.length > 253) return false;
+
+  const labels = host.split('.');
+  // 至少两段：单段的 111 / abc 不是可用域名
+  if (labels.length < 2) return false;
+  if (!labels.every((l) => LABEL_RE.test(l))) return false;
+  return /^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i.test(labels[labels.length - 1]);
+}
+
+/**
+ * 从原始文本里抠出主机名。
+ * 不能只看 new URL().hostname：URL 规范会把 111 当成 IPv4 简写解析成 0.0.0.111，
+ * 于是「111」这种明显填错的值反而能过校验。所以数字写法要回到原文上判断。
+ */
+function rawHostOf(text) {
+  const noScheme = text.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  const authority = noScheme.split(/[/?#]/)[0];
+  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+  if (hostPort.startsWith('[')) {
+    const end = hostPort.indexOf(']');
+    return end === -1 ? hostPort : hostPort.slice(0, end + 1);
+  }
+  return hostPort.split(':')[0].replace(/\.$/, '');
+}
+
+/** 综合判断：纯数字写法必须是严格的四段 IPv4，其余交给 URL 规范化后的主机名 */
+function isValidHost(rawHost, normalizedHost) {
+  if (/^[\d.]+$/.test(rawHost)) return IPV4_RE.test(rawHost);
+  return isHostName(String(normalizedHost || '').replace(/\.$/, ''));
+}
+
+/**
+ * 规范化并校验「订阅对外域名」。
+ * 返回 { value, error }：error 为空表示通过，value 是补全协议、去掉尾斜杠后的地址。
+ * 空值合法，表示自动跟随当前访问地址。
+ */
+function normalizeSubBase(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) return { value: '', error: '' };
+
+  let url;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : 'https://' + text);
+  } catch {
+    return { value: text, error: '格式不正确，请填写完整地址，如 https://sub.example.com' };
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { value: text, error: '只支持 http:// 或 https:// 开头的地址' };
+  }
+  if (url.username || url.password) {
+    return { value: text, error: '地址里不能带账号密码' };
+  }
+  if (url.search || url.hash) {
+    return { value: text, error: '地址里不要带 ? 查询参数或 # 片段' };
+  }
+  if (url.pathname.replace(/\/+$/, '')) {
+    return { value: text, error: '只需填到域名（可带端口），不要带路径' };
+  }
+  if (!isValidHost(rawHostOf(text), url.hostname)) {
+    return { value: text, error: '域名不合法：需要是 IP 或带点号的域名，如 sub.example.com' };
+  }
+  return { value: url.origin, error: '' };
+}
+
+const SUB_BASE_HINT = '留空则自动使用当前访问地址；只填域名（可带端口），不要带路径';
+
+/** 就地校验设置页的域名输入框：贴错误提示、画红框，返回校验结果
+ *  paint=false 只刷新提示文案，不画红框（用于初次渲染，避免一进页面就一片红） */
+function checkSubBaseField(paint = true) {
+  const input = $('#set-base');
+  if (!input) return { value: '', error: '' };
+
+  const r = normalizeSubBase(input.value);
+  const err = $('#set-base-err');
+  const hint = $('#set-base-hint');
+
+  input.classList.toggle('invalid', paint && !!r.error);
+  if (err) {
+    err.hidden = !(paint && r.error);
+    err.textContent = (paint && r.error) || '';
+  }
+  if (hint) {
+    hint.textContent = r.error
+      ? SUB_BASE_HINT
+      : r.value
+        ? `订阅链接将形如 ${r.value}/s/<用户 token>`
+        : SUB_BASE_HINT;
+  }
+  return r;
+}
+
+function bindSubBaseField() {
+  const input = $('#set-base');
+  if (!input) return;
+
+  // 打字时先撤掉红框，别边输边报错；失焦再正式校验
+  input.addEventListener('input', () => {
+    input.classList.remove('invalid');
+    const err = $('#set-base-err');
+    if (err) err.hidden = true;
+  });
+
+  input.addEventListener('blur', () => {
+    const r = normalizeSubBase(input.value);
+    if (!r.error && r.value) input.value = r.value; // 补全协议、去掉尾部斜杠
+    checkSubBaseField();
+  });
+}
+
 /* ============================== 请求封装 ============================== */
 
 async function api(path, options = {}) {
@@ -155,16 +320,19 @@ function openModal({ title, body, wide, okText = '保存', cancelText = '取消'
 
   const okBtn = $('[data-ok]', mask);
   if (okBtn && onOk) {
-    okBtn.addEventListener('click', async () => {
-      okBtn.disabled = true;
-      try {
-        const keep = await onOk(mask);
-        if (keep !== false) closeModal();
-      } catch (err) {
-        showError(err);
-      } finally {
-        okBtn.disabled = false;
-      }
+    okBtn.addEventListener('click', () => {
+      withLoading(
+        okBtn,
+        async () => {
+          try {
+            const keep = await onOk(mask);
+            if (keep !== false) closeModal();
+          } catch (err) {
+            showError(err);
+          }
+        },
+        '处理中',
+      );
     });
   }
   return mask;
@@ -203,28 +371,37 @@ function logoutLocal(silent) {
 $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const btn = $('#login-form button');
-  btn.disabled = true;
-  try {
-    const data = await api('/api/login', {
-      method: 'POST',
-      body: JSON.stringify({ username: $('#login-user').value.trim(), password: $('#login-pass').value }),
-    });
-    state.token = data.token;
-    localStorage.setItem('np_token', data.token);
-    await boot();
-  } catch (err) {
-    showError(err);
-  } finally {
-    btn.disabled = false;
-  }
+  await withLoading(
+    btn,
+    async () => {
+      try {
+        const data = await api('/api/login', {
+          method: 'POST',
+          body: JSON.stringify({ username: $('#login-user').value.trim(), password: $('#login-pass').value }),
+        });
+        state.token = data.token;
+        localStorage.setItem('np_token', data.token);
+        await boot();
+      } catch (err) {
+        showError(err);
+      }
+    },
+    '登录中',
+  );
 });
 
 $('#logout').addEventListener('click', async (e) => {
   e.preventDefault();
-  try {
-    await api('/api/logout', { method: 'POST' });
-  } catch { /* 忽略 */ }
-  logoutLocal();
+  await withLoading(
+    e.currentTarget,
+    async () => {
+      try {
+        await api('/api/logout', { method: 'POST' });
+      } catch { /* 忽略 */ }
+      logoutLocal();
+    },
+    '退出中',
+  );
 });
 
 /* ============================== 导航与收起 ============================== */
@@ -273,16 +450,22 @@ $('#collapse').addEventListener('click', () => {
   applyCollapse(next);
 });
 
+// 每次渲染领一个序号：慢的旧请求回来时不再覆盖新页面
+let renderSeq = 0;
+
 async function render() {
-  const cfg = VIEWS[state.view];
-  $$('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === state.view));
+  const seq = ++renderSeq;
+  const view = state.view;
+  const cfg = VIEWS[view];
+  $$('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
   $('#page-title').textContent = cfg.title;
   $('#page-sub').textContent = cfg.sub;
   $('#page-actions').innerHTML = '';
-  $('#view').innerHTML = '<div class="empty">加载中…</div>';
+  $('#view').innerHTML = '<div class="empty"><i class="spinner" style="margin-right:7px"></i>加载中…</div>';
   try {
-    await RENDERERS[state.view]();
+    await RENDERERS[view]();
   } catch (err) {
+    if (seq !== renderSeq) return;
     if (state.token) $('#view').innerHTML = `<div class="empty"><b>加载失败</b>${esc(err.message)}</div>`;
   }
 }
@@ -604,30 +787,39 @@ function moreMenu(u) {
     const btn = e.target.closest('[data-mm]');
     if (!btn) return;
     const act = btn.dataset.mm;
-    try {
-      if (act === 'reset') {
-        await api('/api/users/' + u.id, { method: 'PUT', body: JSON.stringify({ resetTraffic: true }) });
-        toast('流量已重置', 'ok');
-      } else if (act === 'rotate') {
-        await api('/api/users/' + u.id + '/rotate', { method: 'POST' });
-        toast('已重新生成', 'ok');
-      } else if (act === 'traffic') {
-        await api('/api/demo/traffic', { method: 'POST', body: JSON.stringify({ userId: u.id, mb: 200 }) });
-        toast('已注入演示流量', 'ok');
-      } else if (act === 'del') {
-        closeModal();
-        confirmDialog('删除用户', `确定删除「${u.name}」？该用户的订阅链接将立即失效，此操作不可撤销。`, async () => {
-          await api('/api/users/' + u.id, { method: 'DELETE' });
-          toast('已删除', 'ok');
-          render();
-        });
-        return;
-      }
+
+    if (act === 'del') {
       closeModal();
-      render();
-    } catch (err) {
-      showError(err);
+      confirmDialog('删除用户', `确定删除「${u.name}」？该用户的订阅链接将立即失效，此操作不可撤销。`, async () => {
+        await api('/api/users/' + u.id, { method: 'DELETE' });
+        toast('已删除', 'ok');
+        render();
+      });
+      return;
     }
+
+    await withLoading(
+      btn,
+      async () => {
+        try {
+          if (act === 'reset') {
+            await api('/api/users/' + u.id, { method: 'PUT', body: JSON.stringify({ resetTraffic: true }) });
+            toast('流量已重置', 'ok');
+          } else if (act === 'rotate') {
+            await api('/api/users/' + u.id + '/rotate', { method: 'POST' });
+            toast('已重新生成', 'ok');
+          } else if (act === 'traffic') {
+            await api('/api/demo/traffic', { method: 'POST', body: JSON.stringify({ userId: u.id, mb: 200 }) });
+            toast('已注入演示流量', 'ok');
+          }
+          closeModal();
+          render();
+        } catch (err) {
+          showError(err);
+        }
+      },
+      '处理中',
+    );
   });
 }
 
@@ -1257,16 +1449,23 @@ function bindNodeForm(mask) {
     sync();
   });
 
-  $('#gen-keys', mask).addEventListener('click', async () => {
-    try {
-      const k = await api('/api/reality/keys', { method: 'POST' });
-      $('#r-priv', mask).textContent = k.privateKey;
-      $('#r-pub', mask).textContent = k.publicKey;
-      $('#r-sid', mask).value = k.shortId;
-      toast('已生成 Reality 密钥对', 'ok');
-    } catch (err) {
-      showError(err);
-    }
+  const genKeysBtn = $('#gen-keys', mask);
+  genKeysBtn.addEventListener('click', () => {
+    withLoading(
+      genKeysBtn,
+      async () => {
+        try {
+          const k = await api('/api/reality/keys', { method: 'POST' });
+          $('#r-priv', mask).textContent = k.privateKey;
+          $('#r-pub', mask).textContent = k.publicKey;
+          $('#r-sid', mask).value = k.shortId;
+          toast('已生成 Reality 密钥对', 'ok');
+        } catch (err) {
+          showError(err);
+        }
+      },
+      '生成中',
+    );
   });
 
   /* 套餐多选下拉框 */
@@ -1631,7 +1830,7 @@ async function nodePreviewFlow(id) {
 async function nodeDeployFlow(id) {
   const n = state.data.nodes.find((x) => x.id === id);
   if (!n) return;
-  const cmd = `curl -fsSL "${location.origin}/api/nodes/${n.id}/install?token=${n.token}" | sudo bash`;
+  const cmd = `curl -fsSL "${location.origin}/api/nodes/${n.id}/install?token=${n.token}" | sudo sh`;
 
   openModal({
     title: '独立部署 · ' + n.name,
@@ -1649,8 +1848,9 @@ async function nodeDeployFlow(id) {
         <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${n.online ? 'var(--ok)' : 'var(--muted)'}">${n.online ? '在线' : '离线'}</b></div>
       </div>
       <div class="code" style="white-space:pre-wrap"># 部署完成后
-journalctl -u nodepanel-agent -f     # 查看日志
-${n.protocol === 'hysteria2' ? 'systemctl status nodepanel-hysteria@node-' + n.id : 'systemctl status xray'}</div>
+journalctl -u nodepanel-agent -f      # 查看日志（systemd）
+tail -f /var/log/nodepanel/agent.log  # 查看日志（Alpine / cron）
+${n.protocol === 'hysteria2' ? 'ls /run/nodepanel/                  # Hysteria2 实例 pid' : 'systemctl status xray               # Xray 服务状态'}</div>
       <p class="hint" style="margin-top:14px">
         独立节点使用自己的 token 拉取配置，与服务器 agent 互不影响。修改节点后同样 60 秒内自动生效。
       </p>
@@ -1683,31 +1883,37 @@ ${n.protocol === 'hysteria2' ? 'systemctl status nodepanel-hysteria@node-' + n.i
     box.addEventListener('click', async (e) => {
       const btn = e.target.closest('[data-relay]');
       if (!btn) return;
-      const out = $('#relay-out', box);
-      out.innerHTML = '<div class="hint">正在生成…</div>';
-      try {
-        const q = new URLSearchParams({
-          to: n.host || '',
-          port: btn.dataset.port,
-          label: `${n.name} · ${btn.dataset.host}`,
-          proto: n.protocol === 'hysteria2' ? 'both' : 'tcp',
-        });
-        // 该接口返回纯文本脚本，不能走 api()
-        const res = await fetch('/api/relay/script?' + q.toString(), {
-          headers: { Authorization: 'Bearer ' + state.token },
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.error || '生成失败');
-        }
-        const script = await res.text();
-        out.innerHTML = `<div class="code-wrap">
-          <pre class="code">${esc(script)}</pre>
-          <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(script)}">复制</button>
-        </div>`;
-      } catch (err) {
-        out.innerHTML = `<div class="hint">生成失败：${esc(err.message)}</div>`;
-      }
+      await withLoading(
+        btn,
+        async () => {
+          const out = $('#relay-out', box);
+          out.innerHTML = '<div class="hint">正在生成…</div>';
+          try {
+            const q = new URLSearchParams({
+              to: n.host || '',
+              port: btn.dataset.port,
+              label: `${n.name} · ${btn.dataset.host}`,
+              proto: n.protocol === 'hysteria2' ? 'both' : 'tcp',
+            });
+            // 该接口返回纯文本脚本，不能走 api()
+            const res = await fetch('/api/relay/script?' + q.toString(), {
+              headers: { Authorization: 'Bearer ' + state.token },
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err.error || '生成失败');
+            }
+            const script = await res.text();
+            out.innerHTML = `<div class="code-wrap">
+              <pre class="code">${esc(script)}</pre>
+              <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(script)}">复制</button>
+            </div>`;
+          } catch (err) {
+            out.innerHTML = `<div class="hint">生成失败：${esc(err.message)}</div>`;
+          }
+        },
+        '生成中',
+      );
     });
   } else {
     box.innerHTML = `
@@ -1885,7 +2091,7 @@ async function serverEditFlow(id) {
 async function serverDeployFlow(id) {
   const s = state.data.servers.find((x) => x.id === id);
   if (!s) return;
-  const cmd = `curl -fsSL "${location.origin}/api/servers/${s.id}/install?token=${s.token}" | sudo bash`;
+  const cmd = `curl -fsSL "${location.origin}/api/servers/${s.id}/install?token=${s.token}" | sudo sh`;
   const nodes = (state.data.nodes || []).filter((n) => n.serverId === s.id && n.mode === 'server');
 
   openModal({
@@ -1893,7 +2099,7 @@ async function serverDeployFlow(id) {
     wide: true,
     footer: false,
     body: `
-      <p class="hint" style="margin:0 0 10px">在服务器终端（root）执行以下命令，agent 会自动安装并注册为 systemd 服务：</p>
+      <p class="hint" style="margin:0 0 10px">在服务器终端（root）执行以下命令。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
       <div class="code-wrap">
         <pre class="code">${esc(cmd)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(cmd)}">复制</button>
@@ -1906,8 +2112,10 @@ async function serverDeployFlow(id) {
       </div>
 
       <div class="code" style="white-space:pre-wrap"># 部署完成后可用命令
-journalctl -u nodepanel-agent -f              # 查看 agent 日志
+journalctl -u nodepanel-agent -f              # 查看 agent 日志（systemd）
+tail -f /var/log/nodepanel/agent.log          # 查看 agent 日志（Alpine / cron）
 systemctl restart nodepanel-agent             # 手动重载
+sh /opt/nodepanel/agent.sh --once             # 手动跑一轮
 cat /usr/local/etc/xray/config.json           # 查看 Xray 配置
 ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</div>
 
@@ -1934,8 +2142,9 @@ RENDERERS.settings = async () => {
           </div>
           <div class="field">
             <label>订阅对外域名</label>
-            <input type="text" id="set-base" value="${esc(s.subBase || '')}" placeholder="留空则自动使用当前访问地址">
-            <div class="hint">如果面板在反代后面，建议填写客户端可访问的完整地址，如 https://sub.example.com</div>
+            <input type="text" id="set-base" value="${esc(s.subBase || '')}" placeholder="https://sub.example.com" spellcheck="false" autocomplete="off">
+            <div class="hint" id="set-base-hint">${SUB_BASE_HINT}</div>
+            <div class="field-err" id="set-base-err" hidden></div>
           </div>
           <div class="field">
             <label>订阅页公告</label>
@@ -1978,9 +2187,22 @@ GET  /s/:userToken?format=clash         订阅（Clash YAML）
 GET  /api/health                        健康检查（容器探针）</pre>
       </div>
     </div>`;
+
+  bindSubBaseField();
+  checkSubBaseField(false);
 };
 
 /* ============================== 事件委托 ============================== */
+
+/** 真正会打后端的动作才显示「转圈 + 文案」；开弹窗这类瞬时动作只上锁不换字 */
+const ACT_LOADING = {
+  refresh: '加载中',
+  demo: '注入中',
+  'node-preview': '生成中',
+  'entry-script': '生成中',
+  'save-settings': '保存中',
+  'change-pw': '提交中',
+};
 
 document.addEventListener('click', async (e) => {
   const copyBtn = e.target.closest('[data-copy]');
@@ -1991,158 +2213,176 @@ document.addEventListener('click', async (e) => {
 
   const btn = e.target.closest('[data-act]');
   if (!btn) return;
-  const act = btn.dataset.act;
-  const id = btn.dataset.id;
 
-  try {
-    switch (act) {
-      case 'refresh':
-        render();
-        break;
-      case 'demo': {
-        const d = await api('/api/demo/traffic', { method: 'POST', body: JSON.stringify({ mb: 300 }) });
-        toast(`已为 ${d.users} 位用户注入 ${fmtBytes(d.bytes)} 流量`, 'ok');
-        render();
-        break;
+  const act = btn.dataset.act;
+  // 统一上锁：请求返回前同一按钮的再次点击会被直接丢弃
+  await withLoading(
+    btn,
+    async () => {
+      try {
+        await runAction(act, btn, btn.dataset.id);
+      } catch (err) {
+        showError(err);
       }
-      case 'user-new':
-        await createUserFlow();
-        break;
-      case 'user-edit':
-        await editUserFlow(id);
-        break;
-      case 'user-more': {
-        const u = state.data.users.find((x) => x.id === id);
-        if (u) moreMenu(u);
-        break;
-      }
-      case 'plan-new':
-        await planNewFlow();
-        break;
-      case 'plan-edit':
-        await planEditFlow(id);
-        break;
-      case 'plan-del':
-        confirmDialog('删除套餐', '删除后，使用该套餐的用户会变成「不限套餐」，可见全部节点。', async () => {
-          const r = await api('/api/plans/' + id, { method: 'DELETE' });
-          toast(r.affected ? `已删除，${r.affected} 位用户转为不限套餐` : '已删除', 'ok');
-          render();
-        });
-        break;
-      case 'node-new':
-        await nodeNewFlow();
-        break;
-      case 'node-edit':
-        await nodeEditFlow(id);
-        break;
-      case 'node-preview':
-        await nodePreviewFlow(id);
-        break;
-      case 'node-deploy':
-        await nodeDeployFlow(id);
-        break;
-      case 'node-toggle': {
-        // 纯 DOM 切换，不整页重渲染 —— 否则滚动位置会跳回顶部
-        const nowOpen = !state.treeOpen.has(id);
-        if (nowOpen) state.treeOpen.add(id);
-        else state.treeOpen.delete(id);
-        $$(`tr.tree-child[data-parent="${id}"]`).forEach((tr) => {
-          tr.classList.toggle('collapsed', !nowOpen);
-        });
-        btn.classList.toggle('open', nowOpen);
-        break;
-      }
-      case 'entry-script': {
-        const node = state.data.nodes.find((x) => x.id === id);
-        const entry = node && (node.entries || []).find((e) => e.id === btn.dataset.entry);
-        if (!node || !entry) throw new Error('入口不存在，请刷新后重试');
-        const port = entry.port || node.port;
-        const q = new URLSearchParams({
-          to: node.host || '',
-          port,
-          label: `${node.name} · ${entry.name || entry.host}`,
-          proto: node.protocol === 'hysteria2' ? 'both' : 'tcp',
-        });
-        // 该接口返回纯文本脚本，不能走 api()
-        const res = await fetch('/api/relay/script?' + q.toString(), {
-          headers: { Authorization: 'Bearer ' + state.token },
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.error || '生成失败');
-        }
-        const script = await res.text();
-        openModal({
-          title: '中转脚本 · ' + (entry.name || entry.host),
-          wide: true,
-          footer: false,
-          body: `<p class="hint" style="margin:0 0 12px">
-            在 <b>${esc(entry.host)}</b> 上以 root 执行，把本机 :${port} 的流量 DNAT 到
-            <b>${esc(node.host || '落地节点')}:${node.port}</b>。入口不解析协议，流量仍记在落地节点。
-          </p>
-          <div class="code-wrap">
-            <pre class="code">${esc(script)}</pre>
-            <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(script)}">复制</button>
-          </div>`,
-        });
-        break;
-      }
-      case 'node-del':
-        confirmDialog('删除节点', '删除后该节点将从服务器配置中移除，相关订阅链接失效。', async () => {
-          await api('/api/nodes/' + id, { method: 'DELETE' });
-          toast('节点已删除', 'ok');
-          render();
-        });
-        break;
-      case 'server-new':
-        await serverNewFlow();
-        break;
-      case 'server-edit':
-        await serverEditFlow(id);
-        break;
-      case 'server-deploy':
-        await serverDeployFlow(id);
-        break;
-      case 'server-rotate':
-        confirmDialog('重置 token', '重置后旧 token 立即失效，服务器上的 agent 需重新部署才能继续同步。', async () => {
-          await api('/api/servers/' + id + '/rotate', { method: 'POST' });
-          toast('token 已重置', 'ok');
-          render();
-        });
-        break;
-      case 'server-del':
-        confirmDialog('删除服务器', '该服务器下的所有节点也会一并删除，此操作不可撤销。', async () => {
-          await api('/api/servers/' + id, { method: 'DELETE' });
-          toast('服务器已删除', 'ok');
-          render();
-        });
-        break;
-      case 'save-settings': {
-        await api('/api/settings', {
-          method: 'PUT',
-          body: JSON.stringify({
-            siteName: $('#set-name').value.trim(),
-            subBase: $('#set-base').value.trim(),
-            notice: $('#set-notice').value,
-          }),
-        });
-        toast('设置已保存', 'ok');
-        break;
-      }
-      case 'change-pw': {
-        await api('/api/admin/password', {
-          method: 'POST',
-          body: JSON.stringify({ oldPassword: $('#pw-old').value, newPassword: $('#pw-new').value }),
-        });
-        toast('密码已修改，请重新登录', 'ok');
-        setTimeout(() => logoutLocal(true), 800);
-        break;
-      }
-    }
-  } catch (err) {
-    showError(err);
-  }
+    },
+    ACT_LOADING[act] || '',
+  );
 });
+
+async function runAction(act, btn, id) {
+  switch (act) {
+    case 'refresh':
+      await render();
+      break;
+    case 'demo': {
+      const d = await api('/api/demo/traffic', { method: 'POST', body: JSON.stringify({ mb: 300 }) });
+      toast(`已为 ${d.users} 位用户注入 ${fmtBytes(d.bytes)} 流量`, 'ok');
+      await render();
+      break;
+    }
+    case 'user-new':
+      await createUserFlow();
+      break;
+    case 'user-edit':
+      await editUserFlow(id);
+      break;
+    case 'user-more': {
+      const u = state.data.users.find((x) => x.id === id);
+      if (u) moreMenu(u);
+      break;
+    }
+    case 'plan-new':
+      await planNewFlow();
+      break;
+    case 'plan-edit':
+      await planEditFlow(id);
+      break;
+    case 'plan-del':
+      confirmDialog('删除套餐', '删除后，使用该套餐的用户会变成「不限套餐」，可见全部节点。', async () => {
+        const r = await api('/api/plans/' + id, { method: 'DELETE' });
+        toast(r.affected ? `已删除，${r.affected} 位用户转为不限套餐` : '已删除', 'ok');
+        render();
+      });
+      break;
+    case 'node-new':
+      await nodeNewFlow();
+      break;
+    case 'node-edit':
+      await nodeEditFlow(id);
+      break;
+    case 'node-preview':
+      await nodePreviewFlow(id);
+      break;
+    case 'node-deploy':
+      await nodeDeployFlow(id);
+      break;
+    case 'node-toggle': {
+      // 纯 DOM 切换，不整页重渲染 —— 否则滚动位置会跳回顶部
+      const nowOpen = !state.treeOpen.has(id);
+      if (nowOpen) state.treeOpen.add(id);
+      else state.treeOpen.delete(id);
+      $$(`tr.tree-child[data-parent="${id}"]`).forEach((tr) => {
+        tr.classList.toggle('collapsed', !nowOpen);
+      });
+      btn.classList.toggle('open', nowOpen);
+      break;
+    }
+    case 'entry-script': {
+      const node = state.data.nodes.find((x) => x.id === id);
+      const entry = node && (node.entries || []).find((e) => e.id === btn.dataset.entry);
+      if (!node || !entry) throw new Error('入口不存在，请刷新后重试');
+      const port = entry.port || node.port;
+      const q = new URLSearchParams({
+        to: node.host || '',
+        port,
+        label: `${node.name} · ${entry.name || entry.host}`,
+        proto: node.protocol === 'hysteria2' ? 'both' : 'tcp',
+      });
+      // 该接口返回纯文本脚本，不能走 api()
+      const res = await fetch('/api/relay/script?' + q.toString(), {
+        headers: { Authorization: 'Bearer ' + state.token },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || '生成失败');
+      }
+      const script = await res.text();
+      openModal({
+        title: '中转脚本 · ' + (entry.name || entry.host),
+        wide: true,
+        footer: false,
+        body: `<p class="hint" style="margin:0 0 12px">
+          在 <b>${esc(entry.host)}</b> 上以 root 执行，把本机 :${port} 的流量 DNAT 到
+          <b>${esc(node.host || '落地节点')}:${node.port}</b>。入口不解析协议，流量仍记在落地节点。
+        </p>
+        <div class="code-wrap">
+          <pre class="code">${esc(script)}</pre>
+          <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(script)}">复制</button>
+        </div>`,
+      });
+      break;
+    }
+    case 'node-del':
+      confirmDialog('删除节点', '删除后该节点将从服务器配置中移除，相关订阅链接失效。', async () => {
+        await api('/api/nodes/' + id, { method: 'DELETE' });
+        toast('节点已删除', 'ok');
+        render();
+      });
+      break;
+    case 'server-new':
+      await serverNewFlow();
+      break;
+    case 'server-edit':
+      await serverEditFlow(id);
+      break;
+    case 'server-deploy':
+      await serverDeployFlow(id);
+      break;
+    case 'server-rotate':
+      confirmDialog('重置 token', '重置后旧 token 立即失效，服务器上的 agent 需重新部署才能继续同步。', async () => {
+        await api('/api/servers/' + id + '/rotate', { method: 'POST' });
+        toast('token 已重置', 'ok');
+        render();
+      });
+      break;
+    case 'server-del':
+      confirmDialog('删除服务器', '该服务器下的所有节点也会一并删除，此操作不可撤销。', async () => {
+        await api('/api/servers/' + id, { method: 'DELETE' });
+        toast('服务器已删除', 'ok');
+        render();
+      });
+      break;
+    case 'save-settings': {
+      // 域名格式先在前端拦一道，填错了直接标红，不必等后端往返
+      const base = checkSubBaseField(true);
+      if (base.error) {
+        $('#set-base').focus();
+        return;
+      }
+      await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          siteName: $('#set-name').value.trim(),
+          subBase: base.value,
+          notice: $('#set-notice').value,
+        }),
+      });
+      if ($('#set-base')) $('#set-base').value = base.value;
+      checkSubBaseField(false);
+      toast('设置已保存', 'ok');
+      break;
+    }
+    case 'change-pw': {
+      await api('/api/admin/password', {
+        method: 'POST',
+        body: JSON.stringify({ oldPassword: $('#pw-old').value, newPassword: $('#pw-new').value }),
+      });
+      toast('密码已修改，请重新登录', 'ok');
+      setTimeout(() => logoutLocal(true), 800);
+      break;
+    }
+  }
+}
 
 /* ============================== 启动 ============================== */
 
@@ -2154,6 +2394,7 @@ async function boot() {
     $('#app').classList.remove('hidden');
     $('#side-site').textContent = me.settings.siteName;
     $('#side-user').textContent = '登录为 ' + me.username;
+    if (me.appVersion) $('#side-ver').textContent = 'v' + me.appVersion;
     document.title = me.settings.siteName;
     applyCollapse(localStorage.getItem('np_collapsed') === '1');
 

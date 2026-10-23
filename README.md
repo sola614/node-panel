@@ -2,22 +2,22 @@
 
 一个能跑起来的最小可用控制平面：**面板管数据，服务器上的 agent 管执行，用户看订阅页**。
 
-零外部依赖，只用 Node.js 标准库，`node server.js` 就能跑。
+零外部依赖：面板只用 Node.js 标准库（数据存 SQLite，走内置 `node:sqlite`），
+节点上的 agent 是纯 shell 脚本，**不需要装 Node / Python / jq**。
 
 ```
 ┌─────────────┐   管理操作    ┌──────────────┐
 │  管理面板    │ ───────────▶ │   面板服务    │
 │  (浏览器)    │              │  server.js   │
-└─────────────┘              │  plans       │
-┌─────────────┐   订阅链接    │  users       │
-│  用户订阅页  │ ◀─────────── │  nodes       │
-└─────────────┘              │  servers     │
-                             └──────┬───────┘
-                                    │ ① 拉配置 (60s) + 上报公网 IP
-                                    │ ② 报流量 (60s)
+└─────────────┘              │  panel.db    │
+┌─────────────┐   订阅链接    │  (SQLite)    │
+│  用户订阅页  │ ◀─────────── │              │
+└─────────────┘              └──────┬───────┘
+                                    │ ① 拉配置包 (60s) + 上报公网 IP
+                                    │ ② 报流量 (60s，纯文本)
                              ┌──────▼───────┐
-                             │  agent.js    │ ← 部署在每台节点服务器
-                             │  Xray        │
+                             │  agent.sh    │ ← 部署在每台节点服务器
+                             │  Xray        │    POSIX shell，零运行时
                              │  Hysteria2×N │
                              └──────────────┘
 ```
@@ -31,13 +31,16 @@ cd node-panel
 node server.js          # 或 npm start
 ```
 
+> 需要 **Node.js 22.13+**（内置 `node:sqlite` 从该版本起免 flag 可用）。
+> 镜像用的是 24（Active LTS），自建部署留 22.13 作地板——两件事互不影响。
+
 打开 http://localhost:8080 ，默认账号 **admin / admin888**（登录后请在「设置」里改掉）。
 
-首次启动会自动写入一份演示数据（2 台服务器 / 6 个节点 / 3 个套餐 / 4 位用户），方便直接看效果。
-想从空白开始：
+**首次启动是空库**：只有超级用户 `admin` 和默认站点设置，没有任何演示数据 ——
+套餐、服务器、节点、用户都由你自己建。想先看看有数据长什么样：
 
 ```bash
-PANEL_SEED=0 node server.js
+PANEL_SEED_DEMO=1 node server.js
 ```
 
 环境变量：
@@ -46,10 +49,14 @@ PANEL_SEED=0 node server.js
 | --- | --- | --- |
 | `PORT` | `8080` | 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
-| `PANEL_ADMIN_USER` | `admin` | 初始管理员账号（仅首次生成数据时生效） |
+| `PANEL_ADMIN_USER` | `admin` | 初始管理员账号（仅首次建库时生效） |
 | `PANEL_ADMIN_PASSWORD` | `admin888` | 初始密码 |
-| `PANEL_DATA_DIR` | `./data` | 数据文件目录 |
-| `PANEL_SEED` | `1` | 设为 `0` 时不写入演示数据 |
+| `PANEL_DATA_DIR` | `./data` | 数据目录（`panel.db` 所在处） |
+| `PANEL_DB_FILE` | `$PANEL_DATA_DIR/panel.db` | 直接指定 SQLite 文件路径 |
+| `PANEL_SEED_DEMO` | 空 | 设为 `1` 才写入演示数据（正式部署别开） |
+
+数据文件：`data/panel.db`（SQLite，WAL 模式）。老的 `data/db.json` 会在首次启动时
+自动导入并改名为 `db.json.imported`，不会丢数据。
 
 ---
 
@@ -114,9 +121,10 @@ Reality 下建议 chrome。VLESS Encryption（`mlkem768x25519plus`）则是服�
 ### Hysteria2
 
 由独立的 `hysteria` 二进制承载（不是 Xray 协议）。agent 会为每个节点写一份
-`/etc/hysteria/node-<id>.yaml`，并用 systemd 模板单元 `nodepanel-hysteria@node-<id>` 拉起独立实例，
-所以**一台机器可以跑多个 Hysteria2 节点**。流量通过每实例的 `trafficStats` 接口按用户名归属。
-部署脚本检测到 Hysteria2 节点时会顺带安装 hysteria。
+`/etc/hysteria/node-<id>.yaml`，并**自己用 pid 文件托管实例**（`/run/nodepanel/<实例>.pid`），
+所以**一台机器可以跑多个 Hysteria2 节点**，而且不依赖 systemd / OpenRC 的模板单元 ——
+Alpine 这类没有 systemd 的系统也能跑。流量通过每实例的 `trafficStats` 接口按用户名归属。
+部署脚本检测到 Hysteria2 节点时会按 CPU 架构下载官方静态二进制。
 混淆密码在节点表单里点「生成」即可随机产生，也可手填。
 
 ### TLS 证书的四种来源
@@ -196,19 +204,18 @@ agent 会自动重写配置里的引用，保证「文件写在哪」和「配�
 
 ```bash
 # 跟随服务器
-curl -fsSL "http://面板/api/servers/<id>/install?token=<服务器token>" | sudo bash
+curl -fsSL "http://面板/api/servers/<id>/install?token=<服务器token>" | sh
 
 # 独立节点
-curl -fsSL "http://面板/api/nodes/<id>/install?token=<节点token>" | sudo bash
+curl -fsSL "http://面板/api/nodes/<id>/install?token=<节点token>" | sh
 ```
 
 脚本会做这些事：
 
-1. 检查 Node.js ≥ 18
-2. 把 agent 装到 `/opt/nodepanel/agent.js`
-3. 写入 `/opt/nodepanel/agent.env`
-4. 注册 systemd 服务 `nodepanel-agent` 与模板单元 `nodepanel-hysteria@`
-5. 如果该机有 Hysteria2 节点且未装 hysteria，顺手装上
+1. 把 **纯 shell 版 agent** 装到 `/opt/nodepanel/agent.sh`（不需要 Node）
+2. 写入 `/opt/nodepanel/agent.env`（含 token，权限 600）
+3. 按系统注册开机自启：`systemd` → 服务单元；`OpenRC`（Alpine）→ init 脚本；都没有则退回 crontab
+4. 如果该机有 Hysteria2 节点且未装 hysteria，按架构下载官方静态二进制
 
 **前置条件**：Xray 需要自己装，agent 只负责写配置和重启服务。
 
@@ -218,17 +225,35 @@ bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release
 
 ### 4. 之后的一切都是自动的
 
-agent 每 60 秒执行一次：
+agent 每 60 秒执行一轮：
 
-- 探测公网 IP，`GET /api/agent/config?token=...&ip=...` 拉配置
-- 配置哈希变了才落盘并重载；Hysteria2 多实例同步启停
-- 从 Xray StatsService 和各 Hysteria2 实例读流量，`POST /api/agent/report` 上报
+- 探测公网 IP，带本地 hash 请求 `GET /api/agent/bundle?token=...&hash=...`
+- hash 没变只回一行 `#UNCHANGED`，省流量；变了就下发**配置包**（一段 shell 脚本，base64 内嵌配置文件）
+- agent 执行配置包 → 文件有变化才重载 Xray / 重启对应 Hysteria2 实例
+- 从 Xray StatsService 和各 Hysteria2 实例读流量，`POST /api/agent/report` 以纯文本上报
 
 在面板里加节点、改端口、停用用户，**最多 60 秒自动生效，不用再登服务器**。
 
+#### agent 的资源占用
+
+| 项目 | 占用 |
+| --- | --- |
+| 运行时依赖 | 无（`sh` + `sed` + `awk` + `base64`，busybox 全都有） |
+| 常驻内存 | 约 2–3 MB（一个 shell 循环 + 每轮 fork 的子进程，跑完即释放） |
+| 磁盘 | 脚本约 20 KB + 配置 + 日志（单实例日志超过 5 MB 自动清空） |
+
+64 MB 内存的 Alpine 小鸡也能长期跑。agent 被 OOM 或误杀后由 systemd `Restart=always`
+（OpenRC 由 `supervise`、cron 由下一分钟）自动拉起。
+
+Hysteria2 实例**不依赖 systemd 模板单元**：agent 用 `/run/nodepanel/<实例>.pid` 自己托管，
+每轮检查进程是否还活着，挂了就重启，节点删了就停掉并清理配置。
+
 ```bash
-journalctl -u nodepanel-agent -f              # agent 日志
-systemctl status nodepanel-hysteria@node-xxx  # 某个 Hysteria2 实例
+journalctl -u nodepanel-agent -f        # agent 日志（systemd）
+tail -f /var/log/nodepanel/agent.log    # agent 日志（OpenRC / cron）
+ls /run/nodepanel/                      # Hysteria2 实例 pid
+tail -f /var/log/nodepanel/node-*.log   # 单个 Hysteria2 实例日志
+sh /opt/nodepanel/agent.sh --once       # 手动跑一轮，排查用
 ```
 
 ---
@@ -269,6 +294,13 @@ systemctl status nodepanel-hysteria@node-xxx  # 某个 Hysteria2 实例
 响应带 `Subscription-Userinfo` 头，Clash Verge 等客户端能直接读到已用/总量/到期时间。
 
 「设置 → 订阅对外域名」留空则按当前访问 Host 生成；面板在反代后面时建议显式填写。
+
+该字段会做格式校验（前后端各一道，直接打 API 也绕不过去）：
+
+- 只接受 `http://` / `https://`，不写协议时自动补 `https://`
+- 主机名必须是合法 IP 或带点号的域名（`111`、`abc`、`1.2.3` 都会被拒）
+- 可以带端口，但不能带路径、查询参数、`#` 片段或账号密码
+- 保存时会去掉尾部斜杠，并回填规范化后的地址
 
 ---
 
@@ -313,9 +345,14 @@ POST /api/demo/traffic                     注入演示流量
 GET/PUT /api/settings                      站点设置
 POST /api/admin/password                   修改管理员密码
 
-GET  /api/agent/config?token=TOKEN&ip=IP   拉配置（服务器或独立节点 token）
-POST /api/agent/report?token=TOKEN&ip=IP   上报流量
+GET  /api/agent/config?token=TOKEN&ip=IP   拉配置（JSON，调试用）
+GET  /api/agent/bundle?token=TOKEN&ip=IP   拉配置包（shell 脚本；带 hash 且未变时只回 #UNCHANGED）
+POST /api/agent/report?token=TOKEN&ip=IP   上报流量（支持 JSON 或纯文本「email 上行 下行」）
 ```
+
+`/api/agent/bundle` 是 shell agent 的主通道：把证书、Xray 配置、Hysteria2 配置、
+运行状态全部编译进一段可执行脚本，agent 侧只做 base64 解码和写文件 ——
+所以节点上不需要 Node，也不需要 jq 这类 JSON 工具。
 
 ---
 
@@ -325,7 +362,8 @@ POST /api/agent/report?token=TOKEN&ip=IP   上报流量
 node-panel/
 ├── server.js            HTTP 服务、路由、业务逻辑
 ├── lib/
-│   ├── store.js         数据层（JSON 文件 + 原子写入 + 版本迁移）
+│   ├── store.js         数据层（SQLite，内置 node:sqlite + 内存读缓存）
+│   ├── agentBundle.js   把配置编译成 shell 配置包下发给 agent
 │   ├── xray.js          节点 → Xray 配置（含 Reality / Vision 流控 / VLESS Encryption）
 │   ├── hysteria.js      节点 → Hysteria2 配置
 │   ├── cert.js          TLS 证书三种来源的路径解析
@@ -334,36 +372,53 @@ node-panel/
 │   └── yaml.js          YAML 序列化
 ├── public/
 │   ├── index.html       管理台外壳（菜单可收起）
+│   ├── theme.js         日间/夜间皮肤切换（CSS 变量 + localStorage）
 │   ├── app.js           管理台单页应用
 │   ├── sub.html/sub.js  用户订阅页
-│   └── style.css        样式（深色）
+│   └── style.css        样式（主题变量在文件顶部）
 ├── agent/
-│   └── agent.js         服务器端 agent（双服务管理）
+│   └── agent.sh         服务器端 agent（纯 shell，零运行时依赖）
 ├── test/
-│   └── smoke.js         端到端冒烟测试（53 项）
+│   ├── smoke.js        端到端冒烟测试（后端接口，零依赖）
+│   └── ui.js           前端行为测试（皮肤切换 / loading 锁 / 域名校验，需要 jsdom）
 ├── .github/workflows/   GitHub Actions：测试 → 多架构构建 → 推 ghcr.io
 ├── Dockerfile
 ├── docker-compose.yml
-└── data/db.json         运行时生成，全部数据都在这里
+└── data/panel.db        运行时生成，全部数据都在这里（SQLite）
 ```
 
-数据就是一个 JSON 文件，备份直接拷 `data/db.json`。
+数据全在 `data/panel.db` 一个文件里。热备份用 SQLite 自带命令最稳（会一并处理 WAL）：
+
+```bash
+sqlite3 data/panel.db ".backup /path/backup-$(date +%F).db"
+```
+
+直接拷文件时要连同 `panel.db-wal`、`panel.db-shm` 一起拷，或者先停服务。
 
 ---
 
 ## 八、测试
 
 ```bash
+# 后端 / 接口冒烟测试（零依赖，直接跑）
+node server.js &                       # 先起面板
 node test/smoke.js http://127.0.0.1:8080
+
+# 前端行为测试（需要 jsdom，没装会自动跳过）
+npm i -D jsdom
+node test/ui.js http://127.0.0.1:8080
 ```
 
-89 项断言，覆盖：健康检查 → 残留清理 → 存量数据自检 → 建服务器 → 五种节点 → 套餐（额度/有效期）→ 三类用户 →
+`smoke.js` 覆盖：健康检查 → 残留清理 → 存量数据自检 → 建服务器 → 五种节点 → 套餐（额度/有效期）→ 三类用户 →
 额度与到期继承及套餐变更同步 → 订阅与配置双层套餐隔离 → Reality / Hysteria2 链接与配置 →
 VLESS Encryption → uTLS 指纹 → 证书四态（路径 / 粘贴 / 自签 / ACME）→
 中转入口多端点发布、入口级套餐、入口与节点独立显隐 → 超额自动剔除 →
 部署脚本与鉴权 → 公网 IP 上报（手动不覆盖 / 自动生效）→ 自动清理。
 
-测试是幂等的：启动时会先清理上次崩溃残留的 `SMOKE-*` 数据。
+`ui.js` 用 jsdom 真实跑一遍前端：日间/夜间皮肤切换（管理台 + 订阅页、刷新后保持）、
+接口 loading 锁（连点只发一次请求、弹窗按钮显示「处理中」）、订阅对外域名校验（填错不发请求）、侧栏版本号。
+
+两套测试都是幂等的：`smoke.js` 启动时先清理上次崩溃残留的 `SMOKE-*``/`UI-*` 数据。
 
 ## 九、界面适配
 
@@ -376,22 +431,59 @@ VLESS Encryption → uTLS 指纹 → 证书四态（路径 / 粘贴 / 自签 / A
 
 用户订阅页为阅读优先，内容区限制在 680px 并居中。
 
+### 日间 / 夜间皮肤
+
+全站可切换皮肤，**默认夜间（黑底白字）**，可切成日间（白底黑字）。管理台和用户订阅页共用同一个
+选择，存 `localStorage` 的 `np_theme`，换设备不会同步但也不会互相覆盖。
+
+- 管理台：右上角工具栏的 ☀ / ☾ 按钮（未登录时登录页右上角也有一个）
+- 订阅页：标题栏右侧
+
+实现方式是「一套变量、两套取值」：所有颜色都收在 `style.css` 顶部的 CSS 变量里，
+切换只改 `<html data-theme="dark|light">`，**不重排、不闪烁**，
+订阅页的环形图也改用 `var(--accent)` 之类的变量上色，所以跟着自动变。
+首屏配色由 `<head>` 里一小段内联脚本先定好，避免打开时闪一下默认色。
+
+```css
+:root { --bg: #070a0f; --text: #e9eff8; }              /* 夜间 */
+:root[data-theme='light'] { --bg: #f4f6fb; --text: #17202e; }  /* 日间 */
+```
+
+新加样式时请只写变量，不要再写死色值——否则换肤会漏出破绽。
+
 ---
 
 ## 十、Docker 部署
 
 ```bash
-# 直接拉镜像
+# 直接拉镜像（beta 版本线 0.1.x）
 docker run -d --name node-panel -p 8080:8080 \
   -e PANEL_ADMIN_PASSWORD='换成强密码' \
   -v node-panel-data:/app/data \
-  ghcr.io/sola614/node-panel:latest
+  ghcr.io/sola614/node-panel:0.1
 
-# 或用 compose
-docker compose up -d
+# 或用 compose（默认也是 :0.1，可用 PANEL_IMAGE_TAG=0.1.1 精确锁定）
+PANEL_IMAGE_TAG=0.1.1 docker compose up -d
 ```
 
-数据持久化在 `/app/data` 卷里。镜像已内置 `/api/health` 探针。
+数据持久化在 `/app/data` 卷里（`panel.db` + WAL）。镜像已内置 `/api/health` 探针。
+镜像基线是 `node:24-alpine`（Active LTS，维护到 2028-04）。
+自建部署需要 **Node.js 22.13+**（内置 `node:sqlite` 从该版本起免 flag 可用）。
+
+### 镜像版本号
+
+版本号**只有一处来源**：`package.json` 的 `version`。每次 `main` 推送都会打上对应 tag：
+
+| tag | 含义 |
+| --- | --- |
+| `0.1.0` | 完整版本号 |
+| `0.1` | 次版本线，浮动跟踪（`docker run` 推荐用这个） |
+| `latest` | 最近一次 `main` 构建 |
+| `main` | 分支 tag，便于调试 |
+
+发版时打 Git tag（`git tag v0.1.1 && git push origin v0.1.1`）会额外产出 semver tag。
+版本号同时写进镜像的 `org.opencontainers.image.version` label、`/api/health` 的 `app` 字段，
+以及管理台侧栏底部的「v0.1.0」字样——三处看到的永远一致。
 
 推送到 GitHub 后，`main` 分支的推送和 `v*` 标签会自动触发构建，
 产出 `linux/amd64` 与 `linux/arm64` 双架构镜像到 `ghcr.io/sola614/node-panel`。
@@ -399,13 +491,16 @@ PR 只跑测试和构建，不推送。
 
 ```yaml
 # .github/workflows/docker.yml 关键步骤
-- uses: docker/setup-qemu-action@v3
-- uses: docker/setup-buildx-action@v3
-- uses: docker/login-action@v3      # ghcr.io + GITHUB_TOKEN
+- name: 读取版本号              # 从 package.json 解析，读不到就中止
 - uses: docker/metadata-action@v5
+  with:
+    tags: |
+      type=raw,value=${{ steps.pkg.outputs.version }}   # 0.1.0
+      type=raw,value=${{ steps.pkg.outputs.minor }}     # 0.1
 - uses: docker/build-push-action@v6
   with:
-    platforms: linux/amd64,linux/arm64
+    build-args: |
+      APP_VERSION=${{ steps.pkg.outputs.version }}
 ```
 
 ---
@@ -459,7 +554,7 @@ server {
 - [ ] 面板走 HTTPS，不要裸 HTTP 暴露在公网
 - [ ] 部署脚本 URL 里带 token，属于敏感信息，别贴到公开渠道
 - [ ] 重置服务器/节点 token 后，对应 agent 立即失效，需要重新部署
-- [ ] `data/db.json` 含所有用户 UUID 和 token，注意备份权限
+- [ ] `data/panel.db` 含所有用户 UUID 和 token，注意备份权限（连同 `-wal`/`-shm` 一起备份，或用 `sqlite3 panel.db ".backup out.db"`）
 
 ---
 
@@ -472,7 +567,9 @@ server {
 5. **TLS 证书要自己准备**：面板不签发证书，只把路径写进配置（Reality 除外）。
 6. **公网 IP 探测依赖外部服务**：agent 全部 provider 失败时会沿用上一次的结果；机器在 NAT 后且需要内网穿透时，请改回手动填写。
 7. **VLESS Encryption 需要两端都是 Xray 25.6.0+**：客户端不支持时该节点连不上，建议按需开启而不是全局打开。
-8. **证书路径默认由面板计算**：agent 用 `CERTS_ROOT` 可覆盖，但改完需要等下一轮配置同步才会重写引用。
+8. **自签证书依赖 openssl**：`certMode: self` 时由 agent 在目标机用 openssl 现场生成；Debian/Ubuntu/CentOS 自带，
+   Alpine 需要 `apk add openssl`。其他证书模式（path / content / acme）不需要。
 9. **ACME 走 standalone 模式**：会占用 80 端口，且机器必须能访问外网；80 被占用或域名没解析到本机会申请失败，日志里会说明原因。
+10. **agent 每轮会 fork 若干子进程**：`sed`/`awk`/`base64` 用完即退，不会常驻；极端低配（32MB 以下）建议把 `INTERVAL` 调大到 120。
 
 需要更多的话，往上加的方向：多管理员与审计日志、节点级限速、月结流量重置、在线 IP 数限制、Telegram 通知。

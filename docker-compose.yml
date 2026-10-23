@@ -1,17 +1,17 @@
 services:
   panel:
-    # 用官方构建的镜像，或注释掉 image 用下面的 build 本地构建
-    image: ghcr.io/sola614/node-panel:latest
+    # beta 版本线：默认跟 0.1.x，可用 PANEL_IMAGE_TAG=0.1.1 精确锁定
+    image: ghcr.io/sola614/node-panel:${PANEL_IMAGE_TAG:-0.1}
     build: .
     container_name: node-panel
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
-      # 首次启动时用于生成管理员账号，之后改这里不会覆盖已有密码
+      # 首次建库时用于生成管理员账号，之后改这里不会覆盖已有密码
       PANEL_ADMIN_PASSWORD: ${PANEL_ADMIN_PASSWORD:-admin888}
-      # 设为 0 则不写入演示数据
-      PANEL_SEED: ${PANEL_SEED:-1}
+      # 默认空库启动（只有 admin）。想看演示数据再设 PANEL_SEED_DEMO=1
+      PANEL_SEED_DEMO: ${PANEL_SEED_DEMO:-}
       TZ: Asia/Shanghai
     volumes:
       - panel-data:/app/data

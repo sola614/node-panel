@@ -45,22 +45,22 @@ function ringSvg(percent, color) {
   const r = 58;
   const c = 2 * Math.PI * r;
   const pct = Math.min(100, Math.max(0, percent));
+  // 颜色全部走 CSS 变量，切换日间/夜间时 SVG 会自动跟着变，不用重绘
   return `<svg width="132" height="132" viewBox="0 0 132 132">
     <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#22d3ee"/><stop offset="100%" stop-color="#4c8dff"/>
+      <stop offset="0%" style="stop-color:var(--accent-2)"/><stop offset="100%" style="stop-color:var(--accent)"/>
     </linearGradient></defs>
-    <circle cx="66" cy="66" r="${r}" fill="none" stroke="rgba(255,255,255,.07)" stroke-width="9"/>
-    <circle cx="66" cy="66" r="${r}" fill="none" stroke="${color}" stroke-width="9"
-      stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - pct / 100)}"
-      style="transition:stroke-dashoffset .8s cubic-bezier(.4,0,.2,1)"/>
+    <circle cx="66" cy="66" r="${r}" fill="none" style="stroke:var(--ring-track)" stroke-width="9"/>
+    <circle cx="66" cy="66" r="${r}" fill="none" style="stroke:${color};transition:stroke-dashoffset .8s cubic-bezier(.4,0,.2,1)"
+      stroke-width="9" stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - pct / 100)}"/>
   </svg>`;
 }
 
 function statusColor(status) {
   if (status === 'active') return 'url(#g1)';
-  if (status === 'over') return '#f87171';
-  if (status === 'expired') return '#fbbf24';
-  return '#6f8199';
+  if (status === 'over') return 'var(--bad)';
+  if (status === 'expired') return 'var(--warn)';
+  return 'var(--muted)';
 }
 
 function render(d) {
@@ -109,9 +109,14 @@ function render(d) {
           <span>Subscription</span>
         </div>
       </div>
-      <span class="badge ${u.status === 'active' ? 'badge-ok' : u.status === 'over' || u.status === 'disabled' ? 'badge-bad' : 'badge-warn'}">
-        <i class="dot"></i>${esc(u.statusLabel)}
-      </span>
+      <div class="sub-head-right">
+        <span class="badge ${u.status === 'active' ? 'badge-ok' : u.status === 'over' || u.status === 'disabled' ? 'badge-bad' : 'badge-warn'}">
+          <i class="dot"></i>${esc(u.statusLabel)}
+        </span>
+        <button class="theme-btn" data-theme-toggle type="button" title="切换到日间模式" aria-label="切换到日间模式">
+          <span class="ico">☀</span>
+        </button>
+      </div>
     </div>
 
     <div class="sub-card">
@@ -165,6 +170,9 @@ function render(d) {
       流量数据由节点服务器实时上报，通常有 1 分钟延迟<br>
       最后更新 ${new Date(d.updatedAt).toLocaleString('zh-CN')}
     </div>`;
+
+  // 切换按钮是动态渲染出来的，重绘后要把图标同步成当前主题
+  if (window.NPTheme) window.NPTheme.paint();
 }
 
 (async () => {
