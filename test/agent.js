@@ -24,6 +24,18 @@ const RE_PKG_VER = new RegExp("VERSION='" + PKG_VERSION.replace(/\./g, '\\.') + 
 const AGENT_SRC = fs.readFileSync(path.join(ROOT, 'agent', 'agent.sh'), 'utf8');
 const TMP = path.join(os.tmpdir(), 'np-agent-' + Date.now());
 
+// 版本号漂移是这里最容易踩的坑：package.json 升了版、agent.sh 里那行 VERSION 忘了改，
+// 下面四条断言会一起变红（初始版本 / 旧版本备份 / 坏包不替换 ×2），但红得莫名其妙。
+// 与其让人对着四盏灯猜，不如在门口就拦住，直接把两个值摊开。
+const AGENT_VERSION = (AGENT_SRC.match(/^VERSION='([^']+)'/m) || [])[1];
+if (AGENT_VERSION !== PKG_VERSION) {
+  console.error('\n✗ 版本号不一致，后面的断言必然全红，先修这个：');
+  console.error(`    package.json  version = ${PKG_VERSION}`);
+  console.error(`    agent/agent.sh VERSION = ${AGENT_VERSION}`);
+  console.error('  发版时两处必须一起改（agent.sh 顶部 VERSION= 那一行）。\n');
+  process.exit(1);
+}
+
 let pass = 0;
 let fail = 0;
 const ok = (name, cond, extra = '') => {
