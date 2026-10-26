@@ -16,10 +16,15 @@
 #   AGENT_TOKEN      服务器 token 或独立节点 token，必填
 #   INTERVAL         轮询间隔秒数，默认 60
 #   XRAY_CONFIG      Xray 配置路径，默认 /usr/local/etc/xray/config.json
+#   XRAY_ALIAS       Xray 的本地伪装名（二进制/服务/进程名），默认 xray。
+#                    0.1.9 起部署脚本全新安装时默认 webcore：二进制、systemd 单元、
+#                    配置目录全部换成这个名字，机器上看不到「xray」字样；
+#                    老机器 agent.env 没写这一项，就继续用官方名，互不影响
 #   RELOAD_CMD       重载 Xray 的命令，默认自动探测
 #   SOCK_CMD         端口自检用的命令，默认自动用 ss / netstat（每行「协议 本地地址」）
-#   HYSTERIA_DIR     Hysteria2 配置目录，默认 /etc/hysteria
-#   HYSTERIA_BIN     hysteria 可执行文件，默认 /usr/local/bin/hysteria
+#   HYSTERIA_DIR     Hysteria2 配置目录，默认 /etc/hysteria（伪装部署为 /etc/streamd）
+#   HYSTERIA_BIN     hysteria 可执行文件，默认 /usr/local/bin/hysteria（伪装部署为
+#                    /usr/local/bin/streamd —— 名字改了，二进制本身没动）
 #   STATE_DIR        状态目录，默认 /opt/nodepanel
 #   RUN_DIR          运行时目录（pid），默认 /run/nodepanel
 #   LOG_DIR          日志目录，默认 /var/log/nodepanel
@@ -32,7 +37,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.8'
+VERSION='0.1.9'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -73,8 +78,8 @@ env_read() {
 }
 
 if [ -f "$ENV_FILE" ]; then
-  for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
-                  HYSTERIA_BIN STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX ACME_SH REPORT_IP SOCK_CMD; do
+  for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
+                  HYSTERIA_BIN HYSTERIA_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX ACME_SH REPORT_IP SOCK_CMD; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
     # 赋值语境下不做分词，带空格的值能原样存进变量
@@ -85,9 +90,15 @@ fi
 PANEL_URL=${PANEL_URL:-}
 AGENT_TOKEN=${AGENT_TOKEN:-}
 INTERVAL=${INTERVAL:-60}
+XRAY_ALIAS=${XRAY_ALIAS:-xray}
 XRAY_CONFIG=${XRAY_CONFIG:-/usr/local/etc/xray/config.json}
 HYSTERIA_DIR=${HYSTERIA_DIR:-/etc/hysteria}
 HYSTERIA_BIN=${HYSTERIA_BIN:-/usr/local/bin/hysteria}
+# 配置包（bundle）是「sh 子进程」执行的：不 export 的话，里面引用的
+# $XRAY_CONFIG / $HYSTERIA_DIR / $HYSTERIA_BIN 全是空的，文件会写到别处去
+export XRAY_CONFIG HYSTERIA_DIR HYSTERIA_BIN
+# 有 hy2 实例却没有二进制时自己装一个（见 hy_install）；关掉就只记日志
+HYSTERIA_AUTO_INSTALL=${HYSTERIA_AUTO_INSTALL:-1}
 STATE_DIR=${STATE_DIR:-/opt/nodepanel}
 RUN_DIR=${RUN_DIR:-/run/nodepanel}
 LOG_DIR=${LOG_DIR:-/var/log/nodepanel}
@@ -192,6 +203,18 @@ http_post_json() {
   fi
 }
 
+# 下载到文件。二进制不能用 $(...) 接（NUL 与换行会被吃掉），所以单独一个函数
+http_download() {
+  _u=$1
+  _out=$2
+  [ -n "$HTTP" ] || return 1
+  if [ "$HTTP" = 'curl' ]; then
+    curl -fsSL -m 300 -o "$_out" "$_u" 2>/dev/null
+  else
+    wget -q -T 300 -O "$_out" "$_u" 2>/dev/null
+  fi
+}
+
 # --------------------------------- 公网 IP ----------------------------------
 # 结果缓存 5 分钟写进文件，cron 模式也不会每分钟去问三次
 
@@ -288,15 +311,19 @@ ensure_acme_cert() {
 # ------------------------------ 服务收敛 ------------------------------------
 
 xray_bin() {
-  _b=$(command -v xray 2>/dev/null)
+  _b=$(command -v "$XRAY_ALIAS" 2>/dev/null)
+  [ -n "$_b" ] || _b="/usr/local/bin/$XRAY_ALIAS"
+  # 兜底官方名：机器上手工装过官方 xray、agent.env 又没写 XRAY_ALIAS 的场景
+  [ -x "$_b" ] || _b=$(command -v xray 2>/dev/null)
   [ -n "$_b" ] || _b=/usr/local/bin/xray
   printf '%s' "$_b"
 }
 
-# agent.env 没写 RELOAD_CMD 时现猜一个：服务名不一定叫 xray（xray-core / x-ui 都见过）
+# agent.env 没写 RELOAD_CMD 时现猜一个：服务名不一定叫 xray
+# （xray-core / x-ui 都见过；0.1.9 起还可能是伪装名 webcore）
 detect_reload_cmd() {
   if command -v systemctl >/dev/null 2>&1; then
-    for _u in xray xray-core x-ui; do
+    for _u in "$XRAY_ALIAS" xray xray-core x-ui; do
       if systemctl list-unit-files 2>/dev/null | grep -q "^$_u\.service"; then
         printf 'systemctl restart %s' "$_u"
         return 0
@@ -304,7 +331,11 @@ detect_reload_cmd() {
     done
   fi
   if command -v rc-service >/dev/null 2>&1; then
-    printf 'rc-service xray restart'
+    if [ -x "/etc/init.d/$XRAY_ALIAS" ]; then
+      printf 'rc-service %s restart' "$XRAY_ALIAS"
+    else
+      printf 'rc-service xray restart'
+    fi
     return 0
   fi
   printf ''
@@ -388,8 +419,11 @@ xray_running() {
       return 0
     fi
   fi
-  # 没有服务单元（手动 nohup 起的 / 容器里）时退回看进程
+  # 没有服务单元（手动 nohup 起的 / 容器里）时退回看进程。
+  # 伪装名与官方名都试：XRAY_ALIAS 缺省就是 xray，第二个探测只对
+  # 「手工装了官方 xray 却在 env 里配了别名」这类混搭生效
   if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x "$XRAY_ALIAS" >/dev/null 2>&1 && return 0
     pgrep -x xray >/dev/null 2>&1 && return 0
   fi
   return 1
@@ -542,6 +576,64 @@ hy_stop() {
   rm -f "$_pidfile"
 }
 
+# --------------------------- Hysteria2 二进制自愈 ---------------------------
+# 部署脚本只在「生成脚本那一刻已经有 Hysteria2 节点」时装二进制，而面板推荐的流程是
+# 先部署机器、后加节点 —— 那种情况下 needHysteria 是 0，机器上永远没有 hysteria，
+# 节点就只会一直「端口未监听」。这里让 agent 自己补上，装不上就冷静 30 分钟再试，
+# 免得每分钟往 GitHub 撞一次。
+
+hy_install_allowed() {
+  _f="$STATE_DIR/.hysteria-install-fail"
+  [ -f "$_f" ] || return 0
+  _ts=$(sed -n '1p' "$_f" 2>/dev/null)
+  case "$_ts" in '' | *[!0-9]*) _ts=0 ;; esac
+  [ $(( $(date +%s) - _ts )) -ge 1800 ]
+}
+
+hy_install() {
+  [ -x "$HYSTERIA_BIN" ] && return 0
+  if [ "$HYSTERIA_AUTO_INSTALL" != '1' ]; then
+    log "! 未找到 hysteria（$HYSTERIA_BIN），已禁用自动安装（HYSTERIA_AUTO_INSTALL=0）"
+    log "  手动装：https://v2.hysteria.network/zh/docs/getting-started/Installation/"
+    return 1
+  fi
+  hy_install_allowed || return 1
+
+  case "$(uname -m)" in
+    x86_64 | amd64) _arch=amd64 ;;
+    aarch64 | arm64) _arch=arm64 ;;
+    armv7l | armv7) _arch=arm ;;
+    i386 | i686) _arch=386 ;;
+    *)
+      log "! 不支持的架构 $(uname -m)，无法自动安装 hysteria"
+      return 1
+      ;;
+  esac
+
+  _url="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$_arch"
+  _tmp="$HYSTERIA_BIN.tmp.$$"
+  log "本机没有 hysteria，尝试自动安装（$_url）"
+  if http_download "$_url" "$_tmp" && [ -s "$_tmp" ]; then
+    chmod 755 "$_tmp" 2>/dev/null
+    # 下下来先跑一下：架构不对或文件被截断时，装上去也只会让 hy_ensure 反复失败
+    if "$_tmp" version >/dev/null 2>&1; then
+      mv -f "$_tmp" "$HYSTERIA_BIN" 2>/dev/null || cp -f "$_tmp" "$HYSTERIA_BIN" 2>/dev/null
+      rm -f "$_tmp" "$STATE_DIR/.hysteria-install-fail" 2>/dev/null
+      log "✓ 已安装 hysteria $("$HYSTERIA_BIN" version 2>/dev/null | sed -n '1p')"
+      return 0
+    fi
+    log "! 下载到的 hysteria 跑不起来（架构不匹配或文件损坏）"
+  else
+    log "! hysteria 下载失败（本机可能连不上 GitHub）"
+  fi
+
+  rm -f "$_tmp" 2>/dev/null
+  printf '%s\n' "$(date +%s)" > "$STATE_DIR/.hysteria-install-fail" 2>/dev/null
+  log "  30 分钟内不再重试；也可以回面板复制一次部署命令重跑，或手动装："
+  log "  https://v2.hysteria.network/zh/docs/getting-started/Installation/"
+  return 1
+}
+
 hy_ensure() {
   _inst=$1
   _cfg="$HYSTERIA_DIR/$_inst.yaml"
@@ -556,8 +648,10 @@ hy_ensure() {
   fi
 
   if [ ! -x "$HYSTERIA_BIN" ]; then
-    log "! 未找到 hysteria（$HYSTERIA_BIN），跳过 $_inst"
-    return 1
+    if ! hy_install; then
+      log "! 未找到 hysteria（$HYSTERIA_BIN），跳过 $_inst"
+      return 1
+    fi
   fi
 
   mkdir -p "$RUN_DIR" "$LOG_DIR" 2>/dev/null

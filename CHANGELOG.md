@@ -40,6 +40,63 @@
   这条当初写 rawHostOf 的原因用例）。
 - `test/agent.js` 的假面板按 pathname 匹配、不校验 token，天然兼容双发，无需改动。
 
+## [0.1.9] - 2026-10-26
+
+两件事：agent 自愈安装缺失的 hysteria；全新部署的机器上 Xray / Hysteria2 改以伪装名落地。
+
+### 修复（hy2 自愈）
+
+- **后加的 Hysteria2 节点永远起不来**。部署脚本里的 `NEED_HYSTERIA` 是「生成脚本那一刻」算的，
+  而面板推荐的流程恰恰是**先部署机器、后加节点** —— 先部署时它是 0，机器上就没有 `hysteria` 二进制；
+  之后加 hy2 节点，agent 每轮只会打「未找到 hysteria（/usr/local/bin/hysteria），跳过 node-xxx」
+  和「端口未监听」，面板上那条节点永远是红的，且看不出该干什么。
+  现在 agent 自己补：发现「有 hy2 实例但没有二进制」就按架构自动下载 hysteria，
+  装好立刻拉起实例；装不上就冷静 30 分钟再试，并在日志里给出手动安装地址与「重跑部署命令」两条出路。
+  部署脚本的逻辑没动 —— 部署时已有 hy2 节点仍会提前装好，省掉这一次等待。
+
+### 变更（hy2 自愈）
+
+- 新增 `HYSTERIA_AUTO_INSTALL=0`（写进 `agent.env`）可关掉自动安装，只用自己装的二进制。
+  下载后会先跑一次 `hysteria version` 自检，架构不对或文件截断不会被装上去。
+
+### 新增（安装伪装）
+
+- **Xray 全链路伪装为 `webcore`**：全新安装时二进制落在 `/usr/local/bin/webcore`、
+  服务单元 `webcore.service`（Description=WebCore Service，中性文案）、配置
+  `/usr/local/etc/webcore/`、geo 数据 `/usr/local/share/webcore/`、进程名（ps/pgrep）
+  全是它 —— 机器上不再出现「xray」字样。目的是降低部分服务商主机侧特征扫描
+  （ps / find / systemctl 枚举）的命中率。换名：`curl … | XRAY_ALIAS=自定义名 sh`。
+- **Hysteria2 同理伪装为 `streamd`**（`/usr/local/bin/streamd`、配置 `/etc/streamd/`）。
+- **agent 侧按机器自适应**：`agent.env` 新增 `XRAY_ALIAS`，重载命令探测、存活自检
+  （pgrep）、`xray -test` 自检、卸载清理全部按实际名称工作 —— 部署时不需要任何额外配置。
+
+### 变更（安装伪装）
+
+- **配置包（bundle）的落盘路径改为引用 agent 环境变量**（`$XRAY_CONFIG` / `$HYSTERIA_DIR`），
+  面板不再把自己的字面量路径写进 bundle —— 每台机器的安装名可能不同（伪装名或官方名），
+  只有机器自己（agent.env）说了才算。agent 把这三个变量 export 给 bundle 子进程。
+- **Xray error 日志改 `none`**（错误走 stderr → journald）。一举三得：`/var/log/xray`
+  目录本身就是特征；伪装机器上配置写死这个路径会因目录不存在启动即退（0.1.5 修过同款问题）；
+  新旧机器下发的配置从此完全一致。
+- **老机器零影响**：检测到已有官方名安装（`xray` / `xray-core` / `x-ui` 服务单元，
+  或 `/usr/local/bin/hysteria` 二进制）时，重新执行部署命令沿用原布局 —— 路径、服务名、
+  agent.env 全部按官方名写，不会出现两套并存。
+- **卸载脚本从 agent.env 读取实际名称与路径**，官方名与伪装名两种形态的进程兜底清理都覆盖。
+
+### 测试
+
+- `test/agent.js` +1 条：沙箱里造出「有 hy2 实例、没有二进制」的现场，断言 agent 点名实例、
+  给出可执行的下一步，且这一轮仍正常退出。
+- `makeSandbox` 支持 `hy2List` / `env` 选项，并把 `HYSTERIA_DIR` / `HYSTERIA_BIN` 指向沙箱
+  （agent 只从 `agent.env` 读这两个，配置包里的 `NP_HYSTERIA_*` 它并不认）。
+- `test/smoke.js` 断言更新 +6：伪装名缺省、unit 变量化与 Description 中性、老机器回退
+  官方布局、agent.env 注入伪装名、不再建 /var/log/xray、卸载双形态 pkill。
+- 手工行为验证：bundle 在子 shell 中正确按 `$XRAY_CONFIG`（伪装路径）落盘、
+  `log.error=none`；部署 / 卸载 / bundle 三个生成脚本均过 `sh -n`。
+
+> 伪装只能降低主机侧特征扫描的命中率，挡不住流量层检测（netflow / 主动探测）；
+> 是否可用取决于服务商条款，README「安装伪装」一节有完整说明。
+
 ## [0.1.7] - 2026-10-26
 
 两件事：Hysteria2 终于能配证书了，卸载命令默认就把机器清干净。
