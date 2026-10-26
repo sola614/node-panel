@@ -175,7 +175,8 @@ Reality 下建议 chrome。VLESS Encryption（`mlkem768x25519plus`）则是服�
 ### Hysteria2
 
 由独立的 `hysteria` 二进制承载（不是 Xray 协议）。agent 会为每个节点写一份
-`/etc/hysteria/node-<id>.yaml`，并**自己用 pid 文件托管实例**（`/run/nodepanel/<实例>.pid`），
+`node-<id>.yaml`（老机器在 `/etc/hysteria/`，0.1.9 起新机器在 `/etc/streamd/`），
+并**自己用 pid 文件托管实例**（`/run/nodepanel/<实例>.pid`），
 所以**一台机器可以跑多个 Hysteria2 节点**，而且不依赖 systemd / OpenRC 的模板单元 ——
 Alpine 这类没有 systemd 的系统也能跑。流量通过每实例的 `trafficStats` 接口按用户名归属。
 部署脚本检测到 Hysteria2 节点时会按 CPU 架构下载官方静态二进制。
@@ -277,8 +278,9 @@ curl -fsSL "http://面板/api/nodes/<id>/install?token=<节点token>" | sh
 
 1. 把 agent 装到 `/opt/nodepanel/agent.sh`，`sh -n` 校验后打印版本与体积
 2. **检测并安装 Xray 本体**（`xray-core` 官方发行包 + `geoip.dat` / `geosite.dat` + 服务单元）；
-   机器上已经有 `xray` / `xray-core` / `x-ui` 服务时整段跳过，一个字节都不动
-3. 有 Hysteria2 节点且未装 hysteria 时，按架构下载官方二进制
+   机器上已经有 `xray` / `xray-core` / `x-ui` 服务时整段跳过，一个字节都不动；
+   **全新安装落地为伪装名**（见下方「安装伪装」）
+3. 有 Hysteria2 节点且未装 hysteria 时，按架构下载官方二进制（同样落地为伪装名）
 4. 写入 `/opt/nodepanel/agent.env`（含 token，权限 600；值统一加引号，`RELOAD_CMD` 里有空格也不会被拆成命令）
 5. 按系统注册开机自启：`systemd` → 服务单元；`OpenRC`（Alpine）→ init 脚本；都没有则退回 crontab
 6. 等 agent 首轮同步（最多 12s），打印 Xray 实际运行状态，最后给一份汇总
@@ -291,35 +293,35 @@ curl -fsSL "http://面板/api/nodes/<id>/install?token=<节点token>" | sh
       服务管理  systemd
 
 [1/4] agent 脚本 → /opt/nodepanel/agent.sh
-      版本 0.1.5 · 34 KB · sh -n 通过
+      版本 0.1.9 · 34 KB · sh -n 通过
       · 日志目录 /var/log/nodepanel，运行时目录 /run/nodepanel
 
-[2/4] Xray 本体 → /usr/local/bin/xray
+[2/4] Xray 本体 → /usr/local/bin/webcore
       本机没有 Xray，下载官方发行包
       · 来源 https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
       · 已下载 23.4 MB，解压中
       已安装 Xray 25.9.11 · 27.1 MB
-      · 数据文件 geoip.dat / geosite.dat → /usr/local/share/xray
-      服务单元 /etc/systemd/system/xray.service（已 enable，配置下发后启动）
+      · 数据文件 geoip.dat / geosite.dat → /usr/local/share/webcore
+      服务单元 /etc/systemd/system/webcore.service（已 enable，配置下发后启动）
 
 [3/4] 运行配置 → /opt/nodepanel/agent.env
       PANEL_URL=http://面板地址
-      INTERVAL=60s · XRAY_CONFIG=/usr/local/etc/xray/config.json
-      RELOAD_CMD="systemctl restart xray"
+      INTERVAL=60s · XRAY_CONFIG=/usr/local/etc/webcore/config.json
+      RELOAD_CMD="systemctl restart webcore"
       · 权限 600（内含 token）
 
 [4/4] 开机自启 → nodepanel-agent
       systemd 单元 /etc/systemd/system/nodepanel-agent.service
       · Restart=always · RestartSec=10 · KillMode=process
       等待 agent 首轮同步（最多 12s）
-      Xray 运行中（pid 1234）
+      服务 webcore 运行中（pid 1234）
 
 ✓ 部署完成 · 耗时 8s
 
-  agent      v0.1.5 · systemd · 每 60s 一轮
+  agent      v0.1.9 · systemd · 每 60s 一轮
   xray       Xray 25.9.11 · 运行中
   hysteria2  不需要（本机没有 Hysteria2 节点）
-  配置       /usr/local/etc/xray/config.json
+  配置       /usr/local/etc/webcore/config.json
   状态       /opt/nodepanel/state.env
 
   日志       journalctl -u nodepanel-agent -f
@@ -334,14 +336,36 @@ agent 的版本号只有一处来源：面板 `package.json` 的 `version`。部
 
 | 情况 | 脚本行为 |
 | --- | --- |
-| 全新机器 | 下载官方 `Xray-linux-<arch>.zip`（x86_64 / arm64 / armv7 / 386 / mips / ppc64 / riscv64 / s390x），装好后注册 `xray.service` |
-| 已有 `xray` / `xray-core` / `x-ui` 服务 | 跳过安装，沿用原有单元作为重载命令 |
+| 全新机器 | 下载官方 `Xray-linux-<arch>.zip`（x86_64 / arm64 / armv7 / 386 / mips / ppc64 / riscv64 / s390x），**落地为伪装名 `webcore`**（见下），注册 `webcore.service` |
+| 已有 `xray` / `xray-core` / `x-ui` 服务 | 跳过安装，沿用原有单元与官方路径（老机器不受伪装改造影响） |
 | 只有 `xray` 二进制、没有服务单元 | 只补一份服务单元，不重新下载 |
 | 想完全自己管 Xray | `curl -fsSL "…/install?token=…" \| SKIP_XRAY=1 sh` |
 | GitHub 拉不动 | `curl -fsSL "…/install?token=…" \| XRAY_DOWNLOAD_BASE=<镜像地址> sh` |
+| 想换伪装名 | `curl -fsSL "…/install?token=…" \| XRAY_ALIAS=自定义名 sh` |
 
-纯 Hysteria2 的独立节点不会装 Xray，省这份空间。日志目录 `/var/log/xray` 由脚本一并建好
-——面板下发的配置把 error 日志写在那里，目录不存在时 xray 会启动即退出。
+### 安装伪装（0.1.9）
+
+部分服务商会对主机做特征扫描（`ps` 枚举、`find` 特征文件名、systemd 单元枚举）。
+全新安装的机器上，Xray 不再以本名落地，而是统一伪装成 **`webcore`**：
+
+| 项目 | 官方安装（老机器沿用） | 伪装安装（0.1.9 起新机器） |
+| --- | --- | --- |
+| 二进制 | `/usr/local/bin/xray` | `/usr/local/bin/webcore` |
+| 服务单元 | `xray.service`（Description=Xray Service） | `webcore.service`（Description=WebCore Service） |
+| 配置 / geo 数据 | `/usr/local/etc/xray`、`/usr/local/share/xray` | `/usr/local/etc/webcore`、`/usr/local/share/webcore` |
+| 进程名（`ps` / `pgrep`） | `xray` | `webcore` |
+| Xray error 日志 | `/var/log/xray/error.log` | 不落盘（走 stderr → journald，配置里 `error: 'none'`） |
+
+Hysteria2 同理落地为 **`streamd`**（二进制 `/usr/local/bin/streamd`，配置 `/etc/streamd/`）。
+agent 的一切探测（重载命令、存活自检、端口自检、卸载清理）都按 `agent.env` 里记录的
+实际名称与路径工作，所以伪装不需要任何额外配置。**兼容规则**：机器上已有官方名安装时，
+重新执行部署命令会沿用原布局，不会出现两套并存。
+
+> 伪装只能降低主机侧特征扫描的命中率，**挡不住流量层检测**（netflow / 主动探测）；
+> 是否可用取决于服务商条款，请自行评估。
+
+纯 Hysteria2 的独立节点不会装 Xray，省这份空间。Xray 的 error 日志不落盘（`error: 'none'`，
+错误走 stderr → journald：`journalctl -u webcore`），省掉了「目录不存在 xray 启动即退出」这一类坑。
 
 ### 4. 之后的一切都是自动的
 
@@ -392,14 +416,14 @@ curl -fsSL "http://面板/api/servers/<id>/uninstall?token=<token>" | sh -s -- -
 | 默认清理 | 默认保留 |
 | --- | --- |
 | `nodepanel-agent` 服务（systemd 单元 / OpenRC 脚本 / crontab 三种都认）与残留进程 | `config.json.nodepanel.bak`（面板覆盖前的配置备份） |
-| agent 托管的 Hysteria2 实例与 `/etc/hysteria/node-*.yaml` | `/var/log/nodepanel` 日志（`--purge` 时删除） |
-| `/opt/nodepanel`、`/run/nodepanel`、`/etc/nodepanel`（自签证书） | `/usr/local/bin/xray` 与 geo 数据（可能是你自己装的） |
+| agent 托管的 Hysteria2 实例与配置（`/etc/hysteria` 或 `/etc/streamd`） | `/var/log/nodepanel` 日志（`--purge` 时删除） |
+| `/opt/nodepanel`、`/run/nodepanel`、`/etc/nodepanel`（自签证书） | Xray 二进制与 geo 数据（`webcore` 或 `xray`，可能是你自己装的） |
 | **Xray 服务（停掉 + 取消开机自启）与面板生成的 `config.json`**（先备份；只认带 `StatsService` 的那份） | 面板里的服务器 / 节点记录（要清就在列表里删除） |
 
 脚本幂等，重复执行不报错；想重新接入，执行一遍部署命令即可 —— 记录、token、订阅都不用重建。
 
 > 排查提示：agent 报「Xray 重载失败」时会把服务管理器的原始错误一起打出来。
-> 如果本机服务名不是 `xray`（如 `x-ui`、`xray-core`），部署脚本会自动匹配；
+> 如果本机服务名不是 `webcore` / `xray`（如 `x-ui`、`xray-core`），部署脚本会自动匹配；
 > 手工装的机器把 `RELOAD_CMD="systemctl restart <服务名>"` 写进 `/opt/nodepanel/agent.env` 即可。
 
 ### 6. agent 自更新

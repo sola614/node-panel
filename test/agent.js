@@ -123,11 +123,9 @@ function makeSandbox(port, agentVersion, opts = {}) {
       `NP_XRAY_NODES=${opts.xrayNodes || 0}`,
       'NP_USERS=0',
       `NP_AGENT_VERSION='${agentVersion}'`,
-      "NP_HY2_LIST=''",
+      `NP_HY2_LIST='${opts.hy2List || ''}'`,
       "NP_SELF_CERTS=''",
       "NP_ACME_CERTS=''",
-      `NP_HYSTERIA_DIR='${path.join(dir, 'hy')}'`,
-      `NP_HYSTERIA_BIN='${path.join(dir, 'hybin')}'`,
       '',
     ].join('\n'),
   );
@@ -148,6 +146,15 @@ function makeSandbox(port, agentVersion, opts = {}) {
     }
   }
 
+  // 有 hy2 实例就得有对应的 yaml，否则 hy_ensure 第一行就返回了，测不到缺二进制的分支
+  if (opts.hy2List) {
+    const hyDir = path.join(dir, 'hy');
+    fs.mkdirSync(hyDir, { recursive: true });
+    for (const item of opts.hy2List.split(/\s+/).filter(Boolean)) {
+      fs.writeFileSync(path.join(hyDir, item.split(':')[0] + '.yaml'), 'listen: :42323\n');
+    }
+  }
+
   return {
     dir,
     stateDir,
@@ -156,6 +163,10 @@ function makeSandbox(port, agentVersion, opts = {}) {
     env: {
       ...process.env,
       ...(binDir ? { PATH: binDir + path.delimiter + process.env.PATH } : {}),
+      // agent 只从 agent.env（这里是进程环境）读这两个，配置包里的 NP_HYSTERIA_* 它不认
+      HYSTERIA_DIR: path.join(dir, 'hy'),
+      HYSTERIA_BIN: path.join(dir, 'hybin'),
+      ...(opts.env || {}),
       PANEL_URL: `http://127.0.0.1:${port}`,
       AGENT_TOKEN: 'test-token',
       STATE_DIR: stateDir,
@@ -297,6 +308,21 @@ const runAgent = (box) =>
   const rcSteady = panel.state.receipts[n2] || {};
   ok('Xray 在跑且配置没变时回执 xray=ok', r7.status === 0 && rcSteady.xray === 'ok',
     `exit=${r7.status} xray=${rcSteady.xray}`);
+
+  /* --------------------- 6. Hysteria2 缺二进制的兜底 --------------------- */
+  // 部署脚本只在「生成脚本那一刻已有 hy2 节点」时装二进制，而推荐流程是先部署机器、后加节点。
+  // 这时机器上没有 hysteria，节点会一直「端口未监听」—— agent 得自己补上，至少要说清楚怎么补。
+  console.log('\n— Hysteria2 缺二进制 —');
+  const box6 = makeSandbox(panel.port, PKG_VERSION, {
+    hy2List: 'node-deadbeef:9200:secret',
+    env: { HYSTERIA_AUTO_INSTALL: '0' },
+  });
+  const r8 = await runAgent(box6);
+  const out8 = r8.stdout + r8.stderr;
+  ok('缺 hysteria 时点名实例并给出可执行的下一步',
+    r8.status === 0 && /未找到 hysteria/.test(out8) && /跳过 node-deadbeef/.test(out8) &&
+      /v2\.hysteria\.network/.test(out8),
+    out8.split('\n').filter((l) => /hysteria/.test(l)).slice(0, 2).join(' | '));
 
   panel.server.close();
   try {

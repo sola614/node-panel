@@ -1736,14 +1736,25 @@ note "日志目录 /var/log/nodepanel，运行时目录 /run/nodepanel"
 
 # ------------------------------ 2. Xray 本体 --------------------------------
 # 部署脚本自己装 xray-core，三种情况分开处理，任何一种都不破坏已有安装：
-#   1) 已有服务单元（xray / xray-core / x-ui）→ 完全不碰，直接用
+#   1) 已有服务单元（webcore / xray / xray-core / x-ui）→ 完全不碰，直接用
 #   2) 有 xray 二进制但没有单元（手工解压的）→ 只补一份单元
 #   3) 什么都没有 → 下载官方发行包（xray + geoip/geosite）再建单元
+#
+# 伪装（0.1.9）：全新安装时 Xray 落地为 XRAY_ALIAS（默认 webcore）—— 二进制名、
+# 服务单元名、配置/数据目录、进程名全部用它，机器上不出现「xray」字样；
+# 已有官方名安装（含本面板 0.1.8 及更早部署的）一律沿用原布局，互不影响。
+# Hysteria2 同理（HY_ALIAS，默认 streamd）。想换名字：XRAY_ALIAS=foo HY_ALIAS=bar
+# 在部署命令前加 env（curl -fsSL … | XRAY_ALIAS=foo sh）。
 
-XRAY_BIN=/usr/local/bin/xray
-XRAY_ETC=/usr/local/etc/xray
-XRAY_DAT=/usr/local/share/xray
-XRAY_LOG=/var/log/xray
+XRAY_ALIAS=\${XRAY_ALIAS:-webcore}
+HY_ALIAS=\${HY_ALIAS:-streamd}
+XRAY_BIN=''
+XRAY_ETC=''
+XRAY_DAT=''
+# 决策出来的实际服务单元名（等待启动 / 汇总提示用）
+XRAY_UNIT_NAME=''
+HY_BIN=/usr/local/bin/$HY_ALIAS
+HY_DIR=/etc/$HY_ALIAS
 # 想走镜像（GitHub 拉不动时）：XRAY_DOWNLOAD_BASE=https://某镜像/XTLS/Xray-core/releases/latest/download
 XRAY_ZIP_BASE=\${XRAY_DOWNLOAD_BASE:-https://github.com/XTLS/Xray-core/releases/latest/download}
 XRAY_VER=''
@@ -1771,18 +1782,34 @@ xray_arch() {
   esac
 }
 
-# 已有的 Xray 服务单元名（空 = 没有）
+# 已有的 Xray 服务单元名（空 = 没有）。伪装名优先：0.1.9 装过的机器重跑部署
+# 时按伪装名找到已有单元；老机器按官方名找到 —— 两条路都通向「沿用，不重装」
 xray_unit_name() {
   if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-    for _u in xray xray-core x-ui; do
+    for _u in "$XRAY_ALIAS" xray xray-core x-ui; do
       if systemctl list-unit-files 2>/dev/null | grep -q "^$_u\\.service"; then
         printf '%s' "$_u"
         return 0
       fi
     done
   fi
+  if [ -f "/etc/init.d/$XRAY_ALIAS" ]; then printf '%s' "$XRAY_ALIAS"; return 0; fi
   if [ -f /etc/init.d/xray ]; then printf 'xray'; return 0; fi
   printf ''
+}
+
+# 名称/路径决策：已有官方名单元的机器整条退回官方布局（xray-core / x-ui 的
+# 服务名记进 XRAY_UNIT_NAME，路径仍按 xray 惯例 —— 与 0.1.8 的行为一致）；
+# 其余（全新安装 / 已是伪装名）都用伪装名布局
+resolve_xray_layout() {
+  _preset=$(xray_unit_name)
+  XRAY_UNIT_NAME=$_preset
+  if [ -n "$_preset" ] && [ "$_preset" != "$XRAY_ALIAS" ]; then
+    XRAY_ALIAS=xray
+  fi
+  XRAY_BIN=/usr/local/bin/$XRAY_ALIAS
+  XRAY_ETC=/usr/local/etc/$XRAY_ALIAS
+  XRAY_DAT=/usr/local/share/$XRAY_ALIAS
 }
 
 # 包管理器装依赖（只在缺 unzip 时用得上）
@@ -1819,53 +1846,52 @@ extract_zip() {
 }
 
 # 装服务单元（systemd / OpenRC）。只 enable 不 start：
-# 首次部署时配置还没下发，xray 起来会因为找不到 config.json 直接退出
+# 首次部署时配置还没下发，xray 起来会因为找不到 config.json 直接退出。
+# 单元名与 Description 都用中性词：Description 里出现「Xray」等于把伪装
+# 又贴回去了（journalctl / systemctl list-units 直接可见）
 write_xray_unit() {
   if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     mkdir -p /etc/systemd/system 2>/dev/null
-    cat > /etc/systemd/system/xray.service <<'EOF'
+    cat > /etc/systemd/system/$XRAY_ALIAS.service <<EOF
 [Unit]
-Description=Xray Service
-Documentation=https://xtls.github.io/
+Description=WebCore Service
 After=network.target nss-lookup.target
 
 [Service]
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+ExecStart=$XRAY_BIN run -config $XRAY_ETC/config.json
 Restart=on-failure
 RestartSec=3
 # 23 = 配置错误，重试也没用，别把 CPU 烧在重启循环上
 RestartPreventExitStatus=23
 LimitNPROC=10000
 LimitNOFILE=1000000
-RuntimeDirectory=xray
+RuntimeDirectory=$XRAY_ALIAS
 RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable xray >/dev/null 2>&1
+    systemctl enable $XRAY_ALIAS >/dev/null 2>&1
     printf 'systemd'
   elif command -v rc-update >/dev/null 2>&1; then
     mkdir -p /etc/init.d 2>/dev/null
-    cat > /etc/init.d/xray <<'EOF'
+    cat > /etc/init.d/$XRAY_ALIAS <<EOF
 #!/sbin/openrc-run
-name="xray"
-description="Xray Service"
-command="/usr/local/bin/xray"
-command_args="run -config /usr/local/etc/xray/config.json"
+name="$XRAY_ALIAS"
+description="WebCore Service"
+command="$XRAY_BIN"
+command_args="run -config $XRAY_ETC/config.json"
 command_background="yes"
-pidfile="/run/xray.pid"
-output_log="/var/log/xray/access.log"
-error_log="/var/log/xray/error.log"
+pidfile="/run/$XRAY_ALIAS.pid"
 
 depend() {
   need net
   after firewall
 }
 EOF
-    chmod 755 /etc/init.d/xray
-    rc-update add xray default >/dev/null 2>&1
+    chmod 755 /etc/init.d/$XRAY_ALIAS
+    rc-update add $XRAY_ALIAS default >/dev/null 2>&1
     printf 'openrc'
   else
     printf ''
@@ -1873,16 +1899,14 @@ EOF
 }
 
 if [ "$NEED_XRAY" = "1" ]; then
+  # 先定布局（沿用官方 or 伪装），后续所有路径/服务名都从这来
+  resolve_xray_layout
   step "Xray 本体 → $XRAY_BIN"
   if [ "\${SKIP_XRAY:-0}" = "1" ]; then
     XRAY_SKIPPED=1
     say "SKIP_XRAY=1，跳过安装"
     note "配置仍会下发到 $XRAY_ETC/config.json，服务需自行管理"
   else
-    # 日志目录必须在：面板下发的配置把 error 日志写到 /var/log/xray/error.log，
-    # 目录不存在时 xray 启动即退出，journalctl 里只有一行 failed to open log file
-    mkdir -p "$XRAY_ETC" "$XRAY_LOG" "$XRAY_DAT" 2>/dev/null
-
     _unit=$(xray_unit_name)
     if [ -n "$_unit" ]; then
       _act=''
@@ -1951,10 +1975,11 @@ if [ "$NEED_XRAY" = "1" ]; then
 
       # 二进制到位（或本来就有）才建单元，否则会留一个永远起不来的服务
       if [ -x "$XRAY_BIN" ]; then
+        mkdir -p "$XRAY_ETC" "$XRAY_DAT" 2>/dev/null
         _svc=$(write_xray_unit)
         case "$_svc" in
-          systemd) say "服务单元 /etc/systemd/system/xray.service（已 enable，配置下发后启动）" ;;
-          openrc) say "服务脚本 /etc/init.d/xray（已加入 default 运行级）" ;;
+          systemd) say "服务单元 /etc/systemd/system/$XRAY_ALIAS.service（已 enable，配置下发后启动）" ;;
+          openrc) say "服务脚本 /etc/init.d/$XRAY_ALIAS（已加入 default 运行级）" ;;
           *) bad "没有可用的服务管理器，xray 需手动常驻" ;;
         esac
       fi
@@ -1964,9 +1989,15 @@ fi
 
 # ---------------------------- 3. Hysteria2 ---------------------------------
 if [ "$NEED_HYSTERIA" = "1" ]; then
-  step "Hysteria2 二进制 → /usr/local/bin/hysteria"
+  # 同 Xray 的逻辑：已有官方名安装（0.1.8 及更早装的 /usr/local/bin/hysteria）
+  # 一律沿用，避免同机出现两份二进制各跑各的实例
   if [ -x /usr/local/bin/hysteria ]; then
-    say "已安装 $(/usr/local/bin/hysteria version 2>/dev/null | sed -n '1p')，跳过"
+    HY_BIN=/usr/local/bin/hysteria
+    HY_DIR=/etc/hysteria
+  fi
+  step "Hysteria2 二进制 → $HY_BIN"
+  if [ -x "$HY_BIN" ]; then
+    say "已安装 $("$HY_BIN" version 2>/dev/null | sed -n '1p')，跳过"
   else
     case "$(uname -m)" in
       x86_64 | amd64) HARCH=amd64 ;;
@@ -1979,12 +2010,12 @@ if [ "$NEED_HYSTERIA" = "1" ]; then
       bad "不支持的架构 $(uname -m)，需手动安装"
     else
       note "来源 https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$HARCH"
-      if download "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$HARCH" /usr/local/bin/hysteria.tmp; then
-        chmod 755 /usr/local/bin/hysteria.tmp
-        mv /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
-        say "已安装 $(/usr/local/bin/hysteria version 2>/dev/null | sed -n '1p') · $(size_of /usr/local/bin/hysteria)"
+      if download "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$HARCH" "$HY_BIN.tmp"; then
+        chmod 755 "$HY_BIN.tmp"
+        mv "$HY_BIN.tmp" "$HY_BIN"
+        say "已安装 $("$HY_BIN" version 2>/dev/null | sed -n '1p') · $(size_of "$HY_BIN")"
       else
-        rm -f /usr/local/bin/hysteria.tmp
+        rm -f "$HY_BIN.tmp"
         bad "下载失败"
         note "手动安装：https://v2.hysteria.network/zh/docs/getting-started/Installation/"
       fi
@@ -1995,21 +2026,27 @@ fi
 # ---------------------------- 4. 运行配置 ----------------------------------
 step "运行配置 → /opt/nodepanel/agent.env"
 
-# 服务名不一定叫 xray：xray-core / x-ui 都见过，按实际存在的单元来定，
+# 纯 Hysteria2 的机器没走上面的布局决策：XRAY_* 用官方缺省（反正没有 Xray 节点，
+# 这个路径只是 agent.env 里的占位，bundle 不会往那写东西）
+[ -n "$XRAY_ETC" ] || XRAY_ETC=/usr/local/etc/xray
+[ -n "$XRAY_ALIAS" ] || XRAY_ALIAS=xray
+
+# 服务名不一定叫 xray：伪装名 / xray-core / x-ui 都见过，按实际存在的单元来定，
 # 否则 agent 每轮都会报「Xray 重载失败」却不说为什么。
 # 纯 Hysteria2 的机器不猜：留空，agent 真需要时会自己探测。
 RELOAD_CMD=''
 if [ "$NEED_XRAY" = "1" ]; then
   if command -v systemctl >/dev/null 2>&1; then
-    for _unit in xray xray-core x-ui; do
+    for _unit in "$XRAY_ALIAS" xray xray-core x-ui; do
       if systemctl list-unit-files 2>/dev/null | grep -q "^$_unit\\.service"; then
         RELOAD_CMD="systemctl restart $_unit"
+        XRAY_UNIT_NAME=$_unit
         break
       fi
     done
-    [ -n "$RELOAD_CMD" ] || RELOAD_CMD='systemctl restart xray'
+    [ -n "$RELOAD_CMD" ] || RELOAD_CMD="systemctl restart $XRAY_ALIAS"
   elif command -v rc-service >/dev/null 2>&1; then
-    RELOAD_CMD='rc-service xray restart'
+    RELOAD_CMD="rc-service $XRAY_ALIAS restart"
   fi
 fi
 
@@ -2019,10 +2056,11 @@ cat > /opt/nodepanel/agent.env <<EOF
 PANEL_URL="$PANEL_URL"
 AGENT_TOKEN="$AGENT_TOKEN"
 INTERVAL="$INTERVAL"
+XRAY_ALIAS="$XRAY_ALIAS"
 XRAY_CONFIG="$XRAY_ETC/config.json"
 RELOAD_CMD="$RELOAD_CMD"
-HYSTERIA_DIR="/etc/hysteria"
-HYSTERIA_BIN="/usr/local/bin/hysteria"
+HYSTERIA_DIR="$HY_DIR"
+HYSTERIA_BIN="$HY_BIN"
 EOF
 chmod 600 /opt/nodepanel/agent.env
 
@@ -2111,37 +2149,39 @@ fi
 
 # agent 启动后第一轮就会写配置并重启 xray，等它一下再把结果报出来
 if [ "$NEED_XRAY" = "1" ] && [ "\${SKIP_XRAY:-0}" != "1" ]; then
+  _xs=$XRAY_UNIT_NAME
+  [ -n "$_xs" ] || _xs=$XRAY_ALIAS
   if [ "$STARTED" = 'systemd' ]; then
     say "等待 agent 首轮同步（最多 12s）"
     _i=0
     while [ "$_i" -lt 12 ]; do
-      systemctl is-active --quiet xray >/dev/null 2>&1 && break
+      systemctl is-active --quiet "$_xs" >/dev/null 2>&1 && break
       sleep 1
       _i=$((_i + 1))
     done
-    if systemctl is-active --quiet xray >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$_xs" >/dev/null 2>&1; then
       XRAY_STATE='运行中'
-      say "Xray 运行中（pid $(systemctl show -p MainPID --value xray 2>/dev/null)）"
+      say "服务 $_xs 运行中（pid $(systemctl show -p MainPID --value "$_xs" 2>/dev/null)）"
     else
       XRAY_STATE='未运行'
-      bad "Xray 未运行"
-      note "journalctl -u xray -n 50（配置里的证书路径 / 端口占用是最常见原因）"
+      bad "服务 $_xs 未运行"
+      note "journalctl -u $_xs -n 50（配置里的证书路径 / 端口占用是最常见原因）"
     fi
   elif [ "$STARTED" = 'openrc' ]; then
     say "等待 agent 首轮同步（最多 12s）"
     _i=0
     while [ "$_i" -lt 12 ]; do
-      rc-service xray status >/dev/null 2>&1 && break
+      rc-service "$_xs" status >/dev/null 2>&1 && break
       sleep 1
       _i=$((_i + 1))
     done
-    if rc-service xray status >/dev/null 2>&1; then
+    if rc-service "$_xs" status >/dev/null 2>&1; then
       XRAY_STATE='运行中'
-      say "Xray 运行中"
+      say "服务 $_xs 运行中"
     else
       XRAY_STATE='未运行'
-      bad "Xray 未运行"
-      note "rc-service xray status；tail -n 50 /var/log/xray/error.log"
+      bad "服务 $_xs 未运行"
+      note "rc-service $_xs status；journalctl 或 agent 日志里看失败原因"
     fi
   fi
 fi
@@ -2164,8 +2204,8 @@ else
 fi
 
 if [ "$NEED_HYSTERIA" = "1" ]; then
-  if [ -x /usr/local/bin/hysteria ]; then
-    HY_LINE="$(/usr/local/bin/hysteria version 2>/dev/null | sed -n '1p') · 配置在 /etc/hysteria"
+  if [ -x "$HY_BIN" ]; then
+    HY_LINE="$("$HY_BIN" version 2>/dev/null | sed -n '1p') · 配置在 $HY_DIR"
   else
     HY_LINE='未安装（见上方错误）'
   fi
@@ -2255,8 +2295,24 @@ AGENT_DIR=/opt/nodepanel
 RUN_DIR=/run/nodepanel
 LOG_DIR=/var/log/nodepanel
 CERTS_DIR=/etc/nodepanel
-HY_DIR=/etc/hysteria
-XRAY_CONFIG=/usr/local/etc/xray/config.json
+
+# 0.1.9 起机器上的安装可能是伪装名（webcore / streamd），也可能是老官方名
+# （xray / hysteria）。一切以 agent.env 里记录的为准 —— 它还没被删，就在下面
+# AGENT_DIR 里；读不到（手删过 / 从没部署过）就退回官方缺省路径。
+# 不 source agent.env 的原因同 agent.sh：值里带空格会撕开语句
+env_get() {
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$AGENT_DIR/agent.env" 2>/dev/null \\
+    | tr -d '\\r' | tail -n 1 \\
+    | sed "s/[[:space:]]*\$//; s/^'\\(.*\\)'\$/\\1/; s/^\\"\\(.*\\)\\"\$/\\1/"
+}
+XRAY_ALIAS=$(env_get XRAY_ALIAS)
+[ -n "$XRAY_ALIAS" ] || XRAY_ALIAS=xray
+HY_DIR=$(env_get HYSTERIA_DIR)
+[ -n "$HY_DIR" ] || HY_DIR=/etc/hysteria
+HY_BIN=$(env_get HYSTERIA_BIN)
+[ -n "$HY_BIN" ] || HY_BIN=/usr/local/bin/hysteria
+XRAY_CONFIG=$(env_get XRAY_CONFIG)
+[ -n "$XRAY_CONFIG" ] || XRAY_CONFIG=/usr/local/etc/xray/config.json
 XRAY_BAK=\${XRAY_CONFIG}.nodepanel.bak
 
 echo "→ 停止并注销 nodepanel-agent"
@@ -2317,9 +2373,12 @@ if ls "$HY_DIR"/node-*.yaml >/dev/null 2>&1; then
   echo "  ✓ 已删除 agent 下发的 Hysteria2 配置（$HY_DIR/node-*.yaml）"
 fi
 
-# pid 文件丢了（手删 / 机器重启）时按命令行兜底，只匹配 agent 自己下发的那些实例
+# pid 文件丢了（手删 / 机器重启）时按命令行兜底，只匹配 agent 自己下发的那些实例。
+# 三种形态都试：agent.env 记录的路径（伪装或官方）、默认伪装名、默认官方名
 if command -v pkill >/dev/null 2>&1; then
-  if pkill -f "hysteria server -c $HY_DIR/node-" 2>/dev/null; then
+  if pkill -f "$HY_BIN server -c $HY_DIR/node-" 2>/dev/null \\
+     || pkill -f '/usr/local/bin/streamd server -c /etc/streamd/node-' 2>/dev/null \\
+     || pkill -f 'hysteria server -c /etc/hysteria/node-' 2>/dev/null; then
     echo "  ✓ 已结束残留的 Hysteria2 实例"
   fi
 fi
@@ -2335,16 +2394,17 @@ if [ -d "$CERTS_DIR" ]; then
 fi
 
 echo "→ 停掉 Xray 并清理面板生成的配置"
-# 服务名不一定是 xray：xray-core / x-ui 都见过
+# 服务名不一定是 xray：伪装名 / xray-core / x-ui 都见过
 XRAY_UNIT=''
 if command -v systemctl >/dev/null 2>&1; then
-  for _u in xray xray-core x-ui; do
+  for _u in "$XRAY_ALIAS" xray xray-core x-ui; do
     if systemctl list-unit-files 2>/dev/null | grep -q "^$_u\\.service"; then
       XRAY_UNIT=$_u
       break
     fi
   done
 fi
+if [ -z "$XRAY_UNIT" ] && [ -f "/etc/init.d/$XRAY_ALIAS" ]; then XRAY_UNIT=$XRAY_ALIAS; fi
 if [ -z "$XRAY_UNIT" ] && [ -f /etc/init.d/xray ]; then XRAY_UNIT=xray; fi
 
 # 只动「确实是面板写的」那份配置：面板生成的配置一定带 StatsService。
@@ -2373,7 +2433,9 @@ else
 
   # 没有服务单元时（手工 nohup 起的），按进程名收尾 —— 否则端口会一直被占着
   if [ -z "$XRAY_UNIT" ] && command -v pkill >/dev/null 2>&1; then
-    pkill -x xray 2>/dev/null && echo "  ✓ 已结束手工启动的 xray 进程"
+    if pkill -x "$XRAY_ALIAS" 2>/dev/null || pkill -x xray 2>/dev/null; then
+      echo "  ✓ 已结束手工启动的 Xray 进程"
+    fi
   fi
 fi
 
@@ -2389,9 +2451,9 @@ else
   echo "· 保留 $XRAY_BAK（面板覆盖前的配置备份，不需要可手动删）"
 fi
 
-if [ -x /usr/local/bin/xray ]; then
-  echo "· 保留 /usr/local/bin/xray 与 geo 数据（可能是你自己装的；"
-  echo "  确认是面板装的那份，可执行：rm -rf /usr/local/bin/xray /usr/local/share/xray）"
+if [ -x "/usr/local/bin/$XRAY_ALIAS" ] || [ -x /usr/local/bin/xray ]; then
+  echo "· 保留 Xray 二进制与 geo 数据（可能是你自己装的；"
+  echo "  确认是面板装的那份，可执行：rm -rf /usr/local/bin/$XRAY_ALIAS /usr/local/share/$XRAY_ALIAS）"
 fi
 
 echo ""

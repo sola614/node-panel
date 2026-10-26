@@ -467,11 +467,22 @@ const json = (obj) => JSON.stringify(obj);
     srvInstall.includes('NEED_XRAY="1"') &&
       srvInstall.includes('Xray-linux-') &&
       srvInstall.includes('Xray-core/releases/latest/download') &&
-      srvInstall.includes('/etc/systemd/system/xray.service'));
+      srvInstall.includes('XRAY_BIN=/usr/local/bin/$XRAY_ALIAS'));
+  ok('全新安装落地为伪装名（XRAY_ALIAS=webcore，单元/路径/进程名不含 xray 字样）',
+    srvInstall.includes('XRAY_ALIAS=${XRAY_ALIAS:-webcore}') &&
+      srvInstall.includes('cat > /etc/systemd/system/$XRAY_ALIAS.service') &&
+      srvInstall.includes('Description=WebCore Service') &&
+      !srvInstall.includes('Description=Xray'));
+  ok('已有官方名安装时整条退回官方布局（老机器不受伪装改造影响）',
+    srvInstall.includes('XRAY_ALIAS=xray') && srvInstall.includes('resolve_xray_layout'));
+  ok('agent.env 注入伪装名与变量化路径',
+    srvInstall.includes('XRAY_ALIAS="$XRAY_ALIAS"') &&
+      srvInstall.includes('XRAY_CONFIG="$XRAY_ETC/config.json"') &&
+      srvInstall.includes('HYSTERIA_DIR="$HY_DIR"'));
   ok('已有 Xray 安装时脚本不覆盖',
     srvInstall.includes('xray_unit_name') && srvInstall.includes('已有服务单元'));
-  ok('部署脚本建 Xray 日志目录（配置里写的是 /var/log/xray/error.log）',
-    srvInstall.includes('XRAY_LOG=/var/log/xray'));
+  ok('不再创建 /var/log/xray（error 日志改走 stderr → journald）',
+    !srvInstall.includes('XRAY_LOG=/var/log/xray'));
   ok('部署输出按步骤编号，末尾有汇总',
     srvInstall.includes('step "agent 脚本') &&
       srvInstall.includes('[%s/%s]') &&
@@ -493,7 +504,10 @@ const json = (obj) => JSON.stringify(obj);
       srvUninstall.includes('rm -rf "$AGENT_DIR" "$RUN_DIR"'),
   );
   ok('卸载脚本会停掉 agent 托管的 Hysteria2 实例', srvUninstall.includes('node-*.yaml') && srvUninstall.includes('RUN_DIR"/*.pid'));
-  ok('卸载脚本兜底结束残留的 Hysteria2 实例', srvUninstall.includes('pkill -f "hysteria server -c'));
+  ok('卸载脚本兜底结束残留的 Hysteria2 实例（按实际路径 + 官方/伪装双兜底）',
+    srvUninstall.includes('pkill -f "$HY_BIN server -c $HY_DIR/node-"') &&
+      srvUninstall.includes("'/usr/local/bin/streamd server -c /etc/streamd/node-'") &&
+      srvUninstall.includes("'hysteria server -c /etc/hysteria/node-'"));
   ok(
     '卸载脚本默认停掉 Xray 并删掉面板生成的配置',
     srvUninstall.includes('systemctl stop "$XRAY_UNIT"') &&
@@ -526,7 +540,8 @@ const json = (obj) => JSON.stringify(obj);
   const bundleRes = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}`);
   const bundle = await bundleRes.text();
   ok('配置包可下发', bundleRes.status === 200 && bundle.startsWith('#!/bin/sh'));
-  ok('配置包以 base64 内嵌文件', bundle.includes('base64 -d') && bundle.includes("np_put '"));
+  ok('配置包以 base64 内嵌文件、路径引用 agent 环境变量',
+    bundle.includes('base64 -d') && bundle.includes('np_put "$XRAY_CONFIG"'));
   ok('配置包写入 state.env 供 agent 读取', bundle.includes('NP_HY2_LIST=') && bundle.includes('NP_STATS='));
 
   const bundleHash = /NP_HASH='([^']+)'/.exec(bundle);
