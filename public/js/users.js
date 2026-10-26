@@ -66,6 +66,7 @@ function userRowHtml(u) {
         </td>
         <td>
           <div class="row-actions">
+            <button class="btn btn-sm btn-ghost" data-act="user-copy" data-id="${u.id}">复制</button>
             <button class="btn btn-sm btn-ghost" data-act="user-edit" data-id="${u.id}">编辑</button>
             <button class="btn btn-sm btn-ghost" data-act="user-more" data-id="${u.id}">⋯</button>
           </div>
@@ -369,20 +370,38 @@ function readUserForm(mask) {
   };
 }
 
-async function createUserFlow() {
+async function createUserFlow(template) {
+  const copy = !!template;
   const mask = openModal({
-    title: '新增用户',
-    body: userForm(),
-    okText: '创建',
+    title: copy ? '复制用户 · ' + (template.copyFrom || template.name) : '新增用户',
+    body: userForm(template || null),
+    okText: copy ? '复制' : '创建',
     onOk: async (m) => {
       const payload = readUserForm(m);
       if (!payload.name) throw new Error('请填写用户名称');
       await api('/api/users', { method: 'POST', body: JSON.stringify(payload) });
-      toast('用户已创建', 'ok');
+      toast(copy ? '用户已复制（订阅地址是新的）' : '用户已创建', 'ok');
       render();
     },
   });
   bindUserForm(mask);
+}
+
+/**
+ * 复制用户：套餐 / 额度 / 备注带过来，流量与身份重来 ——
+ * UUID、订阅 token 由服务端重新生成，已用流量清零（否则复制出来的号一出生就是超额状态）。
+ */
+function userCopyFlow(id) {
+  const u = (state.data.users || []).find((x) => x.id === id);
+  if (!u) return;
+  createUserFlow({
+    copyFrom: u.name,
+    name: copyName(u.name, (state.data.users || []).map((x) => x.name)),
+    planId: u.planId || '',
+    quotaGB: u.quotaGB || 0,
+    note: u.note || '',
+    usedBytes: 0,
+  });
 }
 
 async function editUserFlow(id) {

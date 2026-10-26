@@ -475,6 +475,28 @@ function overview(req, res) {
   });
 }
 
+/* ------------------------------- 通用小工具 ------------------------------- */
+
+/**
+ * 名称查重。
+ *
+ * 列表上的「复制」会把「XX」预填成「XX 副本」，但用户改回原名再提交时，
+ * 不该静默多出一条同名记录 —— 名字是面板里唯一的辨识线索（节点、套餐、服务器都没有唯一索引）。
+ * 比较前统一 trim + 小写：SQLite 里没有唯一约束，这一层就是唯一的防线。
+ */
+function nameTaken(list, name, selfId) {
+  const n = String(name || '').trim().toLowerCase();
+  if (!n) return false;
+  return list.some((x) => x.id !== selfId && String(x.name || '').trim().toLowerCase() === n);
+}
+
+/** 批量删除取参：去重后只保留库里真实存在的 id，已经被删掉的静默跳过（并发删除是常态） */
+function pickExistingIds(list, body) {
+  const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(String))] : [];
+  const known = new Set(list.map((x) => x.id));
+  return ids.filter((id) => known.has(id));
+}
+
 /* ---------------------------------- 套餐 ---------------------------------- */
 
 function listPlans(req, res) {
@@ -490,6 +512,7 @@ function listPlans(req, res) {
 function createPlan(req, res, params, body) {
   const name = String(body.name || '').trim();
   if (!name) return sendJson(res, 400, { error: '请填写套餐名称' });
+  if (nameTaken(store.db().plans, name)) return sendJson(res, 409, { error: '已存在同名套餐，换个名字' });
   const validity = readPlanValidity(body) || store.normalizeValidity(null, 0);
   const plan = {
     id: store.uid(),
@@ -525,7 +548,11 @@ function readPlanValidity(body) {
 function updatePlan(req, res, params, body) {
   const plan = store.db().plans.find((p) => p.id === params.id);
   if (!plan) return sendJson(res, 404, { error: '套餐不存在' });
-  if (body.name !== undefined) plan.name = String(body.name).trim() || plan.name;
+  if (body.name !== undefined) {
+    const next = String(body.name).trim() || plan.name;
+    if (nameTaken(store.db().plans, next, plan.id)) return sendJson(res, 409, { error: '已存在同名套餐，换个名字' });
+    plan.name = next;
+  }
   if (body.desc !== undefined) plan.desc = String(body.desc);
   if (body.color !== undefined) plan.color = String(body.color);
   if (body.sort !== undefined) plan.sort = Number(body.sort) || plan.sort;
@@ -565,9 +592,40 @@ function deletePlan(req, res, params) {
   db.users.forEach((u) => {
     if (u.planId === params.id) u.planId = null;
   });
+  // 节点上的 planIds 同理：留着死 id 只会让「归属套餐」看着像有、点开却没有
+  db.nodes.forEach((n) => {
+    if (Array.isArray(n.planIds) && n.planIds.includes(params.id)) {
+      n.planIds = n.planIds.filter((id) => id !== params.id);
+    }
+  });
   store.save();
   auditAction('plan.delete', nameOfDeletedPlan, `影响 ${affected} 位用户，已降级为不限套餐`);
   sendJson(res, 200, { ok: true, affected });
+}
+
+/** 批量删除套餐：用户降级为不限套餐，节点上的归属同步摘掉 */
+function batchDeletePlans(req, res, params, body) {
+  const db = store.db();
+  const ids = pickExistingIds(db.plans, body);
+  if (!ids.length) return sendJson(res, 400, { error: '请选择要删除的套餐' });
+  const names = db.plans.filter((p) => ids.includes(p.id)).map((p) => p.name);
+  const drop = new Set(ids);
+  let affected = 0;
+  db.users.forEach((u) => {
+    if (drop.has(u.planId)) {
+      u.planId = null;
+      affected++;
+    }
+  });
+  db.nodes.forEach((n) => {
+    if (Array.isArray(n.planIds) && n.planIds.some((id) => drop.has(id))) {
+      n.planIds = n.planIds.filter((id) => !drop.has(id));
+    }
+  });
+  db.plans = db.plans.filter((p) => !drop.has(p.id));
+  store.save();
+  auditAction('plan.batch-delete', `${ids.length} 个套餐`, `${affected} 位用户降级为不限套餐 · ${names.slice(0, 5).join('、')}`);
+  sendJson(res, 200, { ok: true, done: ids.length, affected });
 }
 
 /* ---------------------------------- 用户 ---------------------------------- */
@@ -628,8 +686,9 @@ function createUser(req, res, params, body) {
   const name = String(body.name || '').trim();
   if (!name) return sendJson(res, 400, { error: '请填写用户名称' });
   if (name.length > 60) return sendJson(res, 400, { error: '名字太长，60 字以内' });
-  // 批量建号与邀请领取都查重名，单个建号以前不查 —— 于是「按名字找人」这条路径会被同名账号搞乱
-  if (store.db().users.some((u) => u.name === name)) {
+  // 批量建号与邀请领取都查重名，单个建号以前不查 —— 于是「按名字找人」这条路径会被同名账号搞乱。
+  // 复制用户时预填的是「XX 副本」，改回原名会被这里拦下来（大小写、首尾空格也算同一个名字）
+  if (nameTaken(store.db().users, name)) {
     return sendJson(res, 409, { error: '这个用户名已经存在了' });
   }
   const u = buildUser({
@@ -650,7 +709,11 @@ function createUser(req, res, params, body) {
 function updateUser(req, res, params, body) {
   const u = store.db().users.find((x) => x.id === params.id);
   if (!u) return sendJson(res, 404, { error: '用户不存在' });
-  if (body.name !== undefined) u.name = String(body.name).trim() || u.name;
+  if (body.name !== undefined) {
+    const next = String(body.name).trim() || u.name;
+    if (nameTaken(store.db().users, next, u.id)) return sendJson(res, 409, { error: '这个用户名已经存在了' });
+    u.name = next;
+  }
   if (body.enabled !== undefined) u.enabled = !!body.enabled;
   if (body.note !== undefined) u.note = String(body.note);
   if (body.resetTraffic) u.usedBytes = 0;
@@ -1293,13 +1356,27 @@ function normalizeNode(body, prev = {}) {
   return node;
 }
 
+/**
+ * 节点的统一排序：sort 小的在前；sort 相同（老库补列后全是 0）按创建时间兜底。
+ *
+ * 列表与订阅必须走同一个函数 —— 否则「拖完顺序、订阅没变」会变成一个查不出来的长期 bug。
+ */
+function orderedNodes(list) {
+  return [...list].sort(
+    (a, b) =>
+      (Number(a.sort) || 0) - (Number(b.sort) || 0) ||
+      String(a.createdAt || '').localeCompare(String(b.createdAt || '')) ||
+      String(a.id).localeCompare(String(b.id)),
+  );
+}
+
 function listNodes(req, res) {
   desiredHashCache = new Map();
   const db = store.db();
   // 跟随服务器的节点共用服务器的回执，同一台服务器只算一次
   const serverSync = new Map(db.servers.map((s) => [s.id, syncView(s, scopeOfServer(s))]));
   sendJson(res, 200, {
-    items: db.nodes.map((n) => ({
+    items: orderedNodes(db.nodes).map((n) => ({
       ...n,
       serverName: n.mode === 'standalone' ? '独立部署' : (db.servers.find((s) => s.id === n.serverId) || {}).name || '未绑定',
       online: store.nodeOnline(n),
@@ -1330,6 +1407,7 @@ function createNode(req, res, params, body) {
   const data = normalizeNode(body);
   if (!data.name) return sendJson(res, 400, { error: '请填写节点名称' });
   const db = store.db();
+  if (nameTaken(db.nodes, data.name)) return sendJson(res, 409, { error: '已存在同名节点，换个名字' });
 
   if (data.mode === 'server') {
     if (!db.servers.some((s) => s.id === data.serverId)) {
@@ -1343,7 +1421,16 @@ function createNode(req, res, params, body) {
     return sendJson(res, 400, { error: '该服务器上已有相同端口与协议的节点' });
   }
 
-  const node = { id: store.uid(), createdAt: store.iso(), lastSeen: null, agentVersion: null, sync: null, ...data };
+  const node = {
+    id: store.uid(),
+    createdAt: store.iso(),
+    // 新建的排在最后：sort 取当前最大值 +1（老库全是 0 时也能拿到更大的值）
+    sort: db.nodes.reduce((max, n) => Math.max(max, Number(n.sort) || 0), 0) + 1,
+    lastSeen: null,
+    agentVersion: null,
+    sync: null,
+    ...data,
+  };
   db.nodes.push(node);
   store.save();
   auditAction('node.create', node.name, `${node.protocol} · 端口 ${node.port}`);
@@ -1353,7 +1440,11 @@ function createNode(req, res, params, body) {
 function updateNode(req, res, params, body) {
   const node = store.db().nodes.find((n) => n.id === params.id);
   if (!node) return sendJson(res, 404, { error: '节点不存在' });
-  Object.assign(node, normalizeNode({ ...body }, node));
+  const next = normalizeNode({ ...body }, node);
+  if (nameTaken(store.db().nodes, next.name, node.id)) {
+    return sendJson(res, 409, { error: '已存在同名节点，换个名字' });
+  }
+  Object.assign(node, next);
   store.save();
   auditAction('node.update', node.name, `${node.protocol} · 端口 ${node.port}${node.enabled ? '' : ' · 已停用'}`);
   sendJson(res, 200, { ok: true, item: node });
@@ -1368,6 +1459,46 @@ function deleteNode(req, res, params) {
   store.save();
   auditAction('node.delete', nameOfNode);
   sendJson(res, 200, { ok: true });
+}
+
+/** 批量删除节点 */
+function batchDeleteNodes(req, res, params, body) {
+  const db = store.db();
+  const ids = pickExistingIds(db.nodes, body);
+  if (!ids.length) return sendJson(res, 400, { error: '请选择要删除的节点' });
+  const drop = new Set(ids);
+  const names = db.nodes.filter((n) => drop.has(n.id)).map((n) => n.name);
+  db.nodes = db.nodes.filter((n) => !drop.has(n.id));
+  store.save();
+  auditAction(
+    'node.batch-delete',
+    `${ids.length} 个节点`,
+    `${names.slice(0, 5).join('、')}${names.length > 5 ? ' 等' : ''}`,
+  );
+  sendJson(res, 200, { ok: true, done: ids.length });
+}
+
+/**
+ * 保存节点顺序：前端把整份 id 按新顺序传上来，这里写成 sort = 1..N。
+ *
+ * 只接受「全量」列表：并发下别人刚加了个节点，id 集合就对不上 ——
+ * 此时直接报错让前端刷新，比默默漏掉一个节点（它会留在 sort=0 的最前面）安全得多。
+ */
+function reorderNodes(req, res, params, body) {
+  const db = store.db();
+  const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
+  const known = new Set(db.nodes.map((n) => n.id));
+  if (!ids.length) return sendJson(res, 400, { error: '排序列表为空' });
+  if (ids.length !== known.size || new Set(ids).size !== ids.length || ids.some((id) => !known.has(id))) {
+    return sendJson(res, 409, { error: '节点列表已经变化，刷新后重新排序' });
+  }
+  const byId = new Map(db.nodes.map((n) => [n.id, n]));
+  ids.forEach((id, i) => {
+    byId.get(id).sort = i + 1;
+  });
+  store.save();
+  auditAction('node.order', `${ids.length} 个节点`, '列表与订阅顺序已更新');
+  sendJson(res, 200, { ok: true, count: ids.length });
 }
 
 function nodePreview(req, res, params) {
@@ -1423,6 +1554,7 @@ function createServer(req, res, params, body) {
   const host = String(body.host || '').trim();
   const ipMode = body.ipMode === 'auto' ? 'auto' : 'manual';
   if (!name) return sendJson(res, 400, { error: '请填写服务器名称' });
+  if (nameTaken(store.db().servers, name)) return sendJson(res, 409, { error: '已存在同名服务器，换个名字' });
   if (ipMode === 'manual' && !host) {
     return sendJson(res, 400, { error: '请填写服务器地址（IP 或域名）' });
   }
@@ -1449,7 +1581,11 @@ function createServer(req, res, params, body) {
 function updateServer(req, res, params, body) {
   const s = store.db().servers.find((x) => x.id === params.id);
   if (!s) return sendJson(res, 404, { error: '服务器不存在' });
-  if (body.name !== undefined) s.name = String(body.name).trim() || s.name;
+  if (body.name !== undefined) {
+    const next = String(body.name).trim() || s.name;
+    if (nameTaken(store.db().servers, next, s.id)) return sendJson(res, 409, { error: '已存在同名服务器，换个名字' });
+    s.name = next;
+  }
   if (body.host !== undefined) s.host = String(body.host).trim();
   if (body.ipMode !== undefined) s.ipMode = body.ipMode === 'auto' ? 'auto' : 'manual';
   if (body.note !== undefined) s.note = String(body.note);
@@ -1468,6 +1604,25 @@ function deleteServer(req, res, params) {
   store.save();
   auditAction('server.delete', nameOfServer, '其下节点一并删除');
   sendJson(res, 200, { ok: true });
+}
+
+/** 批量删除服务器：跟随它的节点一并删除（与单个删除保持同一语义） */
+function batchDeleteServers(req, res, params, body) {
+  const db = store.db();
+  const ids = pickExistingIds(db.servers, body);
+  if (!ids.length) return sendJson(res, 400, { error: '请选择要删除的服务器' });
+  const drop = new Set(ids);
+  const names = db.servers.filter((s) => drop.has(s.id)).map((s) => s.name);
+  const nodes = db.nodes.filter((n) => drop.has(n.serverId)).length;
+  db.servers = db.servers.filter((s) => !drop.has(s.id));
+  db.nodes = db.nodes.filter((n) => !drop.has(n.serverId));
+  store.save();
+  auditAction(
+    'server.batch-delete',
+    `${ids.length} 台服务器`,
+    `连带删除 ${nodes} 个节点 · ${names.slice(0, 5).join('、')}${names.length > 5 ? ' 等' : ''}`,
+  );
+  sendJson(res, 200, { ok: true, done: ids.length, nodes });
 }
 
 function resetServerToken(req, res, params) {
@@ -3359,8 +3514,9 @@ function subscriptionPayload(user, req) {
   const pub = store.publicUser(user);
   const usable = pub.status === 'active';
 
-  // 只按 enabled 过滤（agent 是否监听），套餐与显隐交给订阅生成器按入口粒度判断
-  const nodes = usable ? db.nodes.filter((n) => n.enabled) : [];
+  // 只按 enabled 过滤（agent 是否监听），套餐与显隐交给订阅生成器按入口粒度判断。
+  // 顺序即「节点排序」页里拖出来的顺序：客户端列表的顺序就靠它
+  const nodes = usable ? orderedNodes(db.nodes.filter((n) => n.enabled)) : [];
   // 把「生效地址」算好再交给订阅生成器：独立节点用自身地址（可能是上报的 IP），
   // 跟随服务器的节点用服务器地址。不修改内存中的原始对象。
   const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
@@ -3432,7 +3588,7 @@ function subPage(req, res, params, body, session, ctx) {
   if (format === 'clash') {
     const db = store.db();
     // 与 JSON 订阅保持一致：只按 enabled 预过滤，套餐与显隐交给 toClash 按端点粒度判断
-    const nodes = db.nodes.filter((n) => n.enabled);
+    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled));
     const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
     const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
     const yaml = sub.toClash(nodesForLinks, servers, user, db.settings.siteName, (n) => store.nodeUsableBy(n, user));
@@ -3478,6 +3634,7 @@ const ROUTES = [
 
   ['GET', '/api/plans', listPlans, true],
   ['POST', '/api/plans', createPlan, true],
+  ['POST', '/api/plans/batch-delete', batchDeletePlans, true],
   ['PUT', '/api/plans/:id', updatePlan, true],
   ['DELETE', '/api/plans/:id', deletePlan, true],
 
@@ -3505,6 +3662,8 @@ const ROUTES = [
 
   ['GET', '/api/nodes', listNodes, true],
   ['POST', '/api/nodes', createNode, true],
+  ['POST', '/api/nodes/order', reorderNodes, true],
+  ['POST', '/api/nodes/batch-delete', batchDeleteNodes, true],
   ['PUT', '/api/nodes/:id', updateNode, true],
   ['DELETE', '/api/nodes/:id', deleteNode, true],
   ['GET', '/api/nodes/:id/preview', nodePreview, true],
@@ -3514,6 +3673,7 @@ const ROUTES = [
 
   ['GET', '/api/servers', listServers, true],
   ['POST', '/api/servers', createServer, true],
+  ['POST', '/api/servers/batch-delete', batchDeleteServers, true],
   ['PUT', '/api/servers/:id', updateServer, true],
   ['DELETE', '/api/servers/:id', deleteServer, true],
   ['POST', '/api/servers/:id/rotate', resetServerToken, true],

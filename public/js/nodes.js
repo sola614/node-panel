@@ -6,13 +6,32 @@
  */
 /* ============================== 节点 ============================== */
 
+/* 列表的勾选与排序状态：只服务这一个页面，切页后重置正是想要的行为 */
+let NODE_SELECTED = new Set();
+let NODE_SORTING = false;
+let NODE_ORDER = [];
+
 RENDERERS.nodes = async () => {
   const [d, pd] = await Promise.all([api('/api/nodes'), api('/api/plans')]);
   state.data.nodes = d.items;
   state.data.serverList = d.servers;
   state.data.planList = pd.items;
+  NODE_SELECTED = new Set();
 
-  $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="node-new">+ 新增节点</button>`;
+  // 排序草稿：沿用服务端顺序，期间别处新增的节点追加到末尾（不至于因为刷新就丢掉手上的顺序）
+  if (NODE_SORTING) {
+    const alive = new Set(d.items.map((n) => n.id));
+    NODE_ORDER = NODE_ORDER.filter((id) => alive.has(id));
+    d.items.forEach((n) => {
+      if (!NODE_ORDER.includes(n.id)) NODE_ORDER.push(n.id);
+    });
+  }
+
+  $('#page-actions').innerHTML = NODE_SORTING
+    ? `<button class="btn btn-sm btn-ghost" data-act="node-sort-cancel">取消</button>
+       <button class="btn btn-primary btn-sm" data-act="node-sort-submit">提交排序</button>`
+    : `<button class="btn btn-sm btn-ghost" data-act="node-sort-start">排序</button>
+       <button class="btn btn-primary btn-sm" data-act="node-new">+ 新增节点</button>`;
 
   const planChip = (pid) => {
     const p = (state.data.planList || []).find((x) => x.id === pid);
@@ -21,8 +40,13 @@ RENDERERS.nodes = async () => {
       : '';
   };
 
-  const rows = d.items.length
-    ? d.items
+  // 排序模式下按草稿顺序画，其余情况按服务端顺序（服务端已按 sort 排好）
+  const items = NODE_SORTING
+    ? NODE_ORDER.map((id) => d.items.find((n) => n.id === id)).filter(Boolean)
+    : d.items;
+
+  const rows = items.length
+    ? items
         .map((n) => {
           // 只有配了地址的入口才进树，空行不会出现在订阅里
           const entries = (n.entries || []).filter((e) => e.host);
@@ -30,7 +54,15 @@ RENDERERS.nodes = async () => {
           const open = state.treeOpen.has(n.id);
           const netLabel = n.protocol === 'hysteria2' ? 'quic' : esc(n.network);
 
-          const parent = `<tr>
+          // 排序模式没有勾选与操作列：首列换成拖动手柄、末列留空，列数与表头保持一致
+          const leadCell = NODE_SORTING
+            ? `<td><span class="drag-handle" title="按住拖动调整顺序">⠿</span></td>`
+            : `<td><input type="checkbox" class="n-pick" data-id="${n.id}" ${
+                NODE_SELECTED.has(n.id) ? 'checked' : ''
+              }></td>`;
+
+          const parent = `<tr${NODE_SORTING ? ` draggable="true" data-id="${n.id}" class="sort-row"` : ''}>
+        ${leadCell}
         <td>
           <div class="tree-cell">
             ${
@@ -67,15 +99,20 @@ RENDERERS.nodes = async () => {
           ${n.hidden ? '<span class="badge badge-dim" style="margin-left:4px">直连隐藏</span>' : ''}
         </td>
         <td>${syncBadge(n.sync, n.name)}</td>
-        <td>
+        ${
+          NODE_SORTING
+            ? '<td></td>'
+            : `<td>
           <div class="row-actions">
             ${n.mode === 'standalone' ? `<button class="btn btn-sm btn-primary" data-act="node-deploy" data-id="${n.id}">部署</button>` : ''}
             ${n.mode === 'standalone' ? `<button class="btn btn-sm btn-ghost" data-act="node-uninstall" data-id="${n.id}">卸载</button>` : ''}
             <button class="btn btn-sm btn-ghost" data-act="node-preview" data-id="${n.id}">配置</button>
+            <button class="btn btn-sm btn-ghost" data-act="node-copy" data-id="${n.id}">复制</button>
             <button class="btn btn-sm btn-ghost" data-act="node-edit" data-id="${n.id}">编辑</button>
             <button class="btn btn-sm btn-danger" data-act="node-del" data-id="${n.id}">删</button>
           </div>
-        </td>
+        </td>`
+        }
       </tr>`;
 
           const children = entries
@@ -114,26 +151,252 @@ RENDERERS.nodes = async () => {
             })
             .join('');
 
-          return parent + children;
+          // 排序只针对节点本身：中转入口跟着父节点走，排序模式下不展开
+          return NODE_SORTING ? parent : parent + children;
         })
         .join('')
-    : `<tr><td colspan="8" class="empty"><b>还没有节点</b>节点可以跟随服务器部署，也可以独立部署</td></tr>`;
+    : `<tr><td colspan="9" class="empty"><b>还没有节点</b>节点可以跟随服务器部署，也可以独立部署</td></tr>`;
 
   $('#view').innerHTML = `
     <div class="card">
+      ${
+        NODE_SORTING
+          ? ''
+          : `<div class="bulk-bar hidden" id="n-bulkbar">
+        <b style="font-size:12.5px">已选 <span id="n-selcount">0</span> 个</b>
+        <button class="btn btn-sm btn-danger" data-act="node-bulk-del">删除</button>
+        <button class="btn btn-sm btn-ghost" data-act="node-bulk-clear" style="margin-left:auto">取消选择</button>
+      </div>`
+      }
       <div class="table-wrap"><table>
-        <thead><tr><th>节点</th><th>协议</th><th>端口</th><th>传输</th><th>所属套餐</th><th>状态</th><th>同步</th><th style="text-align:right">操作</th></tr></thead>
-        <tbody>${rows}</tbody>
+        <thead><tr>
+          <th style="width:34px">${
+            NODE_SORTING ? '' : '<input type="checkbox" id="n-checkall" title="全选">'
+          }</th>
+          <th>节点</th><th>协议</th><th>端口</th><th>传输</th><th>所属套餐</th><th>状态</th><th>同步</th>
+          <th style="text-align:right">${NODE_SORTING ? '' : '操作'}</th>
+        </tr></thead>
+        <tbody id="n-tbody">${rows}</tbody>
       </table></div>
     </div>
     <p class="hint" style="margin-top:14px">
-      节点若不属于任何套餐，只有「不限套餐」的用户能看到它。独立部署的节点用自己的 token 拉配置，在列表里点「部署」获取命令。
+      ${
+        NODE_SORTING
+          ? '拖动行调整顺序（中转入口跟着父节点走），提交后列表与订阅都按这个顺序输出；取消则原样丢弃。'
+          : '节点若不属于任何套餐，只有「不限套餐」的用户能看到它。独立部署的节点用自己的 token 拉配置，在列表里点「部署」获取命令。'
+      }
     </p>`;
+
+  bindNodeList();
 };
 
+/* ------------------------- 列表：勾选 / 批量删 / 排序 ------------------------- */
+
+function bindNodeList() {
+  const tbody = $('#n-tbody');
+  if (!tbody) return;
+
+  if (NODE_SORTING) {
+    bindNodeDrag(tbody);
+    return;
+  }
+
+  tbody.addEventListener('change', (e) => {
+    const box = e.target.closest('.n-pick');
+    if (!box) return;
+    if (box.checked) NODE_SELECTED.add(box.dataset.id);
+    else NODE_SELECTED.delete(box.dataset.id);
+    paintNodeSelection();
+  });
+
+  const all = $('#n-checkall');
+  if (all) {
+    all.addEventListener('change', (e) => {
+      const ids = (state.data.nodes || []).map((n) => n.id);
+      if (e.target.checked) ids.forEach((id) => NODE_SELECTED.add(id));
+      else ids.forEach((id) => NODE_SELECTED.delete(id));
+      $$('#n-tbody .n-pick').forEach((b) => {
+        b.checked = e.target.checked;
+      });
+      paintNodeSelection();
+    });
+  }
+}
+
+/** 勾选状态只更新批量条与全选框，不重画表格 —— 否则刚点的那一下会闪 */
+function paintNodeSelection() {
+  const bar = $('#n-bulkbar');
+  if (bar) bar.classList.toggle('hidden', NODE_SELECTED.size === 0);
+  const count = $('#n-selcount');
+  if (count) count.textContent = String(NODE_SELECTED.size);
+
+  const all = $('#n-checkall');
+  if (all) {
+    const total = (state.data.nodes || []).length;
+    all.checked = total > 0 && NODE_SELECTED.size === total;
+    all.indeterminate = NODE_SELECTED.size > 0 && NODE_SELECTED.size < total;
+  }
+}
+
+/**
+ * 拖拽排序：直接搬 DOM 节点，拖到哪儿看到的就是哪儿，不重画表格。
+ * 松手后把 DOM 顺序读回 NODE_ORDER；只有点「提交排序」才写库，取消等于丢弃。
+ */
+function bindNodeDrag(tbody) {
+  let dragId = '';
+  const rowOf = (el) => (el ? el.closest('tr[data-id]') : null);
+  const readBack = () => {
+    const ids = $$('tr[data-id]', tbody).map((tr) => tr.dataset.id);
+    if (ids.length) NODE_ORDER = ids;
+  };
+
+  tbody.addEventListener('dragstart', (e) => {
+    const row = rowOf(e.target);
+    if (!row) return;
+    dragId = row.dataset.id;
+    row.classList.add('dragging');
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      try {
+        e.dataTransfer.setData('text/plain', dragId);
+      } catch {
+        /* 某些环境只读，忽略即可 */
+      }
+    }
+  });
+
+  tbody.addEventListener('dragover', (e) => {
+    if (!dragId) return;
+    e.preventDefault(); // 不拦默认行为就收不到 drop
+    const dragged = tbody.querySelector('tr.dragging');
+    const over = rowOf(e.target);
+    if (!dragged || !over || over === dragged) return;
+    // 鼠标在目标行的下半部分 → 插到它后面，上半部分 → 插到它前面
+    const rect = over.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    tbody.insertBefore(dragged, after ? over.nextSibling : over);
+  });
+
+  tbody.addEventListener('drop', (e) => {
+    if (dragId) e.preventDefault();
+    readBack();
+  });
+
+  tbody.addEventListener('dragend', () => {
+    const row = tbody.querySelector('tr.dragging');
+    if (row) row.classList.remove('dragging');
+    dragId = '';
+    readBack();
+  });
+}
+
+function nodeSortStart() {
+  // 一个节点谈不上排序：直接不进模式，免得提交时后端回一句「排序列表为空」
+  const items = state.data.nodes || [];
+  if (items.length < 2) return toast('至少要有两个节点才能排序', 'err');
+  NODE_SORTING = true;
+  NODE_ORDER = items.map((n) => n.id);
+  render();
+}
+
+function nodeSortCancel() {
+  NODE_SORTING = false;
+  NODE_ORDER = [];
+  render();
+}
+
+async function nodeSortSubmit() {
+  await api('/api/nodes/order', { method: 'POST', body: JSON.stringify({ ids: NODE_ORDER }) });
+  NODE_SORTING = false;
+  NODE_ORDER = [];
+  toast('顺序已保存，订阅会按这个顺序输出', 'ok');
+  render();
+}
+
+function nodeBulkDelete() {
+  if (!NODE_SELECTED.size) return toast('先勾选节点', 'err');
+  const n = NODE_SELECTED.size;
+  confirmDialog(
+    '批量删除节点',
+    `确定删除选中的 ${n} 个节点？服务器上的监听会在下一轮配置下发时撤掉，订阅链接立即失效。`,
+    async () => {
+      const r = await api('/api/nodes/batch-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids: [...NODE_SELECTED] }),
+      });
+      toast(`已删除 ${r.done} 个节点`, 'ok');
+      render();
+    },
+  );
+}
+
+/**
+ * 复制节点：配置带过来，身份重来 —— 新名字、新端口、新 Reality 密钥。
+ * 密钥不复制是有意的：两台机器共用一对密钥，一旦泄露就是双双沦陷。
+ */
+function nodeCopyFlow(id) {
+  const n = (state.data.nodes || []).find((x) => x.id === id);
+  if (!n) return;
+  const template = {
+    ...n,
+    id: '',
+    copyFrom: n.name,
+    name: copyName(n.name, (state.data.nodes || []).map((x) => x.name)),
+    token: '',
+    reality: n.reality ? { ...n.reality, privateKey: '', publicKey: '', shortId: '' } : {},
+    entries: (n.entries || []).map((e) => ({ ...e, id: '' })),
+  };
+  // 端口交给 pickFreePort 重新分配：复制出来的节点几乎一定要换端口，否则同机必撞
+  delete template.port;
+  nodeNewFlow(template);
+}
+
+/* ------------------------- 端口分配与默认值 ------------------------- */
+
+// 新增节点时给一个随机监听端口：10000-65535，避开本面板里已经用过的端口。
+// 后端只按「同一服务器 + 同协议」判重，跨协议 / 跨服务器仍会写出两份相同监听，
+// 所以前端把节点与中转入口占用的端口全避开，比撞错之后再改省事。
+const PORT_MIN = 10000;
+const PORT_MAX = 65535;
+
+function pickFreePort(nodes) {
+  const used = new Set();
+  for (const n of nodes || []) {
+    const p = Number(n.port);
+    if (Number.isInteger(p) && p > 0) used.add(p);
+    for (const e of n.entries || []) {
+      const ep = Number(e.port);
+      if (Number.isInteger(ep) && ep > 0) used.add(ep);
+    }
+  }
+  // 随机试 50 次：节点数远小于端口总数，正常一两次就命中
+  for (let i = 0; i < 50; i++) {
+    const p = PORT_MIN + Math.floor(Math.random() * (PORT_MAX - PORT_MIN + 1));
+    if (!used.has(p)) return p;
+  }
+  // 端口快被占满时退化成顺序扫描，保证仍能给出一个不冲突的值
+  for (let p = PORT_MIN; p <= PORT_MAX; p++) if (!used.has(p)) return p;
+  return PORT_MIN;
+}
+
+// 加密方式的默认值跟着协议走：VLESS 默认 Reality（免证书、抗主动探测），其余默认 TLS
+function defaultSecurityOf(protocol) {
+  return protocol === 'vless' ? 'reality' : 'tls';
+}
+
 function nodeForm(node, servers) {
+  const isNew = !(node && node.id);
+  const proto = (node && node.protocol) || 'vless';
   const n = Object.assign(
-    { mode: 'server', protocol: 'vless', network: 'ws', port: 443, security: 'tls', reality: {}, hy2: {} },
+    {
+      mode: 'server',
+      protocol: proto,
+      network: 'tcp',
+      port: isNew ? pickFreePort(state.data.nodes) : 443,
+      security: defaultSecurityOf(proto),
+      reality: {},
+      hy2: {},
+    },
     node || {},
   );
   const r = n.reality || {};
@@ -185,6 +448,7 @@ function nodeForm(node, servers) {
       <div class="field">
         <label>监听端口</label>
         <input type="number" id="n-port" value="${n.port}" min="1" max="65535">
+        ${isNew ? '<div class="hint">已随机分配 10000-65535 的空闲端口（避开现有节点），可手动改</div>' : ''}
       </div>
     </div>
 
@@ -473,7 +737,17 @@ function bindNodeForm(mask) {
     $$('#n-mode button', mask).forEach((b) => b.classList.toggle('on', b === btn));
     sync();
   });
-  ['#n-protocol', '#n-security', '#n-network', '#n-certmode'].forEach((sel) => {
+  // 加密方式的默认值跟着协议走，但只在用户没手动改过时跟随：
+  // 手动选了 TLS 之后，再切协议不该被强行改回去
+  let securityTouched = false;
+  $('#n-security', mask).addEventListener('change', () => {
+    securityTouched = true;
+  });
+  $('#n-protocol', mask).addEventListener('change', () => {
+    if (!securityTouched) $('#n-security', mask).value = defaultSecurityOf($('#n-protocol', mask).value);
+    sync();
+  });
+  ['#n-security', '#n-network', '#n-certmode'].forEach((sel) => {
     $(sel, mask).addEventListener('change', sync);
   });
 
@@ -484,16 +758,22 @@ function bindNodeForm(mask) {
     sync();
   });
 
+  // 生成一对 Reality 密钥并填进表单（按钮与「新增节点」预热共用）
+  const fillRealityKeys = async () => {
+    const k = await api('/api/reality/keys', { method: 'POST' });
+    $('#r-priv', mask).textContent = k.privateKey;
+    $('#r-pub', mask).textContent = k.publicKey;
+    $('#r-sid', mask).value = k.shortId;
+    return k;
+  };
+
   const genKeysBtn = $('#gen-keys', mask);
   genKeysBtn.addEventListener('click', () => {
     withLoading(
       genKeysBtn,
       async () => {
         try {
-          const k = await api('/api/reality/keys', { method: 'POST' });
-          $('#r-priv', mask).textContent = k.privateKey;
-          $('#r-pub', mask).textContent = k.publicKey;
-          $('#r-sid', mask).value = k.shortId;
+          await fillRealityKeys();
           toast('已生成 Reality 密钥对', 'ok');
         } catch (err) {
           showError(err);
@@ -502,6 +782,16 @@ function bindNodeForm(mask) {
       '生成中',
     );
   });
+
+  // 新增（含复制）默认就是 VLESS + Reality：进门先把密钥对备好，
+  // 免得用户填完名称和端口、点「创建」才发现私钥是空的。
+  // 复制过来的节点密钥是清空的，所以这里按「有没有密钥」判断，而不是按「是不是新增」
+  const hasKeys = () => /^[\w-]{43}$/.test($('#r-priv', mask).textContent.trim());
+  if ($('#n-security', mask).value === 'reality' && !hasKeys()) {
+    fillRealityKeys().catch(() => {
+      /* 失败就留空，提交前 ensureRealityKeys 还会再补一次 */
+    });
+  }
 
   /* 套餐多选下拉框 */
   // 放在 state 上：readNodeForm 是独立函数，闭包变量在那里访问不到
@@ -801,20 +1091,42 @@ function readNodeForm(mask) {
   return payload;
 }
 
-async function nodeNewFlow() {
-  state.editingNode = null;
-  state.entryDraft = [];
-  state.planDraft = new Set();
+/**
+ * Reality 节点提交前兜底：密钥为空就补一对。
+ * 服务端会原样保存空私钥，写进配置后 xray 直接起不来（privateKey 解析失败），
+ * 订阅里也会是一条 pbk 为空的废链接 —— 与其让用户事后排查，不如提交前就填上。
+ */
+async function ensureRealityKeys(payload) {
+  if (payload.protocol === 'hysteria2' || payload.security !== 'reality') return;
+  const r = payload.reality || {};
+  if (r.privateKey && r.publicKey) return;
+  const k = await api('/api/reality/keys', { method: 'POST' });
+  payload.reality = {
+    ...r,
+    privateKey: r.privateKey || k.privateKey,
+    publicKey: r.publicKey || k.publicKey,
+    shortId: r.shortId || k.shortId,
+  };
+}
+
+async function nodeNewFlow(template) {
+  const copy = !!template;
+  // 复制时把模板挂在 editingNode 上：bindNodeForm 靠它读 planIds / entries，
+  // 但 nodeForm 只看 id —— 模板的 id 是空的，所以表单仍然是「新增」
+  state.editingNode = template || null;
+  state.entryDraft = ((template && template.entries) || []).map((e) => ({ ...e }));
+  state.planDraft = new Set((template && template.planIds) || []);
   const mask = openModal({
-    title: '新增节点',
+    title: copy ? '复制节点 · ' + (template.copyFrom || template.name) : '新增节点',
     wide: true,
-    body: nodeForm(null, state.data.serverList || []),
-    okText: '创建',
+    body: nodeForm(template || null, state.data.serverList || []),
+    okText: copy ? '复制' : '创建',
     onOk: async (m) => {
       const payload = readNodeForm(m);
       if (!payload.name) throw new Error('请填写节点名称');
+      await ensureRealityKeys(payload);
       await api('/api/nodes', { method: 'POST', body: JSON.stringify(payload) });
-      toast('节点已创建', 'ok');
+      toast(copy ? '节点已复制' : '节点已创建', 'ok');
       render();
     },
   });
@@ -833,6 +1145,7 @@ async function nodeEditFlow(id) {
     onOk: async (m) => {
       const payload = readNodeForm(m);
       if (!payload.name) throw new Error('请填写节点名称');
+      await ensureRealityKeys(payload);
       await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify(payload) });
       toast('已保存', 'ok');
       render();

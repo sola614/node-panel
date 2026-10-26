@@ -1114,6 +1114,78 @@ const json = (obj) => JSON.stringify(obj);
   ok('审计支持翻页', auditMore.data.items.length > 0 &&
     auditMore.data.items[0].id < auditPage.data.items[1].id);
 
+  /* ---------- 13.5 复制查重 / 批量删除 / 节点排序 ---------- */
+  console.log('\n── 复制查重 · 批量删除 · 节点排序 ──');
+
+  // 重名：复制功能预填「XX 副本」，但用户改回原名提交时必须被拦住
+  const dupSrv = await call('/api/servers', { method: 'POST', body: json({ name: 'SMOKE-服务器', host: '9.9.9.9' }) });
+  ok('服务器重名被拒', dupSrv.status === 409, dupSrv.data.error);
+  const dupSrvSpace = await call('/api/servers', { method: 'POST', body: json({ name: '  smoke-服务器  ', host: '9.9.9.9' }) });
+  ok('服务器重名忽略大小写与空格', dupSrvSpace.status === 409, dupSrvSpace.data.error);
+  const dupPlan = await call('/api/plans', { method: 'POST', body: json({ name: 'SMOKE-套餐', quotaGB: 1 }) });
+  ok('套餐重名被拒', dupPlan.status === 409, dupPlan.data.error);
+
+  // 排序：建两个临时节点，反序提交后列表与订阅都要跟着变
+  const ordA = await call('/api/nodes', {
+    method: 'POST',
+    body: json({ name: '排序节点A', serverId, protocol: 'vless', port: 21101, network: 'tcp', security: 'reality', reality: { privateKey: 'k', publicKey: 'p' } }),
+  });
+  const ordB = await call('/api/nodes', {
+    method: 'POST',
+    body: json({ name: '排序节点B', serverId, protocol: 'vless', port: 21102, network: 'tcp', security: 'reality', reality: { privateKey: 'k', publicKey: 'p' } }),
+  });
+  ok('新节点按创建顺序排', ordA.data.item.sort < ordB.data.item.sort,
+    `${ordA.data.item.sort} < ${ordB.data.item.sort}`);
+  const dupNode = await call('/api/nodes', {
+    method: 'POST',
+    body: json({ name: '排序节点a', serverId, protocol: 'vless', port: 21103, network: 'tcp', security: 'reality', reality: { privateKey: 'k', publicKey: 'p' } }),
+  });
+  ok('节点重名被拒', dupNode.status === 409, dupNode.data.error);
+
+  const beforeIds = (await call('/api/nodes')).data.items.map((n) => n.id);
+  const flipped = [...beforeIds].reverse();
+  const ordRes = await call('/api/nodes/order', { method: 'POST', body: json({ ids: flipped }) });
+  ok('保存节点顺序', ordRes.status === 200, `count=${ordRes.data.count}`);
+  const afterOrder = (await call('/api/nodes')).data.items.map((n) => n.id);
+  ok('列表按新顺序返回', json(afterOrder) === json(flipped));
+
+  const ordSub = await call('/api/sub/' + u2.token + '?format=json');
+  const ordNames = (ordSub.data.links || []).map((l) => l.name);
+  const idxB = ordNames.findIndex((x) => x.includes('排序节点B'));
+  const idxA = ordNames.findIndex((x) => x.includes('排序节点A'));
+  ok('订阅顺序跟随节点排序', idxB >= 0 && idxA > idxB, `B@${idxB} A@${idxA}`);
+
+  const badOrder = await call('/api/nodes/order', { method: 'POST', body: json({ ids: [flipped[0]] }) });
+  ok('残缺的排序列表被拒', badOrder.status === 409, badOrder.data.error);
+
+  const bdNodes = await call('/api/nodes/batch-delete', {
+    method: 'POST',
+    body: json({ ids: [ordA.data.item.id, ordB.data.item.id, 'no-such-id'] }),
+  });
+  ok('批量删节点（跳过不存在的 id）', bdNodes.status === 200 && bdNodes.data.done === 2, `done=${bdNodes.data.done}`);
+  const bdEmpty = await call('/api/nodes/batch-delete', { method: 'POST', body: json({ ids: [] }) });
+  ok('空 id 列表被拒', bdEmpty.status === 400, bdEmpty.data.error);
+
+  // 还原顺序，别把后面章节的节点次序留在反序状态
+  const restIds = beforeIds.filter((id) => id !== ordA.data.item.id && id !== ordB.data.item.id);
+  await call('/api/nodes/order', { method: 'POST', body: json({ ids: restIds }) });
+
+  const bdSrv = await call('/api/servers', { method: 'POST', body: json({ name: '批量删除服务器', host: '9.9.9.8' }) });
+  await call('/api/nodes', {
+    method: 'POST',
+    body: json({ name: '连带节点', serverId: bdSrv.data.item.id, protocol: 'vless', port: 21104, network: 'tcp', security: 'none' }),
+  });
+  const bdSrvRes = await call('/api/servers/batch-delete', { method: 'POST', body: json({ ids: [bdSrv.data.item.id] }) });
+  ok('批量删服务器连带节点', bdSrvRes.status === 200 && bdSrvRes.data.nodes === 1, `nodes=${bdSrvRes.data.nodes}`);
+
+  const bdPlan = await call('/api/plans', { method: 'POST', body: json({ name: '批量删除套餐', quotaGB: 5 }) });
+  const bdUser = await call('/api/users', { method: 'POST', body: json({ name: '批量删套餐用户', planId: bdPlan.data.item.id }) });
+  const bdPlanRes = await call('/api/plans/batch-delete', { method: 'POST', body: json({ ids: [bdPlan.data.item.id] }) });
+  ok('批量删套餐并把用户降级', bdPlanRes.status === 200 && bdPlanRes.data.affected === 1, `affected=${bdPlanRes.data.affected}`);
+  const bdUserAfter = (await call('/api/users')).data.items.find((u) => u.id === bdUser.data.item.id);
+  ok('降级后用户回到不限套餐', bdUserAfter && !bdUserAfter.planId, String(bdUserAfter && bdUserAfter.planId));
+  await call('/api/users/' + bdUser.data.item.id, { method: 'DELETE' });
+
   /* ---------- 14. 清理 ---------- */
   for (const [path] of cleanup.reverse()) {
     await call(path, { method: 'DELETE' });

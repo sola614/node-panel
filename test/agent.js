@@ -103,7 +103,7 @@ function startPanel() {
 }
 
 /** 造一个可运行的 agent 环境：脚本副本 + state.env + 三个目录 */
-function makeSandbox(port, agentVersion) {
+function makeSandbox(port, agentVersion, opts = {}) {
   const dir = path.join(TMP, 'box-' + Math.random().toString(16).slice(2));
   const stateDir = path.join(dir, 'opt');
   const runDir = path.join(dir, 'run');
@@ -120,7 +120,7 @@ function makeSandbox(port, agentVersion) {
       "NP_SCOPE='测试服务器'",
       "NP_STATS='127.0.0.1:10085'",
       'NP_NODES=0',
-      'NP_XRAY_NODES=0',
+      `NP_XRAY_NODES=${opts.xrayNodes || 0}`,
       'NP_USERS=0',
       `NP_AGENT_VERSION='${agentVersion}'`,
       "NP_HY2_LIST=''",
@@ -133,6 +133,21 @@ function makeSandbox(port, agentVersion) {
   );
   fs.writeFileSync(path.join(stateDir, 'changed.env'), "NP_CHANGED_XRAY=0\nNP_CHANGED_HY=''\n");
 
+  // 造一个「Xray 正在跑」的现场：xray_running 在没有服务单元时会退回 pgrep，
+  // 塞一个永远返回 0 的假 pgrep 就能覆盖「服务正常 + 配置没变」这条最常走的路径
+  let binDir = '';
+  if (opts.fakePgrep) {
+    binDir = path.join(dir, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const pg = path.join(binDir, 'pgrep');
+    fs.writeFileSync(pg, '#!/bin/sh\nexit 0\n');
+    try {
+      fs.chmodSync(pg, 0o755);
+    } catch {
+      /* Windows 上 chmod 是空操作，Git Bash 照样能跑 */
+    }
+  }
+
   return {
     dir,
     stateDir,
@@ -140,6 +155,7 @@ function makeSandbox(port, agentVersion) {
     agentPath,
     env: {
       ...process.env,
+      ...(binDir ? { PATH: binDir + path.delimiter + process.env.PATH } : {}),
       PANEL_URL: `http://127.0.0.1:${port}`,
       AGENT_TOKEN: 'test-token',
       STATE_DIR: stateDir,
@@ -206,6 +222,8 @@ const runAgent = (box) =>
   ok('回执带 agent 版本', /^\d+\.\d+\.\d+$/.test(String(rc.agentVersion)), String(rc.agentVersion));
   ok('回执带节点数与用户数', typeof rc.nodes === 'number' && typeof rc.users === 'number',
     `${rc.nodes}/${rc.users}`);
+  // 本机没有 Xray 节点时没有任何东西需要重载，回执不能报 skip（面板会据此显示「待重载」）
+  ok('没有 Xray 节点时不误报待重载', rc.xray !== 'skip', `xray=${rc.xray}`);
 
   const hitsBefore = panel.state.scriptHits;
   const rcptBefore = panel.state.receiptHits;
@@ -267,6 +285,18 @@ const runAgent = (box) =>
   ok('端口没监听时回执 ok=false', rcBad.ok === false, JSON.stringify({ ok: rcBad.ok }));
   ok('回执点名没监听的端口', rcBad.unbound === 'tcp:1', String(rcBad.unbound));
   ok('日志里也能直接看到', /端口未在监听：tcp:1/.test(r6.stdout + r6.stderr));
+
+  /* ----------------------- 5. 「待重载」误报回归 ----------------------- */
+  // 现场：Xray 正常在跑、配置没变 —— 最平静的一轮。
+  // 以前这一轮 RC_XRAY 留空，回执兜底成 skip，面板于是永远显示「待重载」，
+  // 让人以为机器缺 systemd。用假 pgrep 造出「进程在跑」的现场来盯这条路径。
+  console.log('\n— 待重载误报 —');
+  const box5 = makeSandbox(panel.port, PKG_VERSION, { xrayNodes: 1, fakePgrep: true });
+  const n2 = panel.state.receipts.length;
+  const r7 = await runAgent(box5);
+  const rcSteady = panel.state.receipts[n2] || {};
+  ok('Xray 在跑且配置没变时回执 xray=ok', r7.status === 0 && rcSteady.xray === 'ok',
+    `exit=${r7.status} xray=${rcSteady.xray}`);
 
   panel.server.close();
   try {
