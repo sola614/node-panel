@@ -651,6 +651,21 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     'sid=' + d9.querySelector('#r-sid').value,
   );
 
+  // Hysteria2 本身没有「不加密」这个选项，证书区不能被 xray 那块一起藏掉
+  // （它以前嵌在 #xray-box 里，切到 hy2 就整块消失，等于没法配证书）
+  ok('无加密时证书区隐藏', d9.querySelector('#cert-box').classList.contains('hidden'));
+
+  protoSel.value = 'hysteria2';
+  change(protoSel);
+  ok('切到 Hysteria2 时证书区可见', !d9.querySelector('#cert-box').classList.contains('hidden'));
+  ok('Hysteria2 默认改用自签证书', d9.querySelector('#n-certmode').value === 'self',
+    d9.querySelector('#n-certmode').value);
+  ok('自签模式给出说明', /自签/.test(d9.querySelector('#cert-domain-hint').textContent));
+
+  protoSel.value = 'vless';
+  change(protoSel);
+  ok('切回 vless（无加密）后证书区重新隐藏', d9.querySelector('#cert-box').classList.contains('hidden'));
+
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(150);
 

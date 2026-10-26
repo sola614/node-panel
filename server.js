@@ -2229,9 +2229,12 @@ function buildUninstallScript({ label }) {
 # 生成时间：${new Date().toISOString()}
 #
 # 用法（root）：
-#   curl -fsSL "…/uninstall?token=…" | sh               只卸 agent，保留 Xray 配置与日志
-#   curl -fsSL "…/uninstall?token=…" | sh -s -- --purge 连日志、Xray 配置一起清掉（配置会先备份）
+#   curl -fsSL "…/uninstall?token=…" | sh                卸干净：agent + 节点监听 + 面板下发的配置
+#   curl -fsSL "…/uninstall?token=…" | sh -s -- --purge  连日志与配置备份一起清掉
 #
+# 清理范围：agent 服务 / 进程 / 目录、自签证书、Hysteria2 实例与配置、
+#          面板生成的 Xray 配置（先备份）并停掉 Xray 服务 —— 卸完端口不再监听。
+# 默认保留：日志目录、Xray 配置备份、Xray 本体（可能是你自己装的）。
 # 不会动面板里的服务器 / 节点记录；想恢复接入，重新执行一遍部署命令即可。
 set -u
 
@@ -2241,7 +2244,8 @@ for _arg in "$@"; do
     --purge | -p) PURGE=1 ;;
     -h | --help)
       echo "用法：sh uninstall.sh [--purge]"
-      echo "  --purge  连 /var/log/nodepanel 与面板生成的 Xray 配置一起清理（配置会先备份）"
+      echo "  默认  停掉并清理 agent、Hysteria2 实例、Xray 配置与自签证书（配置会先备份）"
+      echo "  --purge  连 /var/log/nodepanel 与配置备份一起删掉"
       exit 0
       ;;
     *) echo "! 忽略未知参数：$_arg" ;;
@@ -2256,8 +2260,10 @@ fi
 AGENT_DIR=/opt/nodepanel
 RUN_DIR=/run/nodepanel
 LOG_DIR=/var/log/nodepanel
+CERTS_DIR=/etc/nodepanel
 HY_DIR=/etc/hysteria
 XRAY_CONFIG=/usr/local/etc/xray/config.json
+XRAY_BAK=\${XRAY_CONFIG}.nodepanel.bak
 
 echo "→ 停止并注销 nodepanel-agent"
 
@@ -2317,32 +2323,85 @@ if ls "$HY_DIR"/node-*.yaml >/dev/null 2>&1; then
   echo "  ✓ 已删除 agent 下发的 Hysteria2 配置（$HY_DIR/node-*.yaml）"
 fi
 
+# pid 文件丢了（手删 / 机器重启）时按命令行兜底，只匹配 agent 自己下发的那些实例
+if command -v pkill >/dev/null 2>&1; then
+  if pkill -f "hysteria server -c $HY_DIR/node-" 2>/dev/null; then
+    echo "  ✓ 已结束残留的 Hysteria2 实例"
+  fi
+fi
+
 echo "→ 删除 agent 文件与运行时目录"
 rm -rf "$AGENT_DIR" "$RUN_DIR"
 echo "  ✓ 已删除 $AGENT_DIR 与 $RUN_DIR"
+
+# agent 现场生成 / 落盘的自签证书：机器上再没有东西引用它们
+if [ -d "$CERTS_DIR" ]; then
+  rm -rf "$CERTS_DIR"
+  echo "  ✓ 已删除自签证书目录 $CERTS_DIR"
+fi
+
+echo "→ 停掉 Xray 并清理面板生成的配置"
+# 服务名不一定是 xray：xray-core / x-ui 都见过
+XRAY_UNIT=''
+if command -v systemctl >/dev/null 2>&1; then
+  for _u in xray xray-core x-ui; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^$_u\\.service"; then
+      XRAY_UNIT=$_u
+      break
+    fi
+  done
+fi
+if [ -z "$XRAY_UNIT" ] && [ -f /etc/init.d/xray ]; then XRAY_UNIT=xray; fi
+
+# 只动「确实是面板写的」那份配置：面板生成的配置一定带 StatsService。
+# 机器上原有的、管理员自己的 xray 配置一律不碰 —— 卸载命令不该误删别人的服务
+if [ ! -f "$XRAY_CONFIG" ]; then
+  echo "  · 没有 $XRAY_CONFIG（这台机器可能还没部署过节点），跳过"
+elif ! grep -q 'StatsService' "$XRAY_CONFIG" 2>/dev/null; then
+  echo "  · $XRAY_CONFIG 不是面板生成的（没有 StatsService），Xray 与配置都保留"
+else
+  if [ -n "$XRAY_UNIT" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop "$XRAY_UNIT" >/dev/null 2>&1
+      systemctl disable "$XRAY_UNIT" >/dev/null 2>&1
+    elif command -v rc-service >/dev/null 2>&1; then
+      rc-service "$XRAY_UNIT" stop >/dev/null 2>&1
+      command -v rc-update >/dev/null 2>&1 && rc-update del "$XRAY_UNIT" default >/dev/null 2>&1
+    fi
+    echo "  ✓ 已停止并取消开机自启 $XRAY_UNIT"
+  fi
+
+  if cp -f "$XRAY_CONFIG" "$XRAY_BAK" 2>/dev/null; then
+    echo "  ✓ 已备份 Xray 配置到 $XRAY_BAK"
+  fi
+  rm -f "$XRAY_CONFIG"
+  echo "  ✓ 已移除面板生成的 $XRAY_CONFIG"
+
+  # 没有服务单元时（手工 nohup 起的），按进程名收尾 —— 否则端口会一直被占着
+  if [ -z "$XRAY_UNIT" ] && command -v pkill >/dev/null 2>&1; then
+    pkill -x xray 2>/dev/null && echo "  ✓ 已结束手工启动的 xray 进程"
+  fi
+fi
 
 if [ "$PURGE" = "1" ]; then
   echo "→ 深度清理（--purge）"
   rm -rf "$LOG_DIR"
   echo "  ✓ 已删除日志目录 $LOG_DIR"
-  if [ -f "$XRAY_CONFIG" ]; then
-    if cp -f "$XRAY_CONFIG" "$XRAY_CONFIG.nodepanel.bak" 2>/dev/null; then
-      echo "  ✓ 已备份 Xray 配置到 $XRAY_CONFIG.nodepanel.bak"
-    fi
-    rm -f "$XRAY_CONFIG"
-    echo "  ✓ 已移除面板生成的 Xray 配置"
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^xray\\.service'; then
-      systemctl stop xray >/dev/null 2>&1 && echo "  ✓ 已停止 xray 服务"
-    fi
-  fi
+  rm -f "$XRAY_BAK"
+  echo "  ✓ 已删除配置备份 $XRAY_BAK"
 else
   echo ""
-  echo "· 保留 $XRAY_CONFIG（Xray 仍在按这份配置跑，只是面板不再同步用户）"
   echo "· 保留 $LOG_DIR（要一起清掉就加 --purge 重跑）"
+  echo "· 保留 $XRAY_BAK（面板覆盖前的配置备份，不需要可手动删）"
+fi
+
+if [ -x /usr/local/bin/xray ]; then
+  echo "· 保留 /usr/local/bin/xray 与 geo 数据（可能是你自己装的；"
+  echo "  确认是面板装的那份，可执行：rm -rf /usr/local/bin/xray /usr/local/share/xray）"
 fi
 
 echo ""
-echo "✓ 卸载完成"
+echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
 echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即可恢复接入。"
 `;
 }

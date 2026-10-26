@@ -516,57 +516,6 @@ function nodeForm(node, servers) {
         <p class="hint">Shadowsocks 入站为单用户模式，该节点所有用户共用同一密码，无法按用户计费。</p>
       </div>
 
-      <!-- 证书：TLS 与 Hysteria2 共用一套 -->
-      <div id="cert-box" class="hidden">
-        <div class="section-title">TLS 证书</div>
-        <div class="field">
-          <label>SNI / 域名</label>
-          <input type="text" id="n-sni" value="${esc(n.sni || '')}" placeholder="hk1.example.com">
-        </div>
-        <div class="field">
-          <label>证书来源</label>
-          <select id="n-certmode">
-            <option value="path" ${(n.certMode || 'path') === 'path' ? 'selected' : ''}>服务器上的证书路径</option>
-            <option value="content" ${n.certMode === 'content' ? 'selected' : ''}>粘贴证书内容</option>
-            <option value="self" ${n.certMode === 'self' ? 'selected' : ''}>自动生成自签证书</option>
-            <option value="acme" ${n.certMode === 'acme' ? 'selected' : ''}>ACME 自动申请（Let's Encrypt）</option>
-          </select>
-        </div>
-
-        <div id="cert-path-box">
-          <div class="form-row">
-            <div class="field">
-              <label>证书路径</label>
-              <input type="text" id="n-cert" value="${esc(n.certFile || '')}" placeholder="/etc/ssl/x/fullchain.pem">
-            </div>
-            <div class="field">
-              <label>私钥路径</label>
-              <input type="text" id="n-key" value="${esc(n.keyFile || '')}" placeholder="/etc/ssl/x/privkey.pem">
-            </div>
-          </div>
-        </div>
-
-        <div id="cert-content-box" class="hidden">
-          <div class="field">
-            <label>证书 PEM（含证书链）</label>
-            <textarea id="n-certpem" placeholder="-----BEGIN CERTIFICATE-----">${esc(n.certPem || '')}</textarea>
-          </div>
-          <div class="field">
-            <label>私钥 PEM</label>
-            <textarea id="n-keypem" placeholder="-----BEGIN PRIVATE KEY-----">${esc(n.keyPem || '')}</textarea>
-          </div>
-          <p class="hint">agent 会把它写入 /etc/nodepanel/certs/&lt;节点ID&gt;/ 并在配置中引用，权限 0600。</p>
-        </div>
-
-        <div id="cert-domain-box" class="hidden">
-          <div class="field">
-            <label>证书域名 / CN</label>
-            <input type="text" id="n-selfcn" value="${esc(n.selfCN || '')}" placeholder="留空则取上面的 SNI">
-          </div>
-          <p class="hint" id="cert-domain-hint"></p>
-        </div>
-      </div>
-
       <div id="reality-box" class="hidden">
         <div class="form-row">
           <div class="field">
@@ -605,9 +554,60 @@ function nodeForm(node, servers) {
       </div>
     </div>
 
+    <!-- 证书：TLS 与 Hysteria2 共用一套 -->
+    <div id="cert-box" class="hidden">
+      <div class="section-title">TLS 证书</div>
+      <div class="field">
+        <label>SNI / 域名</label>
+        <input type="text" id="n-sni" value="${esc(n.sni || '')}" placeholder="hk1.example.com">
+      </div>
+      <div class="field">
+        <label>证书来源</label>
+        <select id="n-certmode">
+          <option value="path" ${(n.certMode || 'path') === 'path' ? 'selected' : ''}>服务器上的证书路径</option>
+          <option value="content" ${n.certMode === 'content' ? 'selected' : ''}>粘贴证书内容</option>
+          <option value="self" ${n.certMode === 'self' ? 'selected' : ''}>自动生成自签证书</option>
+          <option value="acme" ${n.certMode === 'acme' ? 'selected' : ''}>ACME 自动申请（Let's Encrypt）</option>
+        </select>
+      </div>
+
+      <div id="cert-path-box">
+        <div class="form-row">
+          <div class="field">
+            <label>证书路径</label>
+            <input type="text" id="n-cert" value="${esc(n.certFile || '')}" placeholder="/etc/ssl/x/fullchain.pem">
+          </div>
+          <div class="field">
+            <label>私钥路径</label>
+            <input type="text" id="n-key" value="${esc(n.keyFile || '')}" placeholder="/etc/ssl/x/privkey.pem">
+          </div>
+        </div>
+      </div>
+
+      <div id="cert-content-box" class="hidden">
+        <div class="field">
+          <label>证书 PEM（含证书链）</label>
+          <textarea id="n-certpem" placeholder="-----BEGIN CERTIFICATE-----">${esc(n.certPem || '')}</textarea>
+        </div>
+        <div class="field">
+          <label>私钥 PEM</label>
+          <textarea id="n-keypem" placeholder="-----BEGIN PRIVATE KEY-----">${esc(n.keyPem || '')}</textarea>
+        </div>
+        <p class="hint">agent 会把它写入 /etc/nodepanel/certs/&lt;节点ID&gt;/ 并在配置中引用，权限 0600。</p>
+      </div>
+
+      <div id="cert-domain-box" class="hidden">
+        <div class="field">
+          <label>证书域名 / CN</label>
+          <input type="text" id="n-selfcn" value="${esc(n.selfCN || '')}" placeholder="留空则取上面的 SNI">
+        </div>
+        <p class="hint" id="cert-domain-hint"></p>
+      </div>
+    </div>
+
     <div id="hy2-box" class="hidden">
       <div class="section-title">Hysteria2</div>
-      <p class="hint" style="margin:0 0 12px">Hysteria2 必须启用 TLS，证书与 SNI 在下方「TLS 证书」中统一配置。</p>
+      <p class="hint" style="margin:0 0 12px">Hysteria2 必须启用 TLS，证书与 SNI 在上方「TLS 证书」中统一配置。</p>
       <div class="form-row">
         <div class="field">
           <label>混淆 obfs</label>
@@ -718,7 +718,15 @@ function bindNodeForm(mask) {
     // 证书：TLS 或 Hysteria2 都需要
     const needCert = isHy2 || security === 'tls';
     $('#cert-box', mask).classList.toggle('hidden', !needCert);
-    const cm = $('#n-certmode', mask).value;
+
+    // Hysteria2 没有「不加密」这个选项，而 path 模式留空等于没证书（服务直接起不来）。
+    // 所以切到 hy2 时，只要用户还没手动选过证书来源、也没填过路径，就默认走自签 ——
+    // agent 会现场用 openssl 生成，订阅里自动带 insecure。
+    const cmSel = $('#n-certmode', mask);
+    if (isHy2 && !certModeTouched && cmSel.value === 'path' && !$('#n-cert', mask).value.trim()) {
+      cmSel.value = 'self';
+    }
+    const cm = cmSel.value;
     $('#cert-path-box', mask).classList.toggle('hidden', cm !== 'path');
     $('#cert-content-box', mask).classList.toggle('hidden', cm !== 'content');
     const needDomain = cm === 'self' || cm === 'acme';
@@ -740,6 +748,7 @@ function bindNodeForm(mask) {
   // 加密方式的默认值跟着协议走，但只在用户没手动改过时跟随：
   // 手动选了 TLS 之后，再切协议不该被强行改回去
   let securityTouched = false;
+  let certModeTouched = false;
   $('#n-security', mask).addEventListener('change', () => {
     securityTouched = true;
   });
@@ -747,8 +756,12 @@ function bindNodeForm(mask) {
     if (!securityTouched) $('#n-security', mask).value = defaultSecurityOf($('#n-protocol', mask).value);
     sync();
   });
-  ['#n-security', '#n-network', '#n-certmode'].forEach((sel) => {
+  ['#n-security', '#n-network'].forEach((sel) => {
     $(sel, mask).addEventListener('change', sync);
+  });
+  $('#n-certmode', mask).addEventListener('change', () => {
+    certModeTouched = true;
+    sync();
   });
 
   $('#n-ipmode', mask).addEventListener('click', (e) => {

@@ -379,21 +379,22 @@ sh /opt/nodepanel/agent.sh --version    # 看 agent 版本（与面板版本号�
 
 ### 5. 卸载 / 下线机器
 
-服务器页、独立节点页都有「卸载命令」。在机器上（root）执行后 agent 停机注销：
+服务器页、独立节点页都有「卸载命令」。在机器上（root）执行后 agent 停机注销，**节点端口也不再监听**：
 
 ```bash
-# 只卸 agent
+# 默认就卸干净：agent + 节点监听 + 面板下发的配置
 curl -fsSL "http://面板/api/servers/<id>/uninstall?token=<token>" | sh
 
-# 连日志与 Xray 配置一起清掉（配置先备份成 config.json.nodepanel.bak）
+# 连日志与配置备份一起删
 curl -fsSL "http://面板/api/servers/<id>/uninstall?token=<token>" | sh -s -- --purge
 ```
 
 | 默认清理 | 默认保留 |
 | --- | --- |
-| `nodepanel-agent` 服务（systemd 单元 / OpenRC 脚本 / crontab 三种都认） | `/usr/local/etc/xray/config.json`（Xray 继续跑，只是面板不再同步用户） |
-| agent 托管的 Hysteria2 实例与 `/etc/hysteria/node-*.yaml` | `/var/log/nodepanel` 日志 |
-| `/opt/nodepanel`、`/run/nodepanel` | 面板里的服务器 / 节点记录 |
+| `nodepanel-agent` 服务（systemd 单元 / OpenRC 脚本 / crontab 三种都认）与残留进程 | `config.json.nodepanel.bak`（面板覆盖前的配置备份） |
+| agent 托管的 Hysteria2 实例与 `/etc/hysteria/node-*.yaml` | `/var/log/nodepanel` 日志（`--purge` 时删除） |
+| `/opt/nodepanel`、`/run/nodepanel`、`/etc/nodepanel`（自签证书） | `/usr/local/bin/xray` 与 geo 数据（可能是你自己装的） |
+| **Xray 服务（停掉 + 取消开机自启）与面板生成的 `config.json`**（先备份；只认带 `StatsService` 的那份） | 面板里的服务器 / 节点记录（要清就在列表里删除） |
 
 脚本幂等，重复执行不报错；想重新接入，执行一遍部署命令即可 —— 记录、token、订阅都不用重建。
 
