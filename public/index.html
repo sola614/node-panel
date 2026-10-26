@@ -135,6 +135,8 @@
 <div id="toast-root"></div>
 <script src="/theme.js"></script>
 <!-- 经典脚本按顺序加载：顶层声明共享全局词法环境，所以不需要打包器 -->
+<!-- hosts.js 挂全局 Hosts 且被 core.js 依赖，必须排在它前面；server.js require 的是同一份文件 -->
+<script src="/js/hosts.js"></script>
 <script src="/js/core.js"></script>
 <script src="/js/overview.js"></script>
 <script src="/js/users.js"></script>

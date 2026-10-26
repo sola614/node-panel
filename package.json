@@ -1,6 +1,6 @@
 {
   "name": "node-panel",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": false,
   "description": "轻量节点管理面板：用户 / 节点 / 服务器 + 订阅与流量配额",
   "keywords": [
@@ -20,6 +20,7 @@
     "test:security": "node test/security.js",
     "test:notify": "node test/notify.js",
     "test:agent": "node test/agent.js",
+    "test:hosts": "node test/hosts.js",
     "test:ui": "node test/ui.js",
     "test:browser": "node test/browser.js"
   },

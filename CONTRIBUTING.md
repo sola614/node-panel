@@ -27,6 +27,7 @@ PANEL_SEED_DEMO=1 PANEL_DATA_DIR=./.demo node server.js
 
 ```bash
 # 1) 单元 / 端到端（不需要起服务）
+node test/hosts.js      # 前后端共享的域名校验
 node test/renew.js        # 续期逻辑
 node test/security.js     # 强制改密、登录限流、升级前备份（自带独立实例）
 

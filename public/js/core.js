@@ -228,43 +228,10 @@ async function withLoading(btn, fn, label = '') {
 
 /* ============================== 订阅域名校验 ============================== */
 
-const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
-const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
-
-function isHostName(host) {
-  if (!host) return false;
-  if (IPV4_RE.test(host)) return true;
-  if (/^\[[0-9a-f:.]+\]$/i.test(host)) return true; // IPv6 字面量
-  if (host.length > 253) return false;
-
-  const labels = host.split('.');
-  // 至少两段：单段的 111 / abc 不是可用域名
-  if (labels.length < 2) return false;
-  if (!labels.every((l) => LABEL_RE.test(l))) return false;
-  return /^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i.test(labels[labels.length - 1]);
-}
-
-/**
- * 从原始文本里抠出主机名。
- * 不能只看 new URL().hostname：URL 规范会把 111 当成 IPv4 简写解析成 0.0.0.111，
- * 于是「111」这种明显填错的值反而能过校验。所以数字写法要回到原文上判断。
- */
-function rawHostOf(text) {
-  const noScheme = text.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
-  const authority = noScheme.split(/[/?#]/)[0];
-  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
-  if (hostPort.startsWith('[')) {
-    const end = hostPort.indexOf(']');
-    return end === -1 ? hostPort : hostPort.slice(0, end + 1);
-  }
-  return hostPort.split(':')[0].replace(/\.$/, '');
-}
-
-/** 综合判断：纯数字写法必须是严格的四段 IPv4，其余交给 URL 规范化后的主机名 */
-function isValidHost(rawHost, normalizedHost) {
-  if (/^[\d.]+$/.test(rawHost)) return IPV4_RE.test(rawHost);
-  return isHostName(String(normalizedHost || '').replace(/\.$/, ''));
-}
+// 主机名/域名校验的唯一实现放在 js/hosts.js（server.js require 的是同一份文件，
+// test/hosts.js 锁定两侧行为一致）。这里只做「表单友好」的包装：返回 { value, error }
+// 而不是抛异常。hosts.js 必须在本文件之前加载（见 index.html 的 script 顺序）。
+const { rawHostOf, isValidHost } = window.Hosts;
 
 /**
  * 规范化并校验「订阅对外域名」。

@@ -32,7 +32,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.7'
+VERSION='0.1.8'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -147,14 +147,27 @@ http_get() {
   fi
 }
 
+# 第三个参数是可选的额外请求头（"Key: value" 形式）。
+# 0.1.8 起对面板的请求把 token 放进 Authorization 头；URL 里仍保留一份 query token
+# （双发过渡）：面板升级后、本机 agent 自更新完成前，老面板只认 query，双发保证不掉线。
+# 计划 0.2.0 移除 query 里的 token —— 那会落进反代 access log 和 shell history，泄露面大得多。
 http_post() {
   _u=$1
   _f=$2
+  _h=${3:-}
   [ -n "$HTTP" ] || return 1
   if [ "$HTTP" = 'curl' ]; then
-    curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: text/plain' --data-binary "@$_f" "$_u" 2>/dev/null
+    if [ -n "$_h" ]; then
+      curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: text/plain' -H "$_h" --data-binary "@$_f" "$_u" 2>/dev/null
+    else
+      curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: text/plain' --data-binary "@$_f" "$_u" 2>/dev/null
+    fi
   else
-    wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: text/plain' --post-file="$_f" "$_u" 2>/dev/null
+    if [ -n "$_h" ]; then
+      wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: text/plain' --header="$_h" --post-file="$_f" "$_u" 2>/dev/null
+    else
+      wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: text/plain' --post-file="$_f" "$_u" 2>/dev/null
+    fi
   fi
 }
 
@@ -162,11 +175,20 @@ http_post() {
 http_post_json() {
   _u=$1
   _f=$2
+  _h=${3:-}
   [ -n "$HTTP" ] || return 1
   if [ "$HTTP" = 'curl' ]; then
-    curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: application/json' --data-binary "@$_f" "$_u" 2>/dev/null
+    if [ -n "$_h" ]; then
+      curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: application/json' -H "$_h" --data-binary "@$_f" "$_u" 2>/dev/null
+    else
+      curl -fsS -m "$HTTP_TIMEOUT" -X POST -H 'Content-Type: application/json' --data-binary "@$_f" "$_u" 2>/dev/null
+    fi
   else
-    wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: application/json' --post-file="$_f" "$_u" 2>/dev/null
+    if [ -n "$_h" ]; then
+      wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: application/json' --header="$_h" --post-file="$_f" "$_u" 2>/dev/null
+    else
+      wget -q -T "$HTTP_TIMEOUT" -O - --header='Content-Type: application/json' --post-file="$_f" "$_u" 2>/dev/null
+    fi
   fi
 }
 
@@ -596,7 +618,7 @@ fetch_bundle() {
   _ip=''
   [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
-  http_get "$_url"
+  http_get "$_url" "Authorization: Bearer $AGENT_TOKEN"
 }
 
 # 返回 0 = 应用了配置，1 = 没变化或失败
@@ -812,7 +834,7 @@ report() {
   [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
 
-  _res=$(http_post "$_url" "$RUN_DIR/stats.agg")
+  _res=$(http_post "$_url" "$RUN_DIR/stats.agg" "Authorization: Bearer $AGENT_TOKEN")
   if [ -n "$_res" ]; then
     log "↑ 已上报 $(wc -l < "$RUN_DIR/stats.agg" 2>/dev/null | tr -d ' ') 位用户流量"
     : > "$RUN_DIR/stats.agg"
@@ -856,7 +878,7 @@ send_receipt() {
     "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${BAD_PORTS:-}" \
     "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
 
-  if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" >/dev/null; then
+  if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
     printf '%s\n%s\n' "$_now" "$_sig" > "$STATE_DIR/.receipt" 2>/dev/null
     if [ "$_ok" = 'true' ]; then
       log "✓ 已回执：配置 ${NP_HASH:-（空）} 已生效"
@@ -909,7 +931,7 @@ agent_self_update() {
   log "发现新版本 agent $_want（当前 $VERSION），开始自更新"
   _tmp="$STATE_DIR/agent.sh.new"
   rm -f "$_tmp" 2>/dev/null
-  if ! http_get "$PANEL_URL/api/agent/script?token=$AGENT_TOKEN&v=$VERSION" '' 30 > "$_tmp" 2>/dev/null; then
+  if ! http_get "$PANEL_URL/api/agent/script?token=$AGENT_TOKEN&v=$VERSION" "Authorization: Bearer $AGENT_TOKEN" 30 > "$_tmp" 2>/dev/null; then
     agent_update_fail "$_want" "$_cnt"
     return 1
   fi
