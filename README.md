@@ -852,6 +852,7 @@ sqlite3 data/panel.db ".backup /path/backup-$(date +%F).db"
 
 ```bash
 # 单元 / 端到端（不需要先起服务，用临时库，不碰正式数据）
+node test/hosts.js                      # 前后端共享的域名校验（require 与 <script> 两条加载路径）
 node test/renew.js                      # 自动续期
 node test/security.js                   # 强制改密 / 登录限流 / 升级前备份（自带独立实例）
 node test/notify.js                     # 通知通道（假 SMTP + 假 HTTP）

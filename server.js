@@ -217,46 +217,10 @@ function baseUrl(req) {
 }
 
 /* ---------------------------- 订阅对外域名校验 ---------------------------- */
-// 与前端 public/app.js 的 normalizeSubBase 保持同一套规则：
+// 主机名校验的唯一实现抽到了 public/js/hosts.js（浏览器与 Node 各走一条加载路径，
+// test/hosts.js 锁定两侧行为一致）。这里只保留「后端风格」的包装：
 // 前端负责即时提示，后端负责兜底（直接打 API 也绕不过去）。
-
-const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
-const HOST_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
-
-function isHostName(host) {
-  if (!host) return false;
-  if (IPV4_RE.test(host)) return true;
-  if (/^\[[0-9a-f:.]+\]$/i.test(host)) return true; // IPv6 字面量
-  if (host.length > 253) return false;
-
-  const labels = host.split('.');
-  // 至少两段：单段的 111 / abc 不是可用域名
-  if (labels.length < 2) return false;
-  if (!labels.every((l) => HOST_LABEL_RE.test(l))) return false;
-  return /^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i.test(labels[labels.length - 1]);
-}
-
-/**
- * 从原始文本里抠出主机名。
- * 不能只看 new URL().hostname：URL 规范会把 111 当成 IPv4 简写解析成 0.0.0.111，
- * 于是「111」这种明显填错的值反而能过校验。所以数字写法要回到原文上判断。
- */
-function rawHostOf(text) {
-  const noScheme = text.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
-  const authority = noScheme.split(/[/?#]/)[0];
-  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
-  if (hostPort.startsWith('[')) {
-    const end = hostPort.indexOf(']');
-    return end === -1 ? hostPort : hostPort.slice(0, end + 1);
-  }
-  return hostPort.split(':')[0].replace(/\.$/, '');
-}
-
-/** 综合判断：纯数字写法必须是严格的四段 IPv4，其余交给 URL 规范化后的主机名 */
-function isValidHost(rawHost, normalizedHost) {
-  if (/^[\d.]+$/.test(rawHost)) return IPV4_RE.test(rawHost);
-  return isHostName(String(normalizedHost || '').replace(/\.$/, ''));
-}
+const { rawHostOf, isValidHost } = require('./public/js/hosts');
 
 /**
  * 规范化并校验「订阅对外域名」。
@@ -292,6 +256,36 @@ function normalizeSubBase(raw) {
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+/**
+ * 恒时 token 比较。用 === 比对凭证时，攻击者可以通过响应时间逐位猜出 token，
+ * 所以 token 一律走这里。长度不等直接判否（token 长度本身不是秘密，面板下发的都是固定长度）。
+ */
+function tokenEq(a, b) {
+  const ba = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  if (ba.length !== bb.length || ba.length === 0) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+/**
+ * agent 凭证的读取顺序：URL query 里的 token 优先，Authorization: Bearer 头兜底。
+ * 老版本 agent 把 token 拼在 URL 上 —— 它会原样落进反代 access log 和 shell history，
+ * 泄露面比请求头大得多。0.1.8 起 agent 的请求同时带两份凭证（双发过渡），
+ * 计划 0.2.0 让 agent 停发 query、届时移除 query 通道，避免「面板刚升级、agent
+ * 自更新还没跑完」的窗口期里整批节点掉线。
+ *
+ * 为什么 query 优先而不是头优先：双发期两处值相同，先后无差别；唯一「两处都有但
+ * 值不同」的场景是「管理台脚本拿着会话头、URL 里另带 agent token」（如自动化测试
+ * 的通用 API 客户端），此时 URL 里的才是 agent 凭证，头里的是管理员会话。
+ */
+function agentTokenOf(req, ctx) {
+  const fromQuery = ctx.query.get('token');
+  if (fromQuery) return fromQuery;
+  const auth = req.headers.authorization || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  return '';
 }
 
 function getSession(req) {
@@ -2409,7 +2403,9 @@ echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即
 /** 服务器 / 独立节点共用的卸载脚本鉴权 */
 function sendUninstallScript(res, { item, label, tokenInUrl, session, filename }) {
   if (!item) return sendJson(res, 404, { error: '目标不存在' });
-  if (!session && tokenInUrl !== item.token) {
+  // session 由调用方用 getSession() 现场解析：这两个端点是免登录路由（要给 curl 用），
+  // 路由层不会注入会话，不主动取的话「管理员已登录」这条通道永远是死代码。
+  if (!session && !tokenEq(tokenInUrl, item.token)) {
     return sendJson(res, 401, { error: '无权获取卸载脚本' });
   }
   const script = buildUninstallScript({ label });
@@ -2426,7 +2422,9 @@ function installScript(req, res, params, body, session, ctx) {
   if (!s) return sendJson(res, 404, { error: '服务器不存在' });
 
   const tokenInUrl = ctx.query.get('token');
-  if (!session && tokenInUrl !== s.token) {
+  // 免登录路由里主动解析会话：管理员带着 Bearer 头来（比如前端直接下载脚本）时不必附 token
+  const adminSession = getSession(ctx.req);
+  if (!adminSession && !tokenEq(tokenInUrl, s.token)) {
     return sendJson(res, 401, { error: '无权获取部署脚本' });
   }
 
@@ -2463,7 +2461,7 @@ function uninstallScript(req, res, params, body, session, ctx) {
     item: s,
     label: `${s.name} (${s.host || s.reportedIp || '待上报地址'})`,
     tokenInUrl: ctx.query.get('token'),
-    session,
+    session: getSession(ctx.req),
     filename: `uninstall-${s.name}.sh`,
   });
 }
@@ -2478,7 +2476,9 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
   }
 
   const tokenInUrl = ctx.query.get('token');
-  if (!session && tokenInUrl !== node.token) {
+  // 同 installScript：免登录路由里主动解析会话
+  const adminSession = getSession(ctx.req);
+  if (!adminSession && !tokenEq(tokenInUrl, node.token)) {
     return sendJson(res, 401, { error: '无权获取部署脚本' });
   }
 
@@ -2514,7 +2514,7 @@ function nodeUninstallScript(req, res, params, body, session, ctx) {
     item: node,
     label: `${node.name}（独立部署 · ${node.address || '待上报地址'}）`,
     tokenInUrl: ctx.query.get('token'),
-    session,
+    session: getSession(ctx.req),
     filename: `uninstall-${node.name}.sh`,
   });
 }
@@ -2630,7 +2630,7 @@ function resolveScope(token, ip) {
   if (!token) return null;
   const db = store.db();
 
-  const server = db.servers.find((s) => s.token === token);
+  const server = db.servers.find((s) => tokenEq(s.token, token));
   if (server) {
     server.lastSeen = store.iso();
     const scope = {
@@ -2643,7 +2643,7 @@ function resolveScope(token, ip) {
     return scope;
   }
 
-  const node = db.nodes.find((n) => n.mode === 'standalone' && n.token === token);
+  const node = db.nodes.find((n) => n.mode === 'standalone' && tokenEq(n.token, token));
   if (node) {
     node.lastSeen = store.iso();
     const scope = {
@@ -2746,7 +2746,7 @@ function buildAgentPayload(scope) {
 }
 
 function agentConfig(req, res, params, body, session, ctx) {
-  const scope = resolveScope(ctx.query.get('token'), ctx.query.get('ip'));
+  const scope = resolveScope(agentTokenOf(req, ctx), ctx.query.get('ip'));
   if (!scope) return sendJson(res, 401, { error: 'invalid token' });
 
   if (ctx.query.get('v')) {
@@ -2765,7 +2765,7 @@ function agentConfig(req, res, params, body, session, ctx) {
 }
 
 function agentReport(req, res, params, body, session, ctx) {
-  const scope = resolveScope(ctx.query.get('token'), ctx.query.get('ip'));
+  const scope = resolveScope(agentTokenOf(req, ctx), ctx.query.get('ip'));
   if (!scope) {
     // token 对不上是最常见的一类「节点一直离线」，记 ip 与版本便于定位是哪台机器
     logAgent.warn('上报被拒绝：token 无效', { rid: ctx.rid, ip: clientIp(req), agentVersion: ctx.query.get('v') });
@@ -2939,7 +2939,7 @@ function syncView(item, scope) {
 
 function agentReceipt(req, res, params, body, session, ctx) {
   // 不带 ip 参数：回执不参与地址发现，避免这里把「自动上报」的地址又改一遍
-  const scope = resolveScope(ctx.query.get('token'), '');
+  const scope = resolveScope(agentTokenOf(req, ctx), '');
   if (!scope) {
     logAgent.warn('回执被拒绝：token 无效', { rid: ctx.rid, ip: clientIp(req), agentVersion: ctx.query.get('v') });
     return sendJson(res, 401, { error: 'invalid token' });
@@ -3004,8 +3004,7 @@ function agentReceipt(req, res, params, body, session, ctx) {
  * agent 侧只做 base64 解码 + 写文件，不需要解析 JSON，也就不需要 jq / Node。
  */
 function agentBundleHandler(req, res, params, body, session, ctx) {
-  const token = ctx.query.get('token');
-  const scope = resolveScope(token, ctx.query.get('ip'));
+  const scope = resolveScope(agentTokenOf(req, ctx), ctx.query.get('ip'));
   if (!scope) {
     logAgent.warn('配置包请求被拒绝：token 无效', {
       rid: ctx.rid,
@@ -3542,7 +3541,7 @@ function listAudit(req, res, params, body, session, ctx) {
  * 做语法检查后原子替换自身并重启。
  */
 function agentScript(req, res, params, body, session, ctx) {
-  const scope = resolveScope(ctx.query.get('token'), ctx.query.get('ip'));
+  const scope = resolveScope(agentTokenOf(req, ctx), ctx.query.get('ip'));
   if (!scope) return sendText(res, 401, '#ERROR invalid token');
   let src;
   try {
@@ -3873,7 +3872,15 @@ const server = http.createServer(async (req, res) => {
 /* --------------------------------- 启动 ---------------------------------- */
 
 function main() {
-  store.load();
+  // 数据库初始化失败（单实例锁被占用 / 磁盘不可写 / 库文件损坏）必须直接退出：
+  // uncaughtException 的兜底策略是「记日志继续跑」，但对启动期错误这等于带伤上线，
+  // 比如锁冲突时继续跑就是第二个实例照样去覆盖第一个实例的数据。
+  try {
+    store.load();
+  } catch (err) {
+    console.error(`✗ 启动失败：${err.message}\n`);
+    process.exit(1);
+  }
   // 出厂密码阶段：所有业务接口都返回 403，日志里先说清楚，免得别人以为面板坏了
   if (needsPasswordChange()) {
     log.warn('出厂默认密码未修改：业务接口已全部拦截', { admin: store.db().admin.username });
@@ -3889,6 +3896,23 @@ function main() {
   setTimeout(() => {
     alerts.sweep().catch((err) => log.error('告警巡检异常', { err }));
   }, 15000).unref();
+  // 过期会话原本只在「再次被访问」时删除，长期运行会缓慢堆积（正常一两个管理员
+  // 在线，堆不了几条，但零成本顺手清掉）；每 30 分钟扫一遍，超出硬上限时淘汰最早过期的一批。
+  const SESSION_HARD_LIMIT = 500;
+  const sessionTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [t, s] of sessions) if (now > s.expires) sessions.delete(t);
+    if (sessions.size > SESSION_HARD_LIMIT) {
+      // 只在异常场景（脚本狂登）才会走到：按过期时间淘汰最旧的，代价是踢掉仍有效的会话
+      const excess = sessions.size - SESSION_HARD_LIMIT;
+      const oldest = [...sessions.entries()]
+        .sort((a, b) => a[1].expires - b[1].expires)
+        .slice(0, excess);
+      for (const [t] of oldest) sessions.delete(t);
+      logAuth.warn('会话数超过上限，已淘汰最旧的一批', { before: sessions.size + excess, kept: sessions.size });
+    }
+  }, 30 * 60 * 1000);
+  sessionTimer.unref();
   server.listen(PORT, HOST, () => {
     log.info('面板已启动', {
       version: APP_VERSION,
