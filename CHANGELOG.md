@@ -3,6 +3,50 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.5] - 2026-10-26
+
+修一个「部署脚本装完 agent，却没人装 Xray」的死角。部署脚本一直假定机器上已经有
+Xray 本体，于是新开的机器执行完部署命令后，agent 每轮都在报：
+
+```
+! Xray 未运行（xray 不是 active），尝试拉起
+✗ 未找到 xray 服务：本机没有安装 Xray……
+! 端口未在监听：tcp:42323（配置已落盘，但服务没把它监听起来）
+```
+
+配置写得再对也没人监听端口，面板侧看起来一切正常。
+
+### 修复
+
+- **部署脚本自动安装 xray-core**。按架构下载官方发行包
+  （`Xray-linux-<arch>.zip`，架构映射与 `XTLS/Xray-install` 一致，覆盖
+  x86_64 / arm64 / armv7 / 386 / mips / ppc64 / riscv64 / s390x），
+  装二进制 + `geoip.dat` / `geosite.dat`，再注册服务单元（systemd / OpenRC 双分支）。
+- **已有安装绝不覆盖**：检测到 `xray` / `xray-core` / `x-ui` 任一服务单元就整段跳过，
+  只沿用原有单元作为 `RELOAD_CMD`；只有二进制没有单元（手工解压的）时只补单元，
+  不重新下载。想完全自己管 Xray：`SKIP_XRAY=1` 执行部署脚本。
+- **补建 `/var/log/xray`**。面板下发的配置把 error 日志写到
+  `/var/log/xray/error.log`，目录不存在时 xray 启动即退出，journalctl 里只有一行
+  `failed to open log file` —— 这是装好 Xray 之后第二常见的「起不来」。
+- **解压依赖兜底**：`unzip` → `busybox unzip` → `python3 -m zipfile`，
+  都没有时按 apt/dnf/yum/apk/zypper/pacman 装一个再重试，最小化镜像也能装上。
+- **下载失败给可执行的动作**：打印官方安装脚本与镜像重跑方式
+  （`XRAY_DOWNLOAD_BASE=<镜像地址>`），不再只说一句「下载失败」。
+- **部署脚本收尾自检**：agent 启动后等最多 12 秒，直接打印 `Xray：运行中 / 未运行`，
+  未运行时给出 `journalctl -u xray -n 50`，避免「部署完成」却端口空着的假成功。
+
+### 变更
+
+- **部署输出改成「按步 + 事实」**：`[n/m] 步骤名` 分步，每步给出实际结果 ——
+  agent 版本/体积/语法检查、Xray 版本/体积/数据文件路径/服务单元、`RELOAD_CMD` 实际值、
+  Hysteria2 版本，末尾一份汇总（含耗时、日志/重启/手动一轮的命令）。
+  去掉了「纯 shell，无需 Node」这类无信息量的修饰语。
+- 需要 Xray 的服务器 / 独立节点部署时传 `NEED_XRAY=1`（无节点的服务器也装，
+  免得以后加第一个节点又要返工）；纯 Hysteria2 的独立节点为 `0`，不占这份空间，
+  且 `RELOAD_CMD` 留空（不再硬写 `systemctl restart xray`）。
+- Hysteria2 二进制改到 agent 启动前安装，首轮不再出现「未找到 hysteria」的告警。
+- agent 报「未找到 xray 服务」时，日志里直接给出修复动作：重跑面板上的部署命令。
+
 ## [0.1.4] - 2026-10-24
 
 给关键流程补上「能直接用来排查」的日志。以前日志基本只有一句 `GET /api/x → 200`，

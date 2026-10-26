@@ -415,8 +415,10 @@ xray_ensure() {
 
   case "$_err" in
     *'not found'* | *'not-found'* | *'No such file'*)
-      # 最容易踩的一种：机器上根本没有 Xray，装个节点却从来没装过服务
-      RC_ERR="未找到 $_u 服务：本机没有安装 Xray，或服务名不叫 $_u（装好后把 RELOAD_CMD 写进 $ENV_FILE）"
+      # 最容易踩的一种：机器上根本没有 Xray，装个节点却从来没装过服务。
+      # 0.1.5 起部署脚本会自己装 xray-core，所以这里直接给出能一键修好的动作
+      RC_ERR="未找到 $_u 服务：本机没有安装 Xray。到面板「服务器 / 节点」页复制部署命令重跑一次（会自动装 xray-core），或手工装好后把 RELOAD_CMD 写进 $ENV_FILE"
+      log "  修复：重跑面板上的部署命令即可自动安装 xray-core（已有安装不会被覆盖）"
       ;;
     *)
       RC_ERR="Xray 启动失败：$_u — $(printf '%s' "$_err" | sed -n '1p')"

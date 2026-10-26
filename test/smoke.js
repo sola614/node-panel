@@ -423,6 +423,25 @@ const json = (obj) => JSON.stringify(obj);
     srvInstall.includes('RELOAD_CMD="$RELOAD_CMD"') && srvInstall.includes('PANEL_URL="$PANEL_URL"'),
   );
   ok('部署脚本按实际单元名探测 Xray 服务', srvInstall.includes('xray-core') && srvInstall.includes('x-ui'));
+  ok('部署脚本会自己装 xray-core（不再假定机器上已有 Xray）',
+    srvInstall.includes('NEED_XRAY="1"') &&
+      srvInstall.includes('Xray-linux-') &&
+      srvInstall.includes('Xray-core/releases/latest/download') &&
+      srvInstall.includes('/etc/systemd/system/xray.service'));
+  ok('已有 Xray 安装时脚本不覆盖',
+    srvInstall.includes('xray_unit_name') && srvInstall.includes('已有服务单元'));
+  ok('部署脚本建 Xray 日志目录（配置里写的是 /var/log/xray/error.log）',
+    srvInstall.includes('XRAY_LOG=/var/log/xray'));
+  ok('部署输出按步骤编号，末尾有汇总',
+    srvInstall.includes('step "agent 脚本') &&
+      srvInstall.includes('[%s/%s]') &&
+      srvInstall.includes('部署完成 · 耗时') &&
+      srvInstall.includes('手动一轮'));
+  // 只检查部署脚本自己的那部分：内嵌的 agent.sh 里有「acme.sh 是纯 shell」这类说明
+  const srvWrapper = srvInstall.split('NODEPANEL_AGENT_EOF')[0];
+  ok('部署输出不含「纯 shell，无需 Node」这类修饰语',
+    !srvWrapper.includes('无需 Node') && !srvWrapper.includes('纯 shell'));
+  ok('纯 Hysteria2 独立节点不装 Xray', nodeInstall.includes('NEED_XRAY="0"'));
 
   /* ---------- 11.1 卸载脚本 ---------- */
   const srvUninstall = await fetch(`${BASE}/api/servers/${serverId}/uninstall?token=${serverToken}`).then((r) => r.text());

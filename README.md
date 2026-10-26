@@ -273,22 +273,75 @@ curl -fsSL "http://面板/api/servers/<id>/install?token=<服务器token>" | sh
 curl -fsSL "http://面板/api/nodes/<id>/install?token=<节点token>" | sh
 ```
 
-脚本会做这些事：
+脚本会做这些事（输出按 `[n/m]` 分步，每步都把版本、体积、路径、服务状态打出来）：
 
-1. 把 **纯 shell 版 agent** 装到 `/opt/nodepanel/agent.sh`（不需要 Node）
-2. 写入 `/opt/nodepanel/agent.env`（含 token，权限 600；值统一加引号，`RELOAD_CMD` 里有空格也不会被拆成命令）
-3. 按系统注册开机自启：`systemd` → 服务单元；`OpenRC`（Alpine）→ init 脚本；都没有则退回 crontab
-4. 按实际存在的单元名探测 Xray 重载命令（`xray` / `xray-core` / `x-ui`）
-5. 如果该机有 Hysteria2 节点且未装 hysteria，按架构下载官方静态二进制
+1. 把 agent 装到 `/opt/nodepanel/agent.sh`，`sh -n` 校验后打印版本与体积
+2. **检测并安装 Xray 本体**（`xray-core` 官方发行包 + `geoip.dat` / `geosite.dat` + 服务单元）；
+   机器上已经有 `xray` / `xray-core` / `x-ui` 服务时整段跳过，一个字节都不动
+3. 有 Hysteria2 节点且未装 hysteria 时，按架构下载官方二进制
+4. 写入 `/opt/nodepanel/agent.env`（含 token，权限 600；值统一加引号，`RELOAD_CMD` 里有空格也不会被拆成命令）
+5. 按系统注册开机自启：`systemd` → 服务单元；`OpenRC`（Alpine）→ init 脚本；都没有则退回 crontab
+6. 等 agent 首轮同步（最多 12s），打印 Xray 实际运行状态，最后给一份汇总
+
+```
+星链 · 节点部署
+      目标      美国白猫云 (1.2.3.4)
+      面板      http://面板地址
+      系统      Debian GNU/Linux 12 (bookworm) · x86_64 · 6.1.0-13-amd64
+      服务管理  systemd
+
+[1/4] agent 脚本 → /opt/nodepanel/agent.sh
+      版本 0.1.5 · 34 KB · sh -n 通过
+      · 日志目录 /var/log/nodepanel，运行时目录 /run/nodepanel
+
+[2/4] Xray 本体 → /usr/local/bin/xray
+      本机没有 Xray，下载官方发行包
+      · 来源 https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+      · 已下载 23.4 MB，解压中
+      已安装 Xray 25.9.11 · 27.1 MB
+      · 数据文件 geoip.dat / geosite.dat → /usr/local/share/xray
+      服务单元 /etc/systemd/system/xray.service（已 enable，配置下发后启动）
+
+[3/4] 运行配置 → /opt/nodepanel/agent.env
+      PANEL_URL=http://面板地址
+      INTERVAL=60s · XRAY_CONFIG=/usr/local/etc/xray/config.json
+      RELOAD_CMD="systemctl restart xray"
+      · 权限 600（内含 token）
+
+[4/4] 开机自启 → nodepanel-agent
+      systemd 单元 /etc/systemd/system/nodepanel-agent.service
+      · Restart=always · RestartSec=10 · KillMode=process
+      等待 agent 首轮同步（最多 12s）
+      Xray 运行中（pid 1234）
+
+✓ 部署完成 · 耗时 8s
+
+  agent      v0.1.5 · systemd · 每 60s 一轮
+  xray       Xray 25.9.11 · 运行中
+  hysteria2  不需要（本机没有 Hysteria2 节点）
+  配置       /usr/local/etc/xray/config.json
+  状态       /opt/nodepanel/state.env
+
+  日志       journalctl -u nodepanel-agent -f
+  重启       systemctl restart nodepanel-agent
+  手动一轮   sh /opt/nodepanel/agent.sh --once
+```
 
 agent 的版本号只有一处来源：面板 `package.json` 的 `version`。部署脚本下发时会把脚本里的
 `VERSION=` 替换成当前面板版本，所以面板上看到的 agent 版本永远和面板一致。
 
-**前置条件**：Xray 需要自己装，agent 只负责写配置和重启服务。
+**关于 Xray**：0.1.5 起部署脚本会自己装，新机器开箱即用。几种特殊情况：
 
-```bash
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-```
+| 情况 | 脚本行为 |
+| --- | --- |
+| 全新机器 | 下载官方 `Xray-linux-<arch>.zip`（x86_64 / arm64 / armv7 / 386 / mips / ppc64 / riscv64 / s390x），装好后注册 `xray.service` |
+| 已有 `xray` / `xray-core` / `x-ui` 服务 | 跳过安装，沿用原有单元作为重载命令 |
+| 只有 `xray` 二进制、没有服务单元 | 只补一份服务单元，不重新下载 |
+| 想完全自己管 Xray | `curl -fsSL "…/install?token=…" \| SKIP_XRAY=1 sh` |
+| GitHub 拉不动 | `curl -fsSL "…/install?token=…" \| XRAY_DOWNLOAD_BASE=<镜像地址> sh` |
+
+纯 Hysteria2 的独立节点不会装 Xray，省这份空间。日志目录 `/var/log/xray` 由脚本一并建好
+——面板下发的配置把 error 日志写在那里，目录不存在时 xray 会启动即退出。
 
 ### 4. 之后的一切都是自动的
 
