@@ -313,28 +313,33 @@ function uninstallFlow(kind, id) {
 
       <div class="section-title" style="margin-top:16px">会清理</div>
       <ul class="hint" style="margin:6px 0 0;padding-left:18px;line-height:1.9">
-        <li>停止并注销 <b>nodepanel-agent</b>（systemd / OpenRC / crontab 三种部署方式都认）</li>
+        <li>停止并注销 <b>nodepanel-agent</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
         <li>停掉 agent 托管的 Hysteria2 实例，删除 <span class="mono">/etc/hysteria/node-*.yaml</span></li>
-        <li>删除 <span class="mono">/opt/nodepanel</span>（agent 脚本、token、状态文件）与 <span class="mono">/run/nodepanel</span></li>
+        <li>删除 <span class="mono">/opt/nodepanel</span>（agent 脚本、token、状态文件）、<span class="mono">/run/nodepanel</span>
+          与 <span class="mono">/etc/nodepanel</span>（agent 生成的自签证书）</li>
+        <li><b>停掉 Xray 并取消开机自启</b>，删除面板生成的 <span class="mono">config.json</span>（先备份）
+          —— 卸完这台机器上的节点端口不再监听</li>
       </ul>
 
       <div class="section-title" style="margin-top:16px">默认保留</div>
       <ul class="hint" style="margin:6px 0 0;padding-left:18px;line-height:1.9">
-        <li><span class="mono">/usr/local/etc/xray/config.json</span> —— Xray 继续按这份配置跑，只是面板不再同步用户</li>
+        <li><span class="mono">config.json.nodepanel.bak</span> —— 面板覆盖前的配置备份，需要回滚时用</li>
         <li><span class="mono">/var/log/nodepanel</span> —— 排查用日志</li>
+        <li><span class="mono">/usr/local/bin/xray</span> 与 geo 数据 —— 可能是你自己装的，脚本不动</li>
       </ul>
 
-      <div class="section-title" style="margin-top:16px">连日志和 Xray 配置一起清掉</div>
+      <div class="section-title" style="margin-top:16px">连日志和备份一起清掉</div>
       <div class="code-wrap" style="margin-top:8px">
         <pre class="code">${esc(purge)}</pre>
         <button class="btn btn-sm btn-ghost copy-btn" data-copy="${esc(purge)}">复制</button>
       </div>
       <p class="hint" style="margin-top:10px">
-        <span class="mono">--purge</span> 会先把 Xray 配置备份成 <span class="mono">config.json.nodepanel.bak</span> 再删除，并停掉 xray 服务。
+        <span class="mono">--purge</span> 额外删除 <span class="mono">/var/log/nodepanel</span> 与配置备份；
+        agent、证书、节点配置在默认模式下就已经清掉了。
       </p>
       <p class="hint">
-        面板里的<span style="color:var(--text)">服务器 / 节点记录不会自动消失</span>：卸载期间状态变为离线，
-        想恢复接入重新执行一次部署命令即可，记录和订阅都不用重建。
+        面板里的<span style="color:var(--text)">服务器 / 节点记录不会自动消失</span>：卸载后状态变离线，
+        想彻底移除就在服务器列表里「删除」（其下节点会一并删掉）；只是想恢复接入，重新执行一次部署命令即可。
       </p>`,
   });
 }

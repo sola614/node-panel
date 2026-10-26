@@ -10,6 +10,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('node:child_process');
 
 const BASE = (process.argv[2] || 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const ADMIN_USER = process.env.PANEL_ADMIN_USER || 'admin';
@@ -358,6 +359,45 @@ const json = (obj) => JSON.stringify(obj);
   ok('统计端口在 YAML 中一致',
     hy2All.every((x) => x.yaml.includes(`127.0.0.1:${x.statsPort}`)));
 
+  // 自签证书：cert 与 key 必须同时指向 agent 的落地路径。
+  // resolveCert 的 self 分支曾把字段写成 keyPath，toYaml 把 undefined 整个丢掉 →
+  // 生成的配置只有 cert 没有 key，hysteria / xray 都起不来
+  const selfHy = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-HY2-SELF', mode: 'standalone', ipMode: 'manual', address: '10.0.0.9',
+      protocol: 'hysteria2', port: 20844, certMode: 'self', sni: 'self.example.com', enabled: true,
+    }),
+  });
+  cleanup.push(['/api/nodes/' + selfHy.data.item.id]);
+  const cfgSelfHy = await call(`/api/agent/config?token=${selfHy.data.item.token}&v=test`);
+  const hySelf = (cfgSelfHy.data.hysteria || [])[0];
+  const selfDir = `/etc/nodepanel/certs/${selfHy.data.item.id}`;
+  ok('自签证书的 hy2 配置带 cert 与 key',
+    !!hySelf && hySelf.yaml.includes(`${selfDir}/fullchain.pem`) && hySelf.yaml.includes(`${selfDir}/privkey.pem`),
+    hySelf ? hySelf.yaml.split('\n').filter((l) => /cert|key/.test(l)).map((s) => s.trim()).join(' | ') : '');
+  ok('自签证书随配置包下发给 agent 生成',
+    (cfgSelfHy.data.certs || []).some((c) => c.nodeId === selfHy.data.item.id && c.mode === 'self'));
+
+  const selfTls = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-TLS-SELF', mode: 'standalone', ipMode: 'manual', address: '10.0.0.10',
+      protocol: 'vless', port: 20845, network: 'tcp', security: 'tls', certMode: 'self', sni: 'self2.example.com', enabled: true,
+    }),
+  });
+  cleanup.push(['/api/nodes/' + selfTls.data.item.id]);
+  const cfgSelfTls = await call(`/api/agent/config?token=${selfTls.data.item.token}&v=test`);
+  const certEntry = ((cfgSelfTls.data.xray.inbounds[0] || {}).streamSettings || {}).tlsSettings || {};
+  const certObj = (certEntry.certificates || [])[0] || {};
+  ok('自签证书的 xray 入站带 certificateFile 与 keyFile',
+    String(certObj.certificateFile || '').endsWith('/fullchain.pem') && String(certObj.keyFile || '').endsWith('/privkey.pem'),
+    JSON.stringify(certObj));
+
+  // 这两个节点只为验证证书生成，立刻删掉：留着会混进后面章节「不限套餐用户看到全部节点」的断言
+  await call('/api/nodes/' + selfHy.data.item.id, { method: 'DELETE' });
+  await call('/api/nodes/' + selfTls.data.item.id, { method: 'DELETE' });
+
   /* ---------- 10. 超额自动剔除 ---------- */
   const report = await call(`/api/agent/report?token=${serverToken}`, {
     method: 'POST',
@@ -453,7 +493,25 @@ const json = (obj) => JSON.stringify(obj);
       srvUninstall.includes('rm -rf "$AGENT_DIR" "$RUN_DIR"'),
   );
   ok('卸载脚本会停掉 agent 托管的 Hysteria2 实例', srvUninstall.includes('node-*.yaml') && srvUninstall.includes('RUN_DIR"/*.pid'));
+  ok('卸载脚本兜底结束残留的 Hysteria2 实例', srvUninstall.includes('pkill -f "hysteria server -c'));
+  ok(
+    '卸载脚本默认停掉 Xray 并删掉面板生成的配置',
+    srvUninstall.includes('systemctl stop "$XRAY_UNIT"') &&
+      srvUninstall.includes('systemctl disable "$XRAY_UNIT"') &&
+      srvUninstall.includes('rm -f "$XRAY_CONFIG"'),
+  );
+  ok('卸载脚本清理 agent 生成的自签证书', srvUninstall.includes('CERTS_DIR=/etc/nodepanel') &&
+    srvUninstall.includes('rm -rf "$CERTS_DIR"'));
+  // 卸载命令不该误删管理员自己装的 xray：只认面板写的那份（带 StatsService）
+  ok('卸载脚本只删面板生成的 Xray 配置', srvUninstall.includes("grep -q 'StatsService'") &&
+    srvUninstall.includes('不是面板生成的'));
+  ok('卸载脚本不再保留 Xray 配置（只保留备份）',
+    srvUninstall.includes('保留 $XRAY_BAK') && !srvUninstall.includes('Xray 仍在按这份配置跑'));
   ok('卸载脚本支持 --purge 深度清理', srvUninstall.includes('--purge') && srvUninstall.includes('nodepanel.bak'));
+
+  // 脚本是拼模板拼出来的，少个转义就是语法错 —— 真机执行前先让 sh 自己检查一遍
+  const shCheck = spawnSync('sh', ['-n'], { input: srvUninstall, encoding: 'utf8' });
+  ok('卸载脚本通过 sh -n 语法检查', shCheck.status === 0, String(shCheck.stderr || '').slice(0, 120));
 
   const nodeUninstall = await fetch(`${BASE}/api/nodes/${node3Id}/uninstall?token=${node3Token}`).then((r) => r.text());
   ok('独立节点卸载脚本可下载', nodeUninstall.startsWith('#!/bin/sh') && nodeUninstall.includes('卸载脚本'));
