@@ -6,10 +6,14 @@
  */
 /* ============================== 服务器 ============================== */
 
+/* 勾选状态只服务本页，切页即重置 */
+let SERVER_SELECTED = new Set();
+
 RENDERERS.servers = async () => {
   const [d, nd] = await Promise.all([api('/api/servers'), api('/api/nodes')]);
   state.data.servers = d.items;
   state.data.nodes = nd.items;
+  SERVER_SELECTED = new Set();
 
   $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="server-new">+ 新增服务器</button>`;
 
@@ -28,6 +32,7 @@ RENDERERS.servers = async () => {
             </div>
           </div>
           <div style="display:flex;gap:6px;align-items:center">
+            <input type="checkbox" class="s-pick" data-id="${s.id}" title="勾选后可批量删除" style="width:auto">
             ${syncBadge(s.sync, s.name)}
             <span class="badge ${s.online ? 'badge-ok' : 'badge-dim'}">${s.online ? '在线' : '离线'}</span>
           </div>
@@ -43,6 +48,7 @@ RENDERERS.servers = async () => {
           <button class="btn btn-sm btn-primary" data-act="server-deploy" data-id="${s.id}">部署命令</button>
           <button class="btn btn-sm btn-ghost" data-act="server-uninstall" data-id="${s.id}">卸载命令</button>
           <button class="btn btn-sm btn-ghost" data-act="server-edit" data-id="${s.id}">编辑</button>
+          <button class="btn btn-sm btn-ghost" data-act="server-copy" data-id="${s.id}">复制</button>
           <button class="btn btn-sm btn-ghost" data-act="server-rotate" data-id="${s.id}">重置 token</button>
           <button class="btn btn-sm btn-danger" data-act="server-del" data-id="${s.id}">删除</button>
         </div>
@@ -52,7 +58,14 @@ RENDERERS.servers = async () => {
     : `<div class="card"><div class="empty"><b>还没有服务器</b>添加服务器后，把部署命令贴到机器上执行，agent 就会自动接管</div></div>`;
 
   $('#view').innerHTML = `
-    <div class="grid-3">${cards}</div>
+    <div class="card hidden" id="s-bulkcard" style="padding:0;margin-bottom:16px">
+      <div class="bulk-bar">
+        <b style="font-size:12.5px">已选 <span id="s-selcount">0</span> 台</b>
+        <button class="btn btn-sm btn-danger" data-act="server-bulk-del">删除</button>
+        <button class="btn btn-sm btn-ghost" data-act="server-bulk-clear" style="margin-left:auto">取消选择</button>
+      </div>
+    </div>
+    <div class="grid-3" id="s-grid">${cards}</div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><h3>两种部署方式</h3></div>
       <div class="card-body">
@@ -74,7 +87,61 @@ RENDERERS.servers = async () => {
         </div>
       </div>
     </div>`;
+
+  bindServerList();
 };
+
+/* --------------------------- 勾选 / 批量删 / 复制 --------------------------- */
+
+function bindServerList() {
+  const grid = $('#s-grid');
+  if (!grid) return;
+  grid.addEventListener('change', (e) => {
+    const box = e.target.closest('.s-pick');
+    if (!box) return;
+    if (box.checked) SERVER_SELECTED.add(box.dataset.id);
+    else SERVER_SELECTED.delete(box.dataset.id);
+    paintServerSelection();
+  });
+}
+
+function paintServerSelection() {
+  const card = $('#s-bulkcard');
+  if (card) card.classList.toggle('hidden', SERVER_SELECTED.size === 0);
+  const n = $('#s-selcount');
+  if (n) n.textContent = String(SERVER_SELECTED.size);
+}
+
+/** 复制服务器：地址与备注带过来，名字另起一个 —— token 由服务端重新生成，旧机器不受影响 */
+function serverCopyFlow(id) {
+  const s = (state.data.servers || []).find((x) => x.id === id);
+  if (!s) return;
+  serverNewFlow({
+    copyFrom: s.name,
+    name: copyName(s.name, (state.data.servers || []).map((x) => x.name)),
+    host: s.host || '',
+    ipMode: s.ipMode || 'manual',
+    note: s.note || '',
+  });
+}
+
+function serverBulkDelete() {
+  if (!SERVER_SELECTED.size) return toast('先勾选服务器', 'err');
+  const n = SERVER_SELECTED.size;
+  const nodes = (state.data.nodes || []).filter((x) => SERVER_SELECTED.has(x.serverId)).length;
+  confirmDialog(
+    '批量删除服务器',
+    `确定删除选中的 ${n} 台服务器？其下 ${nodes} 个节点会一并删除，相关订阅链接立即失效。`,
+    async () => {
+      const r = await api('/api/servers/batch-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids: [...SERVER_SELECTED] }),
+      });
+      toast(`已删除 ${r.done} 台服务器${r.nodes ? `、${r.nodes} 个节点` : ''}`, 'ok');
+      render();
+    },
+  );
+}
 
 function serverForm(s) {
   const v = s || {};
@@ -133,11 +200,12 @@ function readServerForm(mask) {
   };
 }
 
-async function serverNewFlow() {
+async function serverNewFlow(template) {
+  const copy = !!template;
   const mask = openModal({
-    title: '新增服务器',
-    body: serverForm(),
-    okText: '创建',
+    title: copy ? '复制服务器 · ' + (template.copyFrom || template.name) : '新增服务器',
+    body: serverForm(template || null),
+    okText: copy ? '复制' : '创建',
     onOk: async (m) => {
       const payload = readServerForm(m);
       if (!payload.name) throw new Error('请填写名称');
@@ -145,7 +213,7 @@ async function serverNewFlow() {
         throw new Error('手动模式下请填写服务器地址');
       }
       await api('/api/servers', { method: 'POST', body: JSON.stringify(payload) });
-      toast('服务器已添加，下一步去「节点」页添加节点', 'ok');
+      toast(copy ? '服务器已复制，记得在新机器上执行部署命令' : '服务器已添加，下一步去「节点」页添加节点', 'ok');
       render();
     },
   });

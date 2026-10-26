@@ -566,6 +566,10 @@ const ACT_LOADING = {
   'backup-del': '删除中',
   'backup-restore': '恢复中',
   'user-bulk-act': '处理中',
+  'node-bulk-del': '删除中',
+  'server-bulk-del': '删除中',
+  'plan-bulk-del': '删除中',
+  'node-sort-submit': '保存中',
   'user-bulk': '创建中',
   'invite-manage': '加载中',
 };
@@ -612,6 +616,9 @@ async function runAction(act, btn, id) {
     }
     case 'user-new':
       await createUserFlow();
+      break;
+    case 'user-copy':
+      userCopyFlow(id);
       break;
     case 'user-edit':
       await editUserFlow(id);
@@ -685,6 +692,16 @@ async function runAction(act, btn, id) {
     case 'plan-new':
       await planNewFlow();
       break;
+    case 'plan-copy':
+      await planCopyFlow(id);
+      break;
+    case 'plan-bulk-del':
+      planBulkDelete();
+      break;
+    case 'plan-bulk-clear':
+      PLAN_SELECTED.clear();
+      paintPlanSelection();
+      break;
     case 'plan-edit':
       await planEditFlow(id);
       break;
@@ -697,6 +714,28 @@ async function runAction(act, btn, id) {
       break;
     case 'node-new':
       await nodeNewFlow();
+      break;
+    case 'node-copy':
+      nodeCopyFlow(id);
+      break;
+    case 'node-sort-start':
+      nodeSortStart();
+      break;
+    case 'node-sort-cancel':
+      nodeSortCancel();
+      break;
+    case 'node-sort-submit':
+      await nodeSortSubmit();
+      break;
+    case 'node-bulk-del':
+      nodeBulkDelete();
+      break;
+    case 'node-bulk-clear':
+      NODE_SELECTED.clear();
+      $$('#n-tbody .n-pick').forEach((b) => {
+        b.checked = false;
+      });
+      paintNodeSelection();
       break;
     case 'node-edit':
       await nodeEditFlow(id);
@@ -765,6 +804,19 @@ async function runAction(act, btn, id) {
       break;
     case 'server-new':
       await serverNewFlow();
+      break;
+    case 'server-copy':
+      serverCopyFlow(id);
+      break;
+    case 'server-bulk-del':
+      serverBulkDelete();
+      break;
+    case 'server-bulk-clear':
+      SERVER_SELECTED.clear();
+      $$('.s-pick').forEach((b) => {
+        b.checked = false;
+      });
+      paintServerSelection();
       break;
     case 'server-edit':
       await serverEditFlow(id);

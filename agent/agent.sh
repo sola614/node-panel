@@ -32,7 +32,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.5'
+VERSION='0.1.6'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -304,9 +304,15 @@ reload_xray() {
   _cmd=${RELOAD_CMD:-}
   [ -n "$_cmd" ] || _cmd=$(detect_reload_cmd)
   if [ -z "$_cmd" ]; then
-    # 没有服务管理器 = 配置已落盘但需要人工重启。这不算「失败」：
+    # 没有可用的重载命令 = 配置已落盘但需要人工重启。这不算「失败」：
     # 把整轮标记成失败会让面板显示红标，掩盖真正的问题（配置自检不过 / 重载报错）
-    log "! 本机没有 systemd / OpenRC，跳过 Xray 重载（配置已写入 $XRAY_CONFIG，需手动重启）"
+    if command -v systemctl >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; then
+      # 有服务管理器却没找到 xray 单元：机器装了 systemd，但服务不叫 xray / xray-core / x-ui
+      log "! 有服务管理器但没找到 xray 服务单元，跳过重载（配置已写入 $XRAY_CONFIG）"
+      log "  把实际的重载命令写进 $ENV_FILE 的 RELOAD_CMD（如 systemctl restart 你的服务名）"
+    else
+      log "! 本机没有 systemd / OpenRC，跳过 Xray 重载（配置已写入 $XRAY_CONFIG，需手动重启）"
+    fi
     RC_XRAY=skip
     return 1
   fi
@@ -368,8 +374,21 @@ xray_running() {
 }
 
 xray_ensure() {
-  [ "${NP_XRAY_NODES:-0}" -gt 0 ] 2>/dev/null || return 0
-  xray_running && { rm -f "$STATE_DIR/.xray-fail" 2>/dev/null; return 0; }
+  # 本机没有 Xray 节点（纯 Hysteria2 / 空节点）：没有需要重载的对象。
+  # 这里必须落一个值 —— 留空会被回执兜底成 skip，面板于是永远显示「待重载」
+  if ! [ "${NP_XRAY_NODES:-0}" -gt 0 ] 2>/dev/null; then
+    RC_XRAY=${RC_XRAY:-ok}
+    return 0
+  fi
+
+  if xray_running; then
+    rm -f "$STATE_DIR/.xray-fail" 2>/dev/null
+    # 本来就在跑：配置没变（或这一轮刚重载过）都说明线上已经是这份配置。
+    # 以前这里直接 return，RC_XRAY 留空 → 回执写 skip → 面板误报「待重载」。
+    # skip 的含义是「配置落盘了但没重启」，没重启这件事没发生过就不能这么说
+    RC_XRAY=${RC_XRAY:-ok}
+    return 0
+  fi
 
   # 拉不起来时（多半是根本没装 Xray）不要每 60 秒往日志里灌一遍：
   # 5 分钟内只报状态、不再重试，过了冷静期再试一次
@@ -834,7 +853,7 @@ send_receipt() {
   mkdir -p "$RUN_DIR" "$STATE_DIR" 2>/dev/null
   _f="$RUN_DIR/receipt.$$.json"
   printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","unbound":"%s","nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
-    "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-skip}" "${RC_HY:-0/0}" "${BAD_PORTS:-}" \
+    "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${BAD_PORTS:-}" \
     "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
 
   if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" >/dev/null; then
@@ -973,7 +992,17 @@ log "HTTP：${HTTP:-未找到 curl/wget}"
 log "Xray：$XRAY_CONFIG · Hysteria2：$HYSTERIA_DIR"
 # 重载命令是「配置没生效」类问题的第一嫌疑，启动时先把它亮出来
 _detect_cmd=$(detect_reload_cmd)
-log "重载：${RELOAD_CMD:-${_detect_cmd:-无服务管理器，需手动重启}} · 轮询 ${INTERVAL}s"
+if [ -n "${RELOAD_CMD:-}" ]; then
+  _reload_show=$RELOAD_CMD
+elif [ -n "$_detect_cmd" ]; then
+  _reload_show=$_detect_cmd
+elif command -v systemctl >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; then
+  # 有服务管理器却没匹配到 xray 单元：这台机器的服务名可能不叫 xray / xray-core / x-ui
+  _reload_show='未找到 xray 服务单元（配置写入后需手动重启）'
+else
+  _reload_show='无服务管理器（配置写入后需手动重启）'
+fi
+log "重载：$_reload_show · 轮询 ${INTERVAL}s"
 
 if [ "${1:-}" = '--once' ]; then
   tick

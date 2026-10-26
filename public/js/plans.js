@@ -6,9 +6,13 @@
  */
 /* ============================== 套餐 ============================== */
 
+/* 勾选状态只服务本页，切页即重置 */
+let PLAN_SELECTED = new Set();
+
 RENDERERS.plans = async () => {
   const d = await api('/api/plans');
   state.data.plans = d.items;
+  PLAN_SELECTED = new Set();
 
   $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="plan-new">+ 新增套餐</button>`;
 
@@ -22,6 +26,7 @@ RENDERERS.plans = async () => {
             <div class="plan-desc">${esc(p.desc || '暂无描述')}</div>
           </div>
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+            <input type="checkbox" class="p-pick" data-id="${p.id}" title="勾选后可批量删除" style="width:auto">
             <span class="badge ${p.autoRenew ? 'badge-ok' : p.validity && p.validity.type === 'none' ? 'badge-dim' : 'badge-warn'}">${
               p.autoRenew ? '自动续期' : p.validity && p.validity.type === 'none' ? '永久' : '到期停用'
             }</span>
@@ -46,6 +51,7 @@ RENDERERS.plans = async () => {
         </div>
         <div style="display:flex;gap:7px">
           <button class="btn btn-sm btn-primary" data-act="plan-edit" data-id="${p.id}">编辑</button>
+          <button class="btn btn-sm btn-ghost" data-act="plan-copy" data-id="${p.id}">复制</button>
           <button class="btn btn-sm btn-danger" data-act="plan-del" data-id="${p.id}">删除</button>
         </div>
       </div>`,
@@ -54,7 +60,14 @@ RENDERERS.plans = async () => {
     : `<div class="card"><div class="empty"><b>还没有套餐</b>套餐定义用户的流量额度与有效期，是订阅的内容边界</div></div>`;
 
   $('#view').innerHTML = `
-    <div class="grid-3">${cards}</div>
+    <div class="card hidden" id="p-bulkcard" style="padding:0;margin-bottom:16px">
+      <div class="bulk-bar">
+        <b style="font-size:12.5px">已选 <span id="p-selcount">0</span> 个</b>
+        <button class="btn btn-sm btn-danger" data-act="plan-bulk-del">删除</button>
+        <button class="btn btn-sm btn-ghost" data-act="plan-bulk-clear" style="margin-left:auto">取消选择</button>
+      </div>
+    </div>
+    <div class="grid-3" id="p-grid">${cards}</div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><h3>套餐是怎么工作的</h3></div>
       <div class="card-body">
@@ -76,7 +89,64 @@ RENDERERS.plans = async () => {
         </div>
       </div>
     </div>`;
+
+  bindPlanList();
 };
+
+/* --------------------------- 勾选 / 批量删 / 复制 --------------------------- */
+
+function bindPlanList() {
+  const grid = $('#p-grid');
+  if (!grid) return;
+  grid.addEventListener('change', (e) => {
+    const box = e.target.closest('.p-pick');
+    if (!box) return;
+    if (box.checked) PLAN_SELECTED.add(box.dataset.id);
+    else PLAN_SELECTED.delete(box.dataset.id);
+    paintPlanSelection();
+  });
+}
+
+function paintPlanSelection() {
+  const card = $('#p-bulkcard');
+  if (card) card.classList.toggle('hidden', PLAN_SELECTED.size === 0);
+  const n = $('#p-selcount');
+  if (n) n.textContent = String(PLAN_SELECTED.size);
+}
+
+/** 复制套餐：额度 / 有效期 / 颜色照搬，名字另起，排序排到最后 */
+function planCopyFlow(id) {
+  const p = (state.data.plans || []).find((x) => x.id === id);
+  if (!p) return;
+  const maxSort = (state.data.plans || []).reduce((m, x) => Math.max(m, Number(x.sort) || 0), 0);
+  planNewFlow({
+    copyFrom: p.name,
+    name: copyName(p.name, (state.data.plans || []).map((x) => x.name)),
+    desc: p.desc || '',
+    color: p.color,
+    quotaGB: p.quotaGB,
+    validity: p.validity,
+    autoRenew: p.autoRenew,
+    sort: maxSort + 1,
+  });
+}
+
+function planBulkDelete() {
+  if (!PLAN_SELECTED.size) return toast('先勾选套餐', 'err');
+  const n = PLAN_SELECTED.size;
+  confirmDialog(
+    '批量删除套餐',
+    `确定删除选中的 ${n} 个套餐？使用这些套餐的用户会变成「不限套餐」（可见全部节点）。`,
+    async () => {
+      const r = await api('/api/plans/batch-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids: [...PLAN_SELECTED] }),
+      });
+      toast(`已删除 ${r.done} 个套餐${r.affected ? `，${r.affected} 位用户转为不限套餐` : ''}`, 'ok');
+      render();
+    },
+  );
+}
 
 function planForm(plan) {
   const p = plan || { color: '#4c8dff', quotaGB: 100, sort: 1 };
@@ -139,7 +209,7 @@ function planForm(plan) {
         <input type="number" id="p-sort" value="${p.sort || 1}" min="1">
       </div>
     </div>
-    <div class="field" id="p-autorenew-field">
+    <div class="field" id="p-autorenew-field" ${type === 'custom' ? 'hidden' : ''}>
       <label>到期处理</label>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);cursor:pointer;padding:9px 0">
         <input type="checkbox" id="p-autorenew" ${p.autoRenew === false ? '' : 'checked'} style="width:auto">
@@ -175,6 +245,10 @@ function bindPlanForm(mask) {
     // 切回有周期的类型时，还原切走之前的选择（新套餐默认是勾上的）
     if (renewBox) {
       const cyclic = type !== 'none' && type !== 'custom';
+      // 自定义到期时间只有一次，压根没有「到期处理」这回事 —— 整块收起来。
+      // 注意只是隐藏：开关照样 disabled + unchecked，readPlanForm 的取值逻辑一个字没改
+      const renewField = $('#p-autorenew-field', mask);
+      if (renewField) renewField.hidden = type === 'custom';
       if (!cyclic) {
         if (!renewBox.disabled) renewBox.dataset.was = renewBox.checked ? '1' : '0';
         renewBox.disabled = true;
@@ -227,16 +301,17 @@ function readPlanForm(mask) {
   };
 }
 
-async function planNewFlow() {
+async function planNewFlow(template) {
+  const copy = !!template;
   const mask = openModal({
-    title: '新增套餐',
-    body: planForm(),
-    okText: '创建',
+    title: copy ? '复制套餐 · ' + (template.copyFrom || template.name) : '新增套餐',
+    body: planForm(template || null),
+    okText: copy ? '复制' : '创建',
     onOk: async (m) => {
       const payload = readPlanForm(m);
       if (!payload.name) throw new Error('请填写套餐名称');
       await api('/api/plans', { method: 'POST', body: JSON.stringify(payload) });
-      toast('套餐已创建，去「节点」页把节点加入这个套餐', 'ok');
+      toast(copy ? '套餐已复制，去「节点」页把节点加进这个套餐' : '套餐已创建，去「节点」页把节点加入这个套餐', 'ok');
       render();
     },
   });

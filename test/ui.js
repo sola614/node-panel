@@ -282,12 +282,18 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   };
 
   ok('新增套餐默认勾选自动续期', renewBox.checked && !renewBox.disabled);
+  const renewField = d6.querySelector('#p-autorenew-field');
+  ok('默认显示「到期处理」', renewField.hidden === false);
   await setType('custom');
   ok('自定义到期时续期开关禁用且取消勾选', renewBox.disabled && !renewBox.checked);
+  // 自定义到期只有一次，没有「下一期」可续：整块收起来（逻辑不变，开关仍是 disabled + unchecked）
+  ok('自定义到期时隐藏「到期处理」', renewField.hidden === true);
   await setType('none');
   ok('永久套餐同样不能续期', renewBox.disabled && !renewBox.checked);
+  ok('永久套餐仍显示「到期处理」（提示不需要续期）', renewField.hidden === false);
   await setType('month');
   ok('切回按月恢复勾选与可编辑', renewBox.checked && !renewBox.disabled);
+  ok('切回按月重新显示「到期处理」', renewField.hidden === false);
 
   // 关掉后提交，提交体里 autoRenew 必须是 false
   renewBox.checked = false;
@@ -598,16 +604,167 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(120);
 
+  /* ---- 新增节点默认值 ---- */
+  console.log('\n── 新增节点默认值 ──');
+  const nodesBefore = await json('/api/nodes', {}, T);
+  const usedPorts = new Set(nodesBefore.items.map((n) => Number(n.port)));
+  click(d9.querySelector('[data-act="node-new"]'), w9);
+  await waitFor(() => d9.querySelector('#n-port'), '新增节点弹窗');
+
+  const portVal = Number(d9.querySelector('#n-port').value);
+  ok('监听端口默认落在 10000-65535', portVal >= 10000 && portVal <= 65535, String(portVal));
+  ok('默认端口避开了已有节点', !usedPorts.has(portVal), `已占用 ${[...usedPorts].join(',')}`);
+  ok('传输方式默认 tcp', d9.querySelector('#n-network').value === 'tcp');
+  ok(
+    'VLESS 的加密方式默认 Reality',
+    d9.querySelector('#n-protocol').value === 'vless' && d9.querySelector('#n-security').value === 'reality',
+  );
+
+  // 端口几乎被占满时不能卡死：只留 10000 一个空位，必须挑中它（随机命中也是同一个答案）
+  const nearlyFull = [];
+  for (let p = 10001; p <= 65535; p++) nearlyFull.push({ port: p });
+  ok('端口占满时退化成顺序找空位', w9.pickFreePort(nearlyFull) === 10000);
+  ok('入口占用的端口也会被避开', w9.pickFreePort([{ port: 10000, entries: [{ port: 10001 }] }]) > 10001);
+
+  // 加密方式跟着协议走，但手动选过之后不再被覆盖
+  const protoSel = d9.querySelector('#n-protocol');
+  const secSel = d9.querySelector('#n-security');
+  const change = (el) => el.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  protoSel.value = 'trojan';
+  change(protoSel);
+  ok('切到 trojan 时加密方式跟到 TLS', secSel.value === 'tls', secSel.value);
+  protoSel.value = 'vless';
+  change(protoSel);
+  ok('切回 vless 时回到 Reality', secSel.value === 'reality', secSel.value);
+  secSel.value = 'none';
+  change(secSel);
+  protoSel.value = 'trojan';
+  change(protoSel);
+  ok('手动选过加密方式后不再被协议切换覆盖', secSel.value === 'none', secSel.value);
+
+  // 默认 Reality 必须自带密钥对：空私钥会让 xray 起不来、订阅里 pbk 也是空的
+  await waitFor(() => /^[\w-]{43}$/.test(d9.querySelector('#r-priv').textContent.trim()), 'Reality 密钥对');
+  ok(
+    'Reality 密钥对已自动生成',
+    /^[\w-]{43}$/.test(d9.querySelector('#r-pub').textContent.trim()) &&
+      /^[0-9a-f]{8}$/.test(d9.querySelector('#r-sid').value),
+    'sid=' + d9.querySelector('#r-sid').value,
+  );
+
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(150);
+
+  /* ---- 复制 · 批量删除 · 拖拽排序 ---- */
+  console.log('\n── 复制 · 批量删除 · 拖拽排序 ──');
+
+  // 排序至少要有两个节点才拖得动；它们挂在 uiSrv 下，最后删服务器会一并清掉
+  const sortA = await json('/api/nodes', {
+    method: 'POST',
+    body: JSON.stringify({ name: TAG + '-排序A', serverId: uiSrv.item.id, protocol: 'vless', port: 21201, network: 'tcp', security: 'none' }),
+  }, T);
+  const sortB = await json('/api/nodes', {
+    method: 'POST',
+    body: JSON.stringify({ name: TAG + '-排序B', serverId: uiSrv.item.id, protocol: 'vless', port: 21202, network: 'tcp', security: 'none' }),
+  }, T);
+
+  click(d9.querySelector('.nav-item[data-view="nodes"]'), w9);
+  await waitFor(() => d9.querySelector('#n-tbody .n-pick'), '节点表与勾选框');
+
+  // 勾选 → 批量条
+  const pick = d9.querySelector('#n-tbody .n-pick');
+  pick.checked = true;
+  pick.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  ok('节点行带勾选框', !!pick);
+  ok('勾选后出现批量删除条', !d9.querySelector('#n-bulkbar').classList.contains('hidden'));
+  ok('批量条显示已选数量', d9.querySelector('#n-selcount').textContent === '1', d9.querySelector('#n-selcount').textContent);
+  ok('批量条提供删除按钮', !!d9.querySelector('[data-act="node-bulk-del"]'));
+  click(d9.querySelector('[data-act="node-bulk-clear"]'), w9);
+  ok('取消选择后批量条收起', d9.querySelector('#n-bulkbar').classList.contains('hidden'));
+
+  // 复制节点：弹窗预填「副本」名 + 换新端口
+  click(d9.querySelector('#n-tbody [data-act="node-copy"]'), w9);
+  await waitFor(() => d9.querySelector('#n-name'), '复制节点弹窗');
+  ok('复制节点预填「副本」名字', /副本$/.test(d9.querySelector('#n-name').value), d9.querySelector('#n-name').value);
+  ok('复制节点换了新端口', Number(d9.querySelector('#n-port').value) >= 10000, d9.querySelector('#n-port').value);
+  ok('弹窗标题标明来源', /复制节点/.test(d9.querySelector('.modal').textContent));
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(150);
+
+  // 排序模式：顶部换按钮、行可拖拽、提交后落库
+  const sortRows = () => [...d9.querySelectorAll('#n-tbody tr.sort-row')];
+  click(d9.querySelector('[data-act="node-sort-start"]'), w9);
+  await waitFor(() => d9.querySelector('[data-act="node-sort-submit"]'), '排序模式');
+  ok('排序模式顶部换成提交/取消', !!d9.querySelector('[data-act="node-sort-cancel"]') && !d9.querySelector('[data-act="node-new"]'));
+  ok('排序模式隐藏勾选框', !d9.querySelector('#n-tbody .n-pick'));
+  ok('排序模式行可拖拽', sortRows().length >= 2 && sortRows()[0].getAttribute('draggable') === 'true',
+    `${sortRows().length} 行`);
+
+  const orderBefore = sortRows().map((tr) => tr.dataset.id);
+  const moving = sortRows()[1];
+  const movingId = moving.dataset.id;
+  moving.dispatchEvent(new w9.Event('dragstart', { bubbles: true }));
+  sortRows()[0].dispatchEvent(new w9.Event('dragover', { bubbles: true }));
+  moving.dispatchEvent(new w9.Event('dragend', { bubbles: true }));
+  ok('拖拽后行位置变了', sortRows()[0].dataset.id === movingId);
+
+  click(d9.querySelector('[data-act="node-sort-submit"]'), w9);
+  await waitFor(() => d9.querySelector('[data-act="node-sort-start"]'), '退出排序模式');
+  const orderSaved = (await json('/api/nodes', {}, T)).items.map((n) => n.id).filter((id) => orderBefore.includes(id));
+  ok('提交后顺序落到服务端', orderSaved[0] === movingId, orderSaved.slice(0, 3).join(','));
+
+  // 取消不落库
+  click(d9.querySelector('[data-act="node-sort-start"]'), w9);
+  await waitFor(() => d9.querySelector('[data-act="node-sort-submit"]'), '再次进入排序');
+  const rows2 = sortRows();
+  rows2[0].dispatchEvent(new w9.Event('dragstart', { bubbles: true }));
+  rows2[rows2.length - 1].dispatchEvent(new w9.Event('dragover', { bubbles: true }));
+  rows2[0].dispatchEvent(new w9.Event('dragend', { bubbles: true }));
+  click(d9.querySelector('[data-act="node-sort-cancel"]'), w9);
+  await waitFor(() => d9.querySelector('[data-act="node-sort-start"]'), '取消排序');
+  const orderKept = (await json('/api/nodes', {}, T)).items.map((n) => n.id).filter((id) => orderBefore.includes(id));
+  ok('取消后服务端顺序不变', JSON.stringify(orderKept) === JSON.stringify(orderSaved));
+
+  // 服务器 / 套餐 / 用户：勾选框与复制入口
+  click(d9.querySelector('.nav-item[data-view="servers"]'), w9);
+  await waitFor(() => d9.querySelector('.s-pick'), '服务器卡片');
+  ok('服务器卡片带勾选框与复制', !!d9.querySelector('.s-pick') && !!d9.querySelector('[data-act="server-copy"]'));
+  click(d9.querySelector('[data-act="server-copy"]'), w9);
+  await waitFor(() => d9.querySelector('#s-name'), '复制服务器弹窗');
+  ok('复制服务器预填「副本」名字', /副本$/.test(d9.querySelector('#s-name').value), d9.querySelector('#s-name').value);
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(150);
+
+  click(d9.querySelector('.nav-item[data-view="plans"]'), w9);
+  await waitFor(() => d9.querySelector('.p-pick'), '套餐卡片');
+  ok('套餐卡片带勾选框与复制', !!d9.querySelector('.p-pick') && !!d9.querySelector('[data-act="plan-copy"]'));
+  click(d9.querySelector('[data-act="plan-copy"]'), w9);
+  await waitFor(() => d9.querySelector('#p-name'), '复制套餐弹窗');
+  ok('复制套餐预填「副本」名字', /副本$/.test(d9.querySelector('#p-name').value), d9.querySelector('#p-name').value);
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(150);
+
+  click(d9.querySelector('.nav-item[data-view="users"]'), w9);
+  await waitFor(() => d9.querySelector('.u-pick'), '用户表');
+  ok('用户行带复制按钮', !!d9.querySelector('[data-act="user-copy"]'));
+  click(d9.querySelector('[data-act="user-copy"]'), w9);
+  await waitFor(() => d9.querySelector('#f-name'), '复制用户弹窗');
+  ok('复制用户预填「副本」名字', /副本$/.test(d9.querySelector('#f-name').value), d9.querySelector('#f-name').value);
+  ok('复制用户不带已用流量', Number(d9.querySelector('#f-used').value) === 0);
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(150);
+
   /* ---- 备份卡片 ---- */
   console.log('\n── 设置页备份卡片 ──');
   click(d9.querySelector('.nav-item[data-view="settings"]'), w9);
   await waitFor(() => d9.querySelector('#bk-body'), '备份卡片');
-  const bkRowsBefore = d9.querySelectorAll('#bk-body tbody tr').length;
-  ok('备份卡片列出已有备份或空态', bkRowsBefore >= 0 && !!d9.querySelector('[data-act="backup-now"]'));
+  // 只数「有下载按钮的行」：空态本身也占一个 <tr>，拿 tbody tr 计数会从 1 变 1 永远等不到
+  const bkCount = () => d9.querySelectorAll('#bk-body [data-act="backup-dl"]').length;
+  const bkRowsBefore = bkCount();
+  ok('备份卡片列出已有备份或空态', !!d9.querySelector('[data-act="backup-now"]'));
   ok('提供上传恢复入口', !!d9.querySelector('[data-act="backup-upload"]'));
   click(d9.querySelector('[data-act="backup-now"]'), w9);
-  await waitFor(() => d9.querySelectorAll('#bk-body tbody tr').length !== bkRowsBefore, '备份完成');
-  ok('点「立即备份」后表格多出一行', d9.querySelectorAll('#bk-body tbody tr').length === bkRowsBefore + 1);
+  await waitFor(() => bkCount() !== bkRowsBefore, '备份完成');
+  ok('点「立即备份」后表格多出一行', bkCount() === bkRowsBefore + 1, `${bkRowsBefore} → ${bkCount()}`);
   ok('备份行带下载 / 恢复 / 删除', !!d9.querySelector('#bk-body [data-act="backup-dl"]') &&
     !!d9.querySelector('#bk-body [data-act="backup-restore"]'));
 

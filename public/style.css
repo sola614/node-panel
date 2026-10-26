@@ -611,6 +611,23 @@ tbody tr:hover { background: var(--tint-1); }
 .cell-sub { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
 .row-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
 
+/* 拖拽排序：手柄只在排序模式下出现，整行可拖 */
+.drag-handle {
+  cursor: grab;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  user-select: none;
+  display: inline-block;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.drag-handle:active { cursor: grabbing; }
+tr.sort-row { cursor: grab; }
+tr.sort-row:hover .drag-handle { color: var(--text); background: var(--tint-2); }
+tr.dragging { opacity: 0.45; }
+tr.dragging td { border-bottom-color: transparent; }
+
 /* --------------------------- 节点树形列表 --------------------------- */
 
 .tree-cell { display: flex; align-items: flex-start; gap: 7px; min-width: 0; }

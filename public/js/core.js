@@ -99,14 +99,14 @@ function syncDetailFlow(sync, name) {
         ${sync.state === 'error' ? '　这台机器的配置应用或服务重载失败了，下面有原始报错。' : ''}
         ${sync.state === 'unbound' ? '　配置已经写进机器，但节点端口没有在监听，客户端一定连不上。通常是 Xray / Hysteria2 没启动、启动即崩溃，或端口被别的程序占着。' : ''}
         ${sync.state === 'stale' ? '　面板上的配置已经变了，等 agent 下一轮拉取就会自动生效（最多 60 秒）。' : ''}
-        ${sync.state === 'partial' ? '　配置已经写进机器，但这台机器没有 systemd / OpenRC，需要手动重启一次 Xray 才会生效。' : ''}
+        ${sync.state === 'partial' ? '　配置已经写进机器，但没有自动重载（没有可用的重载命令），需要手动重启一次 Xray 才会生效。' : ''}
         ${sync.state === 'ok' ? '　机器上的配置和面板完全一致。' : ''}
         ${sync.state === 'pending' ? '　还没有收到回执：agent 可能刚部署，或者一直连不上面板。' : ''}
       </div>
       ${row('最近回执', sync.at ? esc(fmtDate(sync.at)) + ' · ' + esc(fmtAgo(sync.at)) : '—')}
       ${row('应用版本', sync.hash ? `<code>${esc(sync.hash)}</code>${same ? ' <span class="badge badge-ok">与面板一致</span>' : ''}` : '—')}
       ${row('面板当前', sync.desired ? `<code>${esc(sync.desired)}</code>` : '—')}
-      ${row('Xray 重载', { ok: '成功', fail: '失败', skip: '跳过（本机没有服务管理器）' }[sync.xray] || esc(sync.xray || '—'))}
+      ${row('Xray 重载', { ok: '成功（或本来就无需重载）', fail: '失败', skip: '跳过（配置已落盘，需手动重启）' }[sync.xray] || esc(sync.xray || '—'))}
       ${row('Hysteria2', sync.hy && sync.hy !== '0/0' ? esc(sync.hy) + ' 个实例在跑' : '无')}
       ${sync.unbound ? row('未监听端口', `<span style="color:var(--bad)">${esc(sync.unbound)}</span>`) : ''}
       ${row('agent 版本', esc(sync.agentVersion || '—'))}
@@ -140,6 +140,19 @@ const PROTO_BADGE = {
   ss: 'badge-warn',
   hysteria2: 'badge-bad',
 };
+
+/**
+ * 「复制」用的默认名字：XX 副本 / XX 副本 2 / XX 副本 3 …
+ * 名字是面板里唯一的辨识线索（四张表都没有唯一索引），所以复制时先把不重名的默认值算好，
+ * 用户直接点提交就能过；想改回原名也会被后端的重名校验挡住。
+ */
+function copyName(base, taken = []) {
+  const root = String(base || '').trim() || '未命名';
+  const used = new Set((taken || []).map((x) => String(x || '').trim().toLowerCase()));
+  let name = root + ' 副本';
+  for (let i = 2; used.has(name.toLowerCase()) && i < 999; i++) name = `${root} 副本 ${i}`;
+  return name;
+}
 
 function toast(msg, type = '') {
   const el = document.createElement('div');
