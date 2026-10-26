@@ -204,7 +204,11 @@ cat /usr/local/etc/xray/config.json           # 查看 Xray 配置
 ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</div>
 
       <p class="hint" style="margin-top:14px">
-        agent 只负责写配置和重启服务，不会自动安装 Xray。若本机有 Hysteria2 节点，脚本会顺带安装 hysteria。
+        部署脚本会把 Xray 一并装好（本机已有 xray / xray-core / x-ui 服务时不会覆盖）；
+        有 Hysteria2 节点时顺带安装 hysteria。agent 之后只负责写配置和重启服务。
+      </p>
+      <p class="hint">
+        日志里出现「未找到 xray 服务」说明本机没有 Xray：重跑一次部署命令即可自动装好。
       </p>
       <p class="hint">
         要让这台机器彻底退出纳管，用同张卡片上的「卸载命令」，别手动删目录 —— 服务注册和 Hysteria2 实例会残留。

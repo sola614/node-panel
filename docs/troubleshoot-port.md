@@ -72,14 +72,33 @@ systemctl enable --now xray        # 换成实际服务名：xray-core / x-ui
 systemctl status xray --no-pager
 ```
 
-**B. 机器上压根没装 Xray**（装完 agent 就以为万事大吉）
+**B. 机器上压根没装 Xray**（0.1.4 及更早版本的部署脚本不装 Xray）
 
 ```sh
 command -v xray || echo "没装"
 ```
 
-装 Xray 官方发行版后再 `systemctl enable --now xray`。
-面板只下发配置，不负责安装 Xray 本体（Hysteria2 二进制才是部署脚本自动装的）。
+最快的修法：回面板「服务器 / 节点」页复制部署命令重跑一遍。0.1.5 起部署脚本会自己
+下载 `xray-core` 官方发行包、建 `/var/log/xray`、注册 `xray.service`，已有的 Xray
+安装不会被覆盖。
+
+不想重跑脚本就手工装：
+
+```sh
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+mkdir -p /var/log/xray        # 面板下发的配置把 error 日志写在这里，缺目录 xray 启动即退出
+systemctl enable --now xray
+```
+
+**B2. 装了 Xray 但起不来，日志报 `failed to open log file`**
+
+```sh
+mkdir -p /var/log/xray
+systemctl restart xray
+```
+
+面板生成的配置固定写 `/var/log/xray/error.log`，目录不存在时 Xray 会在打开日志文件这步
+直接退出 —— 表现为服务 `failed`、端口空着，`xray -test -config` 却是通过的。
 
 **C. Xray 读的是别的配置**（x-ui / 宝塔 / 手写 unit）
 

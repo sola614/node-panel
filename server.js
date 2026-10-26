@@ -1481,28 +1481,77 @@ function resetServerToken(req, res, params) {
 
 /* ------------------------------- 部署脚本生成 ------------------------------ */
 
-function buildInstallScript({ panelUrl, token, label, needHysteria, agentSrc }) {
+function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc }) {
   // 面板地址来自请求头，插进 shell 之前先去掉能掀起风浪的字符
   const safeUrl = String(panelUrl || '').replace(/["'`\\\s$]/g, '');
-  // 名称是管理员随便填的，注释行里不能带换行，否则能跳出注释写命令
-  const safeLabel = String(label || '').replace(/[\r\n]+/g, ' ');
+  // 名称会进双引号变量：换行撕开语句，引号/反引号/$ 能跑命令
+  const safeLabel = String(label || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/["`\\$]/g, '');
   return `#!/bin/sh
 # ${store.db().settings.siteName} · 节点部署脚本
 # 目标：${safeLabel}
 # 生成时间：${new Date().toISOString()}
 #
-# 纯 shell 部署：不需要 Node / Python / jq，主流 Linux 装完即用。
-# 幂等：重复执行只会覆盖配置并重启 agent，不会重复堆积东西。
+# 幂等：重复执行只覆盖 agent 与配置，不重复堆积东西。
+# 已有 Xray 安装（xray / xray-core / x-ui）不会被覆盖；SKIP_XRAY=1 可跳过 Xray 安装。
 set -u
 
 PANEL_URL="${safeUrl}"
 AGENT_TOKEN="${token}"
+TARGET_LABEL="${safeLabel}"
 NEED_HYSTERIA="${needHysteria ? '1' : '0'}"
+NEED_XRAY="${needXray ? '1' : '0'}"
+INTERVAL=60
+
+# ------------------------------ 输出辅助 ------------------------------------
+START_TS=$(date +%s)
+STEP=0
+TOTAL=3
+[ "$NEED_XRAY" = "1" ] && TOTAL=$((TOTAL + 1))
+[ "$NEED_HYSTERIA" = "1" ] && TOTAL=$((TOTAL + 1))
+
+step() { STEP=$((STEP + 1)); printf '\\n[%s/%s] %s\\n' "$STEP" "$TOTAL" "$1"; }
+say() { printf '      %s\\n' "$*"; }
+note() { printf '      · %s\\n' "$*"; }
+bad() { printf '      ! %s\\n' "$*"; }
+die() { printf '\\n✗ %s\\n' "$*" >&2; exit 1; }
+
+# 人类可读的文件大小
+size_of() {
+  du -k "$1" 2>/dev/null | awk '{ if ($1 >= 1024) printf "%.1f MB", $1 / 1024; else printf "%d KB", $1 }'
+}
+
+os_name() {
+  _n=''
+  if [ -r /etc/os-release ]; then
+    _n=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | sed -n '1p' | cut -d= -f2- | tr -d '"')
+  fi
+  [ -n "$_n" ] || _n=$(uname -s)
+  printf '%s' "$_n"
+}
 
 if [ "$(id -u)" != "0" ]; then
-  echo "✗ 请用 root 执行（需要写 /opt、/etc 与注册服务）"
+  printf '\\n✗ 需要 root：要写 /opt、/etc、/usr/local 并注册系统服务\\n' >&2
   exit 1
 fi
+
+# 服务管理器先定下来，后面注册和汇总都用同一个结论
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  SVC=systemd
+elif command -v rc-update >/dev/null 2>&1; then
+  SVC=openrc
+elif command -v crontab >/dev/null 2>&1; then
+  SVC=cron
+else
+  SVC=none
+fi
+
+printf '\\n%s\\n' '${store.db().settings.siteName} · 节点部署'
+say "目标      $TARGET_LABEL"
+say "面板      $PANEL_URL"
+say "系统      $(os_name) · $(uname -m) · $(uname -r)"
+say "服务管理  $SVC"
 
 # ------------------------------- 下载器 ------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -1510,8 +1559,7 @@ if command -v curl >/dev/null 2>&1; then
 elif command -v wget >/dev/null 2>&1; then
   DL='wget'
 else
-  echo "✗ 需要 curl 或 wget 之一"
-  exit 1
+  die '需要 curl 或 wget 之一'
 fi
 
 download() {
@@ -1523,8 +1571,8 @@ download() {
   fi
 }
 
-# ------------------------------- 安装 agent --------------------------------
-echo "→ 安装 agent 到 /opt/nodepanel（纯 shell，无需 Node）"
+# ------------------------------- 1. agent ----------------------------------
+step "agent 脚本 → /opt/nodepanel/agent.sh"
 mkdir -p /opt/nodepanel /var/log/nodepanel /run/nodepanel
 
 cat > /opt/nodepanel/agent.sh <<'NODEPANEL_AGENT_EOF'
@@ -1532,22 +1580,288 @@ ${agentSrc}
 NODEPANEL_AGENT_EOF
 
 chmod 755 /opt/nodepanel/agent.sh
-sh -n /opt/nodepanel/agent.sh || { echo "✗ agent 脚本语法检查失败"; exit 1; }
+sh -n /opt/nodepanel/agent.sh || die "agent 脚本语法检查失败（面板下发的脚本可能被截断）"
+AGENT_VER=$(sed -n "s/^VERSION='\\(.*\\)'\\$/\\1/p" /opt/nodepanel/agent.sh | sed -n '1p')
+say "版本 \${AGENT_VER:-未知} · $(size_of /opt/nodepanel/agent.sh) · sh -n 通过"
+note "日志目录 /var/log/nodepanel，运行时目录 /run/nodepanel"
 
-# ---------------------------- 探测重载命令 ----------------------------------
-# 服务名不一定叫 xray：xray-core / x-ui 都见过，按实际存在的单元来定，
-# 否则 agent 每轮都会报「Xray 重载失败」却不说为什么
-RELOAD_CMD=''
-if command -v systemctl >/dev/null 2>&1; then
-  for _unit in xray xray-core x-ui; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^$_unit\\.service"; then
-      RELOAD_CMD="systemctl restart $_unit"
-      break
+# ------------------------------ 2. Xray 本体 --------------------------------
+# 部署脚本自己装 xray-core，三种情况分开处理，任何一种都不破坏已有安装：
+#   1) 已有服务单元（xray / xray-core / x-ui）→ 完全不碰，直接用
+#   2) 有 xray 二进制但没有单元（手工解压的）→ 只补一份单元
+#   3) 什么都没有 → 下载官方发行包（xray + geoip/geosite）再建单元
+
+XRAY_BIN=/usr/local/bin/xray
+XRAY_ETC=/usr/local/etc/xray
+XRAY_DAT=/usr/local/share/xray
+XRAY_LOG=/var/log/xray
+# 想走镜像（GitHub 拉不动时）：XRAY_DOWNLOAD_BASE=https://某镜像/XTLS/Xray-core/releases/latest/download
+XRAY_ZIP_BASE=\${XRAY_DOWNLOAD_BASE:-https://github.com/XTLS/Xray-core/releases/latest/download}
+XRAY_VER=''
+XRAY_STATE=''
+XRAY_SKIPPED=0
+
+# uname -m → 官方发行包的架构后缀（与 XTLS/Xray-install 保持一致）
+xray_arch() {
+  case "$(uname -m)" in
+    i386 | i686) printf '32' ;;
+    x86_64 | amd64) printf '64' ;;
+    armv5tel) printf 'arm32-v5' ;;
+    armv6l) printf 'arm32-v6' ;;
+    armv7 | armv7l) printf 'arm32-v7a' ;;
+    armv8 | aarch64) printf 'arm64-v8a' ;;
+    mips) printf 'mips32' ;;
+    mipsle) printf 'mips32le' ;;
+    mips64) printf 'mips64' ;;
+    mips64le) printf 'mips64le' ;;
+    ppc64) printf 'ppc64' ;;
+    ppc64le) printf 'ppc64le' ;;
+    riscv64) printf 'riscv64' ;;
+    s390x) printf 's390x' ;;
+    *) printf '' ;;
+  esac
+}
+
+# 已有的 Xray 服务单元名（空 = 没有）
+xray_unit_name() {
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    for _u in xray xray-core x-ui; do
+      if systemctl list-unit-files 2>/dev/null | grep -q "^$_u\\.service"; then
+        printf '%s' "$_u"
+        return 0
+      fi
+    done
+  fi
+  if [ -f /etc/init.d/xray ]; then printf 'xray'; return 0; fi
+  printf ''
+}
+
+# 包管理器装依赖（只在缺 unzip 时用得上）
+pkg_install() {
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1" >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q "$1" >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q "$1" >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "$1" >/dev/null 2>&1
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper -q install -y "$1" >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm "$1" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+# 解压 zip：unzip → busybox unzip → python3，三选一（最小化系统常常一个都没有）
+extract_zip() {
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -oq "$1" -d "$2" >/dev/null 2>&1 && return 0
+  fi
+  if command -v busybox >/dev/null 2>&1; then
+    busybox unzip -o "$1" -d "$2" >/dev/null 2>&1 && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$1" "$2" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# 装服务单元（systemd / OpenRC）。只 enable 不 start：
+# 首次部署时配置还没下发，xray 起来会因为找不到 config.json 直接退出
+write_xray_unit() {
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    mkdir -p /etc/systemd/system 2>/dev/null
+    cat > /etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray Service
+Documentation=https://xtls.github.io/
+After=network.target nss-lookup.target
+
+[Service]
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartSec=3
+# 23 = 配置错误，重试也没用，别把 CPU 烧在重启循环上
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+RuntimeDirectory=xray
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable xray >/dev/null 2>&1
+    printf 'systemd'
+  elif command -v rc-update >/dev/null 2>&1; then
+    mkdir -p /etc/init.d 2>/dev/null
+    cat > /etc/init.d/xray <<'EOF'
+#!/sbin/openrc-run
+name="xray"
+description="Xray Service"
+command="/usr/local/bin/xray"
+command_args="run -config /usr/local/etc/xray/config.json"
+command_background="yes"
+pidfile="/run/xray.pid"
+output_log="/var/log/xray/access.log"
+error_log="/var/log/xray/error.log"
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+    chmod 755 /etc/init.d/xray
+    rc-update add xray default >/dev/null 2>&1
+    printf 'openrc'
+  else
+    printf ''
+  fi
+}
+
+if [ "$NEED_XRAY" = "1" ]; then
+  step "Xray 本体 → $XRAY_BIN"
+  if [ "\${SKIP_XRAY:-0}" = "1" ]; then
+    XRAY_SKIPPED=1
+    say "SKIP_XRAY=1，跳过安装"
+    note "配置仍会下发到 $XRAY_ETC/config.json，服务需自行管理"
+  else
+    # 日志目录必须在：面板下发的配置把 error 日志写到 /var/log/xray/error.log，
+    # 目录不存在时 xray 启动即退出，journalctl 里只有一行 failed to open log file
+    mkdir -p "$XRAY_ETC" "$XRAY_LOG" "$XRAY_DAT" 2>/dev/null
+
+    _unit=$(xray_unit_name)
+    if [ -n "$_unit" ]; then
+      _act=''
+      if command -v systemctl >/dev/null 2>&1; then
+        _act=$(systemctl is-active "$_unit" 2>/dev/null)
+      elif command -v rc-service >/dev/null 2>&1; then
+        rc-service "$_unit" status >/dev/null 2>&1 && _act='active' || _act='inactive'
+      fi
+      [ -n "$_act" ] || _act='unknown'
+      say "已有服务单元 $_unit（$_act），沿用现有安装"
+      note "不下载、不改配置；重载命令沿用该服务"
+      if [ -x "$XRAY_BIN" ]; then
+        XRAY_VER=$("$XRAY_BIN" -version 2>/dev/null | sed -n '1p' | cut -d' ' -f1-2)
+      fi
+    else
+      if [ -x "$XRAY_BIN" ]; then
+        XRAY_VER=$("$XRAY_BIN" -version 2>/dev/null | sed -n '1p' | cut -d' ' -f1-2)
+        say "已有二进制 \${XRAY_VER:-$XRAY_BIN}，只补服务单元"
+      else
+        _arch=$(xray_arch)
+        if [ -z "$_arch" ]; then
+          say "本机没有 Xray"
+          bad "不支持的架构 $(uname -m)，需手动安装"
+        else
+          say "本机没有 Xray，下载官方发行包"
+          _tmp="/tmp/nodepanel-xray.$$"
+          rm -rf "$_tmp" 2>/dev/null
+          mkdir -p "$_tmp"
+          _zip="Xray-linux-$_arch.zip"
+          note "来源 $XRAY_ZIP_BASE/$_zip"
+          _got=0
+          if download "$XRAY_ZIP_BASE/$_zip" "$_tmp/$_zip"; then
+            note "已下载 $(size_of "$_tmp/$_zip")，解压中"
+            if extract_zip "$_tmp/$_zip" "$_tmp"; then
+              _got=1
+            elif pkg_install unzip >/dev/null 2>&1 && extract_zip "$_tmp/$_zip" "$_tmp"; then
+              _got=1
+            fi
+          fi
+          if [ "$_got" = "1" ] && [ -f "$_tmp/xray" ]; then
+            mkdir -p /usr/local/bin 2>/dev/null
+            cp -f "$_tmp/xray" "$XRAY_BIN" 2>/dev/null || cat "$_tmp/xray" > "$XRAY_BIN"
+            chmod 755 "$XRAY_BIN" 2>/dev/null
+            for _f in geoip.dat geosite.dat; do
+              if [ -f "$_tmp/$_f" ]; then
+                cp -f "$_tmp/$_f" "$XRAY_DAT/$_f" 2>/dev/null
+                chmod 644 "$XRAY_DAT/$_f" 2>/dev/null
+              fi
+            done
+            if "$XRAY_BIN" -version >/dev/null 2>&1; then
+              XRAY_VER=$("$XRAY_BIN" -version 2>/dev/null | sed -n '1p' | cut -d' ' -f1-2)
+              say "已安装 \${XRAY_VER:-$XRAY_BIN} · $(size_of "$XRAY_BIN")"
+              note "数据文件 geoip.dat / geosite.dat → $XRAY_DAT"
+            else
+              bad "二进制无法执行（架构不匹配？），已删除"
+              rm -f "$XRAY_BIN"
+            fi
+          else
+            bad "下载或解压失败"
+            note "手动装：bash -c \\"\\$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\\" @ install"
+            note "GitHub 拉不动时用镜像重跑：curl -fsSL \\"<部署命令>\\" | XRAY_DOWNLOAD_BASE=<镜像地址> sh"
+          fi
+          rm -rf "$_tmp" 2>/dev/null
+        fi
+      fi
+
+      # 二进制到位（或本来就有）才建单元，否则会留一个永远起不来的服务
+      if [ -x "$XRAY_BIN" ]; then
+        _svc=$(write_xray_unit)
+        case "$_svc" in
+          systemd) say "服务单元 /etc/systemd/system/xray.service（已 enable，配置下发后启动）" ;;
+          openrc) say "服务脚本 /etc/init.d/xray（已加入 default 运行级）" ;;
+          *) bad "没有可用的服务管理器，xray 需手动常驻" ;;
+        esac
+      fi
     fi
-  done
-  [ -n "$RELOAD_CMD" ] || RELOAD_CMD='systemctl restart xray'
-elif command -v rc-service >/dev/null 2>&1; then
-  RELOAD_CMD='rc-service xray restart'
+  fi
+fi
+
+# ---------------------------- 3. Hysteria2 ---------------------------------
+if [ "$NEED_HYSTERIA" = "1" ]; then
+  step "Hysteria2 二进制 → /usr/local/bin/hysteria"
+  if [ -x /usr/local/bin/hysteria ]; then
+    say "已安装 $(/usr/local/bin/hysteria version 2>/dev/null | sed -n '1p')，跳过"
+  else
+    case "$(uname -m)" in
+      x86_64 | amd64) HARCH=amd64 ;;
+      aarch64 | arm64) HARCH=arm64 ;;
+      armv7l | armv7) HARCH=arm ;;
+      i386 | i686) HARCH=386 ;;
+      *) HARCH='' ;;
+    esac
+    if [ -z "$HARCH" ]; then
+      bad "不支持的架构 $(uname -m)，需手动安装"
+    else
+      note "来源 https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$HARCH"
+      if download "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$HARCH" /usr/local/bin/hysteria.tmp; then
+        chmod 755 /usr/local/bin/hysteria.tmp
+        mv /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
+        say "已安装 $(/usr/local/bin/hysteria version 2>/dev/null | sed -n '1p') · $(size_of /usr/local/bin/hysteria)"
+      else
+        rm -f /usr/local/bin/hysteria.tmp
+        bad "下载失败"
+        note "手动安装：https://v2.hysteria.network/zh/docs/getting-started/Installation/"
+      fi
+    fi
+  fi
+fi
+
+# ---------------------------- 4. 运行配置 ----------------------------------
+step "运行配置 → /opt/nodepanel/agent.env"
+
+# 服务名不一定叫 xray：xray-core / x-ui 都见过，按实际存在的单元来定，
+# 否则 agent 每轮都会报「Xray 重载失败」却不说为什么。
+# 纯 Hysteria2 的机器不猜：留空，agent 真需要时会自己探测。
+RELOAD_CMD=''
+if [ "$NEED_XRAY" = "1" ]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    for _unit in xray xray-core x-ui; do
+      if systemctl list-unit-files 2>/dev/null | grep -q "^$_unit\\.service"; then
+        RELOAD_CMD="systemctl restart $_unit"
+        break
+      fi
+    done
+    [ -n "$RELOAD_CMD" ] || RELOAD_CMD='systemctl restart xray'
+  elif command -v rc-service >/dev/null 2>&1; then
+    RELOAD_CMD='rc-service xray restart'
+  fi
 fi
 
 # 值一律加引号：RELOAD_CMD 里带空格，不加引号写进 agent.env 后，
@@ -1555,18 +1869,30 @@ fi
 cat > /opt/nodepanel/agent.env <<EOF
 PANEL_URL="$PANEL_URL"
 AGENT_TOKEN="$AGENT_TOKEN"
-INTERVAL="60"
-XRAY_CONFIG="/usr/local/etc/xray/config.json"
+INTERVAL="$INTERVAL"
+XRAY_CONFIG="$XRAY_ETC/config.json"
 RELOAD_CMD="$RELOAD_CMD"
 HYSTERIA_DIR="/etc/hysteria"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
 EOF
 chmod 600 /opt/nodepanel/agent.env
 
-# ---------------------------- 注册开机自启 ----------------------------------
-if [ -d /run/systemd/system ]; then
-  echo "→ 检测到 systemd"
-  cat > /etc/systemd/system/nodepanel-agent.service <<'EOF'
+say "PANEL_URL=$PANEL_URL"
+say "INTERVAL=\${INTERVAL}s · XRAY_CONFIG=$XRAY_ETC/config.json"
+if [ -n "$RELOAD_CMD" ]; then
+  say "RELOAD_CMD=\\"$RELOAD_CMD\\""
+elif [ "$NEED_XRAY" = "1" ]; then
+  bad "没有可用的服务管理器，Xray 需手动重载"
+else
+  say "RELOAD_CMD 留空（本机只有 Hysteria2 节点）"
+fi
+note "权限 600（内含 token）"
+
+# ---------------------------- 5. 开机自启 ----------------------------------
+step "开机自启 → nodepanel-agent"
+case "$SVC" in
+  systemd)
+    cat > /etc/systemd/system/nodepanel-agent.service <<'EOF'
 [Unit]
 Description=Node Panel Agent (shell)
 After=network-online.target
@@ -1584,13 +1910,16 @@ KillMode=process
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable nodepanel-agent >/dev/null 2>&1
-  systemctl restart nodepanel-agent
-  STARTED='systemd'
-elif command -v rc-update >/dev/null 2>&1; then
-  echo "→ 检测到 OpenRC（Alpine 等）"
-  cat > /etc/init.d/nodepanel-agent <<'EOF'
+    systemctl daemon-reload
+    systemctl enable nodepanel-agent >/dev/null 2>&1
+    systemctl restart nodepanel-agent
+    STARTED='systemd'
+    say "systemd 单元 /etc/systemd/system/nodepanel-agent.service"
+    note "Restart=always · RestartSec=10 · KillMode=process"
+    ;;
+  openrc)
+    mkdir -p /etc/init.d 2>/dev/null
+    cat > /etc/init.d/nodepanel-agent <<'EOF'
 #!/sbin/openrc-run
 name="nodepanel-agent"
 description="Node Panel Agent (shell)"
@@ -1606,68 +1935,118 @@ depend() {
   after firewall
 }
 EOF
-  chmod 755 /etc/init.d/nodepanel-agent
-  rc-update add nodepanel-agent default >/dev/null 2>&1
-  rc-service nodepanel-agent restart >/dev/null 2>&1
-  STARTED='openrc'
-elif command -v crontab >/dev/null 2>&1; then
-  echo "→ 没有 systemd / OpenRC，改用 crontab（每分钟一轮）"
-  ( crontab -l 2>/dev/null | grep -v 'nodepanel/agent.sh'
-    echo '* * * * * /bin/sh /opt/nodepanel/agent.sh --once >> /var/log/nodepanel/agent.log 2>&1' ) | crontab -
-  STARTED='cron'
-else
-  echo "! 未找到可用的服务管理器，请手动常驻：nohup sh /opt/nodepanel/agent.sh >/var/log/nodepanel/agent.log 2>&1 &"
-  STARTED='none'
-fi
+    chmod 755 /etc/init.d/nodepanel-agent
+    rc-update add nodepanel-agent default >/dev/null 2>&1
+    rc-service nodepanel-agent restart >/dev/null 2>&1
+    STARTED='openrc'
+    say "OpenRC 脚本 /etc/init.d/nodepanel-agent（已加入 default 运行级）"
+    ;;
+  cron)
+    ( crontab -l 2>/dev/null | grep -v 'nodepanel/agent.sh'
+      echo '* * * * * /bin/sh /opt/nodepanel/agent.sh --once >> /var/log/nodepanel/agent.log 2>&1' ) | crontab -
+    STARTED='cron'
+    say "crontab 每分钟执行一轮（--once 模式）"
+    note "没有 systemd / OpenRC，无法常驻进程"
+    ;;
+  *)
+    STARTED='none'
+    bad "没有可用的服务管理器"
+    note "手动常驻：nohup sh /opt/nodepanel/agent.sh >/var/log/nodepanel/agent.log 2>&1 &"
+    ;;
+esac
 
-# ---------------------------- Hysteria2 -------------------------------------
-if [ "$NEED_HYSTERIA" = "1" ] && [ ! -x /usr/local/bin/hysteria ]; then
-  echo "→ 检测到 Hysteria2 节点，安装 hysteria（静态二进制）"
-  case "$(uname -m)" in
-    x86_64 | amd64) HARCH=amd64 ;;
-    aarch64 | arm64) HARCH=arm64 ;;
-    armv7l | armv7) HARCH=arm ;;
-    i386 | i686) HARCH=386 ;;
-    *) HARCH='' ;;
-  esac
-  if [ -n "$HARCH" ]; then
-    if download "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-$HARCH" /usr/local/bin/hysteria.tmp; then
-      chmod 755 /usr/local/bin/hysteria.tmp
-      mv /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
-      echo "  ✓ hysteria 已安装"
-    else
-      rm -f /usr/local/bin/hysteria.tmp
-      echo "  ! 下载失败，请手动安装：https://v2.hysteria.network/zh/docs/getting-started/Installation/"
-    fi
-  else
-    echo "  ! 不支持的架构 $(uname -m)，请手动安装 hysteria"
-  fi
-fi
-
-# ---------------------------- 首次拉配置 ------------------------------------
+# ---------------------------- 首次同步 --------------------------------------
 if [ "$STARTED" = 'cron' ]; then
   /bin/sh /opt/nodepanel/agent.sh --once || true
 fi
 
-echo ""
-echo "✓ 部署完成（agent: $STARTED）"
+# agent 启动后第一轮就会写配置并重启 xray，等它一下再把结果报出来
+if [ "$NEED_XRAY" = "1" ] && [ "\${SKIP_XRAY:-0}" != "1" ]; then
+  if [ "$STARTED" = 'systemd' ]; then
+    say "等待 agent 首轮同步（最多 12s）"
+    _i=0
+    while [ "$_i" -lt 12 ]; do
+      systemctl is-active --quiet xray >/dev/null 2>&1 && break
+      sleep 1
+      _i=$((_i + 1))
+    done
+    if systemctl is-active --quiet xray >/dev/null 2>&1; then
+      XRAY_STATE='运行中'
+      say "Xray 运行中（pid $(systemctl show -p MainPID --value xray 2>/dev/null)）"
+    else
+      XRAY_STATE='未运行'
+      bad "Xray 未运行"
+      note "journalctl -u xray -n 50（配置里的证书路径 / 端口占用是最常见原因）"
+    fi
+  elif [ "$STARTED" = 'openrc' ]; then
+    say "等待 agent 首轮同步（最多 12s）"
+    _i=0
+    while [ "$_i" -lt 12 ]; do
+      rc-service xray status >/dev/null 2>&1 && break
+      sleep 1
+      _i=$((_i + 1))
+    done
+    if rc-service xray status >/dev/null 2>&1; then
+      XRAY_STATE='运行中'
+      say "Xray 运行中"
+    else
+      XRAY_STATE='未运行'
+      bad "Xray 未运行"
+      note "rc-service xray status；tail -n 50 /var/log/xray/error.log"
+    fi
+  fi
+fi
+
+# ------------------------------ 汇总 ----------------------------------------
+ELAPSED=$(( $(date +%s) - START_TS ))
+
+if [ "$NEED_XRAY" = "1" ]; then
+  if [ "$XRAY_SKIPPED" = "1" ]; then
+    XRAY_LINE='未安装（SKIP_XRAY=1）'
+  elif [ -n "$XRAY_VER" ] && [ -n "$XRAY_STATE" ]; then
+    XRAY_LINE="$XRAY_VER · $XRAY_STATE"
+  elif [ -n "$XRAY_VER" ]; then
+    XRAY_LINE="$XRAY_VER · 待配置下发后启动"
+  else
+    XRAY_LINE='未安装（见上方错误）'
+  fi
+else
+  XRAY_LINE='不需要（本机只有 Hysteria2 节点）'
+fi
+
+if [ "$NEED_HYSTERIA" = "1" ]; then
+  if [ -x /usr/local/bin/hysteria ]; then
+    HY_LINE="$(/usr/local/bin/hysteria version 2>/dev/null | sed -n '1p') · 配置在 /etc/hysteria"
+  else
+    HY_LINE='未安装（见上方错误）'
+  fi
+else
+  HY_LINE='不需要（本机没有 Hysteria2 节点）'
+fi
+
+printf '\\n✓ 部署完成 · 耗时 %ss\\n\\n' "$ELAPSED"
+# 标签是手写对齐的：printf 的 %-10s 按字节补位，中文会被算成 3 字节/字，排不齐
+printf '  agent      %s\\n' "v\${AGENT_VER:-未知} · $STARTED · 每 \${INTERVAL}s 一轮"
+printf '  xray       %s\\n' "$XRAY_LINE"
+printf '  hysteria2  %s\\n' "$HY_LINE"
+printf '  配置       %s\\n' "$XRAY_ETC/config.json"
+printf '  状态       %s\\n' '/opt/nodepanel/state.env'
+printf '\\n'
 case "$STARTED" in
   systemd)
-    echo "  查看日志：journalctl -u nodepanel-agent -f"
-    echo "  重启 agent：systemctl restart nodepanel-agent"
+    printf '  日志       %s\\n' 'journalctl -u nodepanel-agent -f'
+    printf '  重启       %s\\n' 'systemctl restart nodepanel-agent'
     ;;
   openrc)
-    echo "  查看日志：tail -f /var/log/nodepanel/agent.log"
-    echo "  重启 agent：rc-service nodepanel-agent restart"
+    printf '  日志       %s\\n' 'tail -f /var/log/nodepanel/agent.log'
+    printf '  重启       %s\\n' 'rc-service nodepanel-agent restart'
     ;;
-  cron)
-    echo "  查看日志：tail -f /var/log/nodepanel/agent.log"
-    echo "  提示：cron 模式每分钟执行一轮，Hysteria2 实例由 agent 托管"
+  *)
+    printf '  日志       %s\\n' 'tail -f /var/log/nodepanel/agent.log'
     ;;
 esac
-echo "  配置文件：/usr/local/etc/xray/config.json"
-echo "  状态文件：/opt/nodepanel/state.env"
-${needHysteria ? 'echo "  Hysteria2：/etc/hysteria/node-*.yaml（由 agent 托管，pid 在 /run/nodepanel/）"' : ''}
+printf '  手动一轮   %s\\n' 'sh /opt/nodepanel/agent.sh --once'
+printf '\\n'
 `;
 }
 
@@ -1844,12 +2223,16 @@ function installScript(req, res, params, body, session, ctx) {
     return sendJson(res, 500, { error: 'agent 源码缺失' });
   }
 
-  const needHysteria = db.nodes.some((n) => n.serverId === s.id && n.protocol === 'hysteria2');
+  const serverNodes = db.nodes.filter((n) => n.serverId === s.id);
+  const needHysteria = serverNodes.some((n) => n.protocol === 'hysteria2');
+  // 还没有节点的服务器也装 Xray：否则以后加第一个节点又要为「机器上没装 Xray」返工一次
+  const needXray = serverNodes.length === 0 || serverNodes.some((n) => n.protocol !== 'hysteria2');
   const script = buildInstallScript({
     panelUrl: baseUrl(ctx.req),
     token: s.token,
     label: `${s.name} (${s.host})`,
     needHysteria,
+    needXray,
     agentSrc,
   });
 
@@ -1897,6 +2280,7 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
     token: node.token,
     label: `${node.name}（独立部署 · ${node.address}）`,
     needHysteria: node.protocol === 'hysteria2',
+    needXray: node.protocol !== 'hysteria2',
     agentSrc,
   });
 
