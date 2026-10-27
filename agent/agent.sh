@@ -37,7 +37,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.10'
+VERSION='0.1.11'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -283,29 +283,80 @@ EOF
 # ACME：acme.sh 是纯 shell，正好符合「不装运行时」的诉求；失败不影响其它节点
 ACME_SH=${ACME_SH:-${HOME:-/root}/.acme.sh/acme.sh}
 
+# 机器上没有 acme.sh 时自动装（get.acme.sh 本身就是个安装脚本，落 ~/.acme.sh）。
+# 0.1.11 以前这里只是静默跳过 —— 证书永远不生成，节点带着指向不存在文件的
+# 配置每 60 秒崩一次，journal 里只能看到 hysteria 的 tls.cert FATAL。
+acme_install() {
+  [ -f "$ACME_SH" ] && return 0
+  log "本机没有 acme.sh，自动安装（https://get.acme.sh）"
+  _tmp="$RUN_DIR/acme-install.$$.sh"
+  if http_download "https://get.acme.sh" "$_tmp" && [ -s "$_tmp" ]; then
+    if sh "$_tmp" >> "$LOG_DIR/agent.log" 2>&1 && [ -f "$ACME_SH" ]; then
+      rm -f "$_tmp" 2>/dev/null
+      log "✓ 已安装 acme.sh"
+      return 0
+    fi
+  fi
+  rm -f "$_tmp" 2>/dev/null
+  log "! acme.sh 安装失败（机器可能连不上 get.acme.sh，详情见 $LOG_DIR/agent.log）"
+  return 1
+}
+
 ensure_acme_cert() {
   _cn=$1
   _crt=$2
   _key=$3
   [ -n "$_crt" ] || return 0
   [ -f "$_crt" ] && return 0
-  [ -f "$ACME_SH" ] || return 0
+
+  if ! acme_install; then
+    RC_OK=0
+    RC_ERR="${RC_ERR}${RC_ERR:+；}ACME 证书未就绪：acme.sh 安装失败（$_cn）"
+    return 1
+  fi
 
   mkdir -p "$(dirname "$_crt")" 2>/dev/null
   if [ -d "${HOME:-/root}/.acme.sh/${_cn}_ecc" ]; then
-    if "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >/dev/null 2>&1; then
+    if "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >>"$LOG_DIR/agent.log" 2>&1; then
       log "ACME 证书已安装：$_cn"
+      return 0
     fi
-    return 0
+    log "! ACME 证书安装失败：$_cn（详情见 $LOG_DIR/agent.log）"
+    RC_OK=0
+    RC_ERR="${RC_ERR}${RC_ERR:+；}ACME 证书安装失败：$_cn"
+    return 1
+  fi
+
+  # Let's Encrypt 对失败验证限速（5 次/小时/账号+域名）：盲目每分钟重签很快被锁，
+  # 失败后冷静 30 分钟。期间照常回执「证书未就绪」，面板上能看到明确状态而不是红灯猜谜
+  _f="$STATE_DIR/.acme-issue-fail"
+  if [ -f "$_f" ]; then
+    _ts=$(sed -n '1p' "$_f" 2>/dev/null)
+    case "$_ts" in '' | *[!0-9]*) _ts=0 ;; esac
+    if [ $(( $(date +%s) - _ts )) -lt 1800 ]; then
+      RC_OK=0
+      RC_ERR="${RC_ERR}${RC_ERR:+；}ACME 证书未就绪：$_cn 签发失败（30 分钟冷静期，详情见 $LOG_DIR/agent.log）"
+      return 1
+    fi
   fi
 
   log "申请 ACME 证书：$_cn（需要 80 端口可用且域名已解析到本机）"
-  if "$ACME_SH" --issue -d "$_cn" --standalone --keylength ec-256 >/dev/null 2>&1; then
-    "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >/dev/null 2>&1 \
-      && log "ACME 证书就绪：$_crt"
-  else
-    log "! ACME 申请失败：$_cn（检查域名解析与 80 端口）"
+  if "$ACME_SH" --issue -d "$_cn" --standalone --keylength ec-256 >>"$LOG_DIR/agent.log" 2>&1; then
+    if "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >>"$LOG_DIR/agent.log" 2>&1; then
+      log "ACME 证书就绪：$_crt"
+      rm -f "$_f" 2>/dev/null
+      return 0
+    fi
+    log "! ACME 证书安装失败：$_cn（详情见 $LOG_DIR/agent.log）"
+    RC_OK=0
+    RC_ERR="${RC_ERR}${RC_ERR:+；}ACME 证书安装失败：$_cn"
+    return 1
   fi
+  log "! ACME 申请失败：$_cn（检查域名解析与 80 端口，详情见 $LOG_DIR/agent.log）"
+  printf '%s\n' "$(date +%s)" > "$_f" 2>/dev/null
+  RC_OK=0
+  RC_ERR="${RC_ERR}${RC_ERR:+；}ACME 证书申请失败：$_cn（域名需解析到本机且 80 端口可用）"
+  return 1
 }
 
 # ------------------------------ 服务收敛 ------------------------------------
@@ -645,6 +696,16 @@ hy_ensure() {
     if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
       return 0
     fi
+  fi
+
+  # yaml 引用的证书还不存在（ACME 签发中 / 失败）就先别拉起：起来也是秒退，
+  # 60 秒一轮的崩溃循环只会刷屏，还把「证书为什么没有」这个真正的线索淹掉
+  _cert=$(sed -n 's/^[[:space:]]*cert:[[:space:]]*//p' "$_cfg" 2>/dev/null | sed -n '1p')
+  if [ -n "$_cert" ] && [ ! -f "$_cert" ]; then
+    log "! 证书未就绪（$_cert），暂不启动 $_inst；ACME 节点请确认域名解析与 80 端口"
+    RC_ERR="${RC_ERR}${RC_ERR:+；}证书未就绪：$_cert"
+    RC_OK=0
+    return 1
   fi
 
   if [ ! -x "$HYSTERIA_BIN" ]; then

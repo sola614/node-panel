@@ -3,6 +3,33 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.11] - 2026-10-27
+
+线上案例修复（独立节点「hk-bm」）：hy2 节点选 ACME 证书后实例反复
+`tls.cert: no such file or directory` FATAL —— 0.1.10 的存活校验把死因带回 journal，
+这次终于暴露出真正的坑：**agent 从来不装 acme.sh**。
+
+### 修复（ACME 证书）
+
+- **agent 自动安装 acme.sh**（`acme_install`）。此前 `ensure_acme_cert` 开头的
+  `[ -f "$ACME_SH" ] || return 0` 在机器没装 acme.sh 时**静默返回成功**——不打日志、
+  不报失败，证书永远不生成，而部署脚本也不装它；节点带着指向不存在文件的配置
+  每 60 秒崩一次。面板 UI 一直承诺「agent 安装 acme.sh」，这次兑现。装不上
+  （连不上 get.acme.sh）会明确回执「ACME 证书未就绪：acme.sh 安装失败」。
+- **证书未就绪时不再拉起实例**（`hy_ensure` 证书预检）：yaml 引用的 cert 文件
+  不存在就跳过启动并回执「证书未就绪」——终止崩溃循环，面板上的状态也从
+  「启动即退出 + 端口未监听」变成一句能看懂的话。
+- **ACME 签发失败进入 30 分钟冷静期**（`.acme-issue-fail`）。Let's Encrypt 对失败
+  验证限速 5 次/小时/账号+域名，盲目每分钟重签会很快被 CA 锁住。
+- **acme.sh 的输出不再丢 /dev/null**：安装 / install-cert / --issue 全部落
+  `agent.log`，域名解析失败、80 端口被占的真实原因可查（`tail /var/log/nodepanel/agent.log`）。
+
+### 测试
+
+- `test/agent.js` +3 条：证书缺失时不拉实例、假 acme.sh 签发失败进冷静期且回执
+  带「ACME 证书申请失败」、冷静期内不再重试签发。`makeSandbox` 支持
+  `acmeCerts` / `hy2Yaml` 选项。
+
 ## [0.1.10] - 2026-10-27
 
 线上案例修复：Hysteria2 节点反复「端口未监听」，journal 里却一片祥和 —— 真正的死因
