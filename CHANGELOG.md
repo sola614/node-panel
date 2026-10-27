@@ -3,6 +3,30 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.12] - 2026-10-27
+
+线上案例修复（独立节点「hk-bm」续）：0.1.11 的自动安装仍失败 ——
+`wget get.acme.sh` 手动验证返回 200，agent 里 7 秒后报「acme.sh 安装失败」。
+
+### 修复（acme.sh 安装）
+
+- **根因：get.acme.sh 只是个 1KB 引导脚本**，它自己再从 `raw.githubusercontent.com`
+  拉取 acme.sh 主体 —— 该域名在大量机房被 SNI 阻断，而 get.acme.sh 本身在
+  Cloudflare 上反而可达。第一跳验证成功完全不代表安装能走通。
+- **新增 GitHub 归档兜底安装路**：在线安装失败后，从
+  `github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz` 拉源码归档，
+  解压后 `acme.sh --install --home`。github.com 可达性通常没问题（部署 hysteria
+  二进制就是从它的 releases 下的）。
+- **安装失败进入 30 分钟冷静期**（`.acme-install-fail`）：两条路都失败时不再
+  每 60 秒重试刷日志；期间回执仍带「ACME 证书未就绪：acme.sh 安装失败」。
+- 错误信息修正：不再误导性地指向「连不上 get.acme.sh」，并附手动安装命令。
+- `ACME_INSTALL_URL` / `ACME_ARCHIVE_URL` 环境变量可覆盖两个下载源（也供测试注入）。
+
+### 测试
+
+- `test/agent.js` +3 条：两条安装路都失败时回执带原因、进入安装冷静期、
+  冷静期内不再重试下载（不再打「自动安装」日志）。
+
 ## [0.1.11] - 2026-10-27
 
 线上案例修复（独立节点「hk-bm」）：hy2 节点选 ACME 证书后实例反复

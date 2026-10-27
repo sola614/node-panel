@@ -378,6 +378,39 @@ const runAgent = (box) =>
     rB2.status === 0 && !/申请 ACME 证书：acme\.example\.com/.test(outB2) && /ACME 证书未就绪/.test(outB2),
     outB2.split('\n').filter((l) => /ACME|冷静期/.test(l)).slice(0, 2).join(' | '));
 
+  /* ------------- 8. acme.sh 安装双路失败与冷静期（0.1.12） ------------- */
+  // 线上案例：get.acme.sh 可达但 raw.githubusercontent.com 被阻断，安装 7 秒失败。
+  // 用假面板 404 模拟「两条下载路都走不通」：回执必须带原因、进冷静期、不再重试。
+  console.log('\n— acme.sh 安装失败 —');
+  const box9 = makeSandbox(panel.port, PKG_VERSION, {
+    hy2List: 'node-acmenoinst:29502:secret',
+    hy2Yaml: 'listen: :42323\n',
+    env: { HYSTERIA_AUTO_INSTALL: '0' },
+  });
+  const crt9 = pos(path.join(box9.dir, 'certs9', 'fullchain.pem'));
+  const key9 = pos(path.join(box9.dir, 'certs9', 'privkey.pem'));
+  const st9 = path.join(box9.stateDir, 'state.env');
+  fs.writeFileSync(st9, read(st9).replace(/NP_ACME_CERTS=.*/, `NP_ACME_CERTS='acme9.example.com|${crt9}|${key9}'`));
+  box9.env.ACME_SH = pos(path.join(box9.dir, 'acme-home', 'acme.sh'));
+  box9.env.ACME_INSTALL_URL = `http://127.0.0.1:${panel.port}/nope-install`;
+  box9.env.ACME_ARCHIVE_URL = `http://127.0.0.1:${panel.port}/nope-archive`;
+
+  const n4 = panel.state.receipts.length;
+  const rC = await runAgent(box9);
+  const outC = rC.stdout + rC.stderr;
+  const rcC = panel.state.receipts[n4] || {};
+  ok('acme.sh 双路安装失败时回执原因',
+    rC.status === 0 && /acme\.sh 安装失败/.test(outC) && /acme\.sh 安装失败/.test(rcC.error || ''),
+    String(rcC.error || '').slice(0, 100));
+  ok('安装失败给出手动指引', /get\.acme\.sh \| sh/.test(outC));
+  ok('安装失败进入冷静期', fs.existsSync(path.join(box9.stateDir, '.acme-install-fail')));
+
+  const rC2 = await runAgent(box9);
+  const outC2 = rC2.stdout + rC2.stderr;
+  ok('冷静期内不再重试下载安装',
+    rC2.status === 0 && !/自动安装（在线安装/.test(outC2),
+    outC2.split('\n').filter((l) => /acme/.test(l)).slice(0, 2).join(' | '));
+
   panel.server.close();
   try {
     fs.rmSync(TMP, { recursive: true, force: true });

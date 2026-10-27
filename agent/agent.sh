@@ -37,7 +37,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.11'
+VERSION='0.1.12'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -283,22 +283,57 @@ EOF
 # ACME：acme.sh 是纯 shell，正好符合「不装运行时」的诉求；失败不影响其它节点
 ACME_SH=${ACME_SH:-${HOME:-/root}/.acme.sh/acme.sh}
 
-# 机器上没有 acme.sh 时自动装（get.acme.sh 本身就是个安装脚本，落 ~/.acme.sh）。
-# 0.1.11 以前这里只是静默跳过 —— 证书永远不生成，节点带着指向不存在文件的
-# 配置每 60 秒崩一次，journal 里只能看到 hysteria 的 tls.cert FATAL。
+# 机器上没有 acme.sh 时自动安装。get.acme.sh 只是个 1KB 引导脚本：它自己再从
+# raw.githubusercontent.com 拉 acme.sh 主体 —— 那个域名在不少机房被 SNI 阻断
+# （get.acme.sh 在 Cloudflare 上反而通；线上案例：wget get.acme.sh 返回 200，
+# agent 里 7 秒后安装失败）。所以加一条 github.com 源码归档兜底：github.com
+# 可达性通常没问题（部署 hysteria 二进制就是从它 releases 下的）。
+# 两条路都失败就冷静 30 分钟再试，错误信息带手动安装指引。
 acme_install() {
   [ -f "$ACME_SH" ] && return 0
-  log "本机没有 acme.sh，自动安装（https://get.acme.sh）"
+
+  _f="$STATE_DIR/.acme-install-fail"
+  if [ -f "$_f" ]; then
+    _ts=$(sed -n '1p' "$_f" 2>/dev/null)
+    case "$_ts" in '' | *[!0-9]*) _ts=0 ;; esac
+    if [ $(( $(date +%s) - _ts )) -lt 1800 ]; then
+      return 1
+    fi
+  fi
+
+  log "本机没有 acme.sh，自动安装（在线安装 → GitHub 归档兜底）"
+
+  # 方式一：官方在线安装（引导脚本内部从 raw.githubusercontent.com 拉主体）
   _tmp="$RUN_DIR/acme-install.$$.sh"
-  if http_download "https://get.acme.sh" "$_tmp" && [ -s "$_tmp" ]; then
+  if http_download "${ACME_INSTALL_URL:-https://get.acme.sh}" "$_tmp" && [ -s "$_tmp" ]; then
     if sh "$_tmp" >> "$LOG_DIR/agent.log" 2>&1 && [ -f "$ACME_SH" ]; then
-      rm -f "$_tmp" 2>/dev/null
+      rm -f "$_tmp" "$_f" 2>/dev/null
       log "✓ 已安装 acme.sh"
       return 0
     fi
   fi
   rm -f "$_tmp" 2>/dev/null
-  log "! acme.sh 安装失败（机器可能连不上 get.acme.sh，详情见 $LOG_DIR/agent.log）"
+
+  # 方式二：github.com 源码归档直接解压安装（归档顶层目录名不固定，find 定位入口）
+  _t="$RUN_DIR/acme.$$.tar.gz"
+  _d="$RUN_DIR/acme.$$.dir"
+  if http_download "${ACME_ARCHIVE_URL:-https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz}" "$_t" && [ -s "$_t" ]; then
+    mkdir -p "$_d" 2>/dev/null
+    if tar -xzf "$_t" -C "$_d" 2>>"$LOG_DIR/agent.log"; then
+      _entry=$(find "$_d" -type f -name acme.sh 2>/dev/null | sed -n '1p')
+      if [ -n "$_entry" ] && sh "$_entry" --install --home "${ACME_SH%/acme.sh}" >>"$LOG_DIR/agent.log" 2>&1 && [ -f "$ACME_SH" ]; then
+        rm -rf "$_d" "$_t" 2>/dev/null
+        rm -f "$_f" 2>/dev/null
+        log "✓ 已安装 acme.sh（GitHub 归档）"
+        return 0
+      fi
+    fi
+  fi
+  rm -rf "$_d" "$_t" 2>/dev/null
+
+  printf '%s\n' "$(date +%s)" > "$_f" 2>/dev/null
+  log "! acme.sh 安装失败：在线安装与 GitHub 归档都没走通（详情见 $LOG_DIR/agent.log）"
+  log "  手动安装：curl https://get.acme.sh | sh -s -- email=你的邮箱（中国大陆网络另见 acme.sh wiki「Install in China」）"
   return 1
 }
 
