@@ -3022,7 +3022,7 @@ function agentReceipt(req, res, params, body, session, ctx) {
     error: trim(body.error, 500),
     xray: trim(body.xray, 24),
     hy: trim(body.hy, 24),
-    // 本机没在监听的端口（tcp:42323,udp:8443）：配置对了但进程没起来时唯一能暴露问题的信号
+    // 本机没在监听的端口（tcp:42000,udp:8443）：配置对了但进程没起来时唯一能暴露问题的信号
     unbound: trim(body.unbound, 200),
     nodes: Number(body.nodes) || 0,
     users: Number(body.users) || 0,

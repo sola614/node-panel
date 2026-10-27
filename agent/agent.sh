@@ -55,7 +55,7 @@ ENV_FILE=${AGENT_ENV:-$SELF_DIR/agent.env}
 #   RC_OK    1=一切正常，0=有失败（面板上标红）
 #   RC_XRAY  ok / fail / skip
 #   RC_HY    「跑起来的实例数/期望实例数」，没有 Hysteria2 节点时为空
-#   BAD_PORTS 本轮没在监听的端口（tcp:42323,udp:8443），面板据此报「端口未监听」
+#   BAD_PORTS 本轮没在监听的端口（tcp:42000,udp:8443），面板据此报「端口未监听」
 RC_OK=1
 RC_XRAY=''
 RC_HY=''
@@ -79,7 +79,8 @@ env_read() {
 
 if [ -f "$ENV_FILE" ]; then
   for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
-                  HYSTERIA_BIN HYSTERIA_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX ACME_SH REPORT_IP SOCK_CMD; do
+                  HYSTERIA_BIN HYSTERIA_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX \
+                  ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
     # 赋值语境下不做分词，带空格的值能原样存进变量
@@ -289,7 +290,10 @@ ACME_SH=${ACME_SH:-${HOME:-/root}/.acme.sh/acme.sh}
 # agent 里 7 秒后安装失败）。所以加一条 github.com 源码归档兜底：github.com
 # 可达性通常没问题（部署 hysteria 二进制就是从它 releases 下的）。
 # 两条路都失败就冷静 30 分钟再试，错误信息带手动安装指引。
+# $1 = CA 账号邮箱（官方安装命令统一带 email=…；acme.sh 默认 CA ZeroSSL 的账号注册
+# 强制 email，不传的话装得上也签不出来 —— 0.1.12 对照官方文档补的参数）
 acme_install() {
+  _email=${1:-}
   [ -f "$ACME_SH" ] && return 0
 
   _f="$STATE_DIR/.acme-install-fail"
@@ -306,7 +310,7 @@ acme_install() {
   # 方式一：官方在线安装（引导脚本内部从 raw.githubusercontent.com 拉主体）
   _tmp="$RUN_DIR/acme-install.$$.sh"
   if http_download "${ACME_INSTALL_URL:-https://get.acme.sh}" "$_tmp" && [ -s "$_tmp" ]; then
-    if sh "$_tmp" >> "$LOG_DIR/agent.log" 2>&1 && [ -f "$ACME_SH" ]; then
+    if sh "$_tmp" ${_email:+email="$_email"} >> "$LOG_DIR/agent.log" 2>&1 && [ -f "$ACME_SH" ]; then
       rm -f "$_tmp" "$_f" 2>/dev/null
       log "✓ 已安装 acme.sh"
       return 0
@@ -321,7 +325,7 @@ acme_install() {
     mkdir -p "$_d" 2>/dev/null
     if tar -xzf "$_t" -C "$_d" 2>>"$LOG_DIR/agent.log"; then
       _entry=$(find "$_d" -type f -name acme.sh 2>/dev/null | sed -n '1p')
-      if [ -n "$_entry" ] && sh "$_entry" --install --home "${ACME_SH%/acme.sh}" >>"$LOG_DIR/agent.log" 2>&1 && [ -f "$ACME_SH" ]; then
+      if [ -n "$_entry" ] && sh "$_entry" --install --home "${ACME_SH%/acme.sh}" ${_email:+-m "$_email"} >>"$LOG_DIR/agent.log" 2>&1 && [ -f "$ACME_SH" ]; then
         rm -rf "$_d" "$_t" 2>/dev/null
         rm -f "$_f" 2>/dev/null
         log "✓ 已安装 acme.sh（GitHub 归档）"
@@ -344,14 +348,18 @@ ensure_acme_cert() {
   [ -n "$_crt" ] || return 0
   [ -f "$_crt" ] && return 0
 
-  if ! acme_install; then
+  # CA 账号邮箱：agent.env 可指定 ACME_EMAIL，缺省 admin@<证书域名>。
+  # ZeroSSL / Let's Encrypt 注册账号都要邮箱（到期/失败通知用，格式合法即可）
+  _email=${ACME_EMAIL:-admin@$_cn}
+
+  if ! acme_install "$_email"; then
     RC_OK=0
     RC_ERR="${RC_ERR}${RC_ERR:+；}ACME 证书未就绪：acme.sh 安装失败（$_cn）"
     return 1
   fi
 
   mkdir -p "$(dirname "$_crt")" 2>/dev/null
-  if [ -d "${HOME:-/root}/.acme.sh/${_cn}_ecc" ]; then
+  if [ -d "${ACME_SH%/acme.sh}/${_cn}_ecc" ]; then
     if "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >>"$LOG_DIR/agent.log" 2>&1; then
       log "ACME 证书已安装：$_cn"
       return 0
@@ -376,7 +384,10 @@ ensure_acme_cert() {
   fi
 
   log "申请 ACME 证书：$_cn（需要 80 端口可用且域名已解析到本机）"
-  if "$ACME_SH" --issue -d "$_cn" --standalone --keylength ec-256 >>"$LOG_DIR/agent.log" 2>&1; then
+  # --server letsencrypt：acme.sh 缺省 CA 是 ZeroSSL（免费层政策不透明）；
+  # LE 的限速规则公开清晰 —— 失败验证 5 次/小时，正好对上上面的 30 分钟冷静期。
+  # --accountemail：账号自动注册时带上邮箱（账号已存在时 acme.sh 会忽略它）
+  if "$ACME_SH" --issue -d "$_cn" --standalone --keylength ec-256 --server letsencrypt --accountemail "$_email" >>"$LOG_DIR/agent.log" 2>&1; then
     if "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >>"$LOG_DIR/agent.log" 2>&1; then
       log "ACME 证书就绪：$_crt"
       rm -f "$_f" 2>/dev/null
@@ -594,7 +605,7 @@ xray_ensure() {
 }
 
 # ----------------------------- 端口监听自检 ---------------------------------
-# 面板在 state.env 里下发「这台机器应该监听的端口」（NP_LISTEN_PORTS=tcp:42323 udp:8443）。
+# 面板在 state.env 里下发「这台机器应该监听的端口」（NP_LISTEN_PORTS=tcp:42000 udp:8443）。
 # 配置落盘 ≠ 端口在听：进程崩了、配置被别的程序占着、Xray 起在别的配置文件上，
 # 都会让面板显示「已同步」而实际连不上。这里抓一次本机监听表核对。
 
@@ -618,7 +629,7 @@ port_bound() {
   sock_list | awk -v proto="$1" -v p="$2" '
     {
       if (tolower($1) !~ "^" proto) next
-      # 整行匹配「:端口」且后面不是数字，避免 4232 误命中 42323
+      # 整行匹配「:端口」且后面不是数字，避免 4200 误命中 42000
       if ($0 ~ (":" p "([^0-9]|$)")) { found = 1; exit }
     }
     END { exit(found ? 0 : 1) }'
