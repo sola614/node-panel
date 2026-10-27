@@ -601,6 +601,13 @@ function nodeForm(node, servers) {
           <label>证书域名 / CN</label>
           <input type="text" id="n-selfcn" value="${esc(n.selfCN || '')}" placeholder="留空则取上面的 SNI">
         </div>
+        <div class="alert alert-warn" id="acme-warn" style="display:none">
+          <b>使用 ACME 前需确认（缺一不可）：</b>
+          <br>1. 该域名已解析到本节点服务器的 IP（A 记录，Let's Encrypt 会来验证）；
+          <br>2. 节点服务器 80 端口可对外访问且未被占用（申请时 agent 要临时监听它）；
+          <br>3. 节点服务器能访问外网（get.acme.sh 与 Let's Encrypt API）。
+          <br>不满足时证书永远签不下来，节点会持续回执「证书未就绪」而起不来；确认不了的先改用「自动生成自签证书」。域名与 80 端口就位后，agent 会自动完成安装 acme.sh、签发、续期（acme.sh 定时任务）。
+        </div>
         <p class="hint" id="cert-domain-hint"></p>
       </div>
     </div>
@@ -731,10 +738,12 @@ function bindNodeForm(mask) {
     $('#cert-content-box', mask).classList.toggle('hidden', cm !== 'content');
     const needDomain = cm === 'self' || cm === 'acme';
     $('#cert-domain-box', mask).classList.toggle('hidden', !needDomain);
+    // ACME 前提是硬条件：不满足 = 证书签不下来 = 节点起不来，用警示块显式列出
+    $('#acme-warn', mask).style.display = cm === 'acme' ? '' : 'none';
     $('#cert-domain-hint', mask).textContent =
       cm === 'acme'
-        ? 'agent 安装 acme.sh 并向 Let\'s Encrypt 申请证书，之后由 acme.sh 定时任务自动续期。前提：域名已解析到本机、80 端口可用、机器能访问外网。'
-        : 'agent 用 openssl 生成 10 年自签证书。自签证书无法通过客户端校验，订阅会自动带上 allowInsecure / skip-cert-verify，所以节点依然能连通，只是客户端要允许"不安全"。';
+        ? 'agent 自动安装 acme.sh 并向 Let\'s Encrypt 申请证书，之后由 acme.sh 定时任务自动续期（失败重试有 30 分钟冷静期，防触发 CA 限速）。'
+        : 'agent 用 openssl 生成 10 年自签证书。自签证书无法通过客户端校验，订阅会自动带上 allowInsecure / skip-cert-verify，客户端需允许"不安全"。注意：Xray-core v25 起已移除 allowInsecure，新版 v2rayN 导入 Xray 系（VLESS/VMess/Trojan + TLS）自签节点会直接 Failed to start；这类节点建议改用 ACME 证书，Hysteria2 节点不受影响。';
 
     modeHint();
   };

@@ -662,6 +662,19 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     d9.querySelector('#n-certmode').value);
   ok('自签模式给出说明', /自签/.test(d9.querySelector('#cert-domain-hint').textContent));
 
+  // ACME 的前提是硬条件（域名解析 / 80 端口 / 外网）：切过去必须把警示块亮出来
+  // （线上案例：管理员不知道前提，选完 ACME 节点永远「证书未就绪」起不来）
+  const cmSel = d9.querySelector('#n-certmode');
+  cmSel.value = 'acme';
+  change(cmSel);
+  ok('ACME 模式显示前提警示块', d9.querySelector('#acme-warn').style.display === '' &&
+    /80 端口/.test(d9.querySelector('#acme-warn').textContent) &&
+    /解析/.test(d9.querySelector('#acme-warn').textContent),
+    'display=' + d9.querySelector('#acme-warn').style.display);
+  cmSel.value = 'self';
+  change(cmSel);
+  ok('自签模式下警示块隐藏', d9.querySelector('#acme-warn').style.display === 'none');
+
   protoSel.value = 'vless';
   change(protoSel);
   ok('切回 vless（无加密）后证书区重新隐藏', d9.querySelector('#cert-box').classList.contains('hidden'));
