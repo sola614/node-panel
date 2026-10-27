@@ -73,6 +73,11 @@ function startPanel() {
         res.writeHead(200, { 'Content-Type': 'text/x-shellscript' });
         return res.end(state.mode === 'bad' ? state.badScript : state.script);
       }
+      // 模拟「在线安装源」：返回测试注入的安装脚本（默认失败占位）
+      if (pathname === '/install') {
+        res.writeHead(200, { 'Content-Type': 'text/x-shellscript' });
+        return res.end(state.installer || '#!/bin/sh\nexit 1\n');
+      }
       if (pathname === '/api/agent/receipt') {
         let raw = '';
         req.on('data', (c) => (raw += c));
@@ -151,7 +156,7 @@ function makeSandbox(port, agentVersion, opts = {}) {
     const hyDir = path.join(dir, 'hy');
     fs.mkdirSync(hyDir, { recursive: true });
     for (const item of opts.hy2List.split(/\s+/).filter(Boolean)) {
-      fs.writeFileSync(path.join(hyDir, item.split(':')[0] + '.yaml'), opts.hy2Yaml || 'listen: :42323\n');
+      fs.writeFileSync(path.join(hyDir, item.split(':')[0] + '.yaml'), opts.hy2Yaml || 'listen: :42000\n');
     }
   }
 
@@ -332,7 +337,7 @@ const runAgent = (box) =>
   // A. yaml 引用的证书不存在：不拉起实例（终止崩溃循环），回执说人话
   const box7 = makeSandbox(panel.port, PKG_VERSION, {
     hy2List: 'node-acmefail:29500:secret',
-    hy2Yaml: 'listen: :42323\ntls:\n  cert: /nonexistent/node-acmefail/fullchain.pem\n  key: /nonexistent/node-acmefail/privkey.pem\n',
+    hy2Yaml: 'listen: :42000\ntls:\n  cert: /nonexistent/node-acmefail/fullchain.pem\n  key: /nonexistent/node-acmefail/privkey.pem\n',
   });
   const rA = await runAgent(box7);
   const outA = rA.stdout + rA.stderr;
@@ -344,7 +349,7 @@ const runAgent = (box) =>
   // B. 假 acme.sh 永远签发失败：回执必须带「ACME 证书申请失败」，且进入冷静期
   const box8 = makeSandbox(panel.port, PKG_VERSION, {
     hy2List: 'node-acmeissue:29501:secret',
-    hy2Yaml: 'listen: :42323\n',
+    hy2Yaml: 'listen: :42000\n',
     // 不让它真的去 GitHub 下载 hysteria；本节焦点在 ACME 路径
     env: { HYSTERIA_AUTO_INSTALL: '0' },
   });
@@ -384,7 +389,7 @@ const runAgent = (box) =>
   console.log('\n— acme.sh 安装失败 —');
   const box9 = makeSandbox(panel.port, PKG_VERSION, {
     hy2List: 'node-acmenoinst:29502:secret',
-    hy2Yaml: 'listen: :42323\n',
+    hy2Yaml: 'listen: :42000\n',
     env: { HYSTERIA_AUTO_INSTALL: '0' },
   });
   const crt9 = pos(path.join(box9.dir, 'certs9', 'fullchain.pem'));
@@ -410,6 +415,55 @@ const runAgent = (box) =>
   ok('冷静期内不再重试下载安装',
     rC2.status === 0 && !/自动安装（在线安装/.test(outC2),
     outC2.split('\n').filter((l) => /acme/.test(l)).slice(0, 2).join(' | '));
+
+  /* --------- 9. ACME 账号邮箱与 CA 选择（对照官方文档复查，0.1.12） --------- */
+  // 官方安装命令统一带 email=…：ZeroSSL（acme.sh 缺省 CA）/ LE 注册账号都要邮箱。
+  // 假安装源 + 假 acme.sh 分别记录「安装参数」与「签发参数」，验证 email 传递链。
+  console.log('\n— ACME 账号邮箱 —');
+  const box10 = makeSandbox(panel.port, PKG_VERSION, {
+    hy2List: 'node-acmeok:29503:secret',
+    hy2Yaml: 'listen: :42000\n',
+    env: { HYSTERIA_AUTO_INSTALL: '0' },
+  });
+  const argsFile = pos(path.join(box10.dir, 'acme-args.txt'));
+  const crt10 = pos(path.join(box10.dir, 'certs10', 'fullchain.pem'));
+  const key10 = pos(path.join(box10.dir, 'certs10', 'privkey.pem'));
+  const st10 = path.join(box10.stateDir, 'state.env');
+  fs.writeFileSync(st10, read(st10).replace(/NP_ACME_CERTS=.*/, `NP_ACME_CERTS='acme.ok.example.com|${crt10}|${key10}'`));
+  box10.env.ACME_SH = pos(path.join(box10.dir, 'acme-home', 'acme.sh'));
+  box10.env.ARGS = argsFile;
+  box10.env.ACME_INSTALL_URL = `http://127.0.0.1:${panel.port}/install`;
+  box10.env.ACME_ARCHIVE_URL = `http://127.0.0.1:${panel.port}/nope-archive`;
+
+  // 假安装脚本：记录收到的参数，装一个「记录参数并永远签发失败」的假 acme.sh
+  panel.state.installer = [
+    '#!/bin/sh',
+    'printf \'%s\\n\' "INSTALL:$*" >> "$ARGS"',
+    'mkdir -p "$(dirname "$ACME_SH")"',
+    'cat > "$ACME_SH" <<\'EOF\'',
+    '#!/bin/sh',
+    'printf \'%s\\n\' "ISSUE:$*" >> "$ARGS"',
+    'exit 1',
+    'EOF',
+    'chmod 755 "$ACME_SH"',
+    'exit 0',
+    '',
+  ].join('\n');
+
+  const n5 = panel.state.receipts.length;
+  const rD = await runAgent(box10);
+  const outD = rD.stdout + rD.stderr;
+  const rcD = panel.state.receipts[n5] || {};
+  const args = read(argsFile);
+  ok('在线安装成功时装上 acme.sh', /已安装 acme\.sh/.test(outD) && fs.existsSync(argsFile),
+    outD.split('\n').filter((l) => /acme/.test(l)).slice(0, 2).join(' | '));
+  ok('安装参数带 CA 账号邮箱（缺省 admin@域名）', /INSTALL:.*email=admin@acme\.ok\.example\.com/.test(args),
+    args.split('\n')[0] || '(空)');
+  ok('签发参数带 --server letsencrypt 与 --accountemail',
+    /ISSUE:.*--server letsencrypt/.test(args) && /ISSUE:.*--accountemail admin@acme\.ok\.example\.com/.test(args),
+    (args.split('\n').find((l) => l.startsWith('ISSUE:')) || '(空)').slice(0, 120));
+  ok('签发失败照常回执原因', /ACME 申请失败/.test(outD) && /ACME 证书申请失败/.test(rcD.error || ''),
+    String(rcD.error || '').slice(0, 100));
 
   panel.server.close();
   try {
