@@ -125,7 +125,7 @@ function makeSandbox(port, agentVersion, opts = {}) {
       `NP_AGENT_VERSION='${agentVersion}'`,
       `NP_HY2_LIST='${opts.hy2List || ''}'`,
       "NP_SELF_CERTS=''",
-      "NP_ACME_CERTS=''",
+      `NP_ACME_CERTS='${opts.acmeCerts || ''}'`,
       '',
     ].join('\n'),
   );
@@ -151,7 +151,7 @@ function makeSandbox(port, agentVersion, opts = {}) {
     const hyDir = path.join(dir, 'hy');
     fs.mkdirSync(hyDir, { recursive: true });
     for (const item of opts.hy2List.split(/\s+/).filter(Boolean)) {
-      fs.writeFileSync(path.join(hyDir, item.split(':')[0] + '.yaml'), 'listen: :42323\n');
+      fs.writeFileSync(path.join(hyDir, item.split(':')[0] + '.yaml'), opts.hy2Yaml || 'listen: :42323\n');
     }
   }
 
@@ -323,6 +323,60 @@ const runAgent = (box) =>
     r8.status === 0 && /未找到 hysteria/.test(out8) && /跳过 node-deadbeef/.test(out8) &&
       /v2\.hysteria\.network/.test(out8),
     out8.split('\n').filter((l) => /hysteria/.test(l)).slice(0, 2).join(' | '));
+
+  /* ------------------- 7. ACME 证书：静默失败回归（0.1.11） ------------------- */
+  // 线上案例：hy2 节点选 ACME 证书，机器上没装 acme.sh —— ensure_acme_cert 曾静默
+  // 返回成功，证书永远不生成，实例带着指向不存在文件的配置每 60 秒崩一次。
+  console.log('\n— ACME 证书 —');
+
+  // A. yaml 引用的证书不存在：不拉起实例（终止崩溃循环），回执说人话
+  const box7 = makeSandbox(panel.port, PKG_VERSION, {
+    hy2List: 'node-acmefail:29500:secret',
+    hy2Yaml: 'listen: :42323\ntls:\n  cert: /nonexistent/node-acmefail/fullchain.pem\n  key: /nonexistent/node-acmefail/privkey.pem\n',
+  });
+  const rA = await runAgent(box7);
+  const outA = rA.stdout + rA.stderr;
+  ok('证书未就绪时不拉起实例',
+    rA.status === 0 && /证书未就绪/.test(outA) && /暂不启动 node-acmefail/.test(outA) &&
+      !/已启动 Hysteria2 实例 node-acmefail/.test(outA),
+    outA.split('\n').filter((l) => /证书/.test(l)).slice(0, 2).join(' | '));
+
+  // B. 假 acme.sh 永远签发失败：回执必须带「ACME 证书申请失败」，且进入冷静期
+  const box8 = makeSandbox(panel.port, PKG_VERSION, {
+    hy2List: 'node-acmeissue:29501:secret',
+    hy2Yaml: 'listen: :42323\n',
+    // 不让它真的去 GitHub 下载 hysteria；本节焦点在 ACME 路径
+    env: { HYSTERIA_AUTO_INSTALL: '0' },
+  });
+  const pos = (p) => p.split(path.sep).join('/');
+  const crt8 = pos(path.join(box8.dir, 'certs', 'fullchain.pem'));
+  const key8 = pos(path.join(box8.dir, 'certs', 'privkey.pem'));
+  const st8 = path.join(box8.stateDir, 'state.env');
+  fs.writeFileSync(st8, read(st8).replace(/NP_ACME_CERTS=.*/, `NP_ACME_CERTS='acme.example.com|${crt8}|${key8}'`));
+  const fakeAcme = path.join(box8.dir, 'fake-acme.sh');
+  fs.writeFileSync(fakeAcme, '#!/bin/sh\nexit 1\n');
+  try {
+    fs.chmodSync(fakeAcme, 0o755);
+  } catch {
+    /* Windows 上 chmod 是空操作，Git Bash 照样能跑 */
+  }
+  box8.env.ACME_SH = fakeAcme;
+
+  const n3 = panel.state.receipts.length;
+  const rB = await runAgent(box8);
+  const outB = rB.stdout + rB.stderr;
+  const rcB = panel.state.receipts[n3] || {};
+  ok('ACME 签发失败会回执原因',
+    rB.status === 0 && /ACME 申请失败/.test(outB) && /ACME 证书申请失败/.test(rcB.error || ''),
+    String(rcB.error || '').slice(0, 100));
+  ok('签发失败进入冷静期', fs.existsSync(path.join(box8.stateDir, '.acme-issue-fail')));
+
+  // B2. 冷静期内再跑一轮：不再重试签发（Let's Encrypt 失败验证限速 5 次/小时）
+  const rB2 = await runAgent(box8);
+  const outB2 = rB2.stdout + rB2.stderr;
+  ok('冷静期内不再重试签发',
+    rB2.status === 0 && !/申请 ACME 证书：acme\.example\.com/.test(outB2) && /ACME 证书未就绪/.test(outB2),
+    outB2.split('\n').filter((l) => /ACME|冷静期/.test(l)).slice(0, 2).join(' | '));
 
   panel.server.close();
   try {
