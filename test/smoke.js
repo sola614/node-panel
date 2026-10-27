@@ -349,7 +349,7 @@ const json = (obj) => JSON.stringify(obj);
     !!hy && (hy.yaml.includes('listen: :20843') || hy.yaml.includes('listen: ":20843"')), hy ? `端口 ${hy.port}` : '');
   ok('Hysteria2 含 userpass 认证', !!hy && hy.yaml.includes('userpass') && hy.yaml.includes('u' + u2.id));
   ok('Hysteria2 含带宽与混淆', !!hy && hy.yaml.includes('salamander') && hy.yaml.includes('mbps'));
-  ok('Hysteria2 带流量统计端口', !!hy && hy.statsPort >= 9000 && hy.statsPort < 9900 && !!hy.secret,
+  ok('Hysteria2 带流量统计端口', !!hy && hy.statsPort >= 29000 && hy.statsPort < 29900 && !!hy.secret,
     `port=${hy && hy.statsPort}`);
 
   // 同一台机器上多个 Hysteria2 实例的统计端口不得碰撞（否则流量串号）

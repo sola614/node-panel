@@ -1,6 +1,6 @@
 {
   "name": "node-panel",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": false,
   "description": "轻量节点管理面板：用户 / 节点 / 服务器 + 订阅与流量配额",
   "keywords": [
