@@ -37,7 +37,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.9'
+VERSION='0.1.10'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -665,6 +665,9 @@ hy_ensure() {
   nohup "$HYSTERIA_BIN" server -c "$_cfg" >> "$_log" 2>&1 &
   echo $! > "$_pidfile"
   log "已启动 Hysteria2 实例 $_inst"
+  # 「已启动」只说明 nohup 派生成功。hysteria 遇到 YAML 非法、证书读不了、
+  # 端口被占会启动即退，留给 verify_started_hy 统一核对并把死因翻出来
+  NP_STARTED_HY="${NP_STARTED_HY}${NP_STARTED_HY:+ }$_inst"
   NP_JUST_RESTARTED=1
 }
 
@@ -703,6 +706,32 @@ hy_sync() {
     fi
   done
   [ "$_total" -gt 0 ] && RC_HY="$_ok/$_total"
+}
+
+# 本轮拉起的 Hysteria2 实例统一做一次存活核对（apply_services 里 sleep 1 之后才调用，
+# 给 hysteria 留出「启动即退出」的时间）。死进程的 pid 文件顺手清掉，免得下一轮
+# hy_ensure 误判「还活着」；真正的死因（实例日志里的 FATAL 行）带进 agent 日志与回执，
+# 否则面板上只有一个笼统的「端口未监听」，排查得登机器翻日志。
+verify_started_hy() {
+  for _inst in ${NP_STARTED_HY:-}; do
+    _pidfile=$(hy_pidfile "$_inst")
+    _pid=$(cat "$_pidfile" 2>/dev/null)
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+      continue
+    fi
+    rm -f "$_pidfile" 2>/dev/null
+    _why=$(grep 'FATAL' "$LOG_DIR/$_inst.log" 2>/dev/null | tail -n 1 | cut -c1-200)
+    if [ -n "$_why" ]; then
+      log "! Hysteria2 实例 $_inst 启动后立即退出：$_why"
+    else
+      log "! Hysteria2 实例 $_inst 启动后立即退出（$LOG_DIR/$_inst.log 未见 FATAL 记录）"
+    fi
+    log "  完整日志：tail -50 $LOG_DIR/$_inst.log"
+    RC_HY_FAIL="${RC_HY_FAIL:-}${RC_HY_FAIL:+、}${_inst}"
+    RC_ERR="${RC_ERR}${RC_ERR:+；}Hysteria2 启动即退出：${_inst}${_why:+（$_why）}"
+    RC_OK=0
+  done
+  NP_STARTED_HY=''
 }
 
 # ------------------------------- 配置包 -------------------------------------
@@ -788,6 +817,7 @@ apply_services() {
 
   # 等服务把端口 bind 上再自检；每轮都跑一次 ss，开销可以忽略
   [ "$NP_JUST_RESTARTED" = '1' ] && sleep 1 2>/dev/null
+  verify_started_hy
   probe_ports
 }
 
@@ -1081,6 +1111,7 @@ tick() {
   RC_ERR=''
   BAD_PORTS=''
   NP_JUST_RESTARTED=0
+  NP_STARTED_HY=''
   SOCK_LIST=''
   LAST_FETCH_OK=0
 
