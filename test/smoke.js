@@ -1347,7 +1347,78 @@ const json = (obj) => JSON.stringify(obj);
   ok('降级后用户回到不限套餐', bdUserAfter && !bdUserAfter.planId, String(bdUserAfter && bdUserAfter.planId));
   await call('/api/users/' + bdUser.data.item.id, { method: 'DELETE' });
 
-  /* ---------- 14. 清理 ---------- */
+  /* ---------- 14. 证书（只走 draft 状态，不触发真实签发） ---------- */
+  // 这一段刻意不调 /api/certs/:id/issue：签发要真的装 acme.sh 并访问
+  // Let's Encrypt，CI 里既不该跑也跑不通。CRUD 与校验路径已经能覆盖大部分回归。
+  console.log('\n── 证书 ──');
+  const certList0 = await call('/api/certs');
+  ok('证书列表可读', certList0.status === 200 && Array.isArray(certList0.data.items));
+  ok('证书列表带 DNS 提供商元数据', (certList0.data.providers || []).length >= 4,
+    (certList0.data.providers || []).map((p) => p.id).join(', '));
+
+  const cert1 = await call('/api/certs', {
+    method: 'POST',
+    body: json({
+      domains: '*.smoke-cert.example.com',
+      provider: 'cloudflare',
+      creds: { CF_Token: 'smoke-token' },
+    }),
+  });
+  ok(
+    '创建通配符证书自动补裸域',
+    cert1.status === 200 &&
+      json(cert1.data.item.domains) === json(['smoke-cert.example.com', '*.smoke-cert.example.com']),
+    json(cert1.data.item.domains),
+  );
+  cleanup.push(['/api/certs/' + cert1.data.item.id]);
+  ok(
+    '证书响应不回显凭据与私钥',
+    !('creds' in cert1.data.item) &&
+      !('keyPem' in cert1.data.item) &&
+      json(cert1.data.item.credsSet) === json(['CF_Token']),
+    json(cert1.data.item.credsSet),
+  );
+  ok('新建证书状态是未签发', cert1.data.item.state === 'draft', cert1.data.item.state);
+
+  const dupCert = await call('/api/certs', {
+    method: 'POST',
+    body: json({ domains: 'smoke-cert.example.com', provider: 'aliyun' }),
+  });
+  ok('同域名重复建证书被拒', dupCert.status === 409, dupCert.data.error);
+
+  const badCert = await call('/api/certs', {
+    method: 'POST',
+    body: json({ domains: 'not a domain', provider: 'cloudflare' }),
+  });
+  ok('非法域名被拒', badCert.status === 400, badCert.data.error);
+
+  const refNode = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: '证书引用节点',
+      mode: 'standalone',
+      address: '9.9.9.7',
+      protocol: 'vless',
+      port: 21105,
+      network: 'tcp',
+      security: 'tls',
+      certMode: 'ref',
+      certId: cert1.data.item.id,
+    }),
+  });
+  ok('引用未签发的证书被拒', refNode.status === 400, refNode.data.error);
+
+  const certUpd = await call('/api/certs/' + cert1.data.item.id, {
+    method: 'PUT',
+    body: json({ name: '冒烟证书', provider: 'cloudflare' }),
+  });
+  ok('编辑证书名称', certUpd.status === 200 && certUpd.data.item.name === '冒烟证书');
+
+  const certDel = await call('/api/certs/' + cert1.data.item.id, { method: 'DELETE' });
+  ok('未被引用的证书可以删除', certDel.status === 200);
+  cleanup.pop(); // 已经删掉了，清理阶段不用再来一次
+
+  /* ---------- 15. 清理 ---------- */
   for (const [path] of cleanup.reverse()) {
     await call(path, { method: 'DELETE' });
   }

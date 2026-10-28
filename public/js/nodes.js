@@ -12,10 +12,16 @@ let NODE_SORTING = false;
 let NODE_ORDER = [];
 
 RENDERERS.nodes = async () => {
-  const [d, pd] = await Promise.all([api('/api/nodes'), api('/api/plans')]);
+  const [d, pd, cd] = await Promise.all([
+    api('/api/nodes'),
+    api('/api/plans'),
+    api('/api/certs'),
+  ]);
   state.data.nodes = d.items;
   state.data.serverList = d.servers;
   state.data.planList = pd.items;
+  // 节点表单里的「使用已有证书」下拉要用它
+  state.data.certList = cd.items.filter((c) => c.hasKey);
   NODE_SELECTED = new Set();
 
   // 排序草稿：沿用服务端顺序，期间别处新增的节点追加到末尾（不至于因为刷新就丢掉手上的顺序）
@@ -128,6 +134,7 @@ RENDERERS.nodes = async () => {
                 ? e.planIds.map(planChip).join('')
                 : '<span class="chip" style="color:var(--muted)">继承节点套餐</span>';
               return `<tr class="tree-child ${open ? '' : 'collapsed'}" data-parent="${n.id}">
+          <td></td>
           <td>
             <div class="tree-cell tree-child-cell">
               <span class="tree-guide"></span>
@@ -601,11 +608,36 @@ function nodeForm(node, servers) {
       <div class="field">
         <label>证书来源</label>
         <select id="n-certmode">
+          <option value="self" ${(n.certMode || 'path') === 'self' ? 'selected' : ''}>自动生成自签证书</option>
+          <option value="ref" ${n.certMode === 'ref' ? 'selected' : ''}>使用「证书」页里的证书（推荐）</option>
           <option value="path" ${(n.certMode || 'path') === 'path' ? 'selected' : ''}>服务器上的证书路径</option>
           <option value="content" ${n.certMode === 'content' ? 'selected' : ''}>粘贴证书内容</option>
-          <option value="self" ${n.certMode === 'self' ? 'selected' : ''}>自动生成自签证书</option>
-          <option value="acme" ${n.certMode === 'acme' ? 'selected' : ''}>ACME 自动申请（Let's Encrypt）</option>
+          <option value="acme" ${n.certMode === 'acme' ? 'selected' : ''}>节点机 ACME（旧：需 80 端口）</option>
         </select>
+      </div>
+
+      <div id="cert-ref-box" class="hidden">
+        <div class="field">
+          <label>选择证书</label>
+          <select id="n-certref">
+            ${(() => {
+              const list = state.data.certList || [];
+              if (!list.length) return '<option value="">（还没有已签发的证书）</option>';
+              return list
+                .map(
+                  (c) =>
+                    `<option value="${esc(c.id)}" ${n.certId === c.id ? 'selected' : ''}>${esc(
+                      c.domains.join(', '),
+                    )}${c.wildcard ? ' · 通配符' : ''}${c.daysLeft !== null ? ` · 剩 ${c.daysLeft} 天` : ''}</option>`,
+                )
+                .join('');
+            })()}
+          </select>
+          <div class="hint">
+            由面板统一签发并分发给本机，节点机上不用装 acme.sh。
+            没有合适的就到「证书」页新建一张 —— 通配符证书可以被多个节点共用。
+          </div>
+        </div>
       </div>
 
       <div id="cert-path-box">
@@ -639,7 +671,9 @@ function nodeForm(node, servers) {
           <input type="text" id="n-selfcn" value="${esc(n.selfCN || '')}" placeholder="留空则取上面的 SNI">
         </div>
         <div class="alert alert-warn" id="acme-warn" style="display:none">
-          <b>使用 ACME 前需确认（缺一不可）：</b>
+          <b>这是旧路径，建议改用「使用『证书』页里的证书」：</b>
+          <br>面板机签发后自动分发到本机，节点机不用装 acme.sh，也不需要 80 端口。
+          <br><br><b>继续用节点机 ACME 的话，以下缺一不可：</b>
           <br>1. 该域名已解析到本节点服务器的 IP（A 记录，Let's Encrypt 会来验证）；
           <br>2. 节点服务器 80 端口可对外访问且未被占用（申请时 agent 要临时监听它）；
           <br>3. 节点服务器能访问外网（get.acme.sh 与 Let's Encrypt API）。
@@ -773,6 +807,7 @@ function bindNodeForm(mask) {
     const cm = cmSel.value;
     $('#cert-path-box', mask).classList.toggle('hidden', cm !== 'path');
     $('#cert-content-box', mask).classList.toggle('hidden', cm !== 'content');
+    $('#cert-ref-box', mask).classList.toggle('hidden', cm !== 'ref');
     const needDomain = cm === 'self' || cm === 'acme';
     $('#cert-domain-box', mask).classList.toggle('hidden', !needDomain);
     // ACME 前提是硬条件：不满足 = 证书签不下来 = 节点起不来，用警示块显式列出
@@ -1101,6 +1136,7 @@ function readNodeForm(mask) {
     entries: draft.filter((e) => e.host),
     planIds: [...(state.planDraft || [])],
     certMode,
+    certId: v('#n-certref'),
     certFile: v('#n-cert'),
     keyFile: v('#n-key'),
     certPem: v('#n-certpem'),

@@ -182,14 +182,40 @@ Alpine 这类没有 systemd 的系统也能跑。流量通过每实例的 `traff
 部署脚本检测到 Hysteria2 节点时会按 CPU 架构下载官方静态二进制。
 混淆密码在节点表单里点「生成」即可随机产生，也可手填。
 
-### TLS 证书的四种来源
+### TLS 证书的几种来源
 
 | 模式 | 说明 |
 | --- | --- |
+| 使用「证书」页里的证书 | **推荐**。面板机统一签发（DNS-01），自动分发给引用它的节点，多节点/多机器共用一张 |
 | 服务器路径 | 填服务器上已有的证书/私钥路径（原有行为） |
 | 粘贴证书内容 | 面板里贴 PEM，agent 落盘到 `/etc/nodepanel/certs/<节点ID>/`，权限 0600 |
 | 自动生成自签 | agent 用 openssl 生成 10 年自签证书，CN 取 SNI |
-| ACME 自动申请 | agent 安装 acme.sh 向 Let's Encrypt 申请，之后由 acme.sh 定时任务自动续期 |
+| 节点机 ACME | 存量：agent 在节点上装 acme.sh 走 http-01 申请（需要 80 端口，不再新增） |
+
+#### 证书页：面板签发 + 多机分发
+
+「证书」菜单管的是**有生命周期、会被多台机器共用**的证书：
+
+- **面板机签发**：DNS-01 校验，节点机上不用装 acme.sh，DNS 凭据也不离开面板。
+- **通配符**：填 `*.example.com` 会自动补上裸域 `example.com`（通配符不覆盖裸域）。
+  通配符只能走 DNS 校验，这是 Let's Encrypt 的硬规定。
+- **多机共用**：节点只存 `certId`，同一台机器上的多个节点共用一份文件
+  （`/etc/nodepanel/certs/<证书ID>/`），不会各存一份副本。
+- **自动续期**：剩余 30 天时面板自动续签，新证书随下一轮配置下发到所有目标机器并重载服务。
+- **支持四家 DNS 提供商**：Cloudflare / 阿里云 / 腾讯云 DNSPod / 华为云。
+
+支持的 DNS 提供商与凭据字段（`fields` 里的 key 就是 acme.sh 插件读的环境变量名）：
+
+| 提供商 | acme.sh 插件 | 凭据 |
+| --- | --- | --- |
+| Cloudflare | `dns_cf` | `CF_Token`（Zone.DNS 编辑权限） |
+| 阿里云 | `dns_ali` | `Ali_Key` / `Ali_Secret` |
+| 腾讯云 DNSPod | `dns_dp` | `DP_Id` / `DP_Key` |
+| 华为云 | `dns_huaweicloud` | `HUAWEICLOUD_Username` / `_Password` / `_DomainName` |
+
+acme.sh 装在面板的数据目录下（`$PANEL_DATA_DIR/acme`），容器升级不会丢。
+镜像需要 `openssl` 与 `curl`，官方镜像已经带上了。
+**Windows 上不能签发**（acme.sh 需要 sh），但已经签好的证书仍然可以正常分发。
 
 **自签证书节点依然能连通**——TLS 握手本身不校验证书链可信度，只要客户端接受它就能建连。
 代价是客户端必须接受这张不可信证书，面板的做法分两步：
@@ -202,7 +228,8 @@ Alpine 这类没有 systemd 的系统也能跑。流量通过每实例的 `traff
 - 指纹上报前的过渡期回退 `allowInsecure=1`（兼容 24.x 及更早核心）；
   Clash 订阅始终是 `skip-cert-verify: true`。
 
-生产环境建议用 ACME：需要域名已解析到该机、80 端口可用、机器能访问外网。
+生产环境建议用「证书」页签发：走 DNS 校验，不需要 80 端口，一张通配符证书就能覆盖所有节点。
+存量节点机 ACME（http-01）仍然可用，但要求域名解析到该机、80 端口可用、机器能访问外网。
 
 agent 可用 `CERTS_ROOT` 覆盖证书目录：面板下发的路径前缀与本机不一致时，
 agent 会自动重写配置里的引用，保证「文件写在哪」和「配置引用哪」永远一致。
@@ -780,6 +807,12 @@ DELETE /api/servers/:id                    删除服务器
 POST /api/servers/:id/rotate               重置服务器 token
 GET  /api/servers/:id/install?token=       服务器部署脚本
 GET  /api/servers/:id/uninstall?token=     服务器卸载脚本（加 --purge 深度清理）
+
+GET  /api/certs                            证书列表（私钥与凭据永不下发）
+POST /api/certs                            新建证书（DNS-01）
+PUT  /api/certs/:id                        修改证书（留空的凭据字段表示不改）
+DELETE /api/certs/:id                      删除证书（有节点引用时 409）
+POST /api/certs/:id/issue                  申请 / 强制续签（202 异步，前端轮询列表）
 
 POST /api/reality/keys                     生成 Reality 密钥对
 GET  /api/relay/script?to=&port=&proto=    生成中转（L4 转发）部署脚本
