@@ -130,6 +130,7 @@ function makeSandbox(port, agentVersion, opts = {}) {
       `NP_AGENT_VERSION='${agentVersion}'`,
       `NP_HY2_LIST='${opts.hy2List || ''}'`,
       "NP_SELF_CERTS=''",
+      "NP_SELF_CERT_IDS=''",
       `NP_ACME_CERTS='${opts.acmeCerts || ''}'`,
       '',
     ].join('\n'),
@@ -464,6 +465,56 @@ const runAgent = (box) =>
     (args.split('\n').find((l) => l.startsWith('ISSUE:')) || '(空)').slice(0, 120));
   ok('签发失败照常回执原因', /ACME 申请失败/.test(outD) && /ACME 证书申请失败/.test(rcD.error || ''),
     String(rcD.error || '').slice(0, 100));
+
+  /* ------------------ 10. 自签证书指纹回执（0.1.13） ------------------ */
+  // Xray-core v26.2.6 起 allowInsecure 被移除，自签节点改走 pcs（pinnedPeerCertSha256）。
+  // 指纹只有节点机知道：agent 算好随回执上报，面板的订阅才写得出 pcs=。
+  console.log('\n— 自签证书指纹回执 —');
+  let opensslOk = true;
+  try {
+    execSync('openssl version', { stdio: 'ignore' });
+  } catch {
+    opensslOk = false;
+  }
+  if (opensslOk) {
+    const box11 = makeSandbox(panel.port, PKG_VERSION);
+    const certDir = path.join(box11.dir, 'selfcerts');
+    fs.mkdirSync(certDir, { recursive: true });
+    const crt11 = pos(path.join(certDir, 'fullchain.pem'));
+    const key11 = pos(path.join(certDir, 'privkey.pem'));
+    execSync(
+      `openssl req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes -keyout "${key11}" -out "${crt11}" -subj /CN=self.example.com`,
+      { stdio: 'ignore' },
+    );
+    // 与 openssl 原始输出（大写带冒号）独立对账：agent 必须转成 64 位无冒号小写 hex
+    const fpRaw = String(execSync(`openssl x509 -in "${crt11}" -noout -fingerprint -sha256`));
+    const wantFp = fpRaw.replace(/^.*=/, '').replace(/:/g, '').trim().toLowerCase();
+
+    const st11 = path.join(box11.stateDir, 'state.env');
+    fs.writeFileSync(st11, read(st11).replace(/NP_SELF_CERTS=.*/, `NP_SELF_CERTS='self.example.com|${crt11}|${key11}'`));
+    fs.appendFileSync(st11, `NP_SELF_CERT_IDS='deadbeefcafe:${crt11}'\n`);
+
+    const n6 = panel.state.receipts.length;
+    const rE = await runAgent(box11);
+    const rcE = panel.state.receipts[n6] || {};
+    const gotFp = (rcE.selfCerts || {}).deadbeefcafe || '';
+    ok('回执带自签证书指纹',
+      rE.status === 0 && gotFp === wantFp,
+      `got=${gotFp.slice(0, 16)}… want=${wantFp.slice(0, 16)}…`);
+    ok('指纹是 64 位无冒号小写 hex（Xray pinnedPeerCertSha256 认的格式）',
+      /^[0-9a-f]{64}$/.test(gotFp), gotFp.slice(0, 32) + '…');
+    ok('没有自签节点的回执不带 selfCerts 字段',
+      !('selfCerts' in (panel.state.receipts[0] || {})));
+
+    // 指纹进了回执去重签名：证书没换 → 指纹没变 → 不重复发回执
+    const rcpt11 = panel.state.receipts.length;
+    const rE2 = await runAgent(box11);
+    ok('指纹没变时不重复发回执',
+      rE2.status === 0 && panel.state.receipts.length === rcpt11,
+      `多发了 ${panel.state.receipts.length - rcpt11} 条`);
+  } else {
+    console.log('  · 本机没有 openssl，跳过指纹用例');
+  }
 
   panel.server.close();
   try {

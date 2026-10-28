@@ -567,6 +567,7 @@ const ACT_LOADING = {
   'backup-restore': '恢复中',
   'user-bulk-act': '处理中',
   'node-bulk-del': '删除中',
+  'node-enabled': '处理中',
   'server-bulk-del': '删除中',
   'plan-bulk-del': '删除中',
   'node-sort-submit': '保存中',
@@ -729,6 +730,9 @@ async function runAction(act, btn, id) {
       break;
     case 'node-bulk-del':
       nodeBulkDelete();
+      break;
+    case 'node-enabled':
+      await nodeToggleEnabled(id);
       break;
     case 'node-bulk-clear':
       NODE_SELECTED.clear();

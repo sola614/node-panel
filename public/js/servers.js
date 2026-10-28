@@ -15,7 +15,7 @@ RENDERERS.servers = async () => {
   state.data.nodes = nd.items;
   SERVER_SELECTED = new Set();
 
-  $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="server-new">+ 新增服务器</button>`;
+  $('#page-actions').insertAdjacentHTML('beforeend', '<button class="btn btn-primary btn-sm" data-act="server-new">+ 新增服务器</button>');
 
   const cards = d.items.length
     ? d.items

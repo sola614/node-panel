@@ -15,14 +15,15 @@ RENDERERS.stats = async () => {
   state.data.statsDays = days;
   const d = await api('/api/stats?days=' + days);
 
-  $('#page-actions').innerHTML = `
-    <div style="display:flex;gap:2px;background:var(--tint-2);border-radius:8px;padding:2px">
+  $('#page-actions').insertAdjacentHTML(
+    'beforeend',
+    `<div style="display:flex;gap:2px;background:var(--tint-2);border-radius:8px;padding:2px">
       ${STATS_RANGES.map(
         (n) =>
           `<button class="btn btn-sm ${n === days ? 'btn-primary' : 'btn-ghost'}" data-act="stats-range" data-days="${n}" style="border:none">${n} 天</button>`,
       ).join('')}
-    </div>
-    <button class="btn btn-sm" data-act="refresh">刷新</button>`;
+    </div>`,
+  );
 
   const peak = Math.max(d.peak, 1);
   const bars = d.dates

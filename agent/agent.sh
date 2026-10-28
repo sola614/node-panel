@@ -37,7 +37,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.12'
+VERSION='0.1.13'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -279,6 +279,37 @@ EOF
     log "! 自签证书生成失败：$_cn"
   fi
   rm -f "$_cfg" 2>/dev/null
+}
+
+# 自签证书的 SHA-256 指纹（64 位无冒号小写 hex）。
+# Xray-core v25 起 allowInsecure 被整个移除（配置里出现即加载失败），新核心连自签
+# 节点的正解是 pinnedPeerCertSha256 —— 但指纹只有本机知道（证书就在这生成的），
+# 所以每轮算好放进回执，面板转手写进订阅的 pcs 参数。
+# 输出形如「sha256 Fingerprint=AA:BB:…」：取 = 之后、去冒号、转小写；
+# -fingerprint -sha256 在 openssl 1.0.2（CentOS 7）就已支持。
+self_cert_fp() {
+  openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null \
+    | sed -n 's/^.*=//p' | tr -d ': \r\n' | tr 'A-F' 'a-f'
+}
+
+# 每轮重算指纹清单（幂等）。证书十年才换一次，正常情况下这份文件永远不变，
+# send_receipt 的去重签名会把它带上：指纹一变（证书重签）回执立即重发。
+collect_selfcert_fps() {
+  rm -f "$RUN_DIR/selfcerts.list" 2>/dev/null
+  [ -n "${NP_SELF_CERT_IDS:-}" ] || return 0
+  for _item in $NP_SELF_CERT_IDS; do
+    _nid=${_item%%:*}
+    _crt=${_item#*:}
+    [ -n "$_nid" ] && [ -f "$_crt" ] || continue
+    _fp=$(self_cert_fp "$_crt")
+    _len=${#_fp}
+    case "$_fp" in '' | *[!0-9a-f]*) _len=0 ;; esac
+    if [ "$_len" -eq 64 ]; then
+      printf '%s %s\n' "$_nid" "$_fp" >> "$RUN_DIR/selfcerts.list" 2>/dev/null
+    else
+      log "! 自签证书指纹计算失败：$_crt（openssl 不可用或证书损坏）"
+    fi
+  done
 }
 
 # ACME：acme.sh 是纯 shell，正好符合「不装运行时」的诉求；失败不影响其它节点
@@ -909,6 +940,9 @@ apply_services() {
     _rest=${_item#*|}
     ensure_acme_cert "$_cn" "${_rest%%|*}" "${_rest#*|}"
   done
+  # 自签证书就位后立刻算指纹：首轮生成的证书当轮回执就能把指纹带给面板，
+  # 面板订阅从 allowInsecure 切到 pcs 不用等第二轮
+  collect_selfcert_fps
 
   if [ "$1" = 'changed' ]; then
     [ "${NP_CHANGED_XRAY:-0}" = '1' ] && reload_xray
@@ -1086,8 +1120,9 @@ receipt_escape() {
 }
 
 send_receipt() {
-  # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发
-  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')"
+  # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发。
+  # 指纹清单也进签名：证书重签 → 指纹变化 → 回执立即重发，面板订阅里的 pcs 才不会拿着旧指纹
+  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' < "$RUN_DIR/selfcerts.list" 2>/dev/null)"
   _last=''
   _ts=0
   if [ -f "$STATE_DIR/.receipt" ]; then
@@ -1103,11 +1138,16 @@ send_receipt() {
   _err=$(printf '%s' "$RC_ERR" | receipt_escape)
   _ok=false
   [ "$RC_OK" = '1' ] && _ok=true
+  # 自签证书指纹：nodeId → SHA-256（64 hex）。没有自签节点时整个字段不带
+  _extra=''
+  if [ -s "$RUN_DIR/selfcerts.list" ]; then
+    _extra="\"selfCerts\":{$(awk '{ printf "%s\"%s\":\"%s\"", sep, $1, $2; sep="," }' "$RUN_DIR/selfcerts.list" 2>/dev/null)},"
+  fi
   mkdir -p "$RUN_DIR" "$STATE_DIR" 2>/dev/null
   _f="$RUN_DIR/receipt.$$.json"
-  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","unbound":"%s","nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
+  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
     "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${BAD_PORTS:-}" \
-    "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
+    "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
 
   if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
     printf '%s\n%s\n' "$_now" "$_sig" > "$STATE_DIR/.receipt" 2>/dev/null

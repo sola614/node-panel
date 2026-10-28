@@ -3,6 +3,70 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.13] - 2026-10-27
+
+自签证书兼容性修复：Xray-core 自 v26.2.6 起客户端彻底无法使用 `allowInsecure`
+（配置里出现即加载失败，报 `The feature "allowInsecure" has been removed and
+migrated to "pinnedPeerCertSha256"`），VLESS/VMess/Trojan + TLS 的自签节点在新核心
+客户端上直接起不来。
+
+### 修复（自签证书 → pinnedPeerCertSha256）
+
+- **agent（0.1.13）每轮计算自签证书的 SHA-256 指纹**（64 位无冒号小写 hex，
+  `openssl x509 -fingerprint -sha256`，openssl 1.0.2 起可用），随回执上报：
+  回执新增 `selfCerts` 字段（nodeId → 指纹），并纳入回执去重签名——证书重签
+  后指纹一变，回执立即重发。
+- **面板下发 `NP_SELF_CERT_IDS`（nodeId:证书路径）**：旧变量 `NP_SELF_CERTS`
+  （CN|证书|私钥）不含 nodeId、格式不动，新老 agent 互不影响。
+- **面板记录指纹**（`nodes.certFingerprint` 新列，随回执写入）：校验 64 位 hex、
+  只认 `certMode=self` 的节点；编辑节点其它字段时原样保留。
+- **订阅链接改写**：有指纹时 VLESS/Trojan URI 与 VMess JSON 写 `pcs=`（v2rayN
+  映射为 Xray 的 `pinnedPeerCertSha256`，多个指纹可逗号分隔），**不再写
+  `allowInsecure`**；指纹尚未上报（agent 老版本 / 首轮未回执）时回退
+  `allowInsecure=1`，24.x 及更早老核心用户不受影响。Hysteria2（`insecure=1`）
+  与 Clash（`skip-cert-verify`）不变。
+- 指纹是 agent 现场算的，**部署 0.1.13 后首轮回执即可用**：agent 自更新 → 下一轮
+  拉新配置 → 证书就位算指纹 → 回执带上 → 订阅切换为 pcs，节点机器无需任何人工操作。
+
+### 修复（Hysteria2 偶发启动失败：masquerade 伪装地址）
+
+线上案例：hy2 实例 `failed to load server config`，报
+`masquerade.proxy.url: unsupported protocol scheme ""`，端口未监听。
+属于偶发——同一台机器重装后正常。
+
+- **根因**：节点的「伪装站点」填了不带 `http(s)://` 前缀的裸域名
+  （如 `news.ycombinator.com`）。Hysteria2 的 `masquerade.proxy.url` 要求完整
+  URL，`url.Parse` 对裸域名解析出空 scheme，实例加载配置即 FATAL。面板此前
+  对该值无任何校验，填错与否全凭运气，所以表现为偶发。
+- **修复（生成侧兜底 + 存储侧规范化）**：`lib/hysteria.js` 新增
+  `normalizeMaskUrl`——空白走 `masquerade: 404`，无协议前缀自动补 `https://`；
+  `server.js` 保存节点时同样规范化。存量填错的节点无需迁移：下一轮配置下发
+  自动修正，实例即恢复。
+- 表单提示补上「必须带 http(s):// 前缀，留空则伪装为 404」。
+
+### 新增（列表页统一「刷新」按钮；节点行内启停用）
+
+- 顶栏对所有列表页（概览 / 用户 / 套餐 / 节点 / 流量 / 服务器 / 日志）统一注入
+  「刷新」按钮，重拉最新数据——agent 每 60 秒才回执一次，此前只能切页面或
+  手动 F5 才能看到「已同步」状态。设置页除外（表单有未保存输入，整页重渲染
+  会抹掉）。
+- 概览 / 流量页原有的页内刷新按钮移除，统一收进顶栏；各自的功能按钮
+  （模拟流量 / 时间范围 / 新增入口）保持不变。
+- 节点列表每行新增「停用 / 启用」按钮：停用后 agent 下一轮配置移除该入站
+  （端口停止监听）、订阅即时移除；启用则反向恢复。PUT 只带 `enabled`，其余
+  字段由后端沿用当前值，不弹窗、一键生效。
+
+### 变更（协议收紧：暂只开放 vless / hysteria2）
+
+- 新建节点的协议选择器只保留 **vless** 与 **hysteria2**；vmess / trojan / ss
+  暂停开放（后端协议支持与 API 保持兼容，仅为 UI 收口）。
+- **存量 vmess / trojan / ss 节点不受影响**：编辑时其协议仍保留在下拉里
+  （否则 select 错位会在保存时把协议悄悄改掉），并标注「暂不开放新建」。
+
+### 文档
+
+- 节点编辑页「自动生成自签」提示与 README 的自签证书说明更新为 pcs 方案。
+
 ## [0.1.12] - 2026-10-27
 
 线上案例修复（续）：0.1.11 的自动安装仍失败 ——

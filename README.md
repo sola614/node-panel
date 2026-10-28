@@ -192,8 +192,14 @@ Alpine 这类没有 systemd 的系统也能跑。流量通过每实例的 `traff
 | ACME 自动申请 | agent 安装 acme.sh 向 Let's Encrypt 申请，之后由 acme.sh 定时任务自动续期 |
 
 **自签证书节点依然能连通**——TLS 握手本身不校验证书链可信度，只要客户端接受它就能建连。
-代价是客户端必须关闭证书校验，所以面板在自签时会自动给订阅带上
-`allowInsecure=1` / Clash 的 `skip-cert-verify: true`，开箱即用。
+代价是客户端必须接受这张不可信证书，面板的做法分两步：
+
+- agent 生成证书时算出 SHA-256 指纹并随回执上报，订阅链接写 `pcs=`（即 Xray 的
+  `pinnedPeerCertSha256`）——新版 Xray-core（v26.2.6 起，`allowInsecure` 已移除）与
+  新版 v2rayN 导入即用，还顺带完成了证书锁定（防中间人）。
+- 指纹上报前的过渡期回退 `allowInsecure=1`（兼容 24.x 及更早核心）；
+  Clash 订阅始终是 `skip-cert-verify: true`。
+
 生产环境建议用 ACME：需要域名已解析到该机、80 端口可用、机器能访问外网。
 
 agent 可用 `CERTS_ROOT` 覆盖证书目录：面板下发的路径前缀与本机不一致时，

@@ -27,11 +27,14 @@ RENDERERS.nodes = async () => {
     });
   }
 
-  $('#page-actions').innerHTML = NODE_SORTING
-    ? `<button class="btn btn-sm btn-ghost" data-act="node-sort-cancel">取消</button>
-       <button class="btn btn-primary btn-sm" data-act="node-sort-submit">提交排序</button>`
-    : `<button class="btn btn-sm btn-ghost" data-act="node-sort-start">排序</button>
-       <button class="btn btn-primary btn-sm" data-act="node-new">+ 新增节点</button>`;
+  $('#page-actions').insertAdjacentHTML(
+    'beforeend',
+    NODE_SORTING
+      ? `<button class="btn btn-sm btn-ghost" data-act="node-sort-cancel">取消</button>
+         <button class="btn btn-primary btn-sm" data-act="node-sort-submit">提交排序</button>`
+      : `<button class="btn btn-sm btn-ghost" data-act="node-sort-start">排序</button>
+         <button class="btn btn-primary btn-sm" data-act="node-new">+ 新增节点</button>`,
+  );
 
   const planChip = (pid) => {
     const p = (state.data.planList || []).find((x) => x.id === pid);
@@ -106,6 +109,9 @@ RENDERERS.nodes = async () => {
           <div class="row-actions">
             ${n.mode === 'standalone' ? `<button class="btn btn-sm btn-primary" data-act="node-deploy" data-id="${n.id}">部署</button>` : ''}
             ${n.mode === 'standalone' ? `<button class="btn btn-sm btn-ghost" data-act="node-uninstall" data-id="${n.id}">卸载</button>` : ''}
+            ${n.enabled
+              ? '<button class="btn btn-sm btn-ghost" data-act="node-enabled" data-id="' + n.id + '" title="停用后端口停止监听、订阅同步移除">停用</button>'
+              : '<button class="btn btn-sm btn-primary" data-act="node-enabled" data-id="' + n.id + '">启用</button>'}
             <button class="btn btn-sm btn-ghost" data-act="node-preview" data-id="${n.id}">配置</button>
             <button class="btn btn-sm btn-ghost" data-act="node-copy" data-id="${n.id}">复制</button>
             <button class="btn btn-sm btn-ghost" data-act="node-edit" data-id="${n.id}">编辑</button>
@@ -331,6 +337,21 @@ function nodeBulkDelete() {
 }
 
 /**
+ * 节点启停（列表行按钮）：PUT 只带 enabled，其余字段由后端沿用当前值。
+ * 停用 = agent 下一轮配置移除该入站（端口停止监听）+ 订阅立即消失，机器不用动。
+ */
+async function nodeToggleEnabled(id) {
+  const n = (state.data.nodes || []).find((x) => x.id === id);
+  if (!n) throw new Error('节点不存在，请刷新后重试');
+  await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify({ enabled: !n.enabled }) });
+  toast(
+    n.enabled ? '已停用：agent 下一轮同步时撤掉监听，订阅即时移除' : '已启用：agent 下一轮同步时恢复监听',
+    'ok',
+  );
+  render();
+}
+
+/**
  * 复制节点：配置带过来，身份重来 —— 新名字、新端口、新 Reality 密钥。
  * 密钥不复制是有意的：两台机器共用一对密钥，一旦泄露就是双双沦陷。
  */
@@ -382,6 +403,14 @@ function pickFreePort(nodes) {
 // 加密方式的默认值跟着协议走：VLESS 默认 Reality（免证书、抗主动探测），其余默认 TLS
 function defaultSecurityOf(protocol) {
   return protocol === 'vless' ? 'reality' : 'tls';
+}
+
+// 暂只开放这两个协议新建：vmess / trojan / ss 隐藏（后端仍兼容存量）。
+// 存量节点的协议必须保留在下拉里 —— 选项里没有当前值时 select 显示会错位，
+// 一次保存就会把协议悄悄改掉
+const CREATABLE_PROTOCOLS = ['vless', 'hysteria2'];
+function nodeFormProtocols(current) {
+  return CREATABLE_PROTOCOLS.includes(current) ? CREATABLE_PROTOCOLS : [...CREATABLE_PROTOCOLS, current];
 }
 
 function nodeForm(node, servers) {
@@ -443,7 +472,8 @@ function nodeForm(node, servers) {
     <div class="form-row">
       <div class="field">
         <label>协议</label>
-        <select id="n-protocol">${opt(['vless', 'vmess', 'trojan', 'ss', 'hysteria2'], n.protocol)}</select>
+        <select id="n-protocol">${opt(nodeFormProtocols(n.protocol), n.protocol)}</select>
+        ${!CREATABLE_PROTOCOLS.includes(n.protocol) ? '<div class="hint">该协议暂不开放新建，仅存量节点编辑保留</div>' : ''}
       </div>
       <div class="field">
         <label>监听端口</label>
@@ -644,7 +674,7 @@ function nodeForm(node, servers) {
       <div class="field">
         <label>伪装站点（可选）</label>
         <input type="text" id="h-mask" value="${esc(h.maskUrl || '')}" placeholder="https://news.ycombinator.com/">
-        <div class="hint">未通过认证的访问会跳转到这个网站</div>
+        <div class="hint">未通过认证的访问会跳转到这个网站。必须带 http(s):// 前缀，留空则伪装为 404</div>
       </div>
     </div>
 
@@ -743,7 +773,7 @@ function bindNodeForm(mask) {
     $('#cert-domain-hint', mask).textContent =
       cm === 'acme'
         ? 'agent 自动安装 acme.sh 并向 Let\'s Encrypt 申请证书，之后由 acme.sh 定时任务自动续期（失败重试有 30 分钟冷静期，防触发 CA 限速）。'
-        : 'agent 用 openssl 生成 10 年自签证书。自签证书无法通过客户端校验，订阅会自动带上 allowInsecure / skip-cert-verify，客户端需允许"不安全"。注意：Xray-core v25 起已移除 allowInsecure，新版 v2rayN 导入 Xray 系（VLESS/VMess/Trojan + TLS）自签节点会直接 Failed to start；这类节点建议改用 ACME 证书，Hysteria2 节点不受影响。';
+        : 'agent 用 openssl 生成 10 年自签证书，并把证书 SHA-256 指纹随回执报回面板：订阅链接自动带 pcs（pinnedPeerCertSha256），新版 Xray-core（v26.2.6 起，已移除 allowInsecure）与新版 v2rayN 可直接导入使用；指纹上报前的过渡期回退 allowInsecure=1（兼容 24.x 及更早核心），Clash 订阅始终用 skip-cert-verify。生产环境建议改用 ACME 证书。';
 
     modeHint();
   };
