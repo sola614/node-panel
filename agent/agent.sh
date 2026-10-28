@@ -37,7 +37,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.13'
+VERSION='0.1.14'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -386,6 +386,23 @@ acme_install() {
   return 1
 }
 
+# 把 acme.sh 目录里的证书导出到固定路径。
+#
+# --reloadcmd 不能省：acme.sh 续期只换磁盘上的文件，不重载服务的话
+# Xray 进程内存里还是旧证书 —— 面板一路绿灯，客户端第 90 天报证书过期。
+# detect_reload_cmd 定义在文件后面，但 shell 函数是调用时才解析的，这里能拿到。
+acme_install_cert() {
+  _cn=$1
+  _crt=$2
+  _key=$3
+  _reload=$(detect_reload_cmd)
+  if [ -n "$_reload" ]; then
+    "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" --reloadcmd "$_reload" >>"$LOG_DIR/agent.log" 2>&1
+  else
+    "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >>"$LOG_DIR/agent.log" 2>&1
+  fi
+}
+
 ensure_acme_cert() {
   _cn=$1
   _crt=$2
@@ -405,7 +422,7 @@ ensure_acme_cert() {
 
   mkdir -p "$(dirname "$_crt")" 2>/dev/null
   if [ -d "${ACME_SH%/acme.sh}/${_cn}_ecc" ]; then
-    if "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >>"$LOG_DIR/agent.log" 2>&1; then
+    if acme_install_cert "$_cn" "$_crt" "$_key"; then
       log "ACME 证书已安装：$_cn"
       return 0
     fi
@@ -433,7 +450,7 @@ ensure_acme_cert() {
   # LE 的限速规则公开清晰 —— 失败验证 5 次/小时，正好对上上面的 30 分钟冷静期。
   # --accountemail：账号自动注册时带上邮箱（账号已存在时 acme.sh 会忽略它）
   if "$ACME_SH" --issue -d "$_cn" --standalone --keylength ec-256 --server letsencrypt --accountemail "$_email" >>"$LOG_DIR/agent.log" 2>&1; then
-    if "$ACME_SH" --install-cert -d "$_cn" --fullchain-file "$_crt" --key-file "$_key" >>"$LOG_DIR/agent.log" 2>&1; then
+    if acme_install_cert "$_cn" "$_crt" "$_key"; then
       log "ACME 证书就绪：$_crt"
       rm -f "$_f" 2>/dev/null
       return 0

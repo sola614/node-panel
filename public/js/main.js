@@ -573,6 +573,7 @@ const ACT_LOADING = {
   'node-sort-submit': '保存中',
   'user-bulk': '创建中',
   'invite-manage': '加载中',
+  'cert-issue': '提交中',
 };
 
 document.addEventListener('click', async (e) => {
@@ -845,6 +846,35 @@ async function runAction(act, btn, id) {
         render();
       });
       break;
+    case 'cert-new':
+      await certNewFlow();
+      break;
+    case 'cert-edit':
+      await certEditFlow(id);
+      break;
+    case 'cert-detail':
+      certDetailFlow(id);
+      break;
+    case 'cert-issue':
+      certIssueFlow(id);
+      break;
+    case 'cert-force':
+      certIssueFlow(id, true);
+      break;
+    case 'cert-del': {
+      const c = (state.data.certs || []).find((x) => x.id === id);
+      if (!c) break;
+      confirmDialog(
+        '删除证书',
+        `确定删除 ${c.domains.join(', ')}？还有节点在用它时不能删 —— 先把那些节点换成别的证书。`,
+        async () => {
+          await api('/api/certs/' + id, { method: 'DELETE' });
+          toast('证书已删除', 'ok');
+          render();
+        },
+      );
+      break;
+    }
     case 'save-settings': {
       // 域名格式先在前端拦一道，填错了直接标红，不必等后端往返
       const base = checkSubBaseField(true);

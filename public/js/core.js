@@ -539,6 +539,7 @@ const VIEWS = {
   nodes: { title: '节点', sub: '协议、传输与部署方式' },
   stats: { title: '流量', sub: '按用户与节点看每日用量' },
   servers: { title: '服务器', sub: '部署 agent 并下发配置' },
+  certs: { title: '证书', sub: '面板签发、多机分发' },
   audit: { title: '日志', sub: '谁在什么时候改了什么' },
   settings: { title: '设置', sub: '站点信息与安全' },
 };

@@ -351,8 +351,10 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
 
   ok('设置页有「消息通知」卡片', /消息通知/.test(d8.querySelector('#view').textContent));
   ok('通知总开关存在', !!d8.querySelector('#nt-enabled'));
-  ok('六个事件都能勾选', d8.querySelectorAll('.nt-ev').length === 6,
+  ok('八个事件都能勾选', d8.querySelectorAll('.nt-ev').length === 8,
     `实际 ${d8.querySelectorAll('.nt-ev').length} 个`);
+  ok('证书告警事件在列表里',
+    !!d8.querySelector('.nt-ev[value="cert.expiring"]') && !!d8.querySelector('.nt-ev[value="cert.failed"]'));
   ok('默认关注五个事件', d8.querySelectorAll('.nt-ev:checked').length === 5,
     `实际 ${d8.querySelectorAll('.nt-ev:checked').length} 个`);
   ok('触发参数回填（到期前 3 天）', Number(d8.querySelector('#nt-lead').value) === 3,
@@ -603,6 +605,37 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('详情里给出强制拉取命令', syncModal.includes('agent.sh --once'));
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(120);
+
+  /* ---- 中转入口子行：列对齐 ---- */
+  // 子行比父行少了勾选框那一列，很容易写漏一个 <td>，整行就往左错一列 ——
+  // 表头 9 列、子行 8 个单元格时肉眼看只是"缩进怪怪的"，所以这里用列数硬卡住。
+  console.log('\n── 中转入口子行 ──');
+  const treeNode = await json('/api/nodes', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: TAG + '-树',
+      serverId: uiSrv.item.id,
+      protocol: 'vless',
+      port: 21199,
+      entries: [{ name: TAG + '-入口', host: '10.1.1.1', port: 21198 }],
+    }),
+  }, T);
+  click(d9.querySelector('#page-actions [data-act="refresh"]'), w9);
+  await waitFor(() => d9.querySelector(`[data-act="node-toggle"][data-id="${treeNode.item.id}"]`), '中转入口展开按钮');
+  click(d9.querySelector(`[data-act="node-toggle"][data-id="${treeNode.item.id}"]`), w9);
+  await sleep(150);
+
+  const thCount = d9.querySelectorAll('#view thead th').length;
+  const childRows = [...d9.querySelectorAll(`tr.tree-child[data-parent="${treeNode.item.id}"]`)];
+  ok('展开后有中转入口子行', childRows.length === 1, `${childRows.length} 行`);
+  ok('子行单元格数与表头一致', childRows.length === 1 && childRows[0].children.length === thCount,
+    `子行 ${childRows[0] ? childRows[0].children.length : 0} 列 / 表头 ${thCount} 列`);
+  // 语义检查：入口名必须落在「节点」列（第 2 个单元格），偏移一位就说明又写漏了
+  ok('入口名落在节点列', childRows.length === 1 &&
+    childRows[0].children[1] && childRows[0].children[1].textContent.includes(TAG + '-入口'),
+  childRows[0] && childRows[0].children[0] ? childRows[0].children[0].textContent.trim() : '');
+  ok('子行首列留空（勾选列）', childRows.length === 1 && childRows[0].children[0].textContent.trim() === '');
+  await json('/api/nodes/' + treeNode.item.id, { method: 'DELETE' }, T);
 
   /* ---- 顶栏刷新与节点行启停 ---- */
   console.log('\n── 顶栏刷新 · 节点启停 ──');
@@ -937,11 +970,11 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
 
   // 顶层 const 在经典脚本里共享同一个全局词法环境，但不会挂到 window 上，所以用 eval 读
   const keys = w7.eval('Object.keys(RENDERERS).sort().join(",")');
-  ok('九个脚本按序加载，八个渲染器都注册上了',
-    keys === 'audit,dashboard,nodes,plans,servers,settings,stats,users', `(${keys})`);
+  ok('十个脚本按序加载，九个渲染器都注册上了',
+    keys === 'audit,certs,dashboard,nodes,plans,servers,settings,stats,users', `(${keys})`);
   ok('跨文件的工具函数可见', w7.eval('typeof api === "function" && typeof fmtBytes === "function"'));
 
-  for (const view of ['users', 'plans', 'nodes', 'stats', 'servers', 'audit', 'settings', 'dashboard']) {
+  for (const view of ['users', 'plans', 'nodes', 'stats', 'servers', 'certs', 'audit', 'settings', 'dashboard']) {
     click(d7.querySelector(`.nav-item[data-view="${view}"]`), w7);
     await sleep(400);
     const text = d7.querySelector('#view').textContent || '';
