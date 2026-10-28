@@ -114,10 +114,12 @@ RENDERERS.users = async () => {
   state.data.users = d.items;
   state.data.planList = d.plans;
 
-  $('#page-actions').innerHTML = `
-    <button class="btn btn-sm btn-ghost" data-act="invite-manage">邀请链接</button>
-    <button class="btn btn-sm btn-ghost" data-act="user-bulk">批量建号</button>
-    <button class="btn btn-primary btn-sm" data-act="user-new">+ 新增用户</button>`;
+  $('#page-actions').insertAdjacentHTML(
+    'beforeend',
+    `<button class="btn btn-sm btn-ghost" data-act="invite-manage">邀请链接</button>
+     <button class="btn btn-sm btn-ghost" data-act="user-bulk">批量建号</button>
+     <button class="btn btn-primary btn-sm" data-act="user-new">+ 新增用户</button>`,
+  );
 
   const statusOpts = [
     ['all', '全部状态'],

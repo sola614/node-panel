@@ -14,7 +14,7 @@ RENDERERS.plans = async () => {
   state.data.plans = d.items;
   PLAN_SELECTED = new Set();
 
-  $('#page-actions').innerHTML = `<button class="btn btn-primary btn-sm" data-act="plan-new">+ 新增套餐</button>`;
+  $('#page-actions').insertAdjacentHTML('beforeend', '<button class="btn btn-primary btn-sm" data-act="plan-new">+ 新增套餐</button>');
 
   const cards = d.items.length
     ? d.items

@@ -1300,7 +1300,9 @@ function normalizeNode(body, prev = {}) {
       obfsPassword: String(h.obfsPassword || ''),
       upMbps: Number(h.upMbps) || 100,
       downMbps: Number(h.downMbps) || 1000,
-      maskUrl: String(h.maskUrl || ''),
+      // 裸域名补 https:// 前缀：hysteria 的 masquerade.proxy.url 要求完整地址，
+      // 空 scheme 会让实例 FATAL（见 lib/hysteria.js normalizeMaskUrl）
+      maskUrl: hysteria.normalizeMaskUrl(h.maskUrl),
     };
   } else if (prev.hy2) {
     node.hy2 = prev.hy2;
@@ -1322,6 +1324,9 @@ function normalizeNode(body, prev = {}) {
   node.certPem = String(body.certPem !== undefined ? body.certPem : prev.certPem || '');
   node.keyPem = String(body.keyPem !== undefined ? body.keyPem : prev.keyPem || '');
   node.selfCN = String(body.selfCN !== undefined ? body.selfCN : prev.selfCN || '');
+  // 自签证书 SHA-256 指纹：agent 现场生成证书后随回执上报，管理端不提供编辑入口，
+  // 编辑节点其它字段时原样保留（否则一次改名就把指纹抹掉，订阅回退 allowInsecure）
+  node.certFingerprint = String(prev.certFingerprint || '');
 
   // uTLS 指纹（客户端侧，空串表示不模拟）
   const fpRaw = body.fp !== undefined ? body.fp : prev.fp;
@@ -3029,6 +3034,24 @@ function agentReceipt(req, res, params, body, session, ctx) {
     agentVersion: trim(body.agentVersion || ctx.query.get('v'), 24),
   };
   if (item.sync.agentVersion) item.agentVersion = item.sync.agentVersion;
+
+  // 自签证书指纹（nodeId → 64 位 hex）：证书在节点机上现场生成，面板只有拿到
+  // 指纹才能在订阅里写 pcs=（Xray-core v25 起移除 allowInsecure 后的替代方案）。
+  // 只认 certMode=self 的节点；agent 把整个清单报上来，逐条挑有效的
+  const selfCerts = body.selfCerts;
+  let fpApplied = 0;
+  if (selfCerts && typeof selfCerts === 'object' && !Array.isArray(selfCerts)) {
+    for (const [nid, fp] of Object.entries(selfCerts)) {
+      if (!/^[0-9a-f]{64}$/.test(String(fp))) continue;
+      const n = db.nodes.find((x) => x.id === nid);
+      if (!n || n.certMode !== 'self' || n.certFingerprint === fp) continue;
+      n.certFingerprint = fp;
+      fpApplied++;
+    }
+    if (fpApplied) {
+      logAgent.info('自签证书指纹已记录', { rid: ctx.rid, scope: scope.name, count: fpApplied });
+    }
+  }
 
   // 每轮都回执会让日志变成心跳噪音，只在「结论变了」时记一条 info
   const changed = !prev

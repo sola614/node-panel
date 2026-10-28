@@ -604,6 +604,27 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(120);
 
+  /* ---- 顶栏刷新与节点行启停 ---- */
+  console.log('\n── 顶栏刷新 · 节点启停 ──');
+  ok('顶栏有统一刷新按钮', !!d9.querySelector('#page-actions [data-act="refresh"]'));
+  const togBtn = d9.querySelector('[data-act="node-enabled"]');
+  ok('节点行带启停按钮', !!togBtn && /^(停用|启用)$/.test(togBtn.textContent.trim()),
+    togBtn && togBtn.textContent.trim());
+  const togId = togBtn.dataset.id;
+  const beforeOn = (await json('/api/nodes', {}, T)).items.find((n) => n.id === togId).enabled;
+  click(togBtn, w9);
+  await waitFor(() => {
+    const b = d9.querySelector(`[data-act="node-enabled"][data-id="${togId}"]`);
+    return b && b.textContent.trim() !== togBtn.textContent.trim();
+  }, '启停按钮翻转');
+  const afterOn = (await json('/api/nodes', {}, T)).items.find((n) => n.id === togId).enabled;
+  ok('点击后启停状态翻转', afterOn === !beforeOn, `${beforeOn} → ${afterOn}`);
+  // 恢复原状，别影响后面的测试
+  click(d9.querySelector(`[data-act="node-enabled"][data-id="${togId}"]`), w9);
+  await sleep(250);
+  const restoredOn = (await json('/api/nodes', {}, T)).items.find((n) => n.id === togId).enabled;
+  ok('再点一次恢复原状', restoredOn === beforeOn, String(restoredOn));
+
   /* ---- 新增节点默认值 ---- */
   console.log('\n── 新增节点默认值 ──');
   const nodesBefore = await json('/api/nodes', {}, T);
@@ -630,17 +651,22 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   const protoSel = d9.querySelector('#n-protocol');
   const secSel = d9.querySelector('#n-security');
   const change = (el) => el.dispatchEvent(new w9.Event('change', { bubbles: true }));
-  protoSel.value = 'trojan';
+  // 0.1.13 起新建只开放 vless / hysteria2，vmess / trojan / ss 收进存量
+  const protoValues = [...protoSel.options].map((o) => o.value);
+  ok('新建节点只开放 vless / hysteria2', protoValues.join(',') === 'vless,hysteria2', protoValues.join(','));
+  protoSel.value = 'hysteria2';
   change(protoSel);
-  ok('切到 trojan 时加密方式跟到 TLS', secSel.value === 'tls', secSel.value);
+  ok('切到 hysteria2 时加密方式跟到 TLS', secSel.value === 'tls', secSel.value);
   protoSel.value = 'vless';
   change(protoSel);
   ok('切回 vless 时回到 Reality', secSel.value === 'reality', secSel.value);
   secSel.value = 'none';
   change(secSel);
-  protoSel.value = 'trojan';
+  protoSel.value = 'hysteria2';
   change(protoSel);
   ok('手动选过加密方式后不再被协议切换覆盖', secSel.value === 'none', secSel.value);
+  protoSel.value = 'vless';
+  change(protoSel);
 
   // 默认 Reality 必须自带密钥对：空私钥会让 xray 起不来、订阅里 pbk 也是空的
   await waitFor(() => /^[\w-]{43}$/.test(d9.querySelector('#r-priv').textContent.trim()), 'Reality 密钥对');

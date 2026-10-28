@@ -588,7 +588,10 @@ async function render() {
   $$('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
   $('#page-title').textContent = cfg.title;
   $('#page-sub').textContent = cfg.sub;
-  $('#page-actions').innerHTML = '';
+  // 列表页统一带「刷新」：agent 每 60s 才回执一次，不重拉就永远看不到「已同步」。
+  // settings 除外——表单里有未保存的输入，整页重渲染会把它们抹掉
+  $('#page-actions').innerHTML =
+    view === 'settings' ? '' : '<button class="btn btn-sm" data-act="refresh">刷新</button>';
   $('#view').innerHTML = '<div class="empty"><i class="spinner" style="margin-right:7px"></i>加载中…</div>';
   try {
     await RENDERERS[view]();

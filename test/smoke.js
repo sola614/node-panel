@@ -679,7 +679,55 @@ const json = (obj) => JSON.stringify(obj);
     (cfgCert.data.certs || []).some((c) => c.nodeId === nodeCertId && c.certPem.includes('SMOKE-CERT') && c.keyPem.includes('SMOKE-KEY')));
 
   const selfLink = (subCert.data.links || []).find((l) => l.name.includes('SMOKE-SELF'));
-  ok('自签证书链接带 allowInsecure', !!selfLink && selfLink.uri.includes('allowInsecure=1'));
+  ok('指纹未上报时自签链接回退 allowInsecure', !!selfLink && selfLink.uri.includes('allowInsecure=1'));
+
+  // 模拟 agent 回执上报自签证书指纹（Xray-core v26.2.6 起 allowInsecure 被移除，改走 pcs）
+  const selfFp = 'ab'.repeat(32);
+  const rcSelf = await call(`/api/agent/receipt?token=${nodeSelf.data.item.token}`, {
+    method: 'POST',
+    body: json({ hash: 'selffp', ok: true, xray: 'ok', selfCerts: { [nodeSelfId]: selfFp } }),
+  });
+  ok('回执可携带自签证书指纹', rcSelf.status === 200);
+  ok('面板记录指纹', (await call('/api/nodes')).data.items.find((n) => n.id === nodeSelfId).certFingerprint === selfFp);
+
+  const subSelfPcs = await call(`/api/sub/${u2.token}`);
+  const selfPcsLink = (subSelfPcs.data.links || []).find((l) => l.name.includes('SMOKE-SELF'));
+  ok('有指纹的自签链接写 pcs 且不再带 allowInsecure',
+    !!selfPcsLink && selfPcsLink.uri.includes('pcs=' + selfFp) && !selfPcsLink.uri.includes('allowInsecure'));
+
+  // 编辑节点其它字段不能把指纹抹掉（否则订阅又回退 allowInsecure）
+  await call('/api/nodes/' + nodeSelfId, { method: 'PUT', body: json({ name: 'SMOKE-SELF-2' }) });
+  ok('编辑节点保留指纹',
+    (await call('/api/nodes')).data.items.find((n) => n.id === nodeSelfId).certFingerprint === selfFp);
+
+  // 非法指纹（非法字符）一律拒收，不能覆盖已记录的合法指纹
+  await call(`/api/agent/receipt?token=${nodeSelf.data.item.token}`, {
+    method: 'POST',
+    body: json({ hash: 'selffp', ok: true, selfCerts: { [nodeSelfId]: 'zz'.repeat(32), 'no-such-node': 'ab'.repeat(32) } }),
+  });
+  ok('非法指纹被忽略、合法指纹不受影响',
+    (await call('/api/nodes')).data.items.find((n) => n.id === nodeSelfId).certFingerprint === selfFp);
+
+  // vmess 自签节点：pcs 写进 vmess JSON（新版 v2rayN 解析 pcs 字段）
+  const nodeVm = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-VM-SELF', mode: 'standalone', address: 'vmself.example.com',
+      protocol: 'vmess', port: 443, network: 'tcp', security: 'tls',
+      sni: 'vmself.example.com', certMode: 'self', enabled: true,
+    }),
+  });
+  const nodeVmId = nodeVm.data.item.id;
+  cleanup.push(['/api/nodes/' + nodeVmId]);
+  const vmFp = 'cd'.repeat(32);
+  await call(`/api/agent/receipt?token=${nodeVm.data.item.token}`, {
+    method: 'POST',
+    body: json({ hash: 'vmfp', ok: true, selfCerts: { [nodeVmId]: vmFp } }),
+  });
+  const subVm = await call(`/api/sub/${u2.token}`);
+  const vmLink = (subVm.data.links || []).find((l) => l.name.includes('SMOKE-VM-SELF'));
+  const vmObj = vmLink ? JSON.parse(Buffer.from(vmLink.uri.replace('vmess://', ''), 'base64').toString('utf8')) : {};
+  ok('vmess 自签链接的 JSON 带 pcs', vmObj.pcs === vmFp, JSON.stringify(vmObj.pcs || ''));
 
   // VLESS Encryption
   const nodeVe = await call('/api/nodes', {
@@ -703,6 +751,8 @@ const json = (obj) => JSON.stringify(obj);
   const subVe = await call(`/api/sub/${u2.token}`);
   const veLink = (subVe.data.links || []).find((l) => l.name.includes('SMOKE-VE'));
   ok('VLESS Encryption 写入订阅链接', !!veLink && veLink.uri.includes('encryption=mlkem768x25519plus'));
+  ok('该节点未上报指纹 → 仍回退 allowInsecure（老核心兼容）',
+    !!veLink && veLink.uri.includes('allowInsecure=1') && !veLink.uri.includes('pcs='));
 
   const clashVe = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
   ok('Clash 订阅包含 encryption 与 client-fingerprint',
@@ -764,6 +814,21 @@ const json = (obj) => JSON.stringify(obj);
   ok('节点隐藏不影响 agent 配置', !!inboundHidden && inboundHidden.settings.clients.length > 0);
 
   await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ hidden: false }) });
+
+  // 节点启停（列表行「停用/启用」按钮）：PUT 只带 enabled，其余字段必须沿用
+  const nodeOff = await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ enabled: false }) });
+  ok('一键停用节点', nodeOff.status === 200 && nodeOff.data.item.enabled === false);
+  ok('部分更新不丢字段', nodeOff.data.item.name === 'SMOKE-TLS' && Number(nodeOff.data.item.port) === 20443,
+    `${nodeOff.data.item.name}/${nodeOff.data.item.port}`);
+  const subOff = await call(`/api/sub/${u2.token}`);
+  ok('停用后订阅移除该节点', !(subOff.data.links || []).some((l) => l.name.includes('SMOKE-TLS')));
+  const cfgOff = await call(`/api/agent/config?token=${serverToken}&v=test`);
+  ok('停用后 agent 配置撤掉入站（端口停止监听）',
+    !cfgOff.data.xray.inbounds.some((i) => i.tag === 'node-' + node1Id));
+  const nodeOn = await call('/api/nodes/' + node1Id, { method: 'PUT', body: json({ enabled: true }) });
+  const subOn = await call(`/api/sub/${u2.token}`);
+  ok('重新启用后订阅恢复',
+    nodeOn.status === 200 && (subOn.data.links || []).some((l) => l.name.includes('SMOKE-TLS')));
 
   const clashRelay = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
   ok('Clash 订阅包含中转入口节点', clashRelay.includes('relay-a.example.com'));

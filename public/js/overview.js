@@ -13,9 +13,7 @@ RENDERERS.dashboard = async () => {
   const { counts, traffic } = d;
   const maxDay = Math.max(...traffic.days.map((x) => x.bytes), 1);
 
-  $('#page-actions').innerHTML = `
-    <button class="btn btn-sm" data-act="demo">模拟流量</button>
-    <button class="btn btn-sm btn-primary" data-act="refresh">刷新</button>`;
+  $('#page-actions').insertAdjacentHTML('beforeend', '<button class="btn btn-sm" data-act="demo">模拟流量</button>');
 
   const bars = traffic.days
     .map((day) => {
