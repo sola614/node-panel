@@ -15,7 +15,9 @@ migrated to "pinnedPeerCertSha256"`），VLESS/VMess/Trojan + TLS 的自签节�
 - **agent（0.1.13）每轮计算自签证书的 SHA-256 指纹**（64 位无冒号小写 hex，
   `openssl x509 -fingerprint -sha256`，openssl 1.0.2 起可用），随回执上报：
   回执新增 `selfCerts` 字段（nodeId → 指纹），并纳入回执去重签名——证书重签
-  后指纹一变，回执立即重发。
+  后指纹一变，回执立即重发。**指纹清单变化时记一条 agent 日志**
+  （`自签证书指纹：<nodeId>=<64 hex>`，首轮与证书重签后各一条，全量 hex
+  方便与面板节点指纹、订阅 pcs / pinSHA256 直接比对；平时静默不刷屏）。
 - **面板下发 `NP_SELF_CERT_IDS`（nodeId:证书路径）**：旧变量 `NP_SELF_CERTS`
   （CN|证书|私钥）不含 nodeId、格式不动，新老 agent 互不影响。
 - **面板记录指纹**（`nodes.certFingerprint` 新列，随回执写入）：校验 64 位 hex、
@@ -23,10 +25,17 @@ migrated to "pinnedPeerCertSha256"`），VLESS/VMess/Trojan + TLS 的自签节�
 - **订阅链接改写**：有指纹时 VLESS/Trojan URI 与 VMess JSON 写 `pcs=`（v2rayN
   映射为 Xray 的 `pinnedPeerCertSha256`，多个指纹可逗号分隔），**不再写
   `allowInsecure`**；指纹尚未上报（agent 老版本 / 首轮未回执）时回退
-  `allowInsecure=1`，24.x 及更早老核心用户不受影响。Hysteria2（`insecure=1`）
-  与 Clash（`skip-cert-verify`）不变。
+  `allowInsecure=1`，24.x 及更早老核心用户不受影响。Clash（`skip-cert-verify`）不变。
+- **Hysteria2 自签链接写 `pinSHA256=`（有指纹时，`insecure=1` 保留）**：
+  新版 Xray-core 已原生支持 hy2 协议，v2rayN 会用 Xray 核心跑 hy2 节点，且
+  （2026-06~08 版的 v2rayN）把 URI 的 `insecure=1` 存成 `AllowInsecure`、生成
+  Xray 配置时写 `allowInsecure: true`——正好触发上面的移除报错（2026-10-28
+  线上案例：hy2 节点报 allowInsecure 错）。v2rayN 解析 `pinSHA256` 后写
+  `pinnedPeerCertSha256` 并强制 `allowInsecure=false`，报错消失且证书锁定生效；
+  `insecure=1` 必须保留，sing-box / hysteria2 官方客户端不认 `pinSHA256`，
+  只靠它跳过自签校验。
 - 指纹是 agent 现场算的，**部署 0.1.13 后首轮回执即可用**：agent 自更新 → 下一轮
-  拉新配置 → 证书就位算指纹 → 回执带上 → 订阅切换为 pcs，节点机器无需任何人工操作。
+  拉新配置 → 证书就位算指纹 → 回执带上 → 订阅切换为 pcs/pinSHA256，节点机器无需任何人工操作。
 
 ### 修复（Hysteria2 偶发启动失败：masquerade 伪装地址）
 
@@ -44,7 +53,7 @@ migrated to "pinnedPeerCertSha256"`），VLESS/VMess/Trojan + TLS 的自签节�
   自动修正，实例即恢复。
 - 表单提示补上「必须带 http(s):// 前缀，留空则伪装为 404」。
 
-### 新增（列表页统一「刷新」按钮；节点行内启停用）
+### 新增（列表页统一「刷新」按钮；节点行内启停用；待同步自动刷新）
 
 - 顶栏对所有列表页（概览 / 用户 / 套餐 / 节点 / 流量 / 服务器 / 日志）统一注入
   「刷新」按钮，重拉最新数据——agent 每 60 秒才回执一次，此前只能切页面或
@@ -52,6 +61,10 @@ migrated to "pinnedPeerCertSha256"`），VLESS/VMess/Trojan + TLS 的自签节�
   会抹掉）。
 - 概览 / 流量页原有的页内刷新按钮移除，统一收进顶栏；各自的功能按钮
   （模拟流量 / 时间范围 / 新增入口）保持不变。
+- **节点列表存在「待同步」节点（stale / pending）时自动轮询**：刷新按钮变成
+  「自动刷新 Ns」倒计时（默认 10 秒），归零自动重拉；agent 回执到达、状态翻
+  「已同步」后自动停止并恢复普通按钮。刷新后若仍是待同步则续下一轮；切换
+  页面 / 手动刷新会清掉旧计时器，不跨页面泄漏。
 - 节点列表每行新增「停用 / 启用」按钮：停用后 agent 下一轮配置移除该入站
   （端口停止监听）、订阅即时移除；启用则反向恢复。PUT 只带 `enabled`，其余
   字段由后端沿用当前值，不弹窗、一键生效。

@@ -196,7 +196,9 @@ Alpine 这类没有 systemd 的系统也能跑。流量通过每实例的 `traff
 
 - agent 生成证书时算出 SHA-256 指纹并随回执上报，订阅链接写 `pcs=`（即 Xray 的
   `pinnedPeerCertSha256`）——新版 Xray-core（v26.2.6 起，`allowInsecure` 已移除）与
-  新版 v2rayN 导入即用，还顺带完成了证书锁定（防中间人）。
+  新版 v2rayN 导入即用，还顺带完成了证书锁定（防中间人）。Hysteria2 同理：
+  链接写 `pinSHA256=`（v2rayN 同样映射为证书锁定），`insecure=1` 保留给
+  sing-box / hysteria2 官方客户端。
 - 指纹上报前的过渡期回退 `allowInsecure=1`（兼容 24.x 及更早核心）；
   Clash 订阅始终是 `skip-cert-verify: true`。
 

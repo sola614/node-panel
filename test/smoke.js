@@ -729,6 +729,29 @@ const json = (obj) => JSON.stringify(obj);
   const vmObj = vmLink ? JSON.parse(Buffer.from(vmLink.uri.replace('vmess://', ''), 'base64').toString('utf8')) : {};
   ok('vmess 自签链接的 JSON 带 pcs', vmObj.pcs === vmFp, JSON.stringify(vmObj.pcs || ''));
 
+  // hy2 自签节点：pinSHA256（v2rayN 认的 hy2 证书锁定参数 → Xray pinnedPeerCertSha256，
+  // 否则 v2rayN 中间版把 insecure=1 写成 Xray 的 allowInsecure:true 触发移除报错）
+  const nodeHy = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-HY-SELF', mode: 'standalone', address: 'hyself.example.com',
+      protocol: 'hysteria2', port: 443, security: 'tls',
+      sni: 'hyself.example.com', certMode: 'self', enabled: true,
+    }),
+  });
+  const nodeHyId = nodeHy.data.item.id;
+  cleanup.push(['/api/nodes/' + nodeHyId]);
+  const hyFp = 'ef'.repeat(32);
+  await call(`/api/agent/receipt?token=${nodeHy.data.item.token}`, {
+    method: 'POST',
+    body: json({ hash: 'hyfp', ok: true, selfCerts: { [nodeHyId]: hyFp } }),
+  });
+  const subHy = await call(`/api/sub/${u2.token}`);
+  const hyLink = (subHy.data.links || []).find((l) => l.name.includes('SMOKE-HY-SELF'));
+  ok('hy2 自签链接带 pinSHA256 且 insecure=1 保留（sing-box 兼容）',
+    !!hyLink && hyLink.uri.includes('pinSHA256=' + hyFp) && hyLink.uri.includes('insecure=1'),
+    (hyLink && hyLink.uri.split('?')[1] || '').slice(0, 80));
+
   // VLESS Encryption
   const nodeVe = await call('/api/nodes', {
     method: 'POST',

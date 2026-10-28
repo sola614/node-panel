@@ -498,20 +498,26 @@ const runAgent = (box) =>
     const rE = await runAgent(box11);
     const rcE = panel.state.receipts[n6] || {};
     const gotFp = (rcE.selfCerts || {}).deadbeefcafe || '';
+    const outE = rE.stdout + rE.stderr;
     ok('回执带自签证书指纹',
       rE.status === 0 && gotFp === wantFp,
       `got=${gotFp.slice(0, 16)}… want=${wantFp.slice(0, 16)}…`);
     ok('指纹是 64 位无冒号小写 hex（Xray pinnedPeerCertSha256 认的格式）',
       /^[0-9a-f]{64}$/.test(gotFp), gotFp.slice(0, 32) + '…');
+    ok('指纹写进 agent 日志（全量 hex，排查可与订阅 pcs / pinSHA256 比对）',
+      outE.includes(`自签证书指纹：deadbeefcafe=${wantFp}`),
+      outE.split('\n').find((l) => /自签证书指纹/.test(l)) || '(日志里没有)');
     ok('没有自签节点的回执不带 selfCerts 字段',
       !('selfCerts' in (panel.state.receipts[0] || {})));
 
-    // 指纹进了回执去重签名：证书没换 → 指纹没变 → 不重复发回执
+    // 指纹进了回执去重签名：证书没换 → 指纹没变 → 不重复发回执；日志同理不刷屏
     const rcpt11 = panel.state.receipts.length;
     const rE2 = await runAgent(box11);
     ok('指纹没变时不重复发回执',
       rE2.status === 0 && panel.state.receipts.length === rcpt11,
       `多发了 ${panel.state.receipts.length - rcpt11} 条`);
+    ok('指纹没变时不重复记日志（每 60s 一轮，不变化不打）',
+      !(rE2.stdout + rE2.stderr).includes('自签证书指纹'));
   } else {
     console.log('  · 本机没有 openssl，跳过指纹用例');
   }
