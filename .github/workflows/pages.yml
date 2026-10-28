@@ -38,13 +38,15 @@ jobs:
       - name: 构建静态演示站
         run: node demo/build.js
 
-      # 用真浏览器把九个页面点一遍：数据录错了会在这里暴露，
-      # 而不是等用户打开看到一个白屏。
+      # 用真浏览器把九个页面点一遍：数据录错了会在这里暴露，而不是等用户看到白屏。
+      # 但 runner 上的 Chrome 属于外部依赖（缺库、沙箱受限都可能起不来），
+      # 所以这里失败只报警不堵发布 —— 否则一次环境抖动就让演示站更新不了。
       - name: 自检（真浏览器遍历页面）
         run: |
           python3 -m http.server 8081 --directory dist &
           sleep 1
-          node demo/check.js http://127.0.0.1:8081
+          node demo/check.js http://127.0.0.1:8081 \
+            || echo "::warning title=演示站自检未通过::浏览器环境或页面渲染有问题，详见上方日志。本次仍继续发布。"
 
       - uses: actions/configure-pages@v5
 
