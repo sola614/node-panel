@@ -120,7 +120,12 @@ async function evalJs(expr, cdp) {
   return r.result.value;
 }
 
-async function waitFor(expr, label, cdp, timeout = 12000) {
+/**
+ * 等页面进入某个状态。
+ * 超时给到 20s：本地静态服务毫秒级就绪，但对线上站点（GitHub Pages 冷启动 + CDN）
+ * 12s 会偶发不够 —— 第一次跑线上验收就撞上过 nodes 页超时，第二次却全绿。
+ */
+async function waitFor(expr, label, cdp, timeout = 20000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeout) {
     try {
@@ -268,6 +273,11 @@ async function shot(name, cdp) {
   } catch (err) {
     fail++;
     console.log('  ✗ ' + err.message);
+    // 超时只说明「没等到」，得把现场留下：控制台报错和失败请求才是原因
+    const view = await evalJs(`return (document.getElementById('view') || {}).innerText || ''`, cdp).catch(() => '');
+    if (view) console.log('  当前视图：' + view.replace(/\s+/g, ' ').slice(0, 160));
+    if (errors.length) console.log('  控制台：\n' + errors.slice(0, 8).map((e) => '    ' + e).join('\n'));
+    if (bad.length) console.log('  失败请求：\n' + bad.slice(0, 8).map((b) => '    ' + b).join('\n'));
     await shot('99-error', cdp).catch(() => {});
   } finally {
     proc.kill();
