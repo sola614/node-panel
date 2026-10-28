@@ -1,0 +1,252 @@
+{
+  "01b1d3e82064": {
+    "kind": "xray",
+    "inbound": {
+      "tag": "node-01b1d3e82064",
+      "listen": "0.0.0.0",
+      "port": 8080,
+      "protocol": "vmess",
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "settings": {
+        "clients": [
+          {
+            "id": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
+            "email": "u1a0d4963b7ec",
+            "alterId": 0,
+            "level": 0
+          },
+          {
+            "id": "556a830c-35cd-475e-be50-4ebbe894064d",
+            "email": "u4fa024164f38",
+            "alterId": 0,
+            "level": 0
+          },
+          {
+            "id": "ca8a938b-6507-4525-b879-e26a59014118",
+            "email": "u42037059dcfc",
+            "alterId": 0,
+            "level": 0
+          },
+          {
+            "id": "9edc5bfe-daab-4104-8775-18aa60fd387e",
+            "email": "ue1e5476dd027",
+            "alterId": 0,
+            "level": 0
+          }
+        ]
+      }
+    },
+    "users": 4
+  },
+  "7710bf6d00ac": {
+    "kind": "xray",
+    "inbound": {
+      "tag": "node-7710bf6d00ac",
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "trojan",
+      "streamSettings": {
+        "network": "grpc",
+        "security": "tls",
+        "grpcSettings": {
+          "serviceName": "grpcsvc",
+          "multiMode": false
+        },
+        "tlsSettings": {
+          "serverName": "hk1.example.com",
+          "certificates": [
+            {
+              "certificateFile": "/etc/nodepanel/certs/7710bf6d00ac/fullchain.pem",
+              "keyFile": "/etc/nodepanel/certs/7710bf6d00ac/privkey.pem"
+            }
+          ],
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "settings": {
+        "clients": [
+          {
+            "password": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
+            "email": "u1a0d4963b7ec"
+          },
+          {
+            "password": "556a830c-35cd-475e-be50-4ebbe894064d",
+            "email": "u4fa024164f38"
+          },
+          {
+            "password": "9edc5bfe-daab-4104-8775-18aa60fd387e",
+            "email": "ue1e5476dd027"
+          }
+        ]
+      }
+    },
+    "users": 3
+  },
+  "a38c7be8be21": {
+    "kind": "hysteria2",
+    "yaml": "# 星链 · 节点面板 · HK-HY2\n# 由 nodepanel-agent 自动生成，请勿手工修改\nlisten: :8443\ntls:\n  cert: /etc/ssl/hk2/fullchain.pem\n  key: /etc/ssl/hk2/privkey.pem\nobfs:\n  type: salamander\n  salamander:\n    password: 8433a281be005edf\nauth:\n  type: userpass\n  userpass:\n    u1a0d4963b7ec: 34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99\n    ue1e5476dd027: 9edc5bfe-daab-4104-8775-18aa60fd387e\nbandwidth:\n  up: \"100 mbps\"\n  down: \"1000 mbps\"\ntrafficStats:\n  listen: 127.0.0.1:29468\n  secret: 40ba40fe8f4be4b6\nmasquerade:\n  type: proxy\n  proxy:\n    url: https://news.ycombinator.com/\n    rewriteHost: true",
+    "users": 2
+  },
+  "b4ed11bfd706": {
+    "kind": "xray",
+    "inbound": {
+      "tag": "node-b4ed11bfd706",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.microsoft.com"
+          ],
+          "privateKey": "yItkTT9xeTjpZqNu5OEKINuFDeo5qFbUcwwLGCP0tHE",
+          "shortIds": [
+            "594c8260"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "settings": {
+        "clients": [
+          {
+            "id": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
+            "email": "u1a0d4963b7ec",
+            "flow": "xtls-rprx-vision"
+          },
+          {
+            "id": "9edc5bfe-daab-4104-8775-18aa60fd387e",
+            "email": "ue1e5476dd027",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      }
+    },
+    "users": 2
+  },
+  "bf63061349c2": {
+    "kind": "xray",
+    "inbound": {
+      "tag": "node-bf63061349c2",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "wsSettings": {
+          "path": "/ray",
+          "headers": {}
+        },
+        "tlsSettings": {
+          "serverName": "hk1.example.com",
+          "certificates": [
+            {
+              "certificateFile": "/etc/ssl/hk1/fullchain.pem",
+              "keyFile": "/etc/ssl/hk1/privkey.pem"
+            }
+          ],
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "settings": {
+        "clients": [
+          {
+            "id": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
+            "email": "u1a0d4963b7ec",
+            "flow": ""
+          },
+          {
+            "id": "556a830c-35cd-475e-be50-4ebbe894064d",
+            "email": "u4fa024164f38",
+            "flow": ""
+          },
+          {
+            "id": "ca8a938b-6507-4525-b879-e26a59014118",
+            "email": "u42037059dcfc",
+            "flow": ""
+          },
+          {
+            "id": "9edc5bfe-daab-4104-8775-18aa60fd387e",
+            "email": "ue1e5476dd027",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      }
+    },
+    "users": 4
+  },
+  "c55a6314c8fb": {
+    "kind": "xray",
+    "inbound": {
+      "tag": "node-c55a6314c8fb",
+      "listen": "0.0.0.0",
+      "port": 8388,
+      "protocol": "ss",
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "settings": {
+        "method": "aes-256-gcm",
+        "password": "54ec6ca3918f56f8",
+        "network": "tcp,udp"
+      }
+    },
+    "users": 3
+  }
+}

@@ -11,6 +11,10 @@ data/
 # 本地临时目录（测试实例、拆分脚本等）
 .tmp-*/
 .test/
+.demo-tmp/
+
+# 静态演示站的构建产物（node demo/build.js 生成，由 CI 重新构建）
+dist/
 
 # 编辑器
 .vscode/

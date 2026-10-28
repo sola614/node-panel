@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "file": "panel-manual-20261028-100812.db",
+      "size": 176128,
+      "mtime": "2026-10-28T10:08:12.969Z",
+      "kind": "manual"
+    }
+  ],
+  "dir": "D:\\project\\node-panel\\.demo-tmp\\backups",
+  "dbFile": "D:\\project\\node-panel\\.demo-tmp\\panel.db",
+  "dbSize": 4300280,
+  "totalSize": 176128
+}

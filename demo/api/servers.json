@@ -1,0 +1,68 @@
+{
+  "items": [
+    {
+      "id": "fd0c0a9070f7",
+      "name": "香港-01",
+      "host": "",
+      "token": "60c1693ce36bf7bd136b0792a952fd2ffe2d6805",
+      "note": "CN2 GIA · 1Gbps",
+      "createdAt": "2026-10-16T10:08:05.041Z",
+      "lastSeen": "2026-10-28T10:07:20.041Z",
+      "agentVersion": "2.1.0",
+      "ipMode": "auto",
+      "reportedIp": "203.0.113.10",
+      "address": "203.0.113.10",
+      "addressSource": "上报",
+      "online": true,
+      "sync": {
+        "state": "pending",
+        "label": "待同步",
+        "desired": "fc6d36c18436c135",
+        "at": null,
+        "hash": "",
+        "error": "",
+        "xray": "",
+        "hy": "",
+        "unbound": "",
+        "nodes": 0,
+        "users": 0,
+        "agentVersion": ""
+      },
+      "nodeCount": 2,
+      "userCount": 4,
+      "hasHysteria": false
+    },
+    {
+      "id": "2db775407813",
+      "name": "东京-01",
+      "host": "jp1.example.com",
+      "token": "27da96fa7b716ebfbafbae45fadabb06552ac0eb",
+      "note": "IIJ · 500Mbps",
+      "createdAt": "2026-10-22T10:08:05.041Z",
+      "lastSeen": null,
+      "agentVersion": null,
+      "ipMode": "manual",
+      "reportedIp": "",
+      "address": "jp1.example.com",
+      "addressSource": "手动",
+      "online": false,
+      "sync": {
+        "state": "unknown",
+        "label": "未回执",
+        "desired": "24aafa858f79f86d",
+        "at": null,
+        "hash": "",
+        "error": "",
+        "xray": "",
+        "hy": "",
+        "unbound": "",
+        "nodes": 0,
+        "users": 0,
+        "agentVersion": ""
+      },
+      "nodeCount": 2,
+      "userCount": 4,
+      "hasHysteria": false
+    }
+  ]
+}

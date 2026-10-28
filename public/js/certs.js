@@ -52,7 +52,8 @@ RENDERERS.certs = async () => {
   state.data.certAcme = d.acme;
 
   $('#page-actions').innerHTML =
-    '<button class="btn btn-primary btn-sm" data-act="cert-new">+ 新建证书</button>';
+    '<button class="btn btn-sm btn-ghost" data-act="cert-paste">粘贴证书</button>' +
+    '<button class="btn btn-primary btn-sm" data-act="cert-new">+ 申请证书</button>';
 
   const rows = d.items.length
     ? d.items
@@ -75,28 +76,38 @@ RENDERERS.certs = async () => {
             ? '<span class="badge badge-purple">通配符</span>'
             : '<span class="badge badge-dim">单域名</span>'
         }</td>
-        <td><span class="badge badge-dim">DNS · ${esc(c.providerLabel)}</span></td>
+        <td>${
+          c.source === 'upload'
+            ? '<span class="badge badge-dim">粘贴上传</span>'
+            : `<span class="badge badge-dim">DNS · ${esc(c.providerLabel)}</span>`
+        }</td>
         <td><span class="badge ${st.cls}">${st.label}</span></td>
         <td class="mono" style="white-space:nowrap">${certDaysText(c)}</td>
         <td>${machines}${c.nodeCount ? `<div class="cell-sub">${c.nodeCount} 个节点</div>` : ''}</td>
         <td>
           <div class="row-actions">
             ${
-              d.acme.ok && c.state !== 'issuing'
-                ? `<button class="btn btn-sm btn-primary" data-act="cert-issue" data-id="${c.id}">${
-                    c.hasKey ? '续签' : '申请'
-                  }</button>`
-                : ''
+              c.source === 'upload'
+                ? `<button class="btn btn-sm btn-primary" data-act="cert-paste" data-id="${c.id}">编辑</button>`
+                : d.acme.ok && c.state !== 'issuing'
+                  ? `<button class="btn btn-sm btn-primary" data-act="cert-issue" data-id="${c.id}">${
+                      c.hasKey ? '续签' : '申请'
+                    }</button>`
+                  : ''
             }
             <button class="btn btn-sm btn-ghost" data-act="cert-detail" data-id="${c.id}">详情</button>
-            <button class="btn btn-sm btn-ghost" data-act="cert-edit" data-id="${c.id}">编辑</button>
+            ${
+              c.source === 'upload'
+                ? ''
+                : `<button class="btn btn-sm btn-ghost" data-act="cert-edit" data-id="${c.id}">编辑</button>`
+            }
             <button class="btn btn-sm btn-danger" data-act="cert-del" data-id="${c.id}">删</button>
           </div>
         </td>
       </tr>`;
         })
         .join('')
-    : `<tr><td colspan="7" class="empty"><b>还没有证书</b>新建一张通配符证书，多个节点就能共用它</td></tr>`;
+    : `<tr><td colspan="7" class="empty"><b>还没有证书</b>申请一张通配符证书（自动续期），或者把手上已有的 PEM 粘贴进来</td></tr>`;
 
   $('#view').innerHTML = `
     ${
@@ -119,6 +130,8 @@ RENDERERS.certs = async () => {
       通配符证书必须走 DNS 校验，面板会同时把裸域写进证书（<span class="mono">*.example.com</span> 不覆盖
       <span class="mono">example.com</span>）。
       剩余 ${d.renewDays || 30} 天时自动续期，续期后新证书会随下一轮配置下发到所有目标机器。
+      手上已有的证书（别处签的、买的）也可以直接<b>粘贴</b>进来统一分发 ——
+      这类证书面板没有续期通道，只会到期前提醒你换一份。
     </p>`;
 
   if (d.items.some((c) => c.state === 'issuing')) scheduleCertPoll();
@@ -265,6 +278,75 @@ async function certEditFlow(id) {
   bindCertForm(mask);
 }
 
+/* -------------------------------- 粘贴上传 -------------------------------- */
+
+/**
+ * 把已有的 PEM 直接导进证书库。
+ *
+ * 为什么要支持这条：不少人的证书是在别处签的（宝塔、acme.sh 手工、买的商业证书），
+ * 迁到面板里时不想重新签一遍，也不想继续手工往每台机器拷。
+ * 代价是面板不知道它的来路，续期只能靠到期提醒 + 人工换新。
+ */
+function certPasteFormBody(c) {
+  return `
+    <div class="field">
+      <label>名称（选填）</label>
+      <input type="text" id="cp-name" value="${esc((c && c.name) || '')}" placeholder="留空则用证书里的第一个域名">
+    </div>
+    <div class="field">
+      <label>证书 PEM（含证书链）</label>
+      <textarea id="cp-cert" placeholder="-----BEGIN CERTIFICATE-----" style="min-height:120px"></textarea>
+      <div class="hint">把 fullchain / fullchain.pem 整段贴进来，域名与到期时间会自动解析。</div>
+    </div>
+    <div class="field">
+      <label>私钥 PEM</label>
+      <textarea id="cp-key" placeholder="-----BEGIN PRIVATE KEY-----" style="min-height:120px"></textarea>
+      <div class="hint">必须与上面的证书配对，面板会校验；不配对会直接拒绝，免得写进机器后服务起不来。</div>
+    </div>
+    <p class="hint">
+      ${
+        c
+          ? '替换后旧内容会被覆盖，新证书会随下一轮配置下发到所有引用它的机器。只贴证书、不贴私钥时沿用原来的私钥；两个 PEM 都留空则只改名称。'
+          : '粘贴的证书没有续期通道：面板不知道它从哪来，只能到期前提醒你换一份。想要自动续期，用「申请证书」走 DNS-01。'
+      }
+    </p>`;
+}
+
+async function certPasteFlow(id) {
+  const c = id ? (state.data.certs || []).find((x) => x.id === id) : null;
+  openModal({
+    title: c ? `编辑证书 · ${c.domains[0] || c.name}` : '粘贴证书',
+    wide: true,
+    body: certPasteFormBody(c),
+    okText: c ? '保存' : '导入',
+    onOk: async (m) => {
+      const certPem = $('#cp-cert', m).value;
+      const keyPem = $('#cp-key', m).value;
+      const name = $('#cp-name', m).value.trim();
+
+      // 只改名：后端 upload 分支本来就支持只传 name，前端别多拦一道
+      if (c && !certPem.trim() && !keyPem.trim()) {
+        if (!name) throw new Error('名称不能为空');
+        await api('/api/certs/' + id, { method: 'PUT', body: JSON.stringify({ name }) });
+        toast('名称已更新', 'ok');
+        closeModal();
+        await render();
+        return;
+      }
+      if (!certPem.trim()) throw new Error('请粘贴证书内容');
+      if (!keyPem.trim() && !c) throw new Error('请粘贴私钥内容');
+
+      const payload = { source: 'upload', name, certPem, keyPem };
+      const r = c
+        ? await api('/api/certs/' + id, { method: 'PUT', body: JSON.stringify(payload) })
+        : await api('/api/certs', { method: 'POST', body: JSON.stringify(payload) });
+      toast(c ? '证书已替换' : `已导入 ${r.item.domains.join(', ')}`, 'ok');
+      closeModal();
+      await render();
+    },
+  });
+}
+
 /* --------------------------------- 操作 --------------------------------- */
 
 /**
@@ -347,8 +429,16 @@ function certDetailFlow(id) {
         <div><div class="hint" style="margin:0 0 3px">状态</div>
           <span class="badge ${st.cls}">${st.label}</span></div>
         <div><div class="hint" style="margin:0 0 3px">剩余</div><b>${certDaysText(c)}</b></div>
-        <div><div class="hint" style="margin:0 0 3px">校验方式</div><b>DNS-01</b></div>
-        <div><div class="hint" style="margin:0 0 3px">提供商</div><b>${esc(c.providerLabel)}</b></div>
+        <div><div class="hint" style="margin:0 0 3px">${c.source === 'upload' ? '来源' : '校验方式'}</div>
+          <b>${c.source === 'upload' ? '粘贴上传' : 'DNS-01'}</b></div>
+        <div><div class="hint" style="margin:0 0 3px">${c.source === 'upload' ? '导入时间' : '提供商'}</div>
+          <b>${esc(
+            c.source === 'upload'
+              ? c.lastAttempt
+                ? fmtDate(c.lastAttempt)
+                : '—'
+              : c.providerLabel,
+          )}</b></div>
       </div>
 
       <div class="section-title" style="margin-top:16px">域名</div>
@@ -385,9 +475,11 @@ function certDetailFlow(id) {
 
       <div style="display:flex;gap:8px;margin-top:14px">
         ${
-          c.hasKey
-            ? `<button class="btn btn-sm btn-ghost" data-act="cert-force" data-id="${c.id}">强制续签</button>`
-            : ''
+          c.source === 'upload'
+            ? `<button class="btn btn-sm btn-ghost" data-act="cert-paste" data-id="${c.id}">重新粘贴</button>`
+            : c.hasKey
+              ? `<button class="btn btn-sm btn-ghost" data-act="cert-force" data-id="${c.id}">强制续签</button>`
+              : ''
         }
       </div>`,
   });

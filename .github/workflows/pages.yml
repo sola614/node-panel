@@ -1,0 +1,63 @@
+name: demo
+
+# 静态演示站：把 public/ + 录制的接口数据打成 dist/，发布到 GitHub Pages。
+# 只影响演示站，和 build.yml 的镜像构建互不干扰。
+#
+# 首次启用需要在仓库 Settings → Pages → Source 里选 "GitHub Actions"，
+# 之后这个 workflow 每次推 main 都会自动更新演示站。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'public/**'
+      - 'demo/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同时只跑一个发布，新的推上来就把旧的取消掉
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 构建静态演示站
+        run: node demo/build.js
+
+      # 用真浏览器把九个页面点一遍：数据录错了会在这里暴露，
+      # 而不是等用户打开看到一个白屏。
+      - name: 自检（真浏览器遍历页面）
+        run: |
+          python3 -m http.server 8081 --directory dist &
+          sleep 1
+          node demo/check.js http://127.0.0.1:8081
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
