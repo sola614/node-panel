@@ -1347,7 +1347,90 @@ const json = (obj) => JSON.stringify(obj);
   ok('降级后用户回到不限套餐', bdUserAfter && !bdUserAfter.planId, String(bdUserAfter && bdUserAfter.planId));
   await call('/api/users/' + bdUser.data.item.id, { method: 'DELETE' });
 
-  /* ---------- 14. 证书（只走 draft 状态，不触发真实签发） ---------- */
+  /* ---------- 14. 套餐等级（高等级可用低等级节点，反之不行） ---------- */
+  console.log('\n── 套餐等级 ──');
+  const lvSrv = await call('/api/servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-等级机', host: '9.9.9.6' }),
+  });
+  cleanup.push(['/api/servers/' + lvSrv.data.item.id]);
+
+  const lvLow = await call('/api/plans', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-低配', quotaGB: 10, days: 30, level: 1 }),
+  });
+  const lvHigh = await call('/api/plans', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-高配', quotaGB: 100, days: 30, level: 3 }),
+  });
+  cleanup.push(['/api/plans/' + lvLow.data.item.id]);
+  cleanup.push(['/api/plans/' + lvHigh.data.item.id]);
+  ok('套餐带等级', lvHigh.data.item.level === 3 && lvLow.data.item.level === 1,
+    `高=${lvHigh.data.item.level} 低=${lvLow.data.item.level}`);
+
+  const lvNodeLow = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-低配节点', serverId: lvSrv.data.item.id, protocol: 'vless',
+      port: 21310, network: 'tcp', security: 'none', planIds: [lvLow.data.item.id],
+    }),
+  });
+  const lvNodeHigh = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-高配节点', serverId: lvSrv.data.item.id, protocol: 'vless',
+      port: 21311, network: 'tcp', security: 'none', planIds: [lvHigh.data.item.id],
+    }),
+  });
+  cleanup.push(['/api/nodes/' + lvNodeLow.data.item.id]);
+  cleanup.push(['/api/nodes/' + lvNodeHigh.data.item.id]);
+
+  const lvUserLow = await call('/api/users', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-低配用户', planId: lvLow.data.item.id }),
+  });
+  const lvUserHigh = await call('/api/users', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-高配用户', planId: lvHigh.data.item.id }),
+  });
+  cleanup.push(['/api/users/' + lvUserLow.data.item.id]);
+  cleanup.push(['/api/users/' + lvUserHigh.data.item.id]);
+
+  const subLow = await call(`/api/sub/${lvUserLow.data.item.token}`);
+  const lowNames = (subLow.data.links || []).map((l) => l.name);
+  ok('低等级用户看不到高等级节点',
+    lowNames.some((n) => n.includes('低配节点')) && !lowNames.some((n) => n.includes('高配节点')),
+    lowNames.join(',') || '空');
+
+  const subHigh = await call(`/api/sub/${lvUserHigh.data.item.token}`);
+  const highNames = (subHigh.data.links || []).map((l) => l.name);
+  ok('高等级用户同时能看到低等级节点',
+    highNames.some((n) => n.includes('高配节点')) && highNames.some((n) => n.includes('低配节点')),
+    highNames.join(','));
+
+  const lvCfg = await call(`/api/agent/config?token=${lvSrv.data.item.token}`);
+  const inboundOf = (cfg, nodeId) => (cfg.data.xray.inbounds || []).find((i) => i.tag === 'node-' + nodeId);
+  const emailsOf = (inbound) => (inbound && inbound.settings.clients ? inbound.settings.clients.map((c) => c.email) : []);
+  ok('低等级节点注入了高等级用户',
+    emailsOf(inboundOf(lvCfg, lvNodeLow.data.item.id)).includes('u' + lvUserHigh.data.item.id));
+  ok('高等级节点不注入低等级用户',
+    !emailsOf(inboundOf(lvCfg, lvNodeHigh.data.item.id)).includes('u' + lvUserLow.data.item.id));
+
+  // 降级：高配用户切到低配套餐后，必须从原高等级节点上摘掉 ——
+  // 这是「已订阅的客户端还能不能继续用」的关键，只改订阅列表是不够的
+  const lvHashBefore = lvCfg.data.hash;
+  await call('/api/users/' + lvUserHigh.data.item.id, {
+    method: 'PUT',
+    body: json({ planId: lvLow.data.item.id }),
+  });
+  const lvCfg2 = await call(`/api/agent/config?token=${lvSrv.data.item.token}`);
+  ok('降级后从原高等级节点上摘除',
+    !emailsOf(inboundOf(lvCfg2, lvNodeHigh.data.item.id)).includes('u' + lvUserHigh.data.item.id),
+    emailsOf(inboundOf(lvCfg2, lvNodeHigh.data.item.id)).join(',') || '空');
+  ok('降级后配置 hash 变化（agent 下一轮就会重拉）', lvCfg2.data.hash !== lvHashBefore,
+    `${lvHashBefore} → ${lvCfg2.data.hash}`);
+
+  /* ---------- 15. 证书（只走 draft 状态，不触发真实签发） ---------- */
   // 这一段刻意不调 /api/certs/:id/issue：签发要真的装 acme.sh 并访问
   // Let's Encrypt，CI 里既不该跑也跑不通。CRUD 与校验路径已经能覆盖大部分回归。
   console.log('\n── 证书 ──');
@@ -1418,7 +1501,119 @@ const json = (obj) => JSON.stringify(obj);
   ok('未被引用的证书可以删除', certDel.status === 200);
   cleanup.pop(); // 已经删掉了，清理阶段不用再来一次
 
-  /* ---------- 15. 清理 ---------- */
+  // 粘贴上传：不依赖面板能否签发（Windows 也能跑），CI 里能完整验证
+  const hasPem = spawnSync('openssl', ['version'], { encoding: 'utf8' }).status === 0;
+  if (!hasPem) {
+    console.log('  · 跳过粘贴证书用例（本机没有 openssl）');
+  } else {
+    const pemDir = fs.mkdtempSync(path.join(os.tmpdir(), 'np-smoke-cert-'));
+    const pemCrt = path.join(pemDir, 'c.pem');
+    const pemKey = path.join(pemDir, 'k.pem');
+    spawnSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-days', '30', '-nodes',
+        '-keyout', pemKey, '-out', pemCrt, '-subj', '/CN=paste.smoke.example.com'],
+      { encoding: 'utf8' },
+    );
+    const certPem = fs.readFileSync(pemCrt, 'utf8');
+    const keyPem = fs.readFileSync(pemKey, 'utf8');
+
+    const up = await call('/api/certs', {
+      method: 'POST',
+      body: json({ source: 'upload', certPem, keyPem }),
+    });
+    ok('粘贴证书导入成功', up.status === 200 && up.data.item.source === 'upload', up.data.error || '');
+    ok('域名从证书里解析出来', json(up.data.item.domains) === json(['paste.smoke.example.com']),
+      json(up.data.item.domains));
+    ok('粘贴证书导入即已签发', up.data.item.state === 'issued', up.data.item.state);
+    ok('粘贴证书不开启自动续期', up.data.item.autoRenew === false);
+    cleanup.push(['/api/certs/' + up.data.item.id]);
+
+    const reissue = await call('/api/certs/' + up.data.item.id + '/issue', { method: 'POST', body: '{}' });
+    ok('粘贴证书不能签发/续签', reissue.status === 400, reissue.data.error);
+
+    const key2 = path.join(pemDir, 'k2.pem');
+    spawnSync('openssl', ['genrsa', '-out', key2, '2048'], { encoding: 'utf8' });
+    const badKey = await call('/api/certs/' + up.data.item.id, {
+      method: 'PUT',
+      body: json({ keyPem: fs.readFileSync(key2, 'utf8') }),
+    });
+    ok('私钥与证书不配对被拒', badKey.status === 400, badKey.data.error);
+
+    // SNI 必须落在证书域名里：填别的域名，客户端握手会直接报证书不匹配
+    const sniBad = await call('/api/nodes', {
+      method: 'POST',
+      body: json({
+        name: 'SMOKE-SNI不匹配', mode: 'standalone', address: '9.9.9.5',
+        protocol: 'vless', port: 21312, network: 'tcp', security: 'tls',
+        sni: 'other.example.com', certMode: 'ref', certId: up.data.item.id,
+      }),
+    });
+    ok('SNI 不在证书域名里被拒', sniBad.status === 400, sniBad.data.error);
+
+    const sniOk = await call('/api/nodes', {
+      method: 'POST',
+      body: json({
+        name: 'SMOKE-SNI匹配', mode: 'standalone', address: '9.9.9.5',
+        protocol: 'vless', port: 21313, network: 'tcp', security: 'tls',
+        sni: 'paste.smoke.example.com', certMode: 'ref', certId: up.data.item.id,
+      }),
+    });
+    ok('SNI 落在证书域名里可以保存', sniOk.status === 200, sniOk.data.error || '');
+    if (sniOk.status === 200) cleanup.push(['/api/nodes/' + sniOk.data.item.id]);
+
+    // 带口令的私钥：必须报「先解密」，报「不配对」会把排障方向带偏
+    const encPath = path.join(pemDir, 'k-enc.pem');
+    const encGen = spawnSync(
+      'openssl',
+      ['pkcs8', '-topk8', '-in', pemKey, '-out', encPath, '-passout', 'pass:test123'],
+      { encoding: 'utf8' },
+    );
+    if (encGen.status === 0) {
+      const encUp = await call('/api/certs', {
+        method: 'POST',
+        body: json({ source: 'upload', certPem, keyPem: fs.readFileSync(encPath, 'utf8') }),
+      });
+      ok('加密私钥被明确拒绝并给出解密命令',
+        encUp.status === 400 && /口令/.test(encUp.data.error || ''), encUp.data.error);
+    }
+
+    // IP 证书：SAN 是 IP Address 而不是 DNS，不能被报成「没有找到域名」
+    const ipCrt = path.join(pemDir, 'ip.pem');
+    const ipKey = path.join(pemDir, 'ipk.pem');
+    const ipGen = spawnSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-days', '30', '-nodes',
+        '-keyout', ipKey, '-out', ipCrt,
+        '-subj', '/CN=1.2.3.4', '-addext', 'subjectAltName=IP:1.2.3.4'],
+      { encoding: 'utf8' },
+    );
+    if (ipGen.status === 0) {
+      const ipUp = await call('/api/certs', {
+        method: 'POST',
+        body: json({ source: 'upload', certPem: fs.readFileSync(ipCrt, 'utf8'), keyPem: fs.readFileSync(ipKey, 'utf8') }),
+      });
+      ok('IP 证书可以导入', ipUp.status === 200 && json(ipUp.data.item.domains) === json(['1.2.3.4']),
+        ipUp.data.error || json(ipUp.data.item && ipUp.data.item.domains));
+      if (ipUp.status === 200) {
+        cleanup.push(['/api/certs/' + ipUp.data.item.id]);
+        const ipNode = await call('/api/nodes', {
+          method: 'POST',
+          body: json({
+            name: 'SMOKE-IP证书节点', mode: 'standalone', address: '9.9.9.4',
+            protocol: 'vless', port: 21314, network: 'tcp', security: 'tls',
+            sni: '1.2.3.4', certMode: 'ref', certId: ipUp.data.item.id,
+          }),
+        });
+        ok('IP 证书的 SNI 填 IP 可以保存', ipNode.status === 200, ipNode.data.error || '');
+        if (ipNode.status === 200) cleanup.push(['/api/nodes/' + ipNode.data.item.id]);
+      }
+    }
+
+    fs.rmSync(pemDir, { recursive: true, force: true });
+  }
+
+  /* ---------- 16. 清理 ---------- */
   for (const [path] of cleanup.reverse()) {
     await call(path, { method: 'DELETE' });
   }

@@ -173,16 +173,18 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   };
   await sleep(300);
 
-  const demo = d4.querySelector('[data-act="demo"]');
-  click(demo, w4);
-  const locked = demo.disabled && !!demo.querySelector('.spinner');
-  click(demo, w4);
-  click(demo, w4);
-  await sleep(400);
+  // 演示流量按钮已下线，改用顶栏「刷新」验证同一套按钮锁机制
+  seen.length = 0;
+  const refreshBtn = d4.querySelector('#page-actions [data-act="refresh"]');
+  click(refreshBtn, w4);
+  const locked = refreshBtn.disabled && !!refreshBtn.querySelector('.spinner');
+  click(refreshBtn, w4);
+  click(refreshBtn, w4);
+  await sleep(500);
   ok('请求期间按钮禁用并显示转圈', locked);
   ok('连点 3 次只发出 1 个请求',
-    seen.filter((r) => r.url.includes('/api/demo/traffic')).length === 1,
-    `实际 ${seen.filter((r) => r.url.includes('/api/demo/traffic')).length} 个`);
+    seen.filter((r) => r.url.includes('/api/overview')).length === 1,
+    `实际 ${seen.filter((r) => r.url.includes('/api/overview')).length} 个`);
 
   // 弹窗确认按钮同样要锁
   d4.querySelector('.nav-item[data-view="plans"]').dispatchEvent(new w4.MouseEvent('click', { bubbles: true }));
@@ -282,6 +284,16 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   };
 
   ok('新增套餐默认勾选自动续期', renewBox.checked && !renewBox.disabled);
+  // 等级：高等级套餐能用低等级套餐的节点，同级互不影响（默认 0）
+  const levelInput = d6.querySelector('#p-level');
+  ok('套餐弹窗有等级字段', !!levelInput && Number(levelInput.value) === 0,
+    levelInput ? levelInput.value : '缺失');
+  // 弹窗结构：头 / 体 / 尾三段，滚动只发生在 modal-body（头尾固定靠 flex 布局）
+  const modalEl = d6.querySelector('.modal');
+  ok('弹窗拆成 head / body / foot 三段',
+    !!modalEl.querySelector(':scope > .modal-head') &&
+      !!modalEl.querySelector(':scope > .modal-body') &&
+      !!modalEl.querySelector(':scope > .modal-foot'));
   const renewField = d6.querySelector('#p-autorenew-field');
   ok('默认显示「到期处理」', renewField.hidden === false);
   await setType('custom');
@@ -756,18 +768,12 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     d9.querySelector('#n-certmode').value);
   ok('自签模式给出说明', /自签/.test(d9.querySelector('#cert-domain-hint').textContent));
 
-  // ACME 的前提是硬条件（域名解析 / 80 端口 / 外网）：切过去必须把警示块亮出来
-  // （线上案例：管理员不知道前提，选完 ACME 节点永远「证书未就绪」起不来）
-  const cmSel = d9.querySelector('#n-certmode');
-  cmSel.value = 'acme';
-  change(cmSel);
-  ok('ACME 模式显示前提警示块', d9.querySelector('#acme-warn').style.display === '' &&
-    /80 端口/.test(d9.querySelector('#acme-warn').textContent) &&
-    /解析/.test(d9.querySelector('#acme-warn').textContent),
-    'display=' + d9.querySelector('#acme-warn').style.display);
-  cmSel.value = 'self';
-  change(cmSel);
-  ok('自签模式下警示块隐藏', d9.querySelector('#acme-warn').style.display === 'none');
+  // 「粘贴证书」与「节点机 ACME」已经收进「证书」页统一管理，新建节点不再提供
+  const certOpts = [...d9.querySelectorAll('#n-certmode option')].map((o) => o.value);
+  ok('新建节点不再提供粘贴 / 节点机 ACME',
+    !certOpts.includes('content') && !certOpts.includes('acme'), certOpts.join(','));
+  ok('证书来源仍保留自签 / 引用 / 路径',
+    ['self', 'ref', 'path'].every((v) => certOpts.includes(v)), certOpts.join(','));
 
   protoSel.value = 'vless';
   change(protoSel);
@@ -775,6 +781,96 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
 
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(150);
+
+  /* ---- 存量 acme / content 节点：编辑时必须保留旧选项 ---- */
+  // 选项被隐藏掉之后，存量节点的下拉会落到第一项，保存时静默把 certMode 改成 self ——
+  // 那等于一次改名就把用户的证书配置抹了。所以这两种模式要按节点保留。
+  console.log('\n── 存量证书模式兼容 ──');
+  const legacy = await json('/api/nodes', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: TAG + '-旧ACME',
+      serverId: uiSrv.item.id,
+      protocol: 'vless',
+      port: 21197,
+      security: 'tls',
+      certMode: 'acme',
+      selfCN: 'legacy.example.com',
+    }),
+  }, T);
+  click(d9.querySelector('#page-actions [data-act="refresh"]'), w9);
+  await waitFor(() => d9.querySelector(`[data-act="node-edit"][data-id="${legacy.item.id}"]`), '存量节点行');
+  click(d9.querySelector(`[data-act="node-edit"][data-id="${legacy.item.id}"]`), w9);
+  await waitFor(() => d9.querySelector('#n-certmode'), '存量节点编辑弹窗');
+  const legacyOpts = [...d9.querySelectorAll('#n-certmode option')].map((o) => o.value);
+  ok('存量 acme 节点编辑时保留旧选项',
+    legacyOpts.includes('acme') && d9.querySelector('#n-certmode').value === 'acme',
+    d9.querySelector('#n-certmode').value);
+  ok('存量 acme 模式仍亮出前提警示块',
+    d9.querySelector('#acme-warn').style.display === '' &&
+      /80 端口/.test(d9.querySelector('#acme-warn').textContent));
+  ok('存量模式给出迁移提示', /不再新增/.test(d9.querySelector('#cert-box').textContent));
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(120);
+  await json('/api/nodes/' + legacy.item.id, { method: 'DELETE' }, T);
+
+  /* ---- SNI 与证书域名（前端规则是 lib/cert.js 的镜像，漏改一边会被这里抓到） ---- */
+  console.log('\n── SNI 与证书域名 ──');
+  const sniCase = (doms, sni) =>
+    w9.eval(`sniInDomains(${JSON.stringify(doms)}, ${JSON.stringify(sni)})`);
+  const sniTable = [
+    [['a.example.com'], 'a.example.com', true],
+    [['A.Example.com'], 'a.example.com.', true],
+    [['b.example.com'], 'a.example.com', false],
+    [['*.example.com'], 'a.example.com', true],
+    [['*.example.com'], 'example.com', false],
+    [['*.example.com'], 'a.b.example.com', false],
+    [['example.com', '*.example.com'], 'hk.example.com', true],
+    [['a.example.com'], '', true],
+    [['1.2.3.4'], '1.2.3.4', true],
+    [['1.2.3.4'], '5.6.7.8', false],
+  ];
+  const sniWrong = sniTable.filter(([doms, sni, want]) => sniCase(doms, sni) !== want);
+  ok('前端 SNI 规则与后端一致（10 组用例）', sniWrong.length === 0,
+    sniWrong.map(([doms, sni, want]) => `${doms.join('|')} / ${sni || '空'} 期望 ${want}`).join('; '));
+
+  // 表单层：选了域名对不上的证书，保存必须被拦下，而且不能把请求发出去
+  w9.eval(
+    "state.data.certList = [{ id: 'fake-cert-1', name: 'a.example.com', domains: ['a.example.com'], daysLeft: 30 }]",
+  );
+  const nodePosts = [];
+  const realFetch9 = w9.fetch;
+  w9.fetch = (p, o = {}) => {
+    if (String(p).includes('/api/nodes') && (o.method || 'GET').toUpperCase() === 'POST') {
+      nodePosts.push(String(p));
+    }
+    return realFetch9(p, o);
+  };
+  click(d9.querySelector('[data-act="node-new"]'), w9);
+  await waitFor(() => d9.querySelector('#n-certmode'), '新建节点弹窗（SNI 用例）');
+  d9.querySelector('#n-name').value = TAG + '-SNI';
+  const sniSecSel = d9.querySelector('#n-security');
+  if (sniSecSel) {
+    sniSecSel.value = 'tls';
+    sniSecSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  }
+  const cmSel3 = d9.querySelector('#n-certmode');
+  cmSel3.value = 'ref';
+  cmSel3.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  await sleep(80);
+  const refSel = d9.querySelector('#n-certref');
+  refSel.value = 'fake-cert-1';
+  refSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  d9.querySelector('#n-sni').value = 'b.example.com';
+  click(d9.querySelector('.modal [data-ok]'), w9);
+  await sleep(300);
+  const sniToast = (d9.querySelector('#toast-root') || {}).textContent || '';
+  ok('SNI 不匹配时保存被拦下', /不在这张证书的域名里/.test(sniToast), sniToast.trim().slice(0, 28));
+  ok('被拦下时不会发出建节点请求', nodePosts.length === 0, `${nodePosts.length} 个`);
+  w9.fetch = realFetch9;
+  const sniClose = d9.querySelector('.modal [data-close]');
+  if (sniClose) sniClose.dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(100);
 
   /* ---- 复制 · 批量删除 · 拖拽排序 ---- */
   console.log('\n── 复制 · 批量删除 · 拖拽排序 ──');

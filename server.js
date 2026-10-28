@@ -515,6 +515,8 @@ function createPlan(req, res, params, body) {
     desc: String(body.desc || ''),
     color: String(body.color || '#4c8dff'),
     quotaGB: Number(body.quotaGB) || 0,
+    // 等级：高等级套餐可以用等级更低套餐的节点，同级互不影响
+    level: Math.max(0, Math.floor(Number(body.level) || 0)),
     validity,
     // 不传就是「自动续期」——产品默认行为；永久 / 自定义到期会被 normalize 强制关掉
     autoRenew: store.normalizeAutoRenew(validity, body.autoRenew),
@@ -552,6 +554,7 @@ function updatePlan(req, res, params, body) {
   if (body.color !== undefined) plan.color = String(body.color);
   if (body.sort !== undefined) plan.sort = Number(body.sort) || plan.sort;
   if (body.quotaGB !== undefined) plan.quotaGB = Number(body.quotaGB) || 0;
+  if (body.level !== undefined) plan.level = Math.max(0, Math.floor(Number(body.level) || 0));
 
   const validity = readPlanValidity(body);
   if (validity) {
@@ -1416,6 +1419,12 @@ function certRefError(data) {
   const c = store.db().certs.find((x) => x.id === data.certId);
   if (!c) return '请选择一张证书（没有的话先去「证书」页新建）';
   if (!c.certPem || !c.keyPem) return '这张证书还没签发成功，先去「证书」页点「申请」';
+  // SNI 必须落在证书的域名里：填 a.com 却挂 b.com 的证书，客户端握手时会直接报
+  // 证书不匹配，而面板这边看起来一切正常 —— 这种错误只能在保存时拦
+  const sni = String(data.sni || '').trim();
+  if (sni && !cert.sniMatchesDomains(c.domains, sni)) {
+    return `SNI「${sni}」不在这张证书的域名里（${(c.domains || []).join('、')}），客户端会报证书不匹配`;
+  }
   return '';
 }
 
@@ -1626,15 +1635,19 @@ function credsSetOf(c) {
 
 function certView(c) {
   const usage = certUsage(c);
+  const source = c.source === 'upload' ? 'upload' : 'acme';
   const provider = acme.PROVIDERS[c.provider];
   return {
     id: c.id,
     name: c.name || (c.domains || [])[0] || '',
     domains: c.domains || [],
     wildcard: !!c.wildcard,
+    // source：acme=面板签发（可续期）；upload=粘贴上传（只能人工换新）
+    source,
+    sourceLabel: source === 'upload' ? '粘贴上传' : '面板签发',
     provider: c.provider,
-    providerLabel: provider ? provider.label : c.provider,
-    challenge: 'dns-01',
+    providerLabel: source === 'upload' ? '手动上传' : provider ? provider.label : c.provider,
+    challenge: source === 'upload' ? '' : 'dns-01',
     status: c.status,
     state: certState(c),
     daysLeft: certDaysLeft(c),
@@ -1708,6 +1721,53 @@ function normalizeCert(body, prev = {}) {
 }
 
 function createCert(req, res, params, body) {
+  const db = store.db();
+
+  /* ---------------------- 粘贴上传：不签发，只导入 ---------------------- */
+  if (String(body.source || 'acme') === 'upload') {
+    let parsed;
+    try {
+      parsed = acme.parseUploaded(body.certPem, body.keyPem);
+    } catch (err) {
+      return sendJson(res, 400, { error: String((err && err.message) || err) });
+    }
+    const clash = db.certs.find((c) => (c.domains || []).some((d) => parsed.domains.includes(d)));
+    if (clash) {
+      return sendJson(res, 409, {
+        error: `域名 ${(clash.domains || []).join(', ')} 已经有一张证书了，直接编辑那张重新粘贴即可`,
+      });
+    }
+
+    const item = {
+      id: 'c' + store.uid(),
+      name: String(body.name || '').trim() || parsed.domains[0],
+      domains: parsed.domains,
+      wildcard: acme.isWildcard(parsed.domains),
+      source: 'upload',
+      provider: '',
+      creds: {},
+      status: 'issued',
+      certPem: parsed.certPem,
+      keyPem: parsed.keyPem,
+      fingerprint: parsed.fingerprint,
+      notAfter: parsed.notAfter,
+      issuer: parsed.issuer,
+      lastAttempt: store.iso(),
+      lastError: '',
+      // 粘贴上传没有续期通道，自动续期开关直接关掉 ——
+      // 给一个按了没反应的开关，比不给更糟
+      autoRenew: false,
+      extraTargets: [],
+      history: [{ at: store.iso(), ok: true, issued: false, message: '从粘贴内容导入' }],
+      createdAt: store.iso(),
+    };
+    db.certs.push(item);
+    store.save();
+    auditAction('cert.upload', item.name, item.domains.join(', '));
+    return sendJson(res, 200, { ok: true, item: certView(item) });
+  }
+
+  /* ------------------------ 面板签发：先建 draft ------------------------ */
   const data = normalizeCert(body);
   if (!data.domains.length) return sendJson(res, 400, { error: '请填写域名' });
   const bad = data.domains.find((d) => !DOMAIN_RE.test(d));
@@ -1715,7 +1775,6 @@ function createCert(req, res, params, body) {
   if (!acme.PROVIDERS[data.provider]) {
     return sendJson(res, 400, { error: '请选择 DNS 提供商' });
   }
-  const db = store.db();
   if (db.certs.some((c) => (c.domains || []).some((d) => data.domains.includes(d)))) {
     return sendJson(res, 409, { error: '这个域名已经有一张证书了，直接编辑那张即可' });
   }
@@ -1723,6 +1782,7 @@ function createCert(req, res, params, body) {
   const item = {
     id: 'c' + store.uid(),
     ...data,
+    source: 'acme',
     name: data.name || data.domains[0],
     status: 'draft',
     certPem: '',
@@ -1744,6 +1804,43 @@ function createCert(req, res, params, body) {
 function updateCert(req, res, params, body) {
   const c = store.db().certs.find((x) => x.id === params.id);
   if (!c) return sendJson(res, 404, { error: '证书不存在' });
+
+  /* ---------------- 粘贴上传：只能改名 + 换一份新内容 ---------------- */
+  if (c.source === 'upload') {
+    if (body.name !== undefined) {
+      c.name = String(body.name || '').trim() || (c.domains || [])[0] || c.id;
+    }
+    if (body.certPem || body.keyPem) {
+      let parsed;
+      try {
+        // 只贴了其中一半时，另一半沿用库里已有的 —— 校验配对时会当场发现不搭
+        parsed = acme.parseUploaded(body.certPem || c.certPem, body.keyPem || c.keyPem);
+      } catch (err) {
+        return sendJson(res, 400, { error: String((err && err.message) || err) });
+      }
+      const clash = store
+        .db()
+        .certs.find((x) => x.id !== c.id && (x.domains || []).some((d) => parsed.domains.includes(d)));
+      if (clash) {
+        return sendJson(res, 409, { error: `域名 ${(clash.domains || []).join(', ')} 已经被另一张证书占用了` });
+      }
+      c.domains = parsed.domains;
+      c.wildcard = acme.isWildcard(parsed.domains);
+      c.certPem = parsed.certPem;
+      c.keyPem = parsed.keyPem;
+      c.fingerprint = parsed.fingerprint;
+      c.notAfter = parsed.notAfter;
+      c.issuer = parsed.issuer;
+      c.status = 'issued';
+      c.lastAttempt = store.iso();
+      c.lastError = '';
+      pushCertHistory(c, true, '重新导入了证书内容');
+    }
+    store.save();
+    auditAction('cert.update', c.name, (c.domains || []).join(', '));
+    return sendJson(res, 200, { ok: true, item: certView(c) });
+  }
+
   const data = normalizeCert(body, c);
   if (!data.domains.length) return sendJson(res, 400, { error: '请填写域名' });
   const bad = data.domains.find((d) => !DOMAIN_RE.test(d));
@@ -1897,6 +1994,11 @@ async function runCertIssue(certId, force) {
 function issueCert(req, res, params, body) {
   const c = store.db().certs.find((x) => x.id === params.id);
   if (!c) return sendJson(res, 404, { error: '证书不存在' });
+  if (c.source === 'upload') {
+    return sendJson(res, 400, {
+      error: '这张证书是粘贴上传的，面板没有它的续期通道。拿到新证书后编辑它、重新粘贴一份即可',
+    });
+  }
   const gate = acme.available();
   if (!gate.ok) return sendJson(res, 400, { error: gate.reason });
   if (c.status === 'issuing') {
@@ -1940,6 +2042,8 @@ function sweepCerts() {
   const db = store.db();
   let queued = 0;
   for (const c of db.certs) {
+    // 粘贴上传的证书没有续期通道，扫了也白扫
+    if ((c.source || 'acme') !== 'acme') continue;
     if (c.autoRenew === false) continue;
     if (c.status === 'issuing') continue;
     if (!c.certPem || !c.keyPem) continue;
@@ -3154,17 +3258,20 @@ function resolveScope(token, ip) {
 }
 
 function usersForNode(node, activeUsers) {
-  const db = store.db();
-  const nodePlans = new Set(node.planIds || []);
-  const entryPlans = new Set();
+  const nodePlanIds = node.planIds || [];
+  const entryPlanIds = [];
   for (const e of node.entries || []) {
-    if (Array.isArray(e.planIds)) e.planIds.forEach((p) => entryPlans.add(p));
+    if (Array.isArray(e.planIds)) entryPlanIds.push(...e.planIds);
   }
 
   return activeUsers.filter((u) => {
     if (!u.planId) return true;
-    // 节点套餐或任一入口的自有套餐命中即可
-    return nodePlans.has(u.planId) || entryPlans.has(u.planId);
+    // 节点自身的套餐或任一入口的套餐命中即可 —— 入口单独开放给某个套餐时，
+    // 用户必须在这个 inbound 的客户端列表里，否则连入口也走不通。
+    // 等级规则由 planCovers 统一处理：自己的套餐 + 等级严格更低的套餐。
+    const plan = store.planOf(u);
+    if (!plan) return false;
+    return store.planCovers(plan, nodePlanIds) || store.planCovers(plan, entryPlanIds);
   });
 }
 

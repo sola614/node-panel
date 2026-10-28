@@ -27,6 +27,7 @@ RENDERERS.plans = async () => {
           </div>
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
             <input type="checkbox" class="p-pick" data-id="${p.id}" title="勾选后可批量删除" style="width:auto">
+            <span class="badge badge-purple" title="高等级套餐可以使用等级更低套餐的节点">等级 ${Number(p.level) || 0}</span>
             <span class="badge ${p.autoRenew ? 'badge-ok' : p.validity && p.validity.type === 'none' ? 'badge-dim' : 'badge-warn'}">${
               p.autoRenew ? '自动续期' : p.validity && p.validity.type === 'none' ? '永久' : '到期停用'
             }</span>
@@ -78,6 +79,12 @@ RENDERERS.plans = async () => {
             ['③ 用户绑定套餐', '在「用户」页给用户选套餐；不选则表示不限，可见全部节点'],
             ['④ 到期自动续期', '默认开启：到期自动清零流量并顺延一个有效期；关掉则到期即停用'],
             ['⑤ 三层过滤', '订阅只输出套餐内节点 → 节点配置只注入套餐内用户 → 超额用户再被剔除'],
+            [
+              '⑥ 等级继承',
+              '数字越大等级越高：高等级套餐自动能用「等级更低」套餐的节点，反过来不行；' +
+                '同级互不影响（默认全为 0，等于只认自己的套餐）。' +
+                '降级后，用户会在下一轮配置下发时从原高等级节点上被摘掉，已导入的客户端随即失效',
+            ],
           ]
             .map(
               ([t, s]) => `<div style="display:flex;gap:11px;align-items:flex-start">
@@ -125,6 +132,7 @@ function planCopyFlow(id) {
     desc: p.desc || '',
     color: p.color,
     quotaGB: p.quotaGB,
+    level: p.level,
     validity: p.validity,
     autoRenew: p.autoRenew,
     sort: maxSort + 1,
@@ -207,6 +215,11 @@ function planForm(plan) {
       <div class="field">
         <label>排序</label>
         <input type="number" id="p-sort" value="${p.sort || 1}" min="1">
+      </div>
+      <div class="field">
+        <label>等级</label>
+        <input type="number" id="p-level" value="${p.level != null ? p.level : 0}" min="0">
+        <div class="hint">数字越大越高：高等级套餐能用等级更低套餐的节点，同级互不影响</div>
       </div>
     </div>
     <div class="field" id="p-autorenew-field" ${type === 'custom' ? 'hidden' : ''}>
@@ -294,6 +307,7 @@ function readPlanForm(mask) {
     desc: $('#p-desc', mask).value.trim(),
     color: $('#p-color', mask).value,
     quotaGB: Number($('#p-quota', mask).value) || 0,
+    level: Math.max(0, Math.floor(Number($('#p-level', mask).value) || 0)),
     validity,
     // 永久 / 自定义到期时开关是禁用的，按 false 提交（后端也会再兜一层）
     autoRenew: validity.type !== 'none' && validity.type !== 'custom' && $('#p-autorenew', mask).checked,

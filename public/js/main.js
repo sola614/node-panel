@@ -610,12 +610,6 @@ async function runAction(act, btn, id) {
       state.data.statsDays = Number(btn.dataset.days) || 14;
       await render();
       break;
-    case 'demo': {
-      const d = await api('/api/demo/traffic', { method: 'POST', body: JSON.stringify({ mb: 300 }) });
-      toast(`已为 ${d.users} 位用户注入 ${fmtBytes(d.bytes)} 流量`, 'ok');
-      await render();
-      break;
-    }
     case 'user-new':
       await createUserFlow();
       break;
@@ -857,6 +851,9 @@ async function runAction(act, btn, id) {
       break;
     case 'cert-issue':
       certIssueFlow(id);
+      break;
+    case 'cert-paste':
+      await certPasteFlow(id);
       break;
     case 'cert-force':
       certIssueFlow(id, true);

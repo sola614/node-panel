@@ -1,0 +1,133 @@
+{
+  "items": [
+    {
+      "id": 9,
+      "at": "2026-10-28T10:08:13.082Z",
+      "actor": "admin",
+      "action": "backup.create",
+      "target": "panel-manual-20261028-100812.db",
+      "detail": "4199 KB",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 8,
+      "at": "2026-10-28T10:08:12.943Z",
+      "actor": "admin",
+      "action": "settings.update",
+      "target": "站点设置",
+      "detail": "改公告",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 7,
+      "at": "2026-10-28T10:08:12.939Z",
+      "actor": "admin",
+      "action": "settings.update",
+      "target": "站点设置",
+      "detail": "改公告",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 6,
+      "at": "2026-10-28T10:08:12.933Z",
+      "actor": "admin",
+      "action": "user.rotate",
+      "target": "林小满",
+      "detail": "重置 UUID 与订阅链接",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 5,
+      "at": "2026-10-28T10:08:12.927Z",
+      "actor": "admin",
+      "action": "user.delete",
+      "target": "临时账号",
+      "detail": "",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 4,
+      "at": "2026-10-28T10:08:12.924Z",
+      "actor": "admin",
+      "action": "user.create",
+      "target": "临时账号",
+      "detail": "不限套餐",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 3,
+      "at": "2026-10-28T10:08:12.920Z",
+      "actor": "admin",
+      "action": "plan.delete",
+      "target": "临时套餐",
+      "detail": "影响 0 位用户，已降级为不限套餐",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 2,
+      "at": "2026-10-28T10:08:12.916Z",
+      "actor": "admin",
+      "action": "plan.create",
+      "target": "临时套餐",
+      "detail": "额度 50 GB · 有效期 30 天",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 1,
+      "at": "2026-10-28T10:08:12.890Z",
+      "actor": "admin",
+      "action": "login.success",
+      "target": "admin",
+      "detail": "登录管理台",
+      "ip": "127.0.0.1"
+    }
+  ],
+  "total": 9,
+  "keep": 2000,
+  "groups": [
+    {
+      "value": "login",
+      "label": "登录"
+    },
+    {
+      "value": "admin",
+      "label": "管理员"
+    },
+    {
+      "value": "plan",
+      "label": "套餐"
+    },
+    {
+      "value": "user",
+      "label": "用户"
+    },
+    {
+      "value": "node",
+      "label": "节点"
+    },
+    {
+      "value": "server",
+      "label": "服务器"
+    },
+    {
+      "value": "settings",
+      "label": "设置"
+    },
+    {
+      "value": "notify",
+      "label": "通知"
+    },
+    {
+      "value": "invite",
+      "label": "邀请"
+    },
+    {
+      "value": "backup",
+      "label": "备份"
+    },
+    {
+      "value": "demo",
+      "label": "演示"
+    }
+  ]
+}

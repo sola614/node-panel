@@ -611,9 +611,24 @@ function nodeForm(node, servers) {
           <option value="self" ${(n.certMode || 'path') === 'self' ? 'selected' : ''}>自动生成自签证书</option>
           <option value="ref" ${n.certMode === 'ref' ? 'selected' : ''}>使用「证书」页里的证书（推荐）</option>
           <option value="path" ${(n.certMode || 'path') === 'path' ? 'selected' : ''}>服务器上的证书路径</option>
-          <option value="content" ${n.certMode === 'content' ? 'selected' : ''}>粘贴证书内容</option>
-          <option value="acme" ${n.certMode === 'acme' ? 'selected' : ''}>节点机 ACME（旧：需 80 端口）</option>
+          ${
+            // 「粘贴证书」和「节点机 ACME」已经收进「证书」页统一管理，新建时不再提供。
+            // 但存量节点如果正用着，这个选项必须留着 —— 否则编辑一次别的字段，
+            // 下拉会落到第一项，保存时静默把 certMode 改成了 self。
+            n.certMode === 'content'
+              ? '<option value="content" selected>（旧）粘贴证书内容</option>'
+              : ''
+          }
+          ${n.certMode === 'acme' ? '<option value="acme" selected>（旧）节点机 ACME</option>' : ''}
         </select>
+        ${
+          n.certMode === 'content' || n.certMode === 'acme'
+            ? `<div class="hint" style="color:var(--warn)">
+                这个模式已不再新增：证书统一到「证书」页管理（可以粘贴，也可以自动申请）。
+                这里只是保留原配置，改成「使用『证书』页里的证书」才能享受自动续期与多机共用。
+               </div>`
+            : ''
+        }
       </div>
 
       <div id="cert-ref-box" class="hidden">
@@ -1113,6 +1128,19 @@ function readNodeForm(mask) {
   const protocol = v('#n-protocol');
   const security = protocol === 'hysteria2' ? 'tls' : v('#n-security');
   const certMode = v('#n-certmode') || 'path';
+
+  // 引用证书时 SNI 必须落在证书域名里：填 a.com 却挂 b.com 的证书，
+  // 面板这边看着一切正常，客户端握手才报「证书不匹配」。服务端也拦一道，这里先给即时反馈。
+  // 只有真的用得上 SNI 的模式才校验（reality 用 r-names、无加密根本不用证书）
+  if (certMode === 'ref' && (protocol === 'hysteria2' || security === 'tls')) {
+    const c = (state.data.certList || []).find((x) => x.id === v('#n-certref'));
+    const sni = v('#n-sni');
+    if (c && sni && !sniInDomains(c.domains, sni)) {
+      throw new Error(
+        `SNI「${sni}」不在这张证书的域名里（${c.domains.join('、')}），客户端会报证书不匹配`,
+      );
+    }
+  }
 
   const draft = state.entryDraft || [];
   // 入口必须填地址：地址为空的条目会被服务端丢弃，这里提前拦下来并说清楚

@@ -1,0 +1,98 @@
+{
+  "items": [],
+  "types": [
+    {
+      "value": "webhook",
+      "label": "Webhook"
+    },
+    {
+      "value": "telegram",
+      "label": "Telegram"
+    },
+    {
+      "value": "email",
+      "label": "邮件"
+    }
+  ],
+  "formats": [
+    {
+      "value": "json",
+      "label": "通用 JSON（自建服务）"
+    },
+    {
+      "value": "wecom",
+      "label": "企业微信群机器人"
+    },
+    {
+      "value": "dingtalk",
+      "label": "钉钉群机器人"
+    },
+    {
+      "value": "feishu",
+      "label": "飞书群机器人"
+    },
+    {
+      "value": "slack",
+      "label": "Slack Incoming Webhook"
+    }
+  ],
+  "events": [
+    {
+      "kind": "user.expiring",
+      "label": "用户即将到期",
+      "desc": "到期前 N 天提醒，每天最多一次"
+    },
+    {
+      "kind": "user.expired",
+      "label": "用户已过期",
+      "desc": "到期且未开自动续期，已被节点剔除"
+    },
+    {
+      "kind": "user.over",
+      "label": "用户流量超额",
+      "desc": "已用超过额度，已被节点剔除"
+    },
+    {
+      "kind": "server.offline",
+      "label": "服务器离线",
+      "desc": "超过阈值没有心跳，配置不再收敛"
+    },
+    {
+      "kind": "node.offline",
+      "label": "独立节点离线",
+      "desc": "独立部署的机器没有心跳"
+    },
+    {
+      "kind": "agent.old",
+      "label": "agent 版本落后",
+      "desc": "机器上的 agent 与面板版本不一致，可自更新"
+    },
+    {
+      "kind": "cert.expiring",
+      "label": "证书即将到期",
+      "desc": "剩 14 天以内，或已过期；自动续期没成功时最需要这条"
+    },
+    {
+      "kind": "cert.failed",
+      "label": "证书签发失败",
+      "desc": "DNS 凭据错误、域名没解析等，引用它的节点会起不来"
+    }
+  ],
+  "settings": {
+    "enabled": false,
+    "events": [
+      "user.expiring",
+      "user.expired",
+      "user.over",
+      "server.offline",
+      "node.offline"
+    ],
+    "leadDays": 3,
+    "offlineMin": 10,
+    "cooldownHours": 12,
+    "recovery": true
+  },
+  "log": [],
+  "openAlerts": [],
+  "appVersion": "0.1.15"
+}

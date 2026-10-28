@@ -234,6 +234,37 @@ async function withLoading(btn, fn, label = '') {
 const { rawHostOf, isValidHost } = window.Hosts;
 
 /**
+ * SNI 是否落在证书的域名里。
+ *
+ * ⚠️ 这是 `lib/cert.js` 里 `sniMatchesDomains()` 的镜像实现 —— 前端是经典脚本、
+ * 没有构建步骤，拿不到 CommonJS 模块，只能抄一份。改一边必须改另一边，
+ * `test/ui.js` 用同一组用例比对两边结果，跑测试就能发现漏改。
+ *
+ * 通配符只匹配一级：*.example.com 命中 a.example.com，
+ * 不命中裸域（裸域要单独进证书），也不命中 a.b.example.com。
+ * IP 型 SAN（1.2.3.4）走精确匹配。
+ */
+function sniInDomains(domains, sni) {
+  const host = String(sni || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, '');
+  if (!host) return true;
+  return (domains || []).some((raw) => {
+    const name = String(raw || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\.$/, '');
+    if (!name) return false;
+    if (name === host) return true;
+    if (!name.startsWith('*.')) return false;
+    const base = name.slice(2);
+    const dot = host.indexOf('.');
+    return dot > 0 && host.slice(dot + 1) === base;
+  });
+}
+
+/**
  * 规范化并校验「订阅对外域名」。
  * 返回 { value, error }：error 为空表示通过，value 是补全协议、去掉尾斜杠后的地址。
  * 空值合法，表示自动跟随当前访问地址。

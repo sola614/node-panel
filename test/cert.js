@@ -170,6 +170,20 @@ try {
   fs.unlinkSync(tmp);
 } catch { /* 临时文件，删不掉不影响结论 */ }
 
+console.log('\n▸ SNI 与证书域名');
+
+ok('精确匹配', cert.sniMatchesDomains(['a.example.com'], 'a.example.com') === true);
+ok('大小写与结尾点号不敏感', cert.sniMatchesDomains(['A.Example.com'], 'a.example.com.') === true);
+ok('不匹配要被拒', cert.sniMatchesDomains(['b.example.com'], 'a.example.com') === false);
+ok('通配符命中一级子域', cert.sniMatchesDomains(['*.example.com'], 'a.example.com') === true);
+ok('通配符不命中裸域', cert.sniMatchesDomains(['*.example.com'], 'example.com') === false);
+ok('通配符不命中二级子域', cert.sniMatchesDomains(['*.example.com'], 'a.b.example.com') === false);
+ok(
+  '多域名里任意一个命中即可',
+  cert.sniMatchesDomains(['example.com', '*.example.com'], 'hk.example.com') === true,
+);
+ok('没填 SNI 不拦', cert.sniMatchesDomains(['a.example.com'], '') === true);
+
 console.log('\n▸ 签发配额（防撞 LE 重复证书限额）');
 
 const dayAgo = (n) => new Date(Date.now() - n * 864e5).toISOString();
@@ -238,6 +252,102 @@ if (!hasOpenssl) {
     ok('签发者非空', !!info.issuer, info.issuer.slice(0, 40));
     const left = Math.round((Date.parse(info.notAfter) - Date.now()) / 864e5);
     ok('剩余天数接近 90', left >= 88 && left <= 90, `${left} 天`);
+
+    /* ---------------------- 粘贴上传：解析与配对校验 ---------------------- */
+    const certPem = fs.readFileSync(crt, 'utf8');
+    const keyPem = fs.readFileSync(key, 'utf8');
+
+    eq('从证书里解析出域名（SAN 顺序保留）', acme.certDomains(certPem), [
+      'example.com',
+      '*.example.com',
+    ]);
+    ok('配对的私钥能通过校验', acme.keyMatches(certPem, keyPem) === true);
+
+    const up = acme.parseUploaded(certPem, keyPem);
+    eq('粘贴导入解析出域名', up.domains, ['example.com', '*.example.com']);
+    ok('粘贴导入带上到期时间', Number.isFinite(Date.parse(up.notAfter)), up.notAfter);
+    ok('粘贴导入内容原样保留', up.certPem.includes('BEGIN CERTIFICATE') && up.keyPem.includes('PRIVATE KEY'));
+
+    // 换一对私钥：必须被拒，否则写进机器后 Xray 起不来，报错还很难懂
+    const key2 = path.join(dir, 'k2.pem');
+    spawnSync('openssl', ['genrsa', '-out', key2, '2048'], { encoding: 'utf8' });
+    const key2Pem = fs.readFileSync(key2, 'utf8');
+    ok('不配对的私钥判定为不匹配', acme.keyMatches(certPem, key2Pem) === false);
+    let mismatch = '';
+    try {
+      acme.parseUploaded(certPem, key2Pem);
+    } catch (err) {
+      mismatch = err.message;
+    }
+    ok('粘贴不配对的私钥给出明确报错', /不匹配/.test(mismatch), mismatch.slice(0, 24));
+
+    let badFormat = '';
+    try {
+      acme.parseUploaded('not a pem', keyPem);
+    } catch (err) {
+      badFormat = err.message;
+    }
+    ok('粘贴非 PEM 内容被拒', /格式不对/.test(badFormat), badFormat.slice(0, 24));
+
+    let noKey = '';
+    try {
+      acme.parseUploaded(certPem, '');
+    } catch (err) {
+      noKey = err.message;
+    }
+    ok('没贴私钥被拒', /私钥/.test(noKey), noKey.slice(0, 24));
+
+    // 带口令的私钥：不能报「不配对」，那会把排障方向带偏到「证书贴错了」
+    const encKey = path.join(dir, 'k-enc.pem');
+    const enc = spawnSync(
+      'openssl',
+      ['pkcs8', '-topk8', '-in', key, '-out', encKey, '-passout', 'pass:test123'],
+      { encoding: 'utf8' },
+    );
+    if (enc.status === 0) {
+      const encPem = fs.readFileSync(encKey, 'utf8');
+      let encMsg = '';
+      try {
+        acme.parseUploaded(certPem, encPem);
+      } catch (err) {
+        encMsg = err.message;
+      }
+      ok('加密私钥给出「先解密」而不是「不配对」', /口令/.test(encMsg) && /openssl/.test(encMsg),
+        encMsg.slice(0, 26));
+      ok('加密私钥不会被误判成配对成功', acme.keyMatches(certPem, encPem) === false);
+    } else {
+      console.log('  · 跳过加密私钥用例（openssl 版本不支持 pkcs8）');
+    }
+
+    // 格式坏掉的私钥：要说「私钥解析失败」，不能说「不配对」
+    let brokenMsg = '';
+    try {
+      acme.parseUploaded(certPem, '-----BEGIN PRIVATE KEY-----\nbm90LWEta2V5\n-----END PRIVATE KEY-----');
+    } catch (err) {
+      brokenMsg = err.message;
+    }
+    ok('坏私钥报「解析失败」而不是「不配对」', /解析失败/.test(brokenMsg), brokenMsg.slice(0, 26));
+
+    // IP 证书：SAN 是 IP Address:，只认 DNS 的话导入会报「没有找到域名」
+    const ipCrt = path.join(dir, 'ip.pem');
+    const ipKey = path.join(dir, 'ipk.pem');
+    const ipGen = spawnSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-days', '30', '-nodes',
+        '-keyout', ipKey, '-out', ipCrt,
+        '-subj', '/CN=1.2.3.4', '-addext', 'subjectAltName=IP:1.2.3.4'],
+      { encoding: 'utf8' },
+    );
+    if (ipGen.status === 0) {
+      const ipPem = fs.readFileSync(ipCrt, 'utf8');
+      eq('IP 型 SAN 也能解析出来', acme.certDomains(ipPem), ['1.2.3.4']);
+      const ipUp = acme.parseUploaded(ipPem, fs.readFileSync(ipKey, 'utf8'));
+      eq('IP 证书可以导入', ipUp.domains, ['1.2.3.4']);
+      ok('IP 证书的 SNI 用精确匹配', cert.sniMatchesDomains(ipUp.domains, '1.2.3.4') === true);
+      ok('IP 证书不匹配别的 IP', cert.sniMatchesDomains(ipUp.domains, '5.6.7.8') === false);
+    } else {
+      console.log('  · 跳过 IP 证书用例（openssl 不支持 -addext）');
+    }
   }
   fs.rmSync(dir, { recursive: true, force: true });
 }

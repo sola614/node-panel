@@ -1,0 +1,254 @@
+{
+  "items": [
+    {
+      "id": "c9be9c5be752f",
+      "name": "香港节点",
+      "domains": [
+        "hk1.example.com"
+      ],
+      "wildcard": false,
+      "source": "acme",
+      "sourceLabel": "面板签发",
+      "provider": "letsencrypt",
+      "providerLabel": "letsencrypt",
+      "challenge": "dns-01",
+      "status": "issued",
+      "state": "expiring",
+      "daysLeft": 7,
+      "notAfter": "2026-11-05T10:08:05.045Z",
+      "issuer": "Let's Encrypt",
+      "fingerprint": "12321b726f83ae3783f8a25e05e7510a05ecd43e867c9af6e5f6f67fd56de05562309247da7ac504",
+      "autoRenew": true,
+      "hasKey": true,
+      "credsSet": [],
+      "lastAttempt": "2026-10-25T10:08:05.045Z",
+      "lastError": "",
+      "history": [
+        {
+          "at": "2026-10-25T10:08:05.045Z",
+          "ok": true,
+          "issued": true,
+          "message": "自动续期成功"
+        }
+      ],
+      "extraTargets": [
+        "fd0c0a9070f7",
+        "2db775407813"
+      ],
+      "nodeCount": 0,
+      "nodes": [],
+      "machines": [
+        {
+          "id": "fd0c0a9070f7",
+          "name": "香港-01",
+          "kind": "server",
+          "online": true
+        },
+        {
+          "id": "2db775407813",
+          "name": "东京-01",
+          "kind": "server",
+          "online": false
+        }
+      ],
+      "createdAt": "2026-08-07T10:08:05.045Z"
+    },
+    {
+      "id": "c83f57978552a",
+      "name": "主域名",
+      "domains": [
+        "*.example.com"
+      ],
+      "wildcard": true,
+      "source": "acme",
+      "sourceLabel": "面板签发",
+      "provider": "letsencrypt",
+      "providerLabel": "letsencrypt",
+      "challenge": "dns-01",
+      "status": "issued",
+      "state": "issued",
+      "daysLeft": 61,
+      "notAfter": "2026-12-29T10:08:05.045Z",
+      "issuer": "Let's Encrypt",
+      "fingerprint": "672854bcd1781d7dbc743a2f995299389faa587b1e68a8299d50f88a9f78cbc9ba4b9dbcfa8c7a89",
+      "autoRenew": true,
+      "hasKey": true,
+      "credsSet": [],
+      "lastAttempt": "2026-10-25T10:08:05.045Z",
+      "lastError": "",
+      "history": [
+        {
+          "at": "2026-10-25T10:08:05.045Z",
+          "ok": true,
+          "issued": true,
+          "message": "自动续期成功"
+        }
+      ],
+      "extraTargets": [
+        "fd0c0a9070f7",
+        "2db775407813"
+      ],
+      "nodeCount": 0,
+      "nodes": [],
+      "machines": [
+        {
+          "id": "fd0c0a9070f7",
+          "name": "香港-01",
+          "kind": "server",
+          "online": true
+        },
+        {
+          "id": "2db775407813",
+          "name": "东京-01",
+          "kind": "server",
+          "online": false
+        }
+      ],
+      "createdAt": "2026-09-30T10:08:05.045Z"
+    },
+    {
+      "id": "cf089564ebcb6",
+      "name": "东京节点（手动上传）",
+      "domains": [
+        "jp1.example.com"
+      ],
+      "wildcard": false,
+      "source": "upload",
+      "sourceLabel": "粘贴上传",
+      "provider": "",
+      "providerLabel": "手动上传",
+      "challenge": "",
+      "status": "issued",
+      "state": "issued",
+      "daysLeft": 127,
+      "notAfter": "2027-03-05T10:08:05.045Z",
+      "issuer": "DigiCert",
+      "fingerprint": "4a9f104f91aa1402001f63370ca10e0cbe8aa53c3924f0e882b7aafbbf8bd3093d283953e19f3937",
+      "autoRenew": false,
+      "hasKey": true,
+      "credsSet": [],
+      "lastAttempt": "2026-10-25T10:08:05.045Z",
+      "lastError": "",
+      "history": [
+        {
+          "at": "2026-10-25T10:08:05.045Z",
+          "ok": true,
+          "issued": true,
+          "message": "自动续期成功"
+        }
+      ],
+      "extraTargets": [
+        "fd0c0a9070f7",
+        "2db775407813"
+      ],
+      "nodeCount": 0,
+      "nodes": [],
+      "machines": [
+        {
+          "id": "fd0c0a9070f7",
+          "name": "香港-01",
+          "kind": "server",
+          "online": true
+        },
+        {
+          "id": "2db775407813",
+          "name": "东京-01",
+          "kind": "server",
+          "online": false
+        }
+      ],
+      "createdAt": "2026-12-05T10:08:05.045Z"
+    }
+  ],
+  "providers": [
+    {
+      "id": "cloudflare",
+      "label": "Cloudflare",
+      "plugin": "dns_cf",
+      "hint": "别用 Global API Key：那是账号级全权限，泄露等于交出整个域名。",
+      "docs": "https://dash.cloudflare.com/profile/api-tokens",
+      "fields": [
+        {
+          "key": "CF_Token",
+          "label": "API Token",
+          "hint": "权限选 Zone → DNS → Edit，Zone Resources 只勾这个域名所在的 Zone",
+          "secret": true
+        }
+      ]
+    },
+    {
+      "id": "aliyun",
+      "label": "阿里云",
+      "plugin": "dns_ali",
+      "hint": "用 RAM 子账号，只授 AliyunDNSFullAccess；别用主账号 AccessKey。",
+      "docs": "https://ram.console.aliyun.com/users",
+      "fields": [
+        {
+          "key": "Ali_Key",
+          "label": "AccessKey ID",
+          "hint": "",
+          "secret": false
+        },
+        {
+          "key": "Ali_Secret",
+          "label": "AccessKey Secret",
+          "hint": "",
+          "secret": true
+        }
+      ]
+    },
+    {
+      "id": "dnspod",
+      "label": "腾讯云 DNSPod",
+      "plugin": "dns_dp",
+      "hint": "",
+      "docs": "https://console.dnspod.cn/account/token",
+      "fields": [
+        {
+          "key": "DP_Id",
+          "label": "Token ID",
+          "hint": "",
+          "secret": false
+        },
+        {
+          "key": "DP_Key",
+          "label": "Token",
+          "hint": "",
+          "secret": true
+        }
+      ]
+    },
+    {
+      "id": "huaweicloud",
+      "label": "华为云",
+      "plugin": "dns_huaweicloud",
+      "hint": "",
+      "docs": "https://console.huaweicloud.com/iam/",
+      "fields": [
+        {
+          "key": "HUAWEICLOUD_Username",
+          "label": "IAM 用户名",
+          "hint": "",
+          "secret": false
+        },
+        {
+          "key": "HUAWEICLOUD_Password",
+          "label": "IAM 密码",
+          "hint": "",
+          "secret": true
+        },
+        {
+          "key": "HUAWEICLOUD_DomainName",
+          "label": "账号名",
+          "hint": "",
+          "secret": false
+        }
+      ]
+    }
+  ],
+  "acme": {
+    "ok": false,
+    "reason": "面板运行在 Windows：acme.sh 需要 sh，请在 Docker / Linux 上部署面板后再签发。已经签好的证书仍然可以正常分发给节点。"
+  },
+  "renewDays": 30
+}
