@@ -48,6 +48,10 @@ jobs:
           node demo/check.js http://127.0.0.1:8081 \
             || echo "::warning title=演示站自检未通过::浏览器环境或页面渲染有问题，详见上方日志。本次仍继续发布。"
 
+      # 仓库首次启用 Pages 需要人工点一次：Settings → Pages → Source 选 "GitHub Actions"。
+      # 注意 configure-pages 的 enablement 参数看着能自动开，但它明确要求传入
+      # GITHUB_TOKEN 以外的 token（PAT 或 GitHub App），否则一样失败 ——
+      # 为了一个一次性动作去配 secret 不划算，所以这里只做配置、不做启用。
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
