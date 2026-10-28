@@ -295,8 +295,10 @@ self_cert_fp() {
 # 每轮重算指纹清单（幂等）。证书十年才换一次，正常情况下这份文件永远不变，
 # send_receipt 的去重签名会把它带上：指纹一变（证书重签）回执立即重发。
 collect_selfcert_fps() {
-  rm -f "$RUN_DIR/selfcerts.list" 2>/dev/null
-  [ -n "${NP_SELF_CERT_IDS:-}" ] || return 0
+  _list="$RUN_DIR/selfcerts.list"
+  _tmp="$_list.new"
+  rm -f "$_tmp" 2>/dev/null
+  [ -n "${NP_SELF_CERT_IDS:-}" ] || { rm -f "$_list" 2>/dev/null; return 0; }
   for _item in $NP_SELF_CERT_IDS; do
     _nid=${_item%%:*}
     _crt=${_item#*:}
@@ -305,11 +307,23 @@ collect_selfcert_fps() {
     _len=${#_fp}
     case "$_fp" in '' | *[!0-9a-f]*) _len=0 ;; esac
     if [ "$_len" -eq 64 ]; then
-      printf '%s %s\n' "$_nid" "$_fp" >> "$RUN_DIR/selfcerts.list" 2>/dev/null
+      printf '%s %s\n' "$_nid" "$_fp" >> "$_tmp" 2>/dev/null
     else
       log "! 自签证书指纹计算失败：$_crt（openssl 不可用或证书损坏）"
     fi
   done
+  # 指纹清单变化才记日志：本函数每轮 tick 都跑（apply_services 的 changed/same
+  # 两个分支都会到这），无条件打会每 60 秒刷一条。首轮与证书重签后各打一条，
+  # 平时静默；全量 hex 进日志，排查时直接与面板节点指纹、订阅 pcs / pinSHA256 比对
+  _old=$(cat "$_list" 2>/dev/null)
+  _new=$(cat "$_tmp" 2>/dev/null)
+  if [ "$_old" != "$_new" ] && [ -n "$_new" ]; then
+    while read -r _line; do
+      [ -n "$_line" ] || continue
+      log "自签证书指纹：${_line%% *}=${_line#* }"
+    done < "$_tmp"
+  fi
+  mv -f "$_tmp" "$_list" 2>/dev/null
 }
 
 # ACME：acme.sh 是纯 shell，正好符合「不装运行时」的诉求；失败不影响其它节点

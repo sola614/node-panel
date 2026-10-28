@@ -625,6 +625,41 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   const restoredOn = (await json('/api/nodes', {}, T)).items.find((n) => n.id === togId).enabled;
   ok('再点一次恢复原状', restoredOn === beforeOn, String(restoredOn));
 
+  /* ---- 待同步自动刷新 ---- */
+  console.log('\n── 待同步自动刷新 ──');
+  // 缩短倒计时，测试不等 10 秒
+  w9.NP_AUTOREFRESH_SECS = '2';
+  const st = uiSrv.item.token;
+  // 机器拉一次配置点亮「在线」，再回执一个对不上的 hash → stale（待同步）
+  await json(`/api/agent/config?token=${st}`, {}, '');
+  await json(`/api/agent/receipt?token=${st}`, {
+    method: 'POST',
+    body: JSON.stringify({ hash: 'deadbeefdeadbeef', ok: true, xray: 'ok' }),
+  });
+  click(d9.querySelector('[data-act="refresh"]'), w9);
+  await waitFor(() => /自动刷新 \d+s/.test(d9.querySelector('#page-actions [data-act="refresh"]').textContent),
+    '按钮变成自动刷新');
+  ok('有待同步节点时按钮变成「自动刷新 Ns」',
+    /自动刷新 \d+s/.test(d9.querySelector('#page-actions [data-act="refresh"]').textContent),
+    d9.querySelector('#page-actions [data-act="refresh"]').textContent);
+  // 倒计时归零会自动重拉；仍是待同步 → 续下一轮（按钮再次显示倒计时）
+  await sleep(2700);
+  ok('归零后自动重拉并续下一轮',
+    /自动刷新 2s|自动刷新 1s/.test(d9.querySelector('#page-actions [data-act="refresh"]').textContent),
+    d9.querySelector('#page-actions [data-act="refresh"]').textContent);
+  // 回执对上 desired → 已同步：下一轮自动重拉后按钮恢复普通「刷新」
+  const desired = (await json(`/api/agent/receipt?token=${st}`, {
+    method: 'POST',
+    body: JSON.stringify({ hash: 'deadbeefdeadbeef', ok: true, xray: 'ok' }),
+  })).desired;
+  await json(`/api/agent/receipt?token=${st}`, {
+    method: 'POST',
+    body: JSON.stringify({ hash: desired, ok: true, xray: 'ok' }),
+  });
+  await sleep(2700);
+  ok('同步完成后自动刷新停止', d9.querySelector('#page-actions [data-act="refresh"]').textContent.trim() === '刷新',
+    d9.querySelector('#page-actions [data-act="refresh"]').textContent.trim());
+
   /* ---- 新增节点默认值 ---- */
   console.log('\n── 新增节点默认值 ──');
   const nodesBefore = await json('/api/nodes', {}, T);

@@ -194,6 +194,13 @@ RENDERERS.nodes = async () => {
     </p>`;
 
   bindNodeList();
+
+  // 存在「待同步」节点（stale=配置已变等 agent 拉 / pending=机器在线但还没回执过）
+  // 时启动自动轮询：顶栏按钮变成「自动刷新 Ns」倒数，归零自动重拉。
+  // agent 下一轮回执到达后状态翻「已同步」，自动刷新随之停止（见 core.js）
+  if (!NODE_SORTING && d.items.some((n) => n.sync && (n.sync.state === 'stale' || n.sync.state === 'pending'))) {
+    startAutoRefresh();
+  }
 };
 
 /* ------------------------- 列表：勾选 / 批量删 / 排序 ------------------------- */
@@ -773,7 +780,7 @@ function bindNodeForm(mask) {
     $('#cert-domain-hint', mask).textContent =
       cm === 'acme'
         ? 'agent 自动安装 acme.sh 并向 Let\'s Encrypt 申请证书，之后由 acme.sh 定时任务自动续期（失败重试有 30 分钟冷静期，防触发 CA 限速）。'
-        : 'agent 用 openssl 生成 10 年自签证书，并把证书 SHA-256 指纹随回执报回面板：订阅链接自动带 pcs（pinnedPeerCertSha256），新版 Xray-core（v26.2.6 起，已移除 allowInsecure）与新版 v2rayN 可直接导入使用；指纹上报前的过渡期回退 allowInsecure=1（兼容 24.x 及更早核心），Clash 订阅始终用 skip-cert-verify。生产环境建议改用 ACME 证书。';
+        : 'agent 用 openssl 生成 10 年自签证书，并把证书 SHA-256 指纹随回执报回面板：订阅链接自动带证书锁定参数（Xray 系为 pcs，Hysteria2 为 pinSHA256，均映射 pinnedPeerCertSha256），新版 Xray-core（v26.2.6 起，已移除 allowInsecure）与新版 v2rayN 可直接导入使用；指纹上报前的过渡期回退 allowInsecure=1（兼容 24.x 及更早核心），Clash 订阅始终用 skip-cert-verify。生产环境建议改用 ACME 证书。';
 
     modeHint();
   };

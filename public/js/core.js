@@ -581,10 +581,45 @@ $('#collapse').addEventListener('click', () => {
 // 每次渲染领一个序号：慢的旧请求回来时不再覆盖新页面
 let renderSeq = 0;
 
+/* --------------------- 待同步自动刷新（节点列表） --------------------- */
+// agent 最长 60s 才回执一次：列表里挂着「待同步」时不该让人守着 F5。
+// 存在 stale/pending 节点 → 按钮变「自动刷新 Ns」倒数，归零自动 render()；
+// 刷新后仍有待同步就续下一轮，没有了就恢复普通「刷新」。
+// 切页面 / 手动刷新都会走 render() 开头的 stopAutoRefresh()，旧计时器不跨页面泄漏
+let autoRefreshTimer = null;
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = null;
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  const secs = Number(window.NP_AUTOREFRESH_SECS) || 10;
+  let left = secs;
+  const paint = () => {
+    const btn = $('#page-actions [data-act="refresh"]');
+    // 按钮被别的流程重画没了就别硬撑，直接停表
+    if (!btn) return stopAutoRefresh();
+    btn.textContent = left > 0 ? `自动刷新 ${left}s` : '刷新';
+  };
+  paint();
+  autoRefreshTimer = setInterval(() => {
+    left--;
+    if (left <= 0) {
+      stopAutoRefresh();
+      render(); // 归零重拉；render 完若仍是待同步会再启动下一轮
+    } else {
+      paint();
+    }
+  }, 1000);
+}
+
 async function render() {
   const seq = ++renderSeq;
   const view = state.view;
   const cfg = VIEWS[view];
+  stopAutoRefresh();
   $$('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
   $('#page-title').textContent = cfg.title;
   $('#page-sub').textContent = cfg.sub;
