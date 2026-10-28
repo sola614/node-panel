@@ -13,7 +13,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 const BASE = (process.argv[2] || 'http://127.0.0.1:18081').replace(/\/+$/, '');
 const PORT = Number(process.env.CHROME_PORT || 9516);
@@ -25,7 +25,11 @@ const CHROME_CANDIDATES = [
   'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/opt/google/chrome/chrome',
   '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/snap/bin/chromium',
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
 ].filter(Boolean);
 
@@ -140,9 +144,17 @@ async function shot(name, cdp) {
     process.exit(1);
   }
 
+  // 先把版本打出来：二进制存在但跑不起来（缺 .so）时，这里会直接暴露
+  try {
+    const v = spawnSync(chrome, ['--version'], { encoding: 'utf8', timeout: 10000 });
+    // 只取版本号：Windows 上 --version 的输出是本地编码，整行打出来会是乱码
+    const m = String(v.stdout || v.stderr || '').match(/(\d+\.\d+\.\d+\.\d+)/);
+    console.log(`浏览器：${chrome}${m ? '（' + m[1] + '）' : ''}`);
+  } catch { /* 版本探测失败不影响后面的真实启动 */ }
+
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'np-demo-chrome-'));
-  // CI 的容器里 /dev/shm 很小，Chrome 不关沙箱容易崩
-  const ciArgs = process.env.CI ? ['--no-sandbox', '--disable-dev-shm-usage'] : [];
+  // CI 的容器里 /dev/shm 很小、也没有沙箱能力，不关掉这两项 Chrome 会直接崩
+  const ciArgs = process.env.CI ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] : [];
   const proc = spawn(
     chrome,
     [
@@ -150,20 +162,38 @@ async function shot(name, cdp) {
       '--disable-extensions', '--hide-scrollbars', '--remote-debugging-port=' + PORT,
       '--user-data-dir=' + profile, '--window-size=1440,960', ...ciArgs, 'about:blank',
     ],
-    { stdio: 'ignore' },
+    // stderr 必须留着：Chrome 起不来时唯一的原因就在这里面
+    { stdio: ['ignore', 'ignore', 'pipe'] },
   );
 
+  let chromeErr = '';
+  proc.stderr.on('data', (d) => { chromeErr += d.toString(); });
+  let exited = null;
+  proc.on('exit', (code, signal) => { exited = `code=${code} signal=${signal}`; });
+
+  const portFile = path.join(profile, 'DevToolsActivePort');
   let wsUrl = '';
-  for (let i = 0; i < 60; i++) {
-    await sleep(250);
+  const deadline = Date.now() + 25000;
+  while (Date.now() < deadline && !exited) {
+    await sleep(200);
+    // 首选：Chrome 自己写下的端口文件，比猜 HTTP 端点的行为可靠得多
+    try {
+      if (fs.existsSync(portFile)) {
+        const [p, wsPath] = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+        if (p && wsPath) { wsUrl = `ws://127.0.0.1:${p}${wsPath}`; break; }
+      }
+    } catch { /* 文件还在写，下一轮再试 */ }
+    // 回退：老的 /json/new 探测（Chrome 111+ 必须用 PUT）
     try {
       const t = await request('PUT', `http://127.0.0.1:${PORT}/json/new?about:blank`);
       if (t.json && t.json.webSocketDebuggerUrl) { wsUrl = t.json.webSocketDebuggerUrl; break; }
     } catch { /* 还没起来 */ }
   }
+
   if (!wsUrl) {
     proc.kill();
-    console.error('浏览器没起来');
+    console.error('浏览器没起来' + (exited ? `（进程已退出 ${exited}）` : '（25 秒内调试端口无响应）'));
+    if (chromeErr) console.error('Chrome 输出：\n' + chromeErr.trim().split('\n').slice(-12).join('\n'));
     process.exit(1);
   }
 
