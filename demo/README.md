@@ -64,11 +64,18 @@ python3 -m http.server 8081 --directory dist
 
 ## 部署
 
-`.github/workflows/pages.yml` 负责构建、自检、发布。**首次需要在仓库
-Settings → Pages → Source 选 "GitHub Actions"**，之后推 `main` 就会自动更新。
+`.github/workflows/pages.yml` 负责构建、自检、发布。
+
+**首次需要在仓库 Settings → Pages → Source 选 "GitHub Actions"**，之后推 `main` 就会自动更新。
+这一步没法自动化：`configure-pages` 的 `enablement` 参数看着能顺手开掉，但它的 action.yml
+明确要求传入 `GITHUB_TOKEN` 以外的 token（PAT 需要 `repo` 或 Pages write 权限），
+Actions 里的默认 token 做不到。没启用时 CI 报的是 `Get Pages site failed ... 404`，
+很容易被误读成 workflow 写错了。
 
 自检（`check.js`）会用真 Chrome 把九个页面点一遍，卡住三件事：页面渲染出来了、
-控制台没报错、没有 404。数据录坏了会在这里失败，而不是等访客看到白屏。
+控制台没报错、没有 404。**它失败只发 warning、不阻塞发布** —— runner 上的 Chrome 是外部依赖，
+缺库或沙箱受限都可能起不来，一次环境抖动不该让演示站更新不了。
+想知道自检过没过，去 Actions 日志里找 `浏览器：/usr/bin/google-chrome（141.x）` 那行。
 
 ## 已知取舍
 
