@@ -1,14 +1,14 @@
 {
   "items": [
     {
-      "file": "panel-manual-20261028-100812.db",
-      "size": 176128,
-      "mtime": "2026-10-28T10:08:12.969Z",
+      "file": "panel-manual-20261029-094938.db",
+      "size": 184320,
+      "mtime": "2026-10-29T09:49:38.742Z",
       "kind": "manual"
     }
   ],
-  "dir": "D:\\project\\node-panel\\.demo-tmp\\backups",
-  "dbFile": "D:\\project\\node-panel\\.demo-tmp\\panel.db",
-  "dbSize": 4300280,
-  "totalSize": 176128
+  "dir": "C:\\Users\\ZHANGW~1\\AppData\\Local\\Temp\\np-demo-rec\\backups",
+  "dbFile": "C:\\Users\\ZHANGW~1\\AppData\\Local\\Temp\\np-demo-rec\\panel.db",
+  "dbSize": 4320832,
+  "totalSize": 184320
 }

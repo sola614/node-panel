@@ -1,7 +1,6 @@
 {
   "days": 30,
   "dates": [
-    "2026-09-29",
     "2026-09-30",
     "2026-10-01",
     "2026-10-02",
@@ -30,7 +29,8 @@
     "2026-10-25",
     "2026-10-26",
     "2026-10-27",
-    "2026-10-28"
+    "2026-10-28",
+    "2026-10-29"
   ],
   "totals": [
     600221680,
@@ -70,7 +70,7 @@
   "nodeDetailReady": true,
   "users": [
     {
-      "id": "4fa024164f38",
+      "id": "2ef01ef566ae",
       "name": "林小满",
       "planName": "旗舰版",
       "planColor": "#a78bfa",
@@ -112,7 +112,7 @@
       "total": 31503585120
     },
     {
-      "id": "42037059dcfc",
+      "id": "6d0e7c099499",
       "name": "陈拓",
       "planName": "标准版",
       "planColor": "#4c8dff",
@@ -154,7 +154,7 @@
       "total": 11693048462
     },
     {
-      "id": "26664b1a24d4",
+      "id": "32db739a408d",
       "name": "周野",
       "planName": "体验版",
       "planColor": "#34d399",
@@ -196,7 +196,7 @@
       "total": 10436770529
     },
     {
-      "id": "e1e5476dd027",
+      "id": "dd2c6eceb294",
       "name": "测试号",
       "planName": "不限套餐",
       "planColor": "#6f8199",
@@ -238,7 +238,7 @@
       "total": 386547057
     },
     {
-      "id": "1a0d4963b7ec",
+      "id": "738ecd0ff81c",
       "name": "admin",
       "planName": "不限套餐",
       "planColor": "#6f8199",
@@ -282,7 +282,7 @@
   ],
   "nodes": [
     {
-      "id": "a38c7be8be21",
+      "id": "ea728c09869a",
       "name": "HK-HY2",
       "protocol": "hysteria2",
       "label": "HK-HY2",
@@ -323,7 +323,7 @@
       "total": 11846056689
     },
     {
-      "id": "b4ed11bfd706",
+      "id": "9d260e0f0d67",
       "name": "SG-REALITY",
       "protocol": "vless",
       "label": "SG-REALITY",
@@ -364,7 +364,7 @@
       "total": 11846056689
     },
     {
-      "id": "c55a6314c8fb",
+      "id": "2332cf03bb31",
       "name": "JP-SS",
       "protocol": "ss",
       "label": "东京-01 · JP-SS",
@@ -405,7 +405,7 @@
       "total": 8729521035
     },
     {
-      "id": "bf63061349c2",
+      "id": "d65615c91734",
       "name": "HK-VLESS-WS",
       "protocol": "vless",
       "label": "香港-01 · HK-VLESS-WS",
@@ -446,7 +446,7 @@
       "total": 8173859643
     },
     {
-      "id": "01b1d3e82064",
+      "id": "16e8519d253d",
       "name": "JP-VMESS",
       "protocol": "vmess",
       "label": "东京-01 · JP-VMESS",
@@ -487,7 +487,7 @@
       "total": 8173859643
     },
     {
-      "id": "7710bf6d00ac",
+      "id": "c9b4cc734086",
       "name": "HK-TROJAN",
       "protocol": "trojan",
       "label": "香港-01 · HK-TROJAN",
@@ -528,5 +528,5 @@
       "total": 5250597525
     }
   ],
-  "todayKey": "2026-10-28"
+  "todayKey": "2026-10-29"
 }

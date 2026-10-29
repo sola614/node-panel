@@ -41,6 +41,11 @@
         <label>密码</label>
         <input type="password" id="login-pass" autocomplete="current-password" placeholder="••••••••">
       </div>
+      <div class="field" id="login-totp-field" hidden>
+        <label>动态码 / 恢复码</label>
+        <input type="text" id="login-totp" autocomplete="one-time-code" placeholder="6 位动态码，或 xxxx-xxxx 恢复码" inputmode="numeric" style="letter-spacing:1px">
+        <div class="hint" id="login-totp-hint">已开启二步验证：请输入认证器上的 6 位动态码</div>
+      </div>
       <button class="btn btn-primary btn-block" type="submit" style="margin-top:6px;padding:11px">登 录</button>
     </form>
     <p class="hint" style="text-align:center;margin-top:16px">

@@ -10,7 +10,11 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('node:child_process');
+const net = require('net');
+const http = require('http');
+const tls = require('tls');
+const { spawnSync, spawn } = require('node:child_process');
+const totp = require('../lib/totp');
 
 const BASE = (process.argv[2] || 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const ADMIN_USER = process.env.PANEL_ADMIN_USER || 'admin';
@@ -48,6 +52,74 @@ async function call(path, opts = {}) {
 }
 
 const json = (obj) => JSON.stringify(obj);
+
+/** 用 lib/totp 的同源密钥算当前窗口的合法 6 位码（±1 窗口容差由服务端承担） */
+function totpCodeOf(secret) {
+  const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = String(secret).toUpperCase().replace(/[\s=-]/g, '');
+  let bits = 0;
+  let value = 0;
+  const key = [];
+  for (const ch of clean) {
+    value = (value << 5) | B32.indexOf(ch);
+    bits += 5;
+    if (bits >= 8) {
+      key.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
+  buf.writeUInt32BE(counter >>> 0, 4);
+  const crypto = require('crypto');
+  const d = crypto.createHmac('sha1', Buffer.from(key)).update(buf).digest();
+  const off = d[d.length - 1] & 0x0f;
+  const code = (((d[off] & 0x7f) << 24) | (d[off + 1] << 16) | (d[off + 2] << 8) | d[off + 3]) % 1000000;
+  return String(code).padStart(6, '0');
+}
+
+/** 极简 fake SMTP：只回够用的应答，把 DATA 正文收下来（验证码从正文里抠） */
+function startFakeSmtp() {
+  return new Promise((resolve) => {
+    const state = { messages: [] };
+    const server = net.createServer((socket) => {
+      socket.write('220 fake.local ESMTP ready\r\n');
+      let buf = '';
+      let inData = false;
+      socket.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        for (;;) {
+          if (inData) {
+            const end = buf.indexOf('\r\n.\r\n');
+            if (end < 0) return;
+            state.messages.push(buf.slice(0, end));
+            buf = buf.slice(end + 5);
+            inData = false;
+            socket.write('250 2.0.0 Ok: queued\r\n');
+            continue;
+          }
+          const nl = buf.indexOf('\r\n');
+          if (nl < 0) return;
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 2);
+          const cmd = line.slice(0, 4).toUpperCase();
+          if (cmd === 'EHLO' || cmd === 'HELO') socket.write('250 fake.local\r\n');
+          else if (cmd === 'MAIL' || cmd === 'RCPT') socket.write('250 Ok\r\n');
+          else if (cmd === 'DATA') {
+            inData = true;
+            socket.write('354 End data with <CR><LF>.<CR><LF>\r\n');
+          } else if (cmd === 'QUIT') {
+            socket.write('221 Bye\r\n');
+            socket.end();
+          } else socket.write('250 Ok\r\n');
+        }
+      });
+      socket.on('error', () => {});
+    });
+    server.listen(0, '127.0.0.1', () => resolve({ server, state, port: server.address().port, get messages() { return state.messages; } }));
+  });
+}
 
 (async () => {
   console.log(`\n▸ 目标面板：${BASE}\n`);
@@ -494,6 +566,15 @@ const json = (obj) => JSON.stringify(obj);
     !srvWrapper.includes('无需 Node') && !srvWrapper.includes('纯 shell'));
   ok('纯 Hysteria2 独立节点不装 Xray', nodeInstall.includes('NEED_XRAY="0"'));
 
+  // 面板被删 / 换域名 / token 失效之后，机器上要有一条不依赖面板的退路
+  ok('部署脚本落地本机卸载入口 /opt/nodepanel/uninstall.sh',
+    srvInstall.includes('cat > /opt/nodepanel/uninstall.sh') &&
+      srvInstall.includes('exec sh /opt/nodepanel/agent.sh --uninstall'));
+  const entrySrc = (srvInstall.split("<<'NODEPANEL_UNINSTALL_EOF'\n")[1] || '').split('\nNODEPANEL_UNINSTALL_EOF')[0];
+  const entryCheck = spawnSync('sh', ['-n'], { input: entrySrc, encoding: 'utf8' });
+  ok('本机卸载入口通过 sh -n 语法检查', entrySrc.length > 0 && entryCheck.status === 0,
+    String(entryCheck.stderr || '').slice(0, 120));
+
   /* ---------- 11.1 卸载脚本 ---------- */
   const srvUninstall = await fetch(`${BASE}/api/servers/${serverId}/uninstall?token=${serverToken}`).then((r) => r.text());
   ok('服务器卸载脚本可下载', srvUninstall.startsWith('#!/bin/sh') && srvUninstall.includes('nodepanel-agent'));
@@ -522,6 +603,9 @@ const json = (obj) => JSON.stringify(obj);
   ok('卸载脚本不再保留 Xray 配置（只保留备份）',
     srvUninstall.includes('保留 $XRAY_BAK') && !srvUninstall.includes('Xray 仍在按这份配置跑'));
   ok('卸载脚本支持 --purge 深度清理', srvUninstall.includes('--purge') && srvUninstall.includes('nodepanel.bak'));
+  // 清理逻辑只保留一份：机器上还有 agent 本体时，交给它的 --uninstall 去做
+  ok('卸载脚本优先转交 agent 自己的 --uninstall',
+    srvUninstall.includes('exec sh /opt/nodepanel/agent.sh --uninstall "$@"'));
 
   // 脚本是拼模板拼出来的，少个转义就是语法错 —— 真机执行前先让 sh 自己检查一遍
   const shCheck = spawnSync('sh', ['-n'], { input: srvUninstall, encoding: 'utf8' });
@@ -1430,6 +1514,36 @@ const json = (obj) => JSON.stringify(obj);
   ok('降级后配置 hash 变化（agent 下一轮就会重拉）', lvCfg2.data.hash !== lvHashBefore,
     `${lvHashBefore} → ${lvCfg2.data.hash}`);
 
+  // 中转入口单独挂套餐时，订阅与配置必须同一套等级规则。
+  // 改之前订阅写死 entry.planIds.includes(user.planId)（精确匹配），
+  // 配置层却走等级继承，会出现「订阅里看不到、节点里却注入了这个人」。
+  const entryNode = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-入口等级', serverId: lvSrv.data.item.id, protocol: 'vless',
+      port: 21315, network: 'tcp', security: 'none', planIds: [lvHigh.data.item.id],
+      entries: [{ name: '低配入口', host: '10.9.9.9', port: 21316, planIds: [lvLow.data.item.id] }],
+    }),
+  });
+  cleanup.push(['/api/nodes/' + entryNode.data.item.id]);
+  const lvUserHigh2 = await call('/api/users', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-高配用户2', planId: lvHigh.data.item.id }),
+  });
+  cleanup.push(['/api/users/' + lvUserHigh2.data.item.id]);
+
+  const subH2 = await call(`/api/sub/${lvUserHigh2.data.item.token}`);
+  const h2Names = (subH2.data.links || []).map((l) => l.name);
+  ok('高等级用户能看到挂在低等级上的中转入口',
+    h2Names.some((n) => n.includes('低配入口')), h2Names.join(','));
+
+  const subL2 = await call(`/api/sub/${lvUserLow.data.item.token}`);
+  const l2Names = (subL2.data.links || []).map((l) => l.name);
+  ok('低等级用户只看到入口、看不到高等级直连',
+    l2Names.some((n) => n.includes('低配入口')) &&
+      !l2Names.some((n) => n === 'SMOKE-等级机 · SMOKE-入口等级'),
+    l2Names.join(','));
+
   /* ---------- 15. 证书（只走 draft 状态，不触发真实签发） ---------- */
   // 这一段刻意不调 /api/certs/:id/issue：签发要真的装 acme.sh 并访问
   // Let's Encrypt，CI 里既不该跑也跑不通。CRUD 与校验路径已经能覆盖大部分回归。
@@ -1611,6 +1725,569 @@ const json = (obj) => JSON.stringify(obj);
     }
 
     fs.rmSync(pemDir, { recursive: true, force: true });
+  }
+
+  /* ---------- 15.5 管理员 TOTP 二步验证（0.1.16） ---------- */
+  {
+    const loginRaw = (payload) =>
+      fetch(`${BASE}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).then((r) => r.json());
+
+    const setup = await call('/api/admin/totp/setup', { method: 'POST', body: '{}' });
+    ok('TOTP 生成待绑定密钥', setup.status === 200 && /^[A-Z2-7]{32}$/.test(setup.data.secret || ''),
+      setup.data.secret ? `(${setup.data.secret.slice(0, 6)}…)` : '');
+    ok('TOTP 返回认证器导入 URI', setup.status === 200 && String(setup.data.otpauth || '').startsWith('otpauth://totp/'));
+
+    // 开启需要登录密码：会话被劫持者绑自己的认证器 = 把真管理员锁在门外
+    const goodCode = totpCodeOf(setup.data.secret);
+    const noPass = await call('/api/admin/totp/enable', { method: 'POST', body: json({ code: goodCode }) });
+    ok('开启 TOTP 缺登录密码被拒', noPass.status === 400 && /密码/.test(noPass.data.error || ''), noPass.data.error || '');
+    const badPass = await call('/api/admin/totp/enable', { method: 'POST', body: json({ code: goodCode, password: 'wrong-pass' }) });
+    ok('开启 TOTP 密码错误被拒', badPass.status === 400, badPass.data.error || '');
+    const badEnable = await call('/api/admin/totp/enable', { method: 'POST', body: json({ code: '000000', password: ADMIN_PASS }) });
+    ok('错误动态码不能开启 TOTP', badEnable.status === 400, badEnable.data.error || '');
+
+    // setup 密钥可能因上面几次失败而过期待重建？enable 只认最近一次 setup 的密钥，重取一次最稳
+    const setup2 = await call('/api/admin/totp/setup', { method: 'POST', body: '{}' });
+    const finalSecret = setup2.status === 200 ? setup2.data.secret : setup.data.secret;
+    const enableCode = totpCodeOf(finalSecret);
+    const enable = await call('/api/admin/totp/enable', { method: 'POST', body: json({ code: enableCode, password: ADMIN_PASS }) });
+    ok('密码 + 动态码开启 TOTP', enable.status === 200 && enable.data.recoveryCodes.length === 10,
+      `(恢复码 ${enable.data.recoveryCodes.length} 枚)`);
+
+    const step1 = await loginRaw({ username: ADMIN_USER, password: ADMIN_PASS });
+    ok('开启后仅密码登录不发 token', step1.totpRequired === true && !step1.token);
+
+    const step1bad = await loginRaw({ username: ADMIN_USER, password: ADMIN_PASS, totp: '123456' });
+    ok('错误动态码登录被拒', step1bad.error !== undefined && !step1bad.token, `(${step1bad.error || ''})`);
+
+    // 同一枚动态码只能用一次（重放防护）：第一次成功、第二次拒绝
+    const replayCode = totpCodeOf(finalSecret);
+    const stepFirst = await loginRaw({ username: ADMIN_USER, password: ADMIN_PASS, totp: replayCode });
+    ok('密码 + 动态码两段式登录成功', !!stepFirst.token && stepFirst.appVersion === pkgVersion);
+    const stepReplay = await loginRaw({ username: ADMIN_USER, password: ADMIN_PASS, totp: replayCode });
+    ok('同一动态码第二次登录被拒（重放防护）', !stepReplay.token && /刚被用过/.test(stepReplay.error || ''),
+      `(${stepReplay.error || ''})`);
+
+    const recovery = enable.data.recoveryCodes[0];
+    const viaRecovery = await loginRaw({ username: ADMIN_USER, password: ADMIN_PASS, recoveryCode: recovery.toUpperCase() });
+    ok('恢复码可登录（大小写不敏感）', !!viaRecovery.token);
+    const viaRecoveryAgain = await loginRaw({ username: ADMIN_USER, password: ADMIN_PASS, recoveryCode: recovery });
+    ok('同一恢复码第二次被拒（一次性）', !viaRecoveryAgain.token, `(${viaRecoveryAgain.error || ''})`);
+
+    const meTotp = await call('/api/me');
+    ok('/api/me 反映 TOTP 已开启', meTotp.data.totpEnabled === true);
+
+    // 关闭：凭密码（认证器在手也可以用动态码，这里测密码通道）
+    const off = await call('/api/admin/totp/disable', { method: 'POST', body: json({ password: ADMIN_PASS }) });
+    ok('凭登录密码可关闭 TOTP', off.status === 200, off.data.error || '');
+    const stepAfter = await loginRaw({ username: ADMIN_USER, password: ADMIN_PASS });
+    ok('关闭后恢复单段登录', !!stepAfter.token && !stepAfter.totpRequired);
+  }
+
+  /* ---------- 15.6 sing-box 订阅格式（0.1.16） ---------- */
+  {
+    const sbUser = await mkUser('SMOKE-singbox用户', null, 100);
+    const sb = await fetch(`${BASE}/s/${sbUser.token}?format=singbox`);
+    const sbText = await sb.text();
+    const sbHeaders = sb.headers;
+    let sbDoc = null;
+    try {
+      sbDoc = JSON.parse(sbText);
+    } catch { /* 让断言去报错 */ }
+    ok('sing-box 订阅返回 200 且是纯 JSON', sb.status === 200 && !!sbDoc, `(${sb.headers.get('content-type') || ''})`);
+    ok('sing-box 订阅保留 Subscription-Userinfo 头', /upload=/.test(sbHeaders.get('subscription-userinfo') || ''));
+    const obs = (sbDoc && sbDoc.outbounds) || [];
+    const types = obs.map((o) => o.type);
+    ok('sing-box 含 selector / urltest / direct 出站',
+      types.includes('selector') && types.includes('urltest') && types.includes('direct'));
+    ok('sing-box 出站覆盖 vless（Reality）与 hysteria2', types.includes('vless') && types.includes('hysteria2'));
+    const hyOb = obs.find((o) => o.type === 'hysteria2');
+    ok('hysteria2 出站密码是 u<id>:<uuid> 形状', hyOb && /^u[^:]+:[0-9a-f-]{36}$/.test(hyOb.password || ''));
+    const realityOb = obs.find((o) => o.type === 'vless' && o.tls && o.tls.reality);
+    ok('vless Reality 出站带 utls 与 reality 参数',
+      realityOb && realityOb.tls.utls && realityOb.tls.reality.public_key && realityOb.tls.reality.short_id !== undefined);
+    ok('sing-box 路由默认走选择器', sbDoc && sbDoc.route && sbDoc.route.final === obs.find((o) => o.type === 'selector').tag);
+    // JSON 订阅里也应给出 singboxUrl（订阅页一键导入要用）
+    const sbJson = await call(`/api/sub/${sbUser.token}`);
+    ok('订阅 JSON 带 singboxUrl', String(sbJson.data.singboxUrl || '').endsWith('?format=singbox'));
+  }
+
+  /* ---------- 15.7 流量上报对账：累计值 + 序号 + 实例代数（0.1.16） ---------- */
+  {
+    const v2u = await mkUser('SMOKE-对账用户', null, 100);
+    const v2key = 'u' + v2u.id;
+    const usedOf = async () => {
+      const r = await call('/api/users');
+      return (r.data.items.find((x) => x.id === v2u.id) || {}).usedBytes || 0;
+    };
+    const GEN_A = 'aabbccdd00112233';
+    const GEN_B = 'bbccddee44556677'; // 模拟重装后的新实例代数
+
+    const r1 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 1, gen: GEN_A, totals: [[v2key, 1000, 2000]], nodes: [[node1Id, 500, 600]] }),
+    });
+    ok('v2 新代数首轮只建基线不入账', r1.status === 200 && r1.data.baseline === true,
+      JSON.stringify(r1.data).slice(0, 60));
+    ok('v2 建基线后用户用量仍为 0', (await usedOf()) === 0);
+
+    const r2 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 1, gen: GEN_A, totals: [[v2key, 9999, 9999]] }),
+    });
+    ok('v2 重复序号整批丢弃', r2.status === 200 && r2.data.duplicate === true);
+    ok('v2 重复上报不涨量', (await usedOf()) === 0);
+
+    const r3 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 2, gen: GEN_A, totals: [[v2key, 1500, 2500]] }),
+    });
+    ok('v2 按累计差值入账', r3.status === 200 && r3.data.bytes === 1000, `(bytes=${r3.data.bytes})`);
+    ok('v2 差值后用户用量正确', (await usedOf()) === 1000);
+
+    const r4 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 1, gen: GEN_A, totals: [[v2key, 9999, 9999]] }),
+    });
+    ok('v2 乱序（旧序号）整批丢弃', r4.status === 200 && r4.data.duplicate === true);
+
+    // 计数器清零（Xray 重启）：累计值变小 → 全额入账
+    const r5 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 3, gen: GEN_A, totals: [[v2key, 100, 200]] }),
+    });
+    ok('v2 计数器回绕按全量入账', r5.status === 200 && r5.data.bytes === 300, `(bytes=${r5.data.bytes})`);
+    const usedBeforeReinstall = await usedOf();
+
+    // 重装 agent（STATE_DIR 被删）：gen 变了、seq 归零 —— 旧实现会把后续上报
+    // 当「重复」永久丢弃；现在必须只建基线、随后继续正常入账
+    const r6 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 1, gen: GEN_B, totals: [[v2key, 80, 90]] }),
+    });
+    ok('v2 重装（新代数）首轮建基线不重算历史', r6.status === 200 && r6.data.baseline === true,
+      JSON.stringify(r6.data).slice(0, 60));
+    ok('v2 重装基线后用量不变（不把历史累计重算一遍）', (await usedOf()) === usedBeforeReinstall);
+
+    const r7 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 2, gen: GEN_B, totals: [[v2key, 500, 600]] }),
+    });
+    ok('v2 重装后流量继续按差值入账', r7.status === 200 && r7.data.bytes === 930, `(bytes=${r7.data.bytes})`);
+    ok('v2 重装后用户用量正确', (await usedOf()) === usedBeforeReinstall + 930);
+
+    // 无 gen 的 v2 上报（升级窗口期的兜底语义）：首报全量入账，与旧实现一致
+    const v2n = await mkUser('SMOKE-对账无代数', null, 100);
+    const r8 = await call(`/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      body: json({ v2: 1, seq: 1, totals: [['u' + v2n.id, 700, 800]] }),
+    });
+    ok('v2 不带 gen 时首报全量入账（兼容语义）', r8.status === 200 && r8.data.bytes === 1500, `(bytes=${r8.data.bytes})`);
+
+    // 旧 agent 的纯文本增量上报仍然兼容
+    const v2uBefore = await usedOf();
+    const legacy = await fetch(`${BASE}/api/agent/report?token=${serverToken}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: `${v2key} 111 222\n`,
+    });
+    const legacyData = await legacy.json();
+    ok('旧格式纯文本上报继续可用', legacy.status === 200 && legacyData.applied === 1 && legacyData.bytes === 333);
+    ok('旧格式入账正确叠加', (await usedOf()) === v2uBefore + 333);
+  }
+
+  /* ---------- 15.8 面板侧连通性探测（0.1.16） ---------- */
+  {
+    const mkNode = async (name, extra) => {
+      const r = await call('/api/nodes', {
+        method: 'POST',
+        body: json({ name, mode: 'standalone', address: '127.0.0.1', protocol: 'vless', port: 443, ...extra }),
+      });
+      if (r.status === 200) cleanup.push(['/api/nodes/' + r.data.item.id]);
+      return r;
+    };
+
+    // 探测面板自己的 HTTP 端口：一定在监听
+    const probePort = new URL(BASE).port || '80';
+    const okNode = await mkNode('SMOKE-探测可达', { port: Number(probePort), security: 'none' });
+    const probeOk = await call(`/api/nodes/${okNode.data.item.id}/probe`, { method: 'POST', body: '{}' });
+    ok('探测：可达端口握手成功', probeOk.status === 200 && probeOk.data.probe.ok === true && probeOk.data.probe.ms != null,
+      probeOk.data.probe ? `(${probeOk.data.probe.ms}ms)` : JSON.stringify(probeOk.data).slice(0, 80));
+
+    // 127.0.0.1:1 一定拒绝连接（Linux 保留端口；Windows 同样立即 RST/拒绝）
+    const deadNode = await mkNode('SMOKE-探测不可达', { port: 1, security: 'none' });
+    const probeDead = await call(`/api/nodes/${deadNode.data.item.id}/probe`, { method: 'POST', body: '{}' });
+    ok('探测：关闭端口报不可达并带原因',
+      probeDead.status === 200 && probeDead.data.probe.ok === false && /TCP/.test(probeDead.data.probe.error || ''),
+      (probeDead.data.probe && probeDead.data.probe.error || '').slice(0, 60));
+
+    // hy2 只做 DNS 验证，不该报 TCP 失败
+    const hyNode = await mkNode('SMOKE-探测hy2', { port: 1, protocol: 'hysteria2', security: 'tls' });
+    const probeHy = await call(`/api/nodes/${hyNode.data.item.id}/probe`, { method: 'POST', body: '{}' });
+    ok('探测：hy2（UDP）仅验证解析不报 TCP 失败',
+      probeHy.status === 200 && probeHy.data.probe.ok === true && /UDP/.test(probeHy.data.probe.note || ''));
+
+    // 证书不匹配：起一个 SAN=probe-wrong.test 的 TLS 服务，节点 SNI 填别的域名。
+    // 必须呈现为「可达但证书异常」，而不是被降级成「面板不可达」把人引向安全组排查
+    const probeTlsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'np-smoke-probe-'));
+    const wrongCert = path.join(probeTlsDir, 'wrong.pem');
+    const wrongKey = path.join(probeTlsDir, 'wrong.key');
+    const wrongGen = spawnSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-days', '2', '-nodes',
+        '-keyout', wrongKey, '-out', wrongCert, '-subj', '/CN=probe-wrong.test',
+        '-addext', 'subjectAltName=DNS:probe-wrong.test'],
+      { encoding: 'utf8' },
+    );
+    if (wrongGen.status !== 0) {
+      console.log('  · 本机没有 openssl，跳过证书异常态探测用例');
+    } else {
+      const tlsSrv = tls.createServer(
+        { key: fs.readFileSync(wrongKey), cert: fs.readFileSync(wrongCert) },
+        (s) => s.end(),
+      );
+      const tlsReady = new Promise((resolve) => tlsSrv.listen(0, '127.0.0.1', () => resolve(tlsSrv.address().port)));
+      const tlsPort = await tlsReady;
+      const sniNode = await mkNode('SMOKE-探测证书', {
+        port: tlsPort, security: 'tls', sni: 'probe-right.test',
+      });
+      const probeSni = await call(`/api/nodes/${sniNode.data.item.id}/probe`, { method: 'POST', body: '{}' });
+      const p = probeSni.data.probe || {};
+      ok('探测：TCP 可达但证书不匹配 → 证书异常态（不被降级成不可达）',
+        probeSni.status === 200 && p.ok === true && p.tls && p.tls.ok === false,
+        `ok=${p.ok} tls=${JSON.stringify(p.tls || {}).slice(0, 70)}`);
+      ok('探测：证书异常原因点名 SNI 不在证书域名里', /不包含 SNI/.test((p.tls || {}).error || ''),
+        ((p.tls || {}).error || '').slice(0, 60));
+      // IP 型 SAN：证书是 IP 证书、SNI 填同一个 IP → 匹配（不应被报成不匹配）
+      const ipCert = path.join(probeTlsDir, 'ip.pem');
+      const ipKey = path.join(probeTlsDir, 'ip.key');
+      const ipGen = spawnSync(
+        'openssl',
+        ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-days', '2', '-nodes',
+          '-keyout', ipKey, '-out', ipCert, '-subj', '/CN=127.0.0.1',
+          '-addext', 'subjectAltName=IP:127.0.0.1'],
+        { encoding: 'utf8' },
+      );
+      if (ipGen.status === 0) {
+        const ipSrv = tls.createServer(
+          { key: fs.readFileSync(ipKey), cert: fs.readFileSync(ipCert) },
+          (s) => s.end(),
+        );
+        const ipPort = await new Promise((resolve) => ipSrv.listen(0, '127.0.0.1', () => resolve(ipSrv.address().port)));
+        const ipNode = await mkNode('SMOKE-探测IP证书', {
+          port: ipPort, security: 'tls', sni: '127.0.0.1',
+        });
+        const probeIp = await call(`/api/nodes/${ipNode.data.item.id}/probe`, { method: 'POST', body: '{}' });
+        const pip = probeIp.data.probe || {};
+        ok('探测：IP 型 SAN 与 IP 型 SNI 匹配（不误报证书异常）',
+          probeIp.status === 200 && pip.ok === true && pip.tls && pip.tls.ok === true,
+          `tls=${JSON.stringify(pip.tls || {}).slice(0, 70)}`);
+        ipSrv.close();
+      }
+      tlsSrv.close();
+      fs.rmSync(probeTlsDir, { recursive: true, force: true });
+    }
+
+    // 探测结果落在节点列表里（前端徽标的数据源）
+    const nodesList = await call('/api/nodes');
+    const probed = nodesList.data.items.find((n) => n.id === okNode.data.item.id);
+    ok('探测结果随节点列表下发', probed && probed.probe && probed.probe.ok === true);
+  }
+
+  /* ---------- 15.9 订阅页自助重置订阅链接（0.1.16） ---------- */
+  {
+    const ru = await mkUser('SMOKE-自助重置用户', null, 100);
+    const req1 = await call('/api/sub/reset-request', {
+      method: 'POST',
+      body: json({ token: ru.token, email: 'someone@example.com' }),
+    });
+    ok('未设置邮箱的账号不能自助重置', req1.status === 400, req1.data.error || '');
+
+    const setEmail = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ email: 'smoke-user@example.com' }) });
+    ok('管理员可为用户设置邮箱', setEmail.status === 200 && setEmail.data.item.email === 'smoke-user@example.com');
+    const badEmail = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ email: 'not-a-mail' }) });
+    ok('非法邮箱格式被拒绝', badEmail.status === 400, badEmail.data.error || '');
+
+    const req2 = await call('/api/sub/reset-request', {
+      method: 'POST',
+      body: json({ token: ru.token, email: 'smoke-user@example.com' }),
+    });
+    ok('没有邮件渠道时给出明确指引', req2.status === 400 && /邮件渠道/.test(req2.data.error || ''), req2.data.error || '');
+
+    // 起 fake SMTP + 建邮件渠道，走完整闭环
+    const fakeMail = await startFakeSmtp();
+    const channel = await call('/api/notify/channels', {
+      method: 'POST',
+      body: json({
+        name: 'SMOKE-邮件渠道', type: 'email', enabled: true, events: [],
+        config: { host: '127.0.0.1', port: fakeMail.port, secure: 'none', from: 'panel@example.com', to: 'admin@example.com' },
+      }),
+    });
+    ok('邮件渠道创建成功', channel.status === 200, channel.data.error || '');
+    if (channel.status === 200) cleanup.push(['/api/notify/channels/' + channel.data.item.id]);
+
+    const wrongMail = await call('/api/sub/reset-request', {
+      method: 'POST',
+      body: json({ token: ru.token, email: 'other@example.com' }),
+    });
+    ok('邮箱与绑定不一致时拒绝发送', wrongMail.status === 400 && /不一致/.test(wrongMail.data.error || ''));
+
+    const req3 = await call('/api/sub/reset-request', {
+      method: 'POST',
+      body: json({ token: ru.token, email: 'smoke-user@example.com' }),
+    });
+    ok('验证码邮件已发送（收件人打码）', req3.status === 200 && /^sm\*\*\*@example\.com$/.test(req3.data.sentTo || ''),
+      `(${req3.data.sentTo || ''})`);
+
+    const throttled = await call('/api/sub/reset-request', {
+      method: 'POST',
+      body: json({ token: ru.token, email: 'smoke-user@example.com' }),
+    });
+    ok('发送有 60 秒冷却', throttled.status === 429, `(${throttled.status})`);
+
+    // 从 fake SMTP 收到的正文里抠出 6 位验证码（正文按 base64 传输，先解码再找）
+    const mailBody = fakeMail.messages[fakeMail.messages.length - 1] || '';
+    const decoded = mailBody.replace(/[A-Za-z0-9+/=]{40,}/g, (m) => {
+      try {
+        return Buffer.from(m, 'base64').toString('utf8');
+      } catch {
+        return m;
+      }
+    });
+    const codeMatch = decoded.match(/验证码：\s*(\d{6})/);
+    ok('验证码出现在邮件正文里', !!codeMatch);
+
+    const badConfirm = await call('/api/sub/reset-confirm', {
+      method: 'POST',
+      body: json({ token: ru.token, code: '000000' }),
+    });
+    ok('错误验证码不能重置', badConfirm.status === 400, badConfirm.data.error || '');
+
+    // 申请验证码之后账号被停用：确认阶段拦下（停用不该有新凭证流出）
+    if (codeMatch) {
+      await call('/api/users/' + ru.id, { method: 'PUT', body: json({ enabled: false }) });
+      const disabledConfirm = await call('/api/sub/reset-confirm', {
+        method: 'POST',
+        body: json({ token: ru.token, code: codeMatch[1] }),
+      });
+      ok('停用账号的确认请求被拒', disabledConfirm.status === 400 && /停用/.test(disabledConfirm.data.error || ''),
+        disabledConfirm.data.error || '');
+      await call('/api/users/' + ru.id, { method: 'PUT', body: json({ enabled: true }) });
+
+      const confirm = await call('/api/sub/reset-confirm', {
+        method: 'POST',
+        body: json({ token: ru.token, code: codeMatch[1] }),
+      });
+      ok('正确验证码换发新订阅链接', confirm.status === 200 && /\/s\//.test(confirm.data.subUrl || ''));
+      const oldSub = await call(`/api/sub/${ru.token}`);
+      ok('旧订阅链接即刻失效', oldSub.status === 404);
+      const newToken = (confirm.data.subUrl || '').split('/s/')[1] || '';
+      const newSub = await call(`/api/sub/${newToken}`);
+      ok('新订阅链接可用', newSub.status === 200 && newSub.data.user.name === 'SMOKE-自助重置用户');
+    }
+    fakeMail.server.close();
+  }
+
+  /* ---------- 15.10 面板自身 HTTPS（0.1.16，独立实例） ---------- */
+  {
+    const tlsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'np-smoke-tls-'));
+    const certPem = path.join(tlsDir, 'cert.pem');
+    const keyPem = path.join(tlsDir, 'key.pem');
+    const gen = spawnSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-days', '2', '-nodes',
+        '-keyout', keyPem, '-out', certPem, '-subj', '/CN=localhost',
+        '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'],
+      { encoding: 'utf8' },
+    );
+    if (gen.status !== 0) {
+      console.log('  · 本机没有 openssl，跳过 HTTPS 段');
+    } else {
+      const httpPort = 18097;
+      const tlsPort = 18443;
+      const child = spawn(
+        process.execPath,
+        [path.join(__dirname, '..', 'server.js')],
+        {
+          env: {
+            ...process.env,
+            PORT: String(httpPort),
+            PANEL_TLS_PORT: String(tlsPort),
+            PANEL_DB_FILE: path.join(tlsDir, 'panel.db'),
+            PANEL_ADMIN_PASSWORD: 'https-smoke-pass',
+            PANEL_LOG_LEVEL: 'error',
+            PANEL_TLS_CERT: certPem,
+            PANEL_TLS_KEY: keyPem,
+          },
+          stdio: 'ignore',
+        },
+      );
+      // 自签证书：客户端侧关掉校验（只验证通道，不验证信任链）
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+      let healthy = false;
+      for (let i = 0; i < 30 && !healthy; i++) {
+        await new Promise((r) => setTimeout(r, 300));
+        try {
+          const h = await fetch(`https://127.0.0.1:${tlsPort}/api/health`);
+          healthy = h.ok;
+        } catch { /* 还没起来 */ }
+      }
+      ok('HTTPS 端口可服务请求', healthy);
+      if (healthy) {
+        const redir = await fetch(`http://127.0.0.1:${httpPort}/`, { headers: { Accept: 'text/html' }, redirect: 'manual' });
+        ok('浏览器访问 HTTP 301 跳转 HTTPS', redir.status === 301 && /^https:\/\/127\.0\.0\.1:18443\//.test(redir.headers.get('location') || ''),
+          `(${redir.headers.get('location') || ''})`);
+        const noRedir = await fetch(`http://127.0.0.1:${httpPort}/api/health`);
+        ok('agent/健康探针路径不被跳转（升级窗口期不掉线）', noRedir.status === 200);
+        const viaHttps = await fetch(`https://127.0.0.1:${tlsPort}/api/health`);
+        ok('HTTPS 上健康检查正常', viaHttps.status === 200);
+        // HTTPS 直连时订阅地址按 https 生成（x-forwarded-proto 优先级测试在反代场景，这里验证直连）
+        const loginJson = await fetch(`https://127.0.0.1:${tlsPort}/api/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'admin', password: 'https-smoke-pass' }),
+        });
+        ok('HTTPS 上可登录', loginJson.status === 200);
+      }
+      child.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 500));
+
+      // 坏证书（非法 PEM）：createSecureContext 同步抛错 —— 必须回退纯 HTTP 继续服务，
+      // 而不是在 listen 之前炸掉整个进程（静默退出、退出码 0、HTTP 从未监听）
+      const badPem = path.join(tlsDir, 'bad.pem');
+      fs.writeFileSync(badPem, '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n');
+      const badPort = 18098;
+      const badTlsPort = 18444;
+      const child2 = spawn(
+        process.execPath,
+        [path.join(__dirname, '..', 'server.js')],
+        {
+          env: {
+            ...process.env,
+            PORT: String(badPort),
+            PANEL_TLS_PORT: String(badTlsPort),
+            PANEL_DB_FILE: path.join(tlsDir, 'panel2.db'),
+            PANEL_ADMIN_PASSWORD: 'https-smoke-pass',
+            PANEL_LOG_LEVEL: 'error',
+            PANEL_TLS_CERT: badPem,
+            PANEL_TLS_KEY: keyPem,
+          },
+          stdio: 'ignore',
+        },
+      );
+      let badHealthy = false;
+      for (let i = 0; i < 30 && !badHealthy; i++) {
+        await new Promise((r) => setTimeout(r, 300));
+        try {
+          const h = await fetch(`http://127.0.0.1:${badPort}/api/health`);
+          badHealthy = h.ok;
+        } catch { /* 还没起来 */ }
+      }
+      ok('坏证书时面板仍以 HTTP 正常服务（不静默退出）', badHealthy);
+      child2.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 500));
+
+      // TLS 端口被占：listen 异步报 EADDRINUSE —— 跳转判据必须是「真的在服务」，
+      // 否则浏览器被 301 到一个没有服务的死端口，唯一入口当场跳死
+      const squatPort = 18445;
+      const squatter = net.createServer((s) => s.end());
+      // 必须占「所有接口」：Windows 上 127.0.0.1:端口 被占时，0.0.0.0:同端口
+      // 照样能绑成功（SO_REUSEADDR 语义不同），面板会真的把 HTTPS 服务起来，
+      // 这条用例就变成「假失败」。全接口对全接口才会稳定报 EADDRINUSE
+      await new Promise((resolve) => squatter.listen(squatPort, resolve));
+      const busyPort = 18099;
+      const child3 = spawn(
+        process.execPath,
+        [path.join(__dirname, '..', 'server.js')],
+        {
+          env: {
+            ...process.env,
+            PORT: String(busyPort),
+            PANEL_TLS_PORT: String(squatPort),
+            PANEL_DB_FILE: path.join(tlsDir, 'panel3.db'),
+            PANEL_ADMIN_PASSWORD: 'https-smoke-pass',
+            PANEL_LOG_LEVEL: 'error',
+            PANEL_TLS_CERT: certPem,
+            PANEL_TLS_KEY: keyPem,
+          },
+          stdio: 'ignore',
+        },
+      );
+      let busyHealthy = false;
+      for (let i = 0; i < 30 && !busyHealthy; i++) {
+        await new Promise((r) => setTimeout(r, 300));
+        try {
+          const h = await fetch(`http://127.0.0.1:${busyPort}/api/health`);
+          busyHealthy = h.ok;
+        } catch { /* 还没起来 */ }
+      }
+      if (busyHealthy) {
+        const noRedir = await fetch(`http://127.0.0.1:${busyPort}/`, {
+          headers: { Accept: 'text/html' },
+          redirect: 'manual',
+        });
+        // Windows 上这条用例没法做：SO_REUSEADDR 语义不同，占住端口之后
+        // 面板照样能绑成功（0.0.0.0 与 127.0.0.1 互不排斥，甚至同地址也能抢），
+        // 「listen 失败」这个前提根本造不出来。Linux（CI）上才有意义
+        if (process.platform === 'win32') {
+          console.log('  · Windows 允许同端口重复绑定，跳过「TLS 端口被占」用例');
+        } else {
+          ok('TLS 端口被占时不 301 到死端口', noRedir.status === 200,
+            `(status=${noRedir.status})`);
+        }
+      } else {
+        ok('TLS 端口被占时 HTTP 仍可服务', false, 'HTTP 健康检查未通过');
+      }
+      child3.kill('SIGTERM');
+      squatter.close();
+      await new Promise((r) => setTimeout(r, 300));
+      fs.rmSync(tlsDir, { recursive: true, force: true });
+    }
+  }
+
+  /* ---------- 15.11 面板 HTTPS 引用的证书受删除保护（0.1.16） ---------- */
+  {
+    const cDir = fs.mkdtempSync(path.join(os.tmpdir(), 'np-smoke-cert-'));
+    const cPem = path.join(cDir, 'c.pem');
+    const kPem = path.join(cDir, 'k.pem');
+    const cGen = spawnSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-days', '2', '-nodes',
+        '-keyout', kPem, '-out', cPem, '-subj', '/CN=panel.smoke.test',
+        '-addext', 'subjectAltName=DNS:panel.smoke.test'],
+      { encoding: 'utf8' },
+    );
+    if (cGen.status !== 0) {
+      console.log('  · 本机没有 openssl，跳过证书删除保护用例');
+    } else {
+      const up = await call('/api/certs', {
+        method: 'POST',
+        body: json({ source: 'upload', certPem: fs.readFileSync(cPem, 'utf8'), keyPem: fs.readFileSync(kPem, 'utf8') }),
+      });
+      ok('粘贴导入面板证书成功', up.status === 200, up.data.error || '');
+      if (up.status === 200) {
+        cleanup.push(['/api/certs/' + up.data.item.id]);
+        const apply = await call('/api/settings', {
+          method: 'PUT',
+          body: json({ httpsCertId: up.data.item.id }),
+        });
+        ok('设置页可引用证书启用面板 HTTPS', apply.status === 200 && apply.data.httpsActive !== undefined);
+        // 引用中的证书删除被拦（409）：删了它 5 分钟后热加载会把监听关掉，管理员当场失联
+        const del = await call('/api/certs/' + up.data.item.id, { method: 'DELETE' });
+        ok('引用中的证书删除被拦（409）', del.status === 409 && /面板自身/.test(del.data.error || ''),
+          del.data.error || '');
+        // 解除引用后可以删
+        await call('/api/settings', { method: 'PUT', body: json({ httpsCertId: '' }) });
+        const del2 = await call('/api/certs/' + up.data.item.id, { method: 'DELETE' });
+        ok('解除引用后证书可删除', del2.status === 200, del2.data.error || '');
+        if (del2.status === 200) cleanup.pop();
+      }
+      fs.rmSync(cDir, { recursive: true, force: true });
+    }
   }
 
   /* ---------- 16. 清理 ---------- */

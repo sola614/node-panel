@@ -1,8 +1,8 @@
 {
-  "01b1d3e82064": {
+  "16e8519d253d": {
     "kind": "xray",
     "inbound": {
-      "tag": "node-01b1d3e82064",
+      "tag": "node-16e8519d253d",
       "listen": "0.0.0.0",
       "port": 8080,
       "protocol": "vmess",
@@ -21,26 +21,26 @@
       "settings": {
         "clients": [
           {
-            "id": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
-            "email": "u1a0d4963b7ec",
+            "id": "215a0869-55c3-445f-ab84-411cf35f6341",
+            "email": "u738ecd0ff81c",
             "alterId": 0,
             "level": 0
           },
           {
-            "id": "556a830c-35cd-475e-be50-4ebbe894064d",
-            "email": "u4fa024164f38",
+            "id": "a32191c1-0d07-42db-a24e-7c179f21812f",
+            "email": "u2ef01ef566ae",
             "alterId": 0,
             "level": 0
           },
           {
-            "id": "ca8a938b-6507-4525-b879-e26a59014118",
-            "email": "u42037059dcfc",
+            "id": "3ae679f3-d595-4fb5-b9cb-92523f361923",
+            "email": "u6d0e7c099499",
             "alterId": 0,
             "level": 0
           },
           {
-            "id": "9edc5bfe-daab-4104-8775-18aa60fd387e",
-            "email": "ue1e5476dd027",
+            "id": "f86bb004-bbe1-426e-a37c-fedb505a825c",
+            "email": "udd2c6eceb294",
             "alterId": 0,
             "level": 0
           }
@@ -49,10 +49,86 @@
     },
     "users": 4
   },
-  "7710bf6d00ac": {
+  "2332cf03bb31": {
     "kind": "xray",
     "inbound": {
-      "tag": "node-7710bf6d00ac",
+      "tag": "node-2332cf03bb31",
+      "listen": "0.0.0.0",
+      "port": 8388,
+      "protocol": "ss",
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "settings": {
+        "method": "aes-256-gcm",
+        "password": "1b5bddf965a55b31",
+        "network": "tcp,udp"
+      }
+    },
+    "users": 3
+  },
+  "9d260e0f0d67": {
+    "kind": "xray",
+    "inbound": {
+      "tag": "node-9d260e0f0d67",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.microsoft.com"
+          ],
+          "privateKey": "YAZz4ssTCy6eVZQ2c8U95m3K3dzWx6AytuNODQAcblc",
+          "shortIds": [
+            "5407e7fe"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "settings": {
+        "clients": [
+          {
+            "id": "215a0869-55c3-445f-ab84-411cf35f6341",
+            "email": "u738ecd0ff81c",
+            "flow": "xtls-rprx-vision"
+          },
+          {
+            "id": "f86bb004-bbe1-426e-a37c-fedb505a825c",
+            "email": "udd2c6eceb294",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      }
+    },
+    "users": 2
+  },
+  "c9b4cc734086": {
+    "kind": "xray",
+    "inbound": {
+      "tag": "node-c9b4cc734086",
       "listen": "0.0.0.0",
       "port": 8443,
       "protocol": "trojan",
@@ -67,8 +143,8 @@
           "serverName": "hk1.example.com",
           "certificates": [
             {
-              "certificateFile": "/etc/nodepanel/certs/7710bf6d00ac/fullchain.pem",
-              "keyFile": "/etc/nodepanel/certs/7710bf6d00ac/privkey.pem"
+              "certificateFile": "/etc/nodepanel/certs/c9b4cc734086/fullchain.pem",
+              "keyFile": "/etc/nodepanel/certs/c9b4cc734086/privkey.pem"
             }
           ],
           "alpn": [
@@ -88,80 +164,26 @@
       "settings": {
         "clients": [
           {
-            "password": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
-            "email": "u1a0d4963b7ec"
+            "password": "215a0869-55c3-445f-ab84-411cf35f6341",
+            "email": "u738ecd0ff81c"
           },
           {
-            "password": "556a830c-35cd-475e-be50-4ebbe894064d",
-            "email": "u4fa024164f38"
+            "password": "a32191c1-0d07-42db-a24e-7c179f21812f",
+            "email": "u2ef01ef566ae"
           },
           {
-            "password": "9edc5bfe-daab-4104-8775-18aa60fd387e",
-            "email": "ue1e5476dd027"
+            "password": "f86bb004-bbe1-426e-a37c-fedb505a825c",
+            "email": "udd2c6eceb294"
           }
         ]
       }
     },
     "users": 3
   },
-  "a38c7be8be21": {
-    "kind": "hysteria2",
-    "yaml": "# 星链 · 节点面板 · HK-HY2\n# 由 nodepanel-agent 自动生成，请勿手工修改\nlisten: :8443\ntls:\n  cert: /etc/ssl/hk2/fullchain.pem\n  key: /etc/ssl/hk2/privkey.pem\nobfs:\n  type: salamander\n  salamander:\n    password: 8433a281be005edf\nauth:\n  type: userpass\n  userpass:\n    u1a0d4963b7ec: 34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99\n    ue1e5476dd027: 9edc5bfe-daab-4104-8775-18aa60fd387e\nbandwidth:\n  up: \"100 mbps\"\n  down: \"1000 mbps\"\ntrafficStats:\n  listen: 127.0.0.1:29468\n  secret: 40ba40fe8f4be4b6\nmasquerade:\n  type: proxy\n  proxy:\n    url: https://news.ycombinator.com/\n    rewriteHost: true",
-    "users": 2
-  },
-  "b4ed11bfd706": {
+  "d65615c91734": {
     "kind": "xray",
     "inbound": {
-      "tag": "node-b4ed11bfd706",
-      "listen": "0.0.0.0",
-      "port": 443,
-      "protocol": "vless",
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "www.microsoft.com:443",
-          "xver": 0,
-          "serverNames": [
-            "www.microsoft.com"
-          ],
-          "privateKey": "yItkTT9xeTjpZqNu5OEKINuFDeo5qFbUcwwLGCP0tHE",
-          "shortIds": [
-            "594c8260"
-          ]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
-      },
-      "settings": {
-        "clients": [
-          {
-            "id": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
-            "email": "u1a0d4963b7ec",
-            "flow": "xtls-rprx-vision"
-          },
-          {
-            "id": "9edc5bfe-daab-4104-8775-18aa60fd387e",
-            "email": "ue1e5476dd027",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
-        "decryption": "none"
-      }
-    },
-    "users": 2
-  },
-  "bf63061349c2": {
-    "kind": "xray",
-    "inbound": {
-      "tag": "node-bf63061349c2",
+      "tag": "node-d65615c91734",
       "listen": "0.0.0.0",
       "port": 443,
       "protocol": "vless",
@@ -197,23 +219,23 @@
       "settings": {
         "clients": [
           {
-            "id": "34f2e5e5-81f3-4ac2-ae9e-a389e17a1d99",
-            "email": "u1a0d4963b7ec",
+            "id": "215a0869-55c3-445f-ab84-411cf35f6341",
+            "email": "u738ecd0ff81c",
             "flow": ""
           },
           {
-            "id": "556a830c-35cd-475e-be50-4ebbe894064d",
-            "email": "u4fa024164f38",
+            "id": "a32191c1-0d07-42db-a24e-7c179f21812f",
+            "email": "u2ef01ef566ae",
             "flow": ""
           },
           {
-            "id": "ca8a938b-6507-4525-b879-e26a59014118",
-            "email": "u42037059dcfc",
+            "id": "3ae679f3-d595-4fb5-b9cb-92523f361923",
+            "email": "u6d0e7c099499",
             "flow": ""
           },
           {
-            "id": "9edc5bfe-daab-4104-8775-18aa60fd387e",
-            "email": "ue1e5476dd027",
+            "id": "f86bb004-bbe1-426e-a37c-fedb505a825c",
+            "email": "udd2c6eceb294",
             "flow": ""
           }
         ],
@@ -222,31 +244,9 @@
     },
     "users": 4
   },
-  "c55a6314c8fb": {
-    "kind": "xray",
-    "inbound": {
-      "tag": "node-c55a6314c8fb",
-      "listen": "0.0.0.0",
-      "port": 8388,
-      "protocol": "ss",
-      "streamSettings": {
-        "network": "tcp",
-        "security": "none"
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
-      },
-      "settings": {
-        "method": "aes-256-gcm",
-        "password": "54ec6ca3918f56f8",
-        "network": "tcp,udp"
-      }
-    },
-    "users": 3
+  "ea728c09869a": {
+    "kind": "hysteria2",
+    "yaml": "# 星链 · 节点面板 · HK-HY2\n# 由 nodepanel-agent 自动生成，请勿手工修改\nlisten: :8443\ntls:\n  cert: /etc/ssl/hk2/fullchain.pem\n  key: /etc/ssl/hk2/privkey.pem\nobfs:\n  type: salamander\n  salamander:\n    password: af05039be58c466e\nauth:\n  type: userpass\n  userpass:\n    u738ecd0ff81c: 215a0869-55c3-445f-ab84-411cf35f6341\n    udd2c6eceb294: f86bb004-bbe1-426e-a37c-fedb505a825c\nbandwidth:\n  up: \"100 mbps\"\n  down: \"1000 mbps\"\ntrafficStats:\n  listen: 127.0.0.1:29618\n  secret: 673a34fd0fdc83d9\nmasquerade:\n  type: proxy\n  proxy:\n    url: https://news.ycombinator.com/\n    rewriteHost: true",
+    "users": 2
   }
 }

@@ -649,6 +649,34 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('子行首列留空（勾选列）', childRows.length === 1 && childRows[0].children[0].textContent.trim() === '');
   await json('/api/nodes/' + treeNode.item.id, { method: 'DELETE' }, T);
 
+  /* ---- 入口单独挂套餐时必须在配置处就说清「拦不住人」 ---- */
+  const hintPlan = await json('/api/plans', {
+    method: 'POST',
+    body: JSON.stringify({ name: TAG + '-入口套餐', quotaGB: 5 }),
+  }, T);
+  const hintNode = await json('/api/nodes', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: TAG + '-入口套餐节点',
+      serverId: uiSrv.item.id,
+      protocol: 'vless',
+      port: 21500,
+      network: 'tcp',
+      security: 'none',
+      entries: [{ name: '收费入口', host: '10.2.2.2', port: 21501, planIds: [hintPlan.item.id] }],
+    }),
+  }, T);
+  click(d9.querySelector('#page-actions [data-act="refresh"]'), w9);
+  await waitFor(() => d9.querySelector(`[data-act="node-edit"][data-id="${hintNode.item.id}"]`), '入口套餐节点行');
+  click(d9.querySelector(`[data-act="node-edit"][data-id="${hintNode.item.id}"]`), w9);
+  await waitFor(() => d9.querySelector('#entries-list'), '节点编辑弹窗（入口套餐）');
+  ok('入口单独挂套餐时提示「拦不住人」',
+    /拦不住人/.test(d9.querySelector('#entries-list').textContent));
+  d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
+  await sleep(100);
+  await json('/api/nodes/' + hintNode.item.id, { method: 'DELETE' }, T);
+  await json('/api/plans/' + hintPlan.item.id, { method: 'DELETE' }, T);
+
   /* ---- 顶栏刷新与节点行启停 ---- */
   console.log('\n── 顶栏刷新 · 节点启停 ──');
   ok('顶栏有统一刷新按钮', !!d9.querySelector('#page-actions [data-act="refresh"]'));
@@ -1078,6 +1106,68 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
       `(${text.trim().slice(0, 14)}…)`);
   }
   dom7.window.close();
+
+  /* ==================== 7. 0.1.16 新增前端（TOTP / HTTPS / sing-box / 自助重置） ==================== */
+  console.log('\n── 设置页：二步验证与面板 HTTPS 卡片 ──');
+  const domTotp = await openPage(BASE + '/', {
+    before: { np_token: T },
+    ready: (doc) => !doc.querySelector('#app').classList.contains('hidden'),
+  });
+  const wTotp = domTotp.window;
+  const dTotp = wTotp.document;
+  click(dTotp.querySelector('.nav-item[data-view="settings"]'), wTotp);
+  await waitFor(() => dTotp.querySelector('[data-act="totp-setup"]') || dTotp.querySelector('[data-act="totp-disable"]'), 'TOTP 卡片');
+  ok('管理员安全卡片有 TOTP 区块（默认未开启）', !!dTotp.querySelector('[data-act="totp-setup"]'));
+  ok('面板 HTTPS 卡片可选证书并应用', !!dTotp.querySelector('#set-https-cert') && !!dTotp.querySelector('[data-act="save-https"]'));
+  ok('HTTPS 卡片提示端口与热加载', /热加载/.test(dTotp.querySelector('#view').textContent));
+
+  // TOTP 开启弹窗：密钥 + otpauth URI + 确认码输入 + 登录密码（防 2FA 接管）
+  click(dTotp.querySelector('[data-act="totp-setup"]'), wTotp);
+  await waitFor(() => dTotp.querySelector('#totp-verify'), 'TOTP 绑定弹窗');
+  ok('绑定弹窗展示 Base32 密钥与导入 URI',
+    !!dTotp.querySelector('.code') && /otpauth:\/\/totp\//.test(dTotp.querySelector('#view').textContent || '') || /otpauth/.test(dTotp.body.textContent));
+  ok('绑定弹窗要求输入登录密码（防会话劫持者绑定自己的认证器）', !!dTotp.querySelector('#totp-pass'));
+  // 取消弹窗不开启（避免污染后续登录态）：走 modal-foot 的 [data-close]
+  const maskTotp = dTotp.querySelector('.modal-mask');
+  const cancelTotp = maskTotp && maskTotp.querySelector('.modal-foot [data-close]');
+  if (cancelTotp) click(cancelTotp, wTotp);
+  await sleep(200);
+  domTotp.window.close();
+
+  console.log('\n── 订阅页：sing-box 导入与自助重置入口 ──');
+  const uiUser2 = await json('/api/users', {
+    method: 'POST',
+    body: JSON.stringify({ name: TAG + '-订阅页2', quotaGB: 10 }),
+  }, T);
+  const subHtml2 = await fetch(`${BASE}/s/${uiUser2.item.token}`, { headers: { Accept: 'text/html' } })
+    .then((r) => r.text());
+  const dom12 = await openPage(`${BASE}/s/${uiUser2.item.token}`, {
+    html: subHtml2,
+    before: {},
+    ready: (doc) => !!doc.querySelector('.sub-card'),
+  });
+  const d12 = dom12.window.document;
+  const w12 = dom12.window;
+  const actionsText = (d12.querySelector('.sub-actions') || {}).textContent || '';
+  ok('订阅页提供「下载 sing-box 配置」入口', /sing-box/.test(actionsText));
+  // jsdom 默认 UA 走「Windows/其他」分支（推荐 Clash，无 sing-box 一键导入，设计如此），
+  // 这里验证 sing-box 下载按钮指向 ?format=singbox 的原生 JSON 订阅
+  ok('sing-box 配置下载指向 format=singbox',
+    [...d12.querySelectorAll('a')].some((a) => (a.getAttribute('href') || '').includes('format=singbox')));
+  ok('订阅页有「自助重置」入口（默认折叠）', !!d12.querySelector('#reset-toggle') && d12.querySelector('#reset-panel').hidden);
+  click(d12.querySelector('#reset-toggle'), w12);
+  await sleep(100);
+  ok('点开后显示邮箱与验证码输入', !d12.querySelector('#reset-panel').hidden &&
+    !!d12.querySelector('#reset-email') && !!d12.querySelector('#reset-code'));
+  dom12.window.close();
+  await fetch(`${BASE}/api/users/${uiUser2.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
+
+  console.log('\n── 登录页：两步验证输入框默认隐藏 ──');
+  const dom13 = await openPage(BASE + '/', { ready: (doc) => !doc.querySelector('#login').classList.contains('hidden') });
+  const d13 = dom13.window.document;
+  ok('未开启 TOTP 时动态码输入框隐藏', d13.querySelector('#login-totp-field').hidden === true);
+  ok('动态码输入框 DOM 已就绪（开启后无需刷新）', !!d13.querySelector('#login-totp'));
+  dom13.window.close();
 
   /* ============================ 6. 清理 ============================ */
   await fetch(`${BASE}/api/users/${user.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });

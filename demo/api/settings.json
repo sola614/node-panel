@@ -3,6 +3,7 @@
     "siteName": "星链 · 节点面板",
     "notice": "请合理使用节点资源，禁止扫描、爆破、滥发垃圾信息等行为。",
     "subBase": "",
+    "httpsCertId": "",
     "notifyEnabled": "0",
     "notifyEvents": "user.expiring,user.expired,user.over,server.offline,node.offline",
     "notifyLeadDays": "3",
@@ -11,6 +12,11 @@
     "notifyRecovery": "1"
   },
   "admin": {
-    "username": "admin"
-  }
+    "username": "admin",
+    "totpEnabled": false,
+    "recoveryLeft": 0
+  },
+  "httpsActive": false,
+  "httpsError": "",
+  "httpsPort": 8443
 }

@@ -286,6 +286,44 @@ agent 会自动重写配置里的引用，保证「文件写在哪」和「配�
 > 那么该节点下发给 agent 的配置里也会注入这个用户——否则中转把用户送进来，
 > 节点却不认，链路是通的但连不上。
 
+#### 中转入口不是访问控制点
+
+入口只做 L4 端口转发，**鉴权只发生在落地节点的 inbound 上**（UUID / userpass）。因此：
+
+- 用户能用某个节点，就能通过**任何指向这个节点**的入口访问它 ——
+  入口侧既不解析协议，也不知道请求从哪来，无法单独踢掉某个人。
+- 「入口单独勾选套餐」只决定**订阅里出现哪几条链接**，不构成鉴权边界。
+  想让中转成为高等级专属，正确做法是让**节点本身**归属高等级套餐；
+  给低等级节点单独开一个高等级入口是不成立的 —— 只要用户还能用那个节点，入口就一定跟着能用。
+- **降级后能不能断**：节点归属高等级套餐时，降级后用户会从该节点的 inbound 里被摘掉，
+  直连与所有入口同时失效（下一轮配置下发，最多 60 秒）。节点本身就属于低等级套餐时，
+  他本来就有权用这个节点，入口自然也拦不住。
+
+> **验证时别用 ping。** 客户端的「ping / TCPing」只做 TCP 握手，而入口端口是常开的
+> （DNAT 规则一直在），所以降级后**仍然 ping 得通是正常的**，不代表还能用。
+> 要看真实结果：用该节点打开网页，或在落地节点上执行
+> `grep <用户UUID> /usr/local/etc/xray/config.json`，确认这个人已经不在配置里。
+
+#### 想把中转卖成高等级：同机开两个节点
+
+既然权限边界只能落在「端口」上，正确做法是在同一台落地机上建**两个节点**：
+
+| | 节点 A | 节点 B |
+| --- | --- | --- |
+| 端口 | 443 | 8443 |
+| 套餐 | 低配 | **高配** |
+| 入口 | 无（直连） | 中转入口，**不选套餐**（继承节点套餐） |
+| 服务对象 | 低配用户 | 高配用户 |
+
+两个节点各自是一个 inbound、各自有 `clients` 列表，这才是真正的权限边界：
+
+- 用户降级后，从节点 B 的 inbound 里被摘掉 → 中转入口转发过去被拒；
+- 节点 A 仍然可用 —— 他只是降级，不是被封；
+- 证书可以共用一张（两个节点都引用同一个 `certId`）。
+
+反过来，**不要**在低配节点上挂一个「只给高配」的入口 —— 那只影响订阅显示，
+拦不住任何能直连该节点的人。节点表单里给入口选了套餐就会显示这条警告。
+
 ### 公网地址上报
 
 服务器和独立节点都有两种地址来源：
@@ -455,11 +493,22 @@ ls /run/nodepanel/                      # Hysteria2 实例 pid
 tail -f /var/log/nodepanel/node-*.log   # 单个 Hysteria2 实例日志
 sh /opt/nodepanel/agent.sh --once       # 手动跑一轮，排查用
 sh /opt/nodepanel/agent.sh --version    # 看 agent 版本（与面板版本号一致）
+sh /opt/nodepanel/uninstall.sh          # 卸载（不联网，面板没了也能用）
 ```
 
 ### 5. 卸载 / 下线机器
 
-服务器页、独立节点页都有「卸载命令」。在机器上（root）执行后 agent 停机注销，**节点端口也不再监听**：
+**首选：机器上的本地入口（0.1.16 起）**。部署时就落在机器上了，不联网、不依赖面板 ——
+面板被删、换域名、token 失效、机房断网时照样能用：
+
+```bash
+sh /opt/nodepanel/uninstall.sh            # 卸干净：agent + 节点监听 + 面板下发的配置
+sh /opt/nodepanel/uninstall.sh --purge    # 连日志与配置备份一起删
+```
+
+面板还在时，服务器页 / 独立节点页的「卸载命令」与上面等价（机器上还有 agent 本体时，
+这条命令会转交给 `agent.sh --uninstall` 执行，清理逻辑只有一份；`/opt/nodepanel`
+已被手删时走内联兜底）：
 
 ```bash
 # 默认就卸干净：agent + 节点监听 + 面板下发的配置
@@ -468,6 +517,12 @@ curl -fsSL "http://面板/api/servers/<id>/uninstall?token=<token>" | sh
 # 连日志与配置备份一起删
 curl -fsSL "http://面板/api/servers/<id>/uninstall?token=<token>" | sh -s -- --purge
 ```
+
+> **面板上删了记录，机器上的 agent 会怎样？** 它下一轮就会拿到 `401`（token 已不存在），
+> 0.1.16 起认得这个状态：日志收敛成一条并给出上面的卸载命令，6 小时后转成每 30 分钟
+> 低频重试（`ORPHAN_GRACE` 可调），面板记录一旦恢复（重新部署 / 从备份恢复）就自己回到
+> 60 秒一轮。**连不上面板**（网络 / DNS / 面板没起）永远按正常间隔重试 —— 那和「被删了」
+> 是两回事，不会因为一次网络抖动就把节点降级。
 
 | 默认清理 | 默认保留 |
 | --- | --- |
@@ -518,7 +573,17 @@ cat /opt/nodepanel/.agent-update       # 「目标版本 失败次数」，成�
 
 - Xray 用户 email 固定为 `u<用户ID>`，Hysteria2 用户名同样为 `u<用户ID>`（密码 = 用户 UUID）
 - 统计 = 上行 + 下行（双向都算）
-- agent 读取**增量**后上报，面板累加到 `usedBytes`
+- **对账式上报（0.1.16 起）**：agent 报「自部署以来的累计字节 + 单调递增序号 + 实例代数」，
+  面板按（机器, 用户）水位差值入账，重复与乱序的序号整批丢弃 ——
+  丢一轮上报（网络故障、面板重启）只是让这部分量晚一轮到账，
+  不再像旧版纯增量模式那样**丢一次就永久丢量**。
+  旧版 agent（<0.1.16）继续按增量上报，面板两种格式都收，升级期间不会算错。
+- **实例代数（gen）**：agent 的累计文件与「机器」并非一一对应 —— 重装 agent、
+  面板换库恢复、删记录重接入都会让累计值从头开始。agent 给 totals 配一个随机的
+  gen（同生命周期），面板看到**新 gen 只建基线不入账**：既不会把重装后的上报当
+  「重复」永久丢弃（面板一切正常、只有流量不涨），也不会把全量历史重算一遍
+  把用户误打成超额停用。代价是丢一个上报周期（≈60 秒）的量。
+- Xray 重启会让计数器清零（累计值变小）：面板视为从零重新累计，当轮全额入账。
 
 ### 流量明细（用户 × 天 / 节点 × 天）
 
@@ -733,6 +798,25 @@ Hysteria2 几个实例在跑、当前 agent 版本**。
 回执只在**状态变化**或超过 10 分钟时发一次，不会每分钟一条把面板刷满；
 跟随服务器的节点不单独回执，直接沿用所属服务器的状态。
 
+### 面板侧连通性探测（0.1.16）
+
+agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组、外部防火墙、证书链错误
+这些**面板 / 用户视角**的故障，以前只能登机分层排查。现在节点列表每行多一个「探测」按钮，
+面板会从**自己所在的机器**对节点公网地址发起分层探测：
+
+| 层 | 做法 | 能发现什么 |
+| --- | --- | --- |
+| DNS | 解析节点生效地址 | 域名被删记录 / DNS 故障 |
+| TCP | 公网握手一次，量出 RTT（Hysteria2 是 UDP，跳过此层并说明原因） | 安全组 / 外部防火墙拦截、端口未放行 |
+| TLS 抽检 | 仅 security=tls 的节点：看证书是否过期、SAN 是否覆盖 SNI（`DNS:` 与 `IP Address:` 条目分别匹配） | 挂错证书、证书过期（Reality 是伪装握手，校验必误报，跳过） |
+
+结果三态落在节点列表里：**面板可达 Xms / 证书异常 / 面板不可达**（徽标点开看解析 IP、
+延迟、证书详情）。可达性（`ok`）与证书（`tls.ok`）是两个独立结论 —— 证书过期
+不会被降级显示成「不可达」把人引向安全组排查的错方向。
+**`同步=已同步` 且 `探测=不可达` ≈ agent 活着但公网进不来** ——
+大概率是云厂商安全组，去控制台放行端口就行，不用再登机器。
+探测本身不做 CA 信任判定（自签证书是本项目支持的常态），只看过期与 SNI 匹配。
+
 ### 备份与恢复
 
 「设置 → 备份与恢复」：
@@ -775,9 +859,23 @@ Hysteria2 几个实例在跑、当前 agent 版本**。
 | `/s/<token>` | 浏览器打开 → 订阅页面（流量环、节点列表、一键导入） |
 | `/s/<token>?format=base64` | Base64 节点链接（通用订阅格式） |
 | `/s/<token>?format=clash` | Clash / Mihomo YAML（含 reality-opts、hysteria2） |
+| `/s/<token>?format=singbox` | **sing-box 原生 JSON**（SFI / SFM / SFA 等一键导入） |
 | `/s/<token>?format=json` | 结构化数据 |
 
 响应带 `Subscription-Userinfo` 头，Clash Verge 等客户端能直接读到已用/总量/到期时间。
+
+**sing-box 格式**（0.1.16）：输出是纯 JSON（客户端拉远程订阅走严格解析，注释头都会被拒），
+覆盖 vless（Reality 的 `tls.reality` + `tls.utls`）、vmess、trojan、ss、hysteria2，
+外加 selector / urltest / direct 出站。可见性与 Clash 同一套规则（入口套餐独立、直连继承节点）。
+sing-box 不认 `pcs` / `pinSHA256`：自签证书节点在该格式下只能 `tls.insecure`，
+与 sing-box 官方客户端的行为一致。订阅页会按 UA 给 sing-box 系客户端
+（SFI / SFM / 官方 App）提供指向该格式的一键导入链接。
+
+**订阅页自助重置**（0.1.16）：怀疑订阅链接泄露时，用户在订阅页点「自助重置」→
+输入管理员绑定的邮箱 → 收 6 位验证码（10 分钟有效，60 秒发送冷却）→ 换发新链接，
+旧链接即刻失效、UUID 一并换发（配置层下一轮生效，最多 60 秒）。
+前提：管理员在用户编辑里填了邮箱，且面板配置了启用的邮件渠道；
+不满足时订阅页会给出明确指引，管理端 rotate 接口照常可兜底。
 
 「设置 → 订阅对外域名」留空则按当前访问 Host 生成；面板在反代后面时建议显式填写。
 
@@ -825,6 +923,7 @@ PUT  /api/nodes/:id                        修改节点
 DELETE /api/nodes/:id                      删除节点
 GET  /api/nodes/:id/preview                查看生成的配置（Xray / Hysteria2）
 POST /api/nodes/:id/rotate                 重置独立节点 token
+POST /api/nodes/:id/probe                  面板侧连通性探测（DNS + TCP + TLS 抽检，0.1.16）
 GET  /api/nodes/:id/install?token=         独立节点部署脚本
 GET  /api/nodes/:id/uninstall?token=       独立节点卸载脚本（加 --purge 深度清理）
 
@@ -845,8 +944,11 @@ POST /api/certs/:id/issue                  申请 / 强制续签（202 异步，
 POST /api/reality/keys                     生成 Reality 密钥对
 GET  /api/relay/script?to=&port=&proto=    生成中转（L4 转发）部署脚本
 POST /api/demo/traffic                     注入演示流量
-GET/PUT /api/settings                      站点设置
+GET/PUT /api/settings                      站点设置（含 httpsCertId：面板自身 HTTPS 引用的证书）
 POST /api/admin/password                   修改管理员密码
+POST /api/admin/totp/setup                 生成待绑定的 TOTP 密钥（Base32 + otpauth URI）
+POST /api/admin/totp/enable                输入动态码确认开启（返回一次性恢复码）
+POST /api/admin/totp/disable               关闭（动态码或登录密码二选一）
 
 GET  /api/stats?days=14                    流量明细（用户 × 日、节点 × 日、每日总计）
 GET  /api/users/:id/traffic?days=30        单个用户的每日用量
@@ -870,8 +972,12 @@ POST /api/notify/sweep                     立刻巡检一次（等同定时任�
 GET  /api/agent/config?token=TOKEN&ip=IP   拉配置（JSON，调试用）
 GET  /api/agent/bundle?token=TOKEN&ip=IP   拉配置包（shell 脚本；带 hash 且未变时只回 #UNCHANGED）
 GET  /api/agent/script?token=TOKEN&v=版本  拉 agent 脚本（自更新用，会校验版本号）
-POST /api/agent/report?token=TOKEN&ip=IP   上报流量（JSON 或纯文本「email 上行 下行」/「node:ID 上行 下行」）
+POST /api/agent/report?token=TOKEN&ip=IP   上报流量（v2：{v2:1,seq,totals,nodes} 累计值+序号；
+                                           旧格式：JSON 或纯文本「email 上行 下行」/「node:ID 上行 下行」）
 POST /api/agent/receipt?token=TOKEN        回执：这一轮应用的 hash、重载结果、实例数与 agent 版本
+
+POST /api/sub/reset-request                订阅页自助重置：发验证码到绑定邮箱（0.1.16）
+POST /api/sub/reset-confirm                订阅页自助重置：验证码换发新订阅链接（旧链接即刻失效）
 ```
 
 `/api/agent/bundle` 是 shell agent 的主通道：把证书、Xray 配置、Hysteria2 配置、
@@ -891,11 +997,12 @@ node-panel/
 │   ├── xray.js          节点 → Xray 配置（含 Reality / Vision 流控 / VLESS Encryption）
 │   ├── hysteria.js      节点 → Hysteria2 配置
 │   ├── cert.js          TLS 证书三种来源的路径解析
-│   ├── sub.js           分享链接 / Base64 / Clash 订阅生成
+│   ├── sub.js           分享链接 / Base64 / Clash / sing-box 订阅生成
 │   ├── notify.js        通知渠道（webhook / Telegram / 邮件）+ 载荷格式 + 发送日志
 │   ├── smtp.js          手写 SMTP 客户端（TLS / STARTTLS / AUTH LOGIN / PLAIN）
 │   ├── alerts.js        告警巡检与去重（按 key + 冷却时间 + 恢复通知）
 │   ├── keys.js          x25519 密钥对生成
+│   ├── totp.js          管理员二步验证（RFC 6238，node:crypto 手写 HMAC-SHA1）
 │   └── yaml.js          YAML 序列化
 ├── public/
 │   ├── index.html       管理台外壳（菜单可收起）
@@ -974,7 +1081,14 @@ VLESS Encryption → uTLS 指纹 → 证书四态（路径 / 粘贴 / 自签 / A
 邀请（生成 / 公开信息 / 领取 / 重名 409 / 名额用尽 410 / 停用）→
 回执（未回执 → 已同步 → 待同步 → 同步失败、节点继承服务器状态、token 校验）→
 备份（创建 / 列表 / 下载 / 路径穿越 400 / 恢复 / 恢复前兜底 / 会话失效 / 上传非 SQLite 拒绝 / 删除）→
-审计（关键字、类型、翻页、操作者与 IP）→ 自动清理。
+审计（关键字、类型、翻页、操作者与 IP）→
+**0.1.16 新增**：管理员 TOTP 全流程（绑定需密码 / 两段式登录 / 动态码重放被拒 /
+恢复码一次性 / 密码关闭）→ sing-box 订阅结构与订阅头 → v2 流量上报（新代数建基线 /
+重装后继续入账 / 不带 gen 兼容 / 重复 / 差值 / 乱序 / 回绕 / 旧格式兼容）→
+面板侧探测（可达 / 拒绝端口 / hy2 仅解析说明 / 证书不匹配呈现为证书异常态 /
+IP 型 SAN 不误报）→ 订阅页自助重置闭环（fake SMTP 收验证码、邮箱校验、冷却、
+停用拦截、旧链接失效）→ 面板 HTTPS 独立实例（TLS 起服务 / 浏览器 301 / agent 路径
+不跳转 / 坏证书仍以 HTTP 服务 / 端口被占不跳死端口）→ 引用中的证书删除被拦 → 自动清理。
 
 `renew.js` 覆盖自动续期的边界：默认开启、永久与自定义到期强制关闭、未到期不打扰、
 到期重置流量并顺延、重复扫描不重复续、改套餐额度不覆盖续期结果、落库重载一致、
@@ -989,6 +1103,8 @@ VLESS Encryption → uTLS 指纹 → 证书四态（路径 / 粘贴 / 自签 / A
 邀请弹窗（生成、列表、操作按钮、参数落到后端）、节点同步徽标与回执详情、
 设置页备份卡片（立即备份后多一行）、审计页（动作徽标、中文动作名、搜索与类型筛选）、
 邀请领取页（展示名额、填名字领取、成功后给订阅地址、无效码提示）、
+**0.1.16 新增**：设置页 TOTP / 面板 HTTPS 卡片、TOTP 绑定弹窗、订阅页 sing-box 下载与
+自助重置折叠面板、登录页动态码输入框默认隐藏、
 拆分后八个页面都能渲染。
 
 `notify.js` 起一对**假服务**（SMTP 服务器 + HTTP 接收端），覆盖：SMTP 明文/TLS 分支的
@@ -1001,6 +1117,10 @@ base64 正文可解码、点号转义（`\r\n.` → `\r\n..`）不会提前结�
 记事到日志、清掉失败计数、不重复下载、`--version` 自报新版本；
 回执内容（hash / ok / 版本 / 节点数）正确且状态没变时不重复发；
 坏包（版本对不上）被拒且计数 +1；计数到 3 后不再尝试。
+0.1.16 起还覆盖**流量对账（v2）行为**：上报 JSON 的 totals / nodes / seq / gen 结构、
+累计值随轮次翻倍、gen 落盘且跨轮不变、重装（totals/gen 被删）后重新上报且 gen 更新、
+序号落盘递增、旧面板（不下发 `NP_REPORT_V2`）继续纯文本增量且不产生 v2 文件；
+401 孤儿模式下上报静默但累计值保留。
 
 所有测试都幂等：`smoke.js` 启动时先清理上次崩溃残留的 `SMOKE-*` / `UI-*` 数据，
 `ui.js` 会把自己建的渠道删掉并还原通知参数。
@@ -1189,6 +1309,59 @@ Environment=PANEL_ADMIN_PASSWORD=换成你的强密码
 WantedBy=multi-user.target
 ```
 
+### 面板自身 HTTPS（0.1.16）
+
+不想搭反代时，面板可以直接用 TLS 监听公网，两种证书来源任选其一：
+
+| 来源 | 用法 | 适合 |
+| --- | --- | --- |
+| 证书页引用 | 设置 → 面板 HTTPS → 选一张已签发的证书 | 已在面板里跑 ACME 的，续期后**自动热加载** |
+| 环境变量 | `PANEL_TLS_CERT` / `PANEL_TLS_KEY` 指向 PEM 文件 | 容器 / systemd，证书由外部管理（acme.sh 等） |
+
+```ini
+Environment=PORT=8080            # HTTP 端口（保留：agent 回调 + 健康探针）
+Environment=PANEL_TLS_PORT=443   # HTTPS 监听端口，默认 8443
+Environment=PANEL_TLS_CERT=/etc/letsencrypt/live/panel.example.com/fullchain.pem
+Environment=PANEL_TLS_KEY=/etc/letsencrypt/live/panel.example.com/privkey.pem
+```
+
+行为细节：
+
+- 两种来源都没有时面板维持纯 HTTP（与旧版一致）；设置页保存后立即生效，无需重启。
+- **失败路径全部回退纯 HTTP，不阻断启动**：证书文件读不了 / PEM 非法 / 公私钥不配对
+  → 记 error 日志后照常监听 HTTP；TLS 端口被占 → 关掉 TLS 监听并**不再 301 跳转**
+  （跳到一个没有服务的死端口比不跳糟得多），设置页红字提示原因，
+  5 分钟一轮自动重试 —— 端口冲突解除后 HTTPS 自动恢复。「监听中」状态以
+  listen 成功为准，不是「配置存在」。
+- 浏览器访问 `http://` 会 301 到 HTTPS（跳转目标自动换算 TLS 端口，Host 头先过
+  合法性校验）；**agent / 订阅 / 健康探针路径不跳转** —— agent 的 curl 不带 `-L`，
+  收到 301 会把跳转页当正文处理，升级窗口期里整批节点会一起「掉线」。
+  想让机器全部走 HTTPS，把各机器 `agent.env` 里的 `PANEL_URL` 换成 `https://` 即可。
+  `PANEL_HTTP_REDIRECT=1` 强制全路径跳转（纯 HTTPS 部署），`=0` 彻底关闭。
+- 证书页引用的证书续期后，热加载定时器（每 5 分钟）会把新证书换进 TLS 上下文，
+  正在握手的连接不受影响；新证书解析失败时沿用旧证书。
+- 面板自身正在引用的证书受删除保护（409），先解除引用才能删。
+- HTTPS 直连时，订阅页生成的 `subUrl` / `clashUrl` 自动按 `https://` 输出。
+
+### 管理员二步验证（TOTP，0.1.16）
+
+设置 → 管理员安全 → 「开启」：拿到 Base32 密钥（或 `otpauth://` URI 扫码），
+在 Google Authenticator / Aegis / 1Password 里添加账号，输入当前 6 位动态码
+与登录密码完成绑定。**默认关闭**，开启后登录变成「密码 + 动态码」两段式，
+密码泄露也进不来面板。
+
+- **开启需要登录密码**：防会话被劫持者绑定他自己的认证器，把真管理员锁在门外
+  （典型 2FA 接管向量）。关闭同样要动态码或密码，进出对称。
+- **重放防护**：同一枚动态码只认一次 —— 90 秒有效窗口内被肩窥 / 截获的码
+  不能二次登录（提示「这个动态码刚被用过」）。
+- **恢复码 10 枚**（`xxxx-xxxx`）：只在开启时显示一次，库里只存哈希；每枚限用一次，
+  大小写不敏感。认证器丢失 / 换手机时凭它登录。
+- 动态码验证容忍 ±1 个 30 秒窗口（手机时间漂移很常见）；动态码错误计入登录限流。
+- RFC 6238 用 `node:crypto` 手写 HMAC-SHA1，零依赖约定不变。
+- 安全边界：`admin.totp_secret` 必须可还原、在库里是**明文**（密码是 scrypt 哈希，
+  TOTP 密钥做不到）—— `data/panel.db` 的保密等级等同于凭证本体，
+  这条同样适用于用户 UUID / 订阅 token / 证书私钥。
+
 ### Nginx 反代 + HTTPS
 
 ```nginx
@@ -1214,7 +1387,8 @@ server {
 
 - [x] 出厂密码会**强制**改掉（≥8 位、不能还是 `admin888`），改密前业务接口全拦
 - [x] 登录失败限流：同一 IP 10 分钟内 5 次失败锁 10 分钟
-- [ ] 面板走 HTTPS，不要裸 HTTP 暴露在公网
+- [x] 管理员 TOTP 二步验证（0.1.16，设置页开启；见上方说明）
+- [x] 面板自身 HTTPS（0.1.16；证书页引用或 `PANEL_TLS_CERT`/`PANEL_TLS_KEY`，见上方说明）
 - [ ] 尽量别把面板直接暴露在公网，前面加一层反代 + 访问控制（IP 白名单 / Basic Auth / VPN）
 - [ ] 部署脚本 URL 里带 token，属于敏感信息，别贴到公开渠道
 - [ ] 重置服务器/节点 token 后，对应 agent 立即失效，需要重新部署
@@ -1303,10 +1477,10 @@ docker logs --tail 200 node-panel 2>&1 | grep WARN
 ## 十六、已知限制
 
 1. **SS 节点是单用户模式**：Xray 的 shadowsocks 入站不支持多用户，所有用户共用同一密码，无法按用户计费。要精确计费请用 VLESS / VMess / Trojan。
-2. **流量上报是增量式**：上报请求丢了这一分钟的流量就丢了。要对账严格需改成累积值 + 服务端去重。
+2. **流量上报是对账式（0.1.16 起）**：agent 报「累计值 + 单调序号」，面板按水位差值入账，重复与乱序丢弃 —— 丢一轮上报只是让量晚一轮到账，不再永久丢量。旧版 agent（<0.1.16）仍是增量式，升级面板后等 agent 自更新完成（一轮心跳）即切换。
 3. **会话存在内存**：面板重启后管理员需要重新登录。
-4. **单管理员**：没有多账号和权限体系。
-5. **TLS 证书要自己准备**：面板不签发证书，只把路径写进配置（Reality 除外）。
+4. **单管理员**：没有多账号和权限体系（支持 TOTP 二步验证，见「生产部署建议」）。
+5. **节点 TLS 证书要自己准备**（Reality 除外）：面板不代签节点证书，只把路径 / PEM 写进配置。**面板自身**的 HTTPS 从 0.1.16 起内建支持，见「面板自身 HTTPS」一节。
 6. **公网 IP 探测依赖外部服务**：agent 全部 provider 失败时会沿用上一次的结果；机器在 NAT 后且需要内网穿透时，请改回手动填写。
 7. **VLESS Encryption 需要两端都是 Xray 25.6.0+**：客户端不支持时该节点连不上，建议按需开启而不是全局打开。
 8. **自签证书依赖 openssl**：`certMode: self` 时由 agent 在目标机用 openssl 现场生成；Debian/Ubuntu/CentOS 自带，

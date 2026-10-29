@@ -84,6 +84,60 @@ function syncBadge(sync, name = '') {
   return `<button type="button" class="badge ${cls}" data-act="sync-info" data-name="${esc(name)}" data-sync="${esc(JSON.stringify(sync))}" title="${esc(tip)}" style="border:0;cursor:pointer;font:inherit">${esc(sync.label || SYNC_STATE_LABEL[sync.state] || '—')}</button>`;
 }
 
+/* ------------------- 面板侧连通性探测徽标（0.1.16） -------------------- */
+
+/**
+ * 面板视角的探测结果徽标：与 agent 回执（sync）互补 ——
+ * sync=ok 且 probe 失败 ≈ 「agent 正常但面板/用户不可达」（安全组、防火墙）。
+ */
+function probeBadge(probe) {
+  if (!probe) return '';
+  let cls = 'badge-dim';
+  let label = '未探测';
+  if (probe.ok) {
+    cls = 'badge-ok';
+    label = probe.ms != null ? `面板可达 ${probe.ms}ms` : '解析正常';
+    if (probe.tls && !probe.tls.ok) {
+      cls = 'badge-warn';
+      label = '证书异常';
+    }
+  } else {
+    cls = 'badge-bad';
+    label = '面板不可达';
+  }
+  const tip = probe.error || (probe.tls && probe.tls.error) || probe.note || (probe.at ? `探测于 ${fmtAgo(probe.at)}` : '');
+  return `<button type="button" class="badge ${cls}" data-act="probe-info" data-probe="${esc(JSON.stringify(probe))}" title="${esc(tip)}" style="border:0;cursor:pointer;font:inherit;margin-top:4px">${esc(label)}</button>`;
+}
+
+function probeDetailFlow(probe) {
+  if (!probe) return;
+  const row = (k, v) => `<div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line-soft)">
+    <span style="width:88px;color:var(--muted);flex-shrink:0">${esc(k)}</span>
+    <span style="flex:1;min-width:0;word-break:break-all">${v}</span>
+  </div>`;
+  const tls = probe.tls;
+  openModal({
+    title: '面板侧探测',
+    body: `
+      <div class="alert ${probe.ok ? 'alert-ok' : 'alert-bad'}" style="margin:0 0 14px">
+        <b>${probe.ok ? '面板可以连上这个节点' : '面板连不上这个节点'}</b>
+        ${probe.ok ? '　TCP 握手成功，客户端视角的网络路径是通的。' : `　${esc(probe.error || '原因见下方详情。')}`}
+        ${probe.ok && tls && !tls.ok ? `　但 TLS 抽检发现问题：${esc(tls.error)}` : ''}
+      </div>
+      ${row('探测目标', `<code>${esc(probe.host || '')}:${probe.port || ''}</code>`)}
+      ${row('解析 IP', probe.ip ? `<code>${esc(probe.ip)}</code>` : '—')}
+      ${probe.ms != null ? row('TCP 延迟', `${probe.ms} ms`) : ''}
+      ${probe.note ? row('说明', esc(probe.note)) : ''}
+      ${tls ? row('TLS 证书', tls.ok ? `正常${tls.selfSigned ? '（自签，预期内）' : ''}${tls.daysLeft != null ? `，剩 ${tls.daysLeft} 天` : ''}` : `<span style="color:var(--bad)">${esc(tls.error)}</span>`) : ''}
+      ${probe.at ? row('探测时间', esc(fmtDate(probe.at)) + ' · ' + esc(fmtAgo(probe.at))) : ''}
+      <p class="hint" style="margin-top:14px">
+        这是从<b>面板所在机器</b>发起的公网探测：agent 在线但这里不可达，多半是云厂商安全组 /
+        外部防火墙拦了端口；两者都正常用户还连不上，再看证书与客户端配置。
+      </p>`,
+    footer: false,
+  });
+}
+
 function syncDetailFlow(sync, name) {
   if (!sync) return;
   const row = (k, v) => `<div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line-soft)">
@@ -530,10 +584,29 @@ $('#login-form').addEventListener('submit', async (e) => {
     async () => {
       try {
         const password = $('#login-pass').value;
+        const totpField = $('#login-totp-field');
+        const payload = { username: $('#login-user').value.trim(), password };
+        if (!totpField.hidden) {
+          const code = $('#login-totp').value.trim();
+          if (!code) throw new Error('请输入 6 位动态码或恢复码');
+          // 恢复码形状（xxxx-xxxx）走恢复码字段，其余按动态码提交
+          if (/^[0-9a-f]{4}-[0-9a-f]{4}$/i.test(code)) payload.recoveryCode = code;
+          else payload.totp = code;
+        }
         const data = await api('/api/login', {
           method: 'POST',
-          body: JSON.stringify({ username: $('#login-user').value.trim(), password }),
+          body: JSON.stringify(payload),
         });
+        // 第一段通过但开了二步验证：亮出动态码输入框，登录按钮保持「登 录」
+        if (data && data.totpRequired && !data.token) {
+          totpField.hidden = false;
+          const hint = $('#login-totp-hint');
+          hint.textContent = data.hasRecoveryCodes
+            ? '已开启二步验证：输入 6 位动态码；认证器丢失时可改用恢复码'
+            : '已开启二步验证：输入 6 位动态码（恢复码已全部用完，如丢失认证器请联系管理员重置）';
+          $('#login-totp').focus();
+          return;
+        }
         state.token = data.token;
         state.pendingPassword = password;
         localStorage.setItem('np_token', data.token);

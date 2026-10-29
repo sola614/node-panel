@@ -15,7 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
-const { spawn, execSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 // 仓库版本的唯一来源是 package.json —— 别再硬编码，改一次版本要改四个地方
@@ -56,15 +56,22 @@ function startPanel() {
     const state = {
       scriptHits: 0,
       reportHits: 0,
+      reportBodies: [],
       receiptHits: 0,
       receipts: [],
       mode: 'good',
       script: '',
+      // 模拟「面板上这台机器已经被删了」：token 查不到，面板回 401
+      bundleStatus: 200,
       badScript: '#!/bin/sh\nthis is not valid shell ((\n',
     };
     const server = http.createServer((req, res) => {
       const { pathname } = new URL(req.url, 'http://127.0.0.1');
       if (pathname === '/api/agent/bundle') {
+        if (state.bundleStatus !== 200) {
+          res.writeHead(state.bundleStatus, { 'Content-Type': 'text/plain' });
+          return res.end('#ERROR invalid token\n');
+        }
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         return res.end('#UNCHANGED\n');
       }
@@ -93,9 +100,11 @@ function startPanel() {
         });
       }
       if (pathname === '/api/agent/report') {
-        req.resume();
+        let raw = '';
+        req.on('data', (c) => (raw += c));
         return req.on('end', () => {
           state.reportHits++;
+          state.reportBodies.push(raw);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end('{"ok":true}');
         });
@@ -132,6 +141,8 @@ function makeSandbox(port, agentVersion, opts = {}) {
       "NP_SELF_CERTS=''",
       "NP_SELF_CERT_IDS=''",
       `NP_ACME_CERTS='${opts.acmeCerts || ''}'`,
+      // 0.1.16 面板会下发：agent 看到它才切「累计值 + 序号」的 v2 上报
+      `NP_REPORT_V2=${opts.reportV2 ? '1' : '0'}`,
       '',
     ].join('\n'),
   );
@@ -152,6 +163,36 @@ function makeSandbox(port, agentVersion, opts = {}) {
     }
   }
 
+  // 假 xray：statsquery 时吐出可控的流量计数（user 维度与 inbound 维度各一份）
+  if (opts.fakeXray) {
+    binDir = binDir || path.join(dir, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const xi = path.join(binDir, 'xray');
+    const userUp = opts.fakeXray.userUp || 100;
+    const userDown = opts.fakeXray.userDown || 200;
+    const nodeUp = opts.fakeXray.nodeUp || 50;
+    const nodeDown = opts.fakeXray.nodeDown || 60;
+    fs.writeFileSync(
+      xi,
+      [
+        '#!/bin/sh',
+        'if [ "$1" = "api" ] && [ "$2" = "statsquery" ]; then',
+        '  case "$*" in',
+        `    *user*) printf '{"stat":[{"name":"user>>>u1>>>traffic>>>uplink","value":${userUp}},{"name":"user>>>u1>>>traffic>>>downlink","value":${userDown}}]}' ;;`,
+        `    *) printf '{"stat":[{"name":"inbound>>>node-n1>>>traffic>>>uplink","value":${nodeUp}},{"name":"inbound>>>node-n1>>>traffic>>>downlink","value":${nodeDown}}]}' ;;`,
+        '  esac',
+        'fi',
+        'exit 0',
+        '',
+      ].join('\n'),
+    );
+    try {
+      fs.chmodSync(xi, 0o755);
+    } catch {
+      /* 同上 */
+    }
+  }
+
   // 有 hy2 实例就得有对应的 yaml，否则 hy_ensure 第一行就返回了，测不到缺二进制的分支
   if (opts.hy2List) {
     const hyDir = path.join(dir, 'hy');
@@ -164,6 +205,7 @@ function makeSandbox(port, agentVersion, opts = {}) {
   return {
     dir,
     stateDir,
+    runDir,
     logDir,
     agentPath,
     env: {
@@ -520,6 +562,141 @@ const runAgent = (box) =>
       !(rE2.stdout + rE2.stderr).includes('自签证书指纹'));
   } else {
     console.log('  · 本机没有 openssl，跳过指纹用例');
+  }
+
+  /* ------------------- 流量上报对账（v2：累计 + 序号） ------------------- */
+  console.log('\n— 流量上报对账（v2） —');
+  {
+    // 面板下发了 NP_REPORT_V2=1：两轮各采到 100/200 与 50/60，
+    // 第二轮上报的累计值应翻倍、序号递增 —— 面板按差值入账
+    const boxV2 = makeSandbox(panel.port, PKG_VERSION, {
+      xrayNodes: 1,
+      reportV2: true,
+      fakePgrep: true,
+      fakeXray: { userUp: 100, userDown: 200, nodeUp: 50, nodeDown: 60 },
+    });
+    const rV2a = await runAgent(boxV2);
+    ok('v2 模式一轮正常退出', rV2a.status === 0, `exit=${rV2a.status}`);
+    const bodyA = panel.state.reportBodies[panel.state.reportBodies.length - 1] || '';
+    let jA = null;
+    try { jA = JSON.parse(bodyA); } catch { /* 断言去报 */ }
+    ok('v2 上报是 JSON（totals + nodes + seq + gen）',
+      jA && jA.v2 === 1 && Array.isArray(jA.totals) && Array.isArray(jA.nodes) && typeof jA.gen === 'string',
+      bodyA.slice(0, 90));
+    ok('v2 首轮累计值 = 本轮采集值', jA && jA.totals[0] && jA.totals[0][0] === 'u1' && jA.totals[0][1] === 100 && jA.totals[0][2] === 200,
+      jA ? JSON.stringify(jA.totals) : '');
+    ok('v2 节点维度进 nodes 数组（不带 node: 前缀）', jA && jA.nodes[0] && jA.nodes[0][0] === 'n1',
+      jA ? JSON.stringify(jA.nodes) : '');
+    ok('v2 首轮序号为 1', jA && jA.seq === 1, jA ? String(jA.seq) : '');
+    ok('v2 上报带实例代数 gen（非空）', jA && jA.gen && jA.gen.length >= 8, jA ? String(jA.gen) : '');
+    ok('v2 gen 已落盘（与 totals 同生命周期）', /^[0-9a-f-]{8,}$/.test(read(path.join(boxV2.stateDir, 'totals.gen')).trim()));
+    ok('v2 序号已落盘（重启后接着排）', read(path.join(boxV2.stateDir, '.seq')).trim() === '1');
+    ok('v2 累计值已落盘（.totals）', /u1 100 200/.test(read(path.join(boxV2.stateDir, 'totals'))));
+
+    const rV2b = await runAgent(boxV2);
+    const bodyB = panel.state.reportBodies[panel.state.reportBodies.length - 1] || '';
+    let jB = null;
+    try { jB = JSON.parse(bodyB); } catch { /* 断言去报 */ }
+    ok('v2 第二轮序号递增', jB && jB.seq === 2, jB ? String(jB.seq) : '');
+    ok('v2 第二轮累计值翻倍（对账的基础）',
+      jB && jB.totals[0][1] === 200 && jB.totals[0][2] === 400 && jB.nodes[0][1] === 100 && jB.nodes[0][2] === 120,
+      jB ? JSON.stringify(jB.totals) + ' ' + JSON.stringify(jB.nodes) : '');
+    ok('v2 同一实例的 gen 跨轮不变（面板据此认得是同一台机器）', jA && jB && jA.gen === jB.gen,
+      `${jA && jA.gen} vs ${jB && jB.gen}`);
+    ok('v2 日志明说「累计」', /已上报累计流量/.test(rV2b.stdout + rV2b.stderr),
+      (rV2b.stdout + rV2b.stderr).split('\n').find((l) => /上报/.test(l)) || '');
+
+    // 重装场景：totals 与 gen 一并被删 → 重新生成新 gen、seq 从 1 起，
+    // 面板看到新 gen 只建基线 —— 旧实现会把 seq=1 当「重复」永久丢弃
+    fs.rmSync(path.join(boxV2.stateDir, 'totals'));
+    fs.rmSync(path.join(boxV2.stateDir, 'totals.gen'));
+    fs.rmSync(path.join(boxV2.stateDir, '.seq'));
+    const rV2c = await runAgent(boxV2);
+    const bodyC = panel.state.reportBodies[panel.state.reportBodies.length - 1] || '';
+    let jC = null;
+    try { jC = JSON.parse(bodyC); } catch { /* 断言去报 */ }
+    ok('v2 重装（totals/gen 被删）后重新上报', rV2c.status === 0 && jC && jC.seq === 1,
+      rV2c.status === 0 ? bodyC.slice(0, 60) : `exit=${rV2c.status}`);
+    ok('v2 重装后 gen 是新的（与重装前不同）', jC && jA && jC.gen !== jA.gen,
+      `${jA && jA.gen} → ${jC && jC.gen}`);
+
+    // 旧面板（不下发 NP_REPORT_V2）：必须继续用纯文本增量，且不动 totals/seq
+    const boxV1 = makeSandbox(panel.port, PKG_VERSION, {
+      xrayNodes: 1,
+      reportV2: false,
+      fakePgrep: true,
+      fakeXray: { userUp: 100, userDown: 200 },
+    });
+    const rV1 = await runAgent(boxV1);
+    const bodyV1 = panel.state.reportBodies[panel.state.reportBodies.length - 1] || '';
+    ok('旧面板下继续用纯文本增量上报', rV1.status === 0 && /^u1 100 200$/m.test(bodyV1),
+      JSON.stringify(bodyV1.slice(0, 60)));
+    ok('旧面板下不产生 totals / seq / gen 文件',
+      !fs.existsSync(path.join(boxV1.stateDir, 'totals')) && !fs.existsSync(path.join(boxV1.stateDir, '.seq')) &&
+      !fs.existsSync(path.join(boxV1.stateDir, 'totals.gen')));
+    ok('旧面板下成功上报后清空增量文件', read(path.join(boxV1.runDir, 'stats.agg')).trim() === '');
+  }
+
+  /* ------------------- 面板上这台机器已被删除（HTTP 401） ------------------- */
+  console.log('\n— 面板不认这台机器（401） —');
+  {
+    panel.state.bundleStatus = 401;
+    const box401 = makeSandbox(panel.port, PKG_VERSION);
+    const r401 = await runAgent(box401);
+    const log401 = read(path.join(box401.logDir, 'agent.log')) + r401.stdout + r401.stderr;
+    // 这一条是整个改造的动因：401 和「连不上」必须是两种结论，
+    // 否则面板删了记录之后 agent 只会永远喊「无法连接面板」，没有任何出路
+    ok('401 被识别成「面板不认这台机器」', /面板不认这台机器（HTTP 401）/.test(log401),
+      (log401.split('\n').find((l) => /401/.test(l)) || '').slice(0, 80));
+    ok('401 不再被误报成「无法连接面板」', !/无法连接面板/.test(log401));
+    ok('记下 401 的起点，供宽限期判断', read(path.join(box401.stateDir, '.orphan')).trim() !== '');
+    ok('宽限期内进程照常退出（不自杀、不碰服务）', r401.status === 0, `exit=${r401.status}`);
+
+    // 同一台机器再来一轮：宽限期没到，日志要收敛（10 分钟内只记一条），
+    // 否则孤儿 agent 一天能在 journal 里刷 1440 行
+    const r401b = await runAgent(box401);
+    ok('宽限期内重复 401 不重复刷日志', !/401/.test(r401b.stdout + r401b.stderr));
+
+    // 宽限期设为 0：立刻判定为「面板上已经没有我了」
+    const boxGone = makeSandbox(panel.port, PKG_VERSION, { env: { ORPHAN_GRACE: '0' } });
+    const rGone = await runAgent(boxGone);
+    const logGone = read(path.join(boxGone.logDir, 'agent.log')) + rGone.stdout + rGone.stderr;
+    ok('超过宽限期转低频重试', /低频重试/.test(logGone), (logGone.split('\n').find((l) => /低频/.test(l)) || '').slice(0, 90));
+    ok('日志里给出本机卸载入口', /uninstall\.sh/.test(logGone));
+    ok('降级后仍正常退出（面板恢复时还能自己回来）', rGone.status === 0, `exit=${rGone.status}`);
+
+    // 孤儿模式下的流量上报必须静默（v2）：累计值照常并入 totals 保留，
+    // 面板恢复后按 gen 建基线自动接上 —— 每 60 秒一条「✗ 流量上报失败」只会把
+    // 降频后的日志又刷成噪音
+    const boxOrphanV2 = makeSandbox(panel.port, PKG_VERSION, {
+      env: { ORPHAN_GRACE: '0' },
+      xrayNodes: 1,
+      reportV2: true,
+      fakePgrep: true,
+      fakeXray: { userUp: 100, userDown: 200 },
+    });
+    const rOrphanV2 = await runAgent(boxOrphanV2);
+    const outOrphan = rOrphanV2.stdout + rOrphanV2.stderr;
+    ok('孤儿模式下 v2 上报静默（不打失败日志）', rOrphanV2.status === 0 && !/流量上报失败/.test(outOrphan),
+      outOrphan.split('\n').find((l) => /上报/.test(l)) || '(无上报日志)');
+    ok('孤儿模式下累计值照常落盘保留（恢复后自动接上）',
+      /u1 100 200/.test(read(path.join(boxOrphanV2.stateDir, 'totals'))));
+
+    // 面板重新认可这台机器（重新部署 / 从备份恢复）：标记要清掉，间隔回到 INTERVAL
+    panel.state.bundleStatus = 200;
+    const rBack = await runAgent(boxGone);
+    const logBack = read(path.join(boxGone.logDir, 'agent.log')) + rBack.stdout + rBack.stderr;
+    ok('面板恢复认可后清掉 401 标记', !fs.existsSync(path.join(boxGone.stateDir, '.orphan')));
+    ok('日志说明轮询间隔已恢复', /面板恢复认可这台机器/.test(logBack));
+
+    // 卸载入口：--help 只打印用法，不碰任何文件（真正的清理要 root，不在测试里跑）
+    const rHelp = spawnSync('sh', [boxGone.agentPath, '--uninstall', '--help'], {
+      cwd: boxGone.dir,
+      env: boxGone.env,
+      encoding: 'utf8',
+    });
+    ok('--uninstall --help 打印用法并正常退出', rHelp.status === 0 && /--purge/.test(rHelp.stdout),
+      String(rHelp.stdout || rHelp.stderr).slice(0, 80));
   }
 
   panel.server.close();

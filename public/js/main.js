@@ -7,12 +7,18 @@
 /* ============================== 设置 ============================== */
 
 RENDERERS.settings = async () => {
-  const [d, n, b] = await Promise.all([api('/api/settings'), api('/api/notify/channels'), api('/api/backups')]);
+  const [d, n, b, cd] = await Promise.all([
+    api('/api/settings'),
+    api('/api/notify/channels'),
+    api('/api/backups'),
+    api('/api/certs'),
+  ]);
   const s = d.settings;
   // 渠道列表留着给「编辑」用，避免再单独查一次
   state.data.notifyItems = n.items;
   state.data.notifyMeta = n;
   state.data.backups = b;
+  state.data.certList = (cd.items || []).filter((c) => c.hasKey);
 
   $('#view').innerHTML = `
     <div class="grid-2">
@@ -54,6 +60,52 @@ RENDERERS.settings = async () => {
           </div>
           <button class="btn" data-act="change-pw">修改密码</button>
           <p class="hint">修改后所有会话失效，需要重新登录。</p>
+
+          <div style="border-top:1px solid var(--line-soft);margin:18px 0 14px"></div>
+          <div class="field">
+            <label>二步验证（TOTP）</label>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <span class="badge ${d.admin.totpEnabled ? 'badge-ok' : 'badge-dim'}">
+                <i class="dot"></i>${d.admin.totpEnabled ? '已开启' : '未开启'}
+              </span>
+              ${d.admin.totpEnabled
+                ? `<span style="font-size:11.5px;color:var(--muted)">剩余恢复码 ${d.admin.recoveryLeft} 枚</span>
+                   <div class="row-actions">
+                     <button class="btn btn-sm btn-ghost" data-act="totp-disable">关闭</button>
+                   </div>`
+                : `<button class="btn btn-sm" data-act="totp-setup">开启</button>`}
+            </div>
+            <p class="hint">开启后登录需要「密码 + 认证器动态码」，密码泄露也进不来面板。支持 Google Authenticator / Aegis / 1Password 等。</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>面板 HTTPS</h3></div>
+        <div class="card-body">
+          <div class="field">
+            <label>监听证书（引用「证书」页的证书）</label>
+            <select id="set-https-cert">
+              <option value="">不启用（保持纯 HTTP）</option>
+              ${(state.data.certList || [])
+                .map(
+                  (c) =>
+                    `<option value="${esc(c.id)}" ${s.httpsCertId === c.id ? 'selected' : ''}>${esc(c.name || (c.domains || []).join('、'))}${c.daysLeft != null ? `（剩 ${c.daysLeft} 天）` : ''}</option>`,
+                )
+                .join('')}
+            </select>
+            <div class="hint">
+              HTTPS 端口 ${d.httpsPort}（PANEL_TLS_PORT 可改）·
+              ${d.httpsActive
+                ? '<b style="color:var(--ok)">监听中</b>'
+                : d.httpsError
+                  ? `<b style="color:var(--bad)">启动失败</b>：${esc(d.httpsError.slice(0, 90))}（面板以 HTTP 运行，修复后每 5 分钟自动重试）`
+                  : '未监听'}
+              · 证书续期后自动热加载，agent 不受影响
+            </div>
+          </div>
+          <button class="btn btn-primary" data-act="save-https">应用 HTTPS 设置</button>
+          <p class="hint">保存后立即生效，无需重启。浏览器访问 http:// 会自动跳到 https://；agent 与订阅地址不受跳转影响（要加密就把机器上的 PANEL_URL 换成 https://）。</p>
         </div>
       </div>
     </div>
@@ -68,14 +120,18 @@ RENDERERS.settings = async () => {
         <pre class="code" style="white-space:pre-wrap">GET  /api/agent/config?token=TOKEN      服务器/独立节点拉取配置（含 Xray 与 Hysteria2）
 POST /api/agent/receipt?token=TOKEN     回执：这一轮应用了哪个版本、重载是否成功
 GET  /api/agent/script?token=TOKEN      agent 自更新脚本（版本不一致时拉取）
-POST /api/agent/report?token=TOKEN      上报用户流量与节点用量
+POST /api/agent/report?token=TOKEN      上报用户流量与节点用量（0.1.16+ 为累计值+序号）
 GET  /api/servers/:id/install?token=    服务器部署脚本
 GET  /api/servers/:id/uninstall?token=  服务器卸载脚本（加 --purge 深度清理）
 GET  /api/nodes/:id/install?token=      独立节点部署脚本
 GET  /api/nodes/:id/uninstall?token=    独立节点卸载脚本（加 --purge 深度清理）
+POST /api/nodes/:id/probe               面板侧连通性探测（TCP + TLS 抽检）
 GET  /api/stats?days=14                 流量明细（用户 × 日、节点 × 日）
 GET  /s/:userToken                      订阅（base64）
 GET  /s/:userToken?format=clash         订阅（Clash YAML）
+GET  /s/:userToken?format=singbox       订阅（sing-box JSON）
+POST /api/sub/reset-request             订阅页自助重置：发验证码到绑定邮箱
+POST /api/sub/reset-confirm             订阅页自助重置：验证码换发新链接
 GET  /api/invite/:code                  邀请码公开信息（名额、套餐、有效期）
 POST /api/invite/:code/claim            用邀请码自助建号
 GET  /api/health                        健康检查（容器探针）</pre>
@@ -554,6 +610,7 @@ const ACT_LOADING = {
   refresh: '加载中',
   demo: '注入中',
   'node-preview': '生成中',
+  'node-probe': '探测中',
   'entry-script': '生成中',
   'save-settings': '保存中',
   'change-pw': '提交中',
@@ -574,6 +631,8 @@ const ACT_LOADING = {
   'user-bulk': '创建中',
   'invite-manage': '加载中',
   'cert-issue': '提交中',
+  'totp-setup': '生成中',
+  'save-https': '应用中',
 };
 
 document.addEventListener('click', async (e) => {
@@ -742,6 +801,20 @@ async function runAction(act, btn, id) {
     case 'node-preview':
       await nodePreviewFlow(id);
       break;
+    case 'node-probe': {
+      const node = (state.data.nodes || []).find((x) => x.id === id);
+      if (!node) throw new Error('节点不存在，请刷新后重试');
+      const r = await api(`/api/nodes/${id}/probe`, { method: 'POST', body: '{}' });
+      const p = r.probe || {};
+      if (p.ok && p.tls && !p.tls.ok) toast(`探测完成：可达，但证书异常（${p.tls.error}）`, 'err');
+      else if (p.ok) toast(`面板可达${p.ms != null ? `（${p.ms}ms）` : ''}`, 'ok');
+      else toast(`面板不可达：${p.error || '未知原因'}`, 'err');
+      render();
+      break;
+    }
+    case 'probe-info':
+      probeDetailFlow(JSON.parse(btn.dataset.probe || '{}'));
+      break;
     case 'node-deploy':
       await nodeDeployFlow(id);
       break;
@@ -899,6 +972,102 @@ async function runAction(act, btn, id) {
       });
       toast('密码已修改，请重新登录', 'ok');
       setTimeout(() => logoutLocal(true), 800);
+      break;
+    }
+    case 'totp-setup': {
+      const r = await api('/api/admin/totp/setup', { method: 'POST', body: '{}' });
+      const secretGrouped = (r.secret || '').replace(/(.{4})/g, '$1 ').trim();
+      openModal({
+        title: '开启二步验证',
+        body: `
+          <div class="alert alert-warn" style="margin:0 0 14px">
+            在认证器（Google Authenticator / Aegis / 1Password 等）里「添加账号 → 输入设置密钥」，粘贴下面的密钥，账号名随意。
+          </div>
+          <div class="field">
+            <label>密钥（Base32，${r.expiresInMin || 10} 分钟内有效）</label>
+            <div class="code-wrap">
+              <pre class="code" style="font-size:13px;letter-spacing:2px">${esc(secretGrouped)}</pre>
+              <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(r.secret)}">复制</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>认证器导入 URI（支持扫码类工具）</label>
+            <div class="code-wrap">
+              <pre class="code" style="font-size:10.5px;white-space:pre-wrap;word-break:break-all">${esc(r.otpauth)}</pre>
+              <button class="btn btn-sm copy-btn" data-copy="${esc(r.otpauth)}">复制</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>输入认证器显示的 6 位动态码完成绑定</label>
+            <input type="text" id="totp-verify" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位动态码" style="letter-spacing:2px">
+          </div>
+          <div class="field">
+            <label>登录密码（确认是本人在操作）</label>
+            <input type="password" id="totp-pass" autocomplete="current-password" placeholder="••••••••">
+            <div class="hint">防止会话被劫持时，别人把他自己的认证器绑上来把你锁在门外</div>
+          </div>`,
+        okText: '确认并开启',
+        onOk: async (m) => {
+          const code = m.querySelector('#totp-verify').value.trim();
+          const password = m.querySelector('#totp-pass').value;
+          if (!/^\d{6}$/.test(code)) throw new Error('请输入 6 位动态码');
+          if (!password) throw new Error('请输入登录密码');
+          const en = await api('/api/admin/totp/enable', {
+            method: 'POST',
+            body: JSON.stringify({ code, password }),
+          });
+          // 恢复码只在这里出现一次：关掉弹窗就再也看不到明文了
+          openModal({
+            title: '二步验证已开启',
+            body: `
+              <div class="alert alert-warn" style="margin:0 0 14px">
+                <b>请把恢复码抄写或截图保存</b> —— 认证器丢失 / 换手机时，这是唯一的自救入口。
+                每枚只能用一次，用过的自动作废。丢了恢复码又丢了认证器，就只能重置面板数据找回。
+              </div>
+              <div class="code-wrap">
+                <pre class="code" style="font-size:14px;letter-spacing:1px">${esc((en.recoveryCodes || []).join('\n'))}</pre>
+                <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc((en.recoveryCodes || []).join('\n'))}">复制</button>
+              </div>`,
+            okText: '我已保存恢复码',
+          });
+          render();
+        },
+      });
+      break;
+    }
+    case 'totp-disable': {
+      openModal({
+        title: '关闭二步验证',
+        body: `
+          <div class="alert alert-warn" style="margin:0 0 14px">
+            关闭后登录回到单因子（仅密码）。为防误操作，请输入<b>当前动态码</b>或<b>登录密码</b>确认。
+          </div>
+          <div class="field">
+            <label>动态码 或 登录密码</label>
+            <input type="text" id="totp-off" placeholder="6 位动态码 / 登录密码" autocomplete="off">
+          </div>`,
+        okText: '确认关闭',
+        onOk: async (m) => {
+          const v = m.querySelector('#totp-off').value.trim();
+          if (!v) throw new Error('请输入动态码或密码');
+          await api('/api/admin/totp/disable', {
+            method: 'POST',
+            body: JSON.stringify(/^\d{6}$/.test(v) ? { code: v } : { password: v }),
+          });
+          toast('二步验证已关闭', 'ok');
+          render();
+        },
+      });
+      break;
+    }
+    case 'save-https': {
+      const certId = $('#set-https-cert') ? $('#set-https-cert').value : '';
+      const r = await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ httpsCertId: certId }),
+      });
+      toast(certId ? (r.httpsActive ? 'HTTPS 已启用并生效（无需重启）' : '证书不可用，请检查证书状态') : '已切换回纯 HTTP', r.httpsActive || !certId ? 'ok' : 'err');
+      render();
       break;
     }
     case 'notify-new':

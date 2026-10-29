@@ -285,6 +285,11 @@ function userForm(user) {
       <label>备注</label>
       <input type="text" id="f-note" value="${esc(u.note || '')}" placeholder="套餐、联系方式等">
     </div>
+    <div class="field">
+      <label>邮箱（自助重置订阅链接用）</label>
+      <input type="email" id="f-email" value="${esc(u.email || '')}" placeholder="user@example.com" spellcheck="false" autocomplete="off">
+      <div class="hint">填了邮箱，用户才能在订阅页「自助重置订阅链接」（验证码发到这个邮箱）</div>
+    </div>
     <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);cursor:pointer">
       <input type="checkbox" id="f-enabled" ${u.enabled === false ? '' : 'checked'} style="width:auto">
       启用该用户
@@ -361,6 +366,7 @@ function bindUserForm(mask) {
 
 function readUserForm(mask) {
   const usedVal = $('#f-used', mask) ? $('#f-used', mask).value : '';
+  const emailEl = $('#f-email', mask);
   return {
     name: $('#f-name', mask).value.trim(),
     planId: $('#f-plan', mask).value || null,
@@ -368,6 +374,7 @@ function readUserForm(mask) {
     expireAt: $('#f-expire', mask).value ? new Date($('#f-expire', mask).value + 'T23:59:59').toISOString() : null,
     usedGB: usedVal === '' ? undefined : Number(usedVal),
     note: $('#f-note', mask).value.trim(),
+    email: emailEl ? emailEl.value.trim() : '',
     enabled: $('#f-enabled', mask).checked,
   };
 }

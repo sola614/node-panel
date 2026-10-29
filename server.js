@@ -8,6 +8,10 @@
  *   3. 服务器/节点 agent → /api/agent/* （服务器 token 或独立节点 token）
  */
 const http = require('http');
+const https = require('https');
+const net = require('net');
+const tls = require('tls');
+const dns = require('dns');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -23,6 +27,7 @@ const acme = require('./lib/acme');
 const agentBundle = require('./lib/agentBundle');
 const notify = require('./lib/notify');
 const alerts = require('./lib/alerts');
+const totp = require('./lib/totp');
 const logger = require('./lib/log');
 
 const log = logger.create('http');
@@ -32,6 +37,9 @@ const logData = logger.create('data');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
+const TLS_PORT = Number(process.env.PANEL_TLS_PORT || 8443);
+const TLS_CERT_FILE = process.env.PANEL_TLS_CERT || '';
+const TLS_KEY_FILE = process.env.PANEL_TLS_KEY || '';
 // 超过这个耗时记一条 warn：慢请求往往是被忽略的性能问题的最早信号
 const SLOW_MS = Number(process.env.PANEL_SLOW_MS || 1000);
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -213,7 +221,8 @@ function readBody(req) {
 function baseUrl(req) {
   const cfg = store.db().settings.subBase;
   if (cfg && cfg.trim()) return cfg.trim().replace(/\/+$/, '');
-  const proto = req.headers['x-forwarded-proto'] || 'http';
+  // 直连 TLS（面板自身 HTTPS）时按 https 生成订阅地址；反代场景仍优先看转发头
+  const proto = req.headers['x-forwarded-proto'] || (req.socket && req.socket.encrypted ? 'https' : 'http');
   return `${proto}://${req.headers.host || 'localhost:' + PORT}`;
 }
 
@@ -332,6 +341,54 @@ async function login(req, res, params, body) {
     });
   }
 
+  /* 第二因子（0.1.16）：密码通过后，开了 TOTP 还要一道 6 位动态码或恢复码。
+     第一段（不带动态码）只回「还要动态码」，不发 token —— 密码对了不等于登录成功。 */
+  if (admin.totpEnabled && admin.totpSecret) {
+    const code = String(body.totp || '').replace(/\s+/g, '');
+    const recovery = String(body.recoveryCode || '').trim().toLowerCase();
+
+    if (!code && !recovery) {
+      const usable = (admin.recoveryCodes || []).some((c) => c && !c.used);
+      logAuth.info('密码已通过，等待第二因子', { rid: req.__rid, user: username, ip });
+      return sendJson(res, 200, { totpRequired: true, hasRecoveryCodes: usable });
+    }
+
+    let secondOk = false;
+    let usedRecovery = false;
+    const step = code ? totp.verify(admin.totpSecret, code) : 0;
+    if (step) {
+      // 重放防护：同一枚动态码只认一次 —— 没这层的话，±1 窗口（90 秒）内
+      // 被肩窥 / 截获的码可以二次登录。内存级（重启后失效），重启窗口远小于 90 秒
+      const lastStep = totpUsedSteps.get(String(username)) || 0;
+      if (step <= lastStep) {
+        logAuth.warn('第二因子被重放（动态码时间步不前进）', { rid: req.__rid, user: username, ip });
+        return sendJson(res, 401, { error: '这个动态码刚被用过，请等认证器刷新下一枚再试' });
+      }
+      totpUsedSteps.set(String(username), step);
+      secondOk = true;
+    } else if (recovery) {
+      // 恢复码大小写不敏感：显示时是小写十六进制，用户可能抄成大写
+      const h = totp.sha256Hex(recovery);
+      const hit = (admin.recoveryCodes || []).find((c) => c && !c.used && c.hash === h);
+      if (hit) {
+        hit.used = true;
+        usedRecovery = true;
+        secondOk = true;
+      }
+    }
+
+    if (!secondOk) {
+      noteLoginFail(ip);
+      logAuth.warn('第二因子校验失败', { rid: req.__rid, user: username, ip });
+      auditAction('login.fail', String(username || ''), '动态码或恢复码不正确', String(username || ''));
+      return sendJson(res, 401, { error: '动态码不正确，请确认设备时间同步后重试（也可改用恢复码）' });
+    }
+    if (usedRecovery) {
+      store.save();
+      logAuth.warn('已用恢复码登录（一次性，作废一枚）', { rid: req.__rid, user: username, ip });
+    }
+  }
+
   loginFails.delete(ip);
   const token = crypto.randomBytes(24).toString('hex');
   sessions.set(token, { username, expires: Date.now() + SESSION_TTL });
@@ -355,12 +412,14 @@ function logout(req, res) {
 
 function me(req, res, params, body, session) {
   const s = store.db().settings;
+  const admin = store.db().admin;
   sendJson(res, 200, {
     username: session.username,
     settings: s,
     version: store.SCHEMA_VERSION,
     appVersion: APP_VERSION,
     mustChangePassword: needsPasswordChange(),
+    totpEnabled: !!(admin && admin.totpEnabled),
     uptime: Date.now() - STARTED_AT,
   });
 }
@@ -410,6 +469,83 @@ function changePassword(req, res, params, body) {
   // 改密即登出全部会话：万一是别人正在用旧密码登录，也一并踢掉
   sessions.clear();
   sendJson(res, 200, { ok: true, message: '密码已更新，请重新登录' });
+}
+
+/* -------------------------- 管理员二步验证（TOTP） -------------------------- */
+
+// 开启流程的「待确认密钥」只放内存：没确认完的密钥不落库，重启即作废重来
+const totpPending = new Map(); // admin.username → { secret, expires }
+const TOTP_PENDING_TTL = 10 * 60 * 1000;
+// 已接受的动态码时间步（重放防护）：username → 最后接受的最大 step。
+// 单管理员单键，无泄漏风险；重启清零的暴露窗口远小于动态码本身的有效期
+const totpUsedSteps = new Map();
+
+function totpSetup(req, res) {
+  const admin = store.db().admin;
+  if (admin.totpEnabled) return sendJson(res, 400, { error: '二步验证已开启；如需换绑请先关闭' });
+  const secret = totp.generateSecret();
+  totpPending.set(admin.username, { secret, expires: Date.now() + TOTP_PENDING_TTL });
+  logAuth.info('已生成待确认的 TOTP 密钥', { rid: req.__rid, user: admin.username });
+  sendJson(res, 200, {
+    ok: true,
+    secret,
+    // 认证器「添加账号 → 输入设置密钥」用 secret；扫码导入用 otpauth URI
+    otpauth: totp.otpauthUrl(secret, admin.username, store.db().settings.siteName || 'node-panel'),
+    expiresInMin: 10,
+  });
+}
+
+function totpEnable(req, res, params, body) {
+  const admin = store.db().admin;
+  if (admin.totpEnabled) return sendJson(res, 400, { error: '二步验证已开启' });
+  // 开启也要验登录密码：会话被劫持者可以绑定**自己的**认证器把真管理员锁在
+  // 门外（典型 2FA 接管向量）。关闭要动态码或密码，开启却什么都不问，不对称
+  if (!body.password || !store.checkPassword(String(body.password), admin.password)) {
+    logAuth.warn('开启二步验证失败：登录密码不正确', { rid: req.__rid, user: admin.username });
+    return sendJson(res, 400, { error: '请输入正确的登录密码（防会话劫持者绑定他自己的认证器）' });
+  }
+  const p = totpPending.get(admin.username);
+  if (!p || Date.now() > p.expires) {
+    totpPending.delete(admin.username);
+    return sendJson(res, 400, { error: '密钥已过期或未生成，请重新开始' });
+  }
+  if (!totp.verify(p.secret, body.code)) {
+    logAuth.warn('开启二步验证失败：动态码不正确', { rid: req.__rid, user: admin.username });
+    return sendJson(res, 400, { error: '动态码不正确，请确认认证器时间同步后重试' });
+  }
+
+  admin.totpSecret = p.secret;
+  admin.totpEnabled = true;
+  admin.updatedAt = store.iso();
+  const codes = totp.generateRecoveryCodes(10);
+  // 库里只存哈希；明文只在这一次响应里出现，前端提示用户自行保存
+  admin.recoveryCodes = codes.map((c) => ({ hash: totp.sha256Hex(c), used: false }));
+  totpPending.delete(admin.username);
+  totpUsedSteps.delete(admin.username);
+  store.save();
+  logAuth.info('二步验证已开启', { rid: req.__rid, user: admin.username, recoveryCodes: codes.length });
+  auditAction('admin.totp', admin.username, '开启二步验证');
+  sendJson(res, 200, { ok: true, recoveryCodes: codes });
+}
+
+function totpDisable(req, res, params, body) {
+  const admin = store.db().admin;
+  if (!admin.totpEnabled) return sendJson(res, 400, { error: '二步验证未开启' });
+  // 关闭需要「当前动态码」或「登录密码」二选一：认证器丢了的人可以凭密码自救
+  const byCode = totp.verify(admin.totpSecret, body.code);
+  const byPass = !byCode && body.password && store.checkPassword(String(body.password), admin.password);
+  if (!byCode && !byPass) {
+    logAuth.warn('关闭二步验证失败：动态码与密码均不正确', { rid: req.__rid, user: admin.username });
+    return sendJson(res, 400, { error: '请输入正确的动态码或登录密码' });
+  }
+  admin.totpSecret = '';
+  admin.totpEnabled = false;
+  admin.recoveryCodes = [];
+  admin.updatedAt = store.iso();
+  store.save();
+  logAuth.warn('二步验证已关闭', { rid: req.__rid, user: admin.username, via: byCode ? '动态码' : '密码' });
+  auditAction('admin.totp', admin.username, '关闭二步验证');
+  sendJson(res, 200, { ok: true });
 }
 
 /* ---------------------------------- 概览 ---------------------------------- */
@@ -657,12 +793,14 @@ function listUsers(req, res, params, body, session, ctx) {
 }
 
 /** 建一个用户对象（不落库）：单个新增、批量建号、邀请领取共用同一套字段规则 */
-function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = '', enabled = true, extra = {} }) {
+function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = '', email = '', enabled = true, extra = {} }) {
   const u = {
     id: store.uid(),
     name: String(name || '').trim(),
     uuid: store.newUuid(),
     token: store.rnd(16),
+    // 订阅页自助重置订阅链接的验证码收件地址（可选，管理员在编辑里填）
+    email: String(email || '').trim(),
     planId: planId || null,
     enabled: enabled !== false,
     // 有套餐时额度与到期由套餐决定；无套餐才允许手填
@@ -689,6 +827,9 @@ function createUser(req, res, params, body) {
   if (nameTaken(store.db().users, name)) {
     return sendJson(res, 409, { error: '这个用户名已经存在了' });
   }
+  if (body.email !== undefined && body.email !== null && String(body.email).trim() && !EMAIL_RE.test(String(body.email).trim())) {
+    return sendJson(res, 400, { error: '邮箱格式不正确' });
+  }
   const u = buildUser({
     name,
     planId: body.planId,
@@ -696,6 +837,7 @@ function createUser(req, res, params, body) {
     usedGB: body.usedGB,
     expireAt: body.expireAt,
     note: body.note,
+    email: body.email,
     enabled: body.enabled !== false,
   });
   store.db().users.push(u);
@@ -714,6 +856,11 @@ function updateUser(req, res, params, body) {
   }
   if (body.enabled !== undefined) u.enabled = !!body.enabled;
   if (body.note !== undefined) u.note = String(body.note);
+  if (body.email !== undefined) {
+    const email = String(body.email).trim();
+    if (email && !EMAIL_RE.test(email)) return sendJson(res, 400, { error: '邮箱格式不正确' });
+    u.email = email;
+  }
   if (body.resetTraffic) u.usedBytes = 0;
 
   // 管理员可以直接改「已用流量」：调小等于把额度还回去，调大等于提前触达超量。
@@ -1485,6 +1632,8 @@ function deleteNode(req, res, params) {
   if (i < 0) return sendJson(res, 404, { error: '节点不存在' });
   const nameOfNode = db.nodes[i].name;
   db.nodes.splice(i, 1);
+  // 独立节点的对账水位一并清掉（server 模式节点的水位挂在服务器 scope 下，不受影响）
+  try { store.clearReportState(params.id); } catch { /* 水位清理失败不影响删除 */ }
   store.save();
   auditAction('node.delete', nameOfNode);
   sendJson(res, 200, { ok: true });
@@ -1498,6 +1647,9 @@ function batchDeleteNodes(req, res, params, body) {
   const drop = new Set(ids);
   const names = db.nodes.filter((n) => drop.has(n.id)).map((n) => n.name);
   db.nodes = db.nodes.filter((n) => !drop.has(n.id));
+  for (const id of ids) {
+    try { store.clearReportState(id); } catch { /* 水位清理失败不影响删除 */ }
+  }
   store.save();
   auditAction(
     'node.batch-delete',
@@ -1557,6 +1709,164 @@ function rotateNodeToken(req, res, params) {
   store.save();
   auditAction('node.rotate', node.name, '重置独立节点 token');
   sendJson(res, 200, { ok: true, item: node });
+}
+
+/* ------------------------- 面板侧连通性探测（0.1.16） ------------------------ */
+
+/**
+ * agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组、外部防火墙、证书链错误
+ * 这些「面板/用户视角」的故障，没有这一环就只能登机分层排查。
+ *
+ * 探测分三层：
+ *   1. DNS：域名解析失败（被删记录 / DNS 故障）直接判不可达；
+ *   2. TCP：非 UDP 协议做一次公网握手，量出 RTT；
+ *   3. TLS 抽检：仅 security=tls 的节点 —— 校验证书是否过期、SAN 是否覆盖 SNI。
+ *      Reality 是伪装握手，证书本来就「不属于」本站，做证书校验必然误报，跳过。
+ * Hysteria2 是 UDP：没有连接语义，TCP 握手不通是正常现象，只做 DNS 验证。
+ */
+const PROBE_TIMEOUT = 5000;
+
+function tcpProbe(host, port) {
+  return new Promise((resolve, reject) => {
+    const s = net.connect({ host, port });
+    s.setTimeout(PROBE_TIMEOUT);
+    s.once('connect', () => {
+      s.destroy();
+      resolve();
+    });
+    s.once('timeout', () => {
+      s.destroy();
+      reject(new Error(`连接超时（${PROBE_TIMEOUT / 1000} 秒）`));
+    });
+    s.once('error', (err) => reject(err));
+  });
+}
+
+/** TLS 握手抽检：不做 CA 信任判定（自签证书是本项目支持的常态），只看过期与 SNI 匹配 */
+function tlsProbe(host, port, sni) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    const s = tls.connect({ host, port, servername: sni, rejectUnauthorized: false });
+    s.setTimeout(PROBE_TIMEOUT);
+    s.once('secureConnect', () => {
+      try {
+        const c = s.getPeerCertificate();
+        s.destroy();
+        if (!c || !c.subject) return done({ ok: false, error: '未取得对端证书' });
+        const out = { ok: true, error: '', notAfter: c.valid_to || '', selfSigned: false, daysLeft: null };
+        if (c.valid_to) {
+          const t = Date.parse(c.valid_to);
+          if (Number.isFinite(t)) {
+            out.daysLeft = Math.floor((t - Date.now()) / 864e5);
+            if (t < Date.now()) {
+              out.ok = false;
+              out.error = `证书已于 ${c.valid_to} 过期`;
+            }
+          }
+        }
+        const issuer = (c.issuer && (c.issuer.O || c.issuer.CN)) || '';
+        const subject = (c.subject && (c.subject.O || c.subject.CN)) || '';
+        if (issuer && issuer === subject) out.selfSigned = true;
+        // SAN 形如 "DNS:a.example.com, DNS:b.example.com, IP Address:1.2.3.4"
+        // （Node 的字段名是 subjectaltname；IP 条目剥前缀后由 sniMatchesDomains 精确匹配）
+        const sans = String(c.subjectaltname || '')
+          .split(',')
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .map((x) => x.replace(/^DNS:/i, '').replace(/^IP Address:/i, '').trim())
+          .filter(Boolean);
+        if (sans.length && !cert.sniMatchesDomains(sans, sni)) {
+          out.ok = false;
+          out.error = `证书域名（${sans.slice(0, 4).join('、')}）不包含 SNI「${sni}」，客户端会报证书不匹配`;
+        }
+        return done(out);
+      } catch (err) {
+        return done({ ok: false, error: '证书解析失败：' + err.message });
+      }
+    });
+    s.once('timeout', () => {
+      s.destroy();
+      done({ ok: false, error: `TLS 握手超时（${PROBE_TIMEOUT / 1000} 秒）` });
+    });
+    s.once('error', (err) => done({ ok: false, error: 'TLS 握手失败：' + err.message }));
+  });
+}
+
+async function runNodeProbe(node) {
+  const host = store.nodeHost(node);
+  const port = Number(node.port);
+  const out = { host, port, ip: '', ms: null, ok: false, error: '', note: '', tls: null };
+
+  try {
+    const r = await dns.promises.lookup(host);
+    out.ip = r.address;
+  } catch (err) {
+    out.error = `域名解析失败：${err.code || err.message}（${host}）`;
+    return out;
+  }
+
+  if (node.protocol === 'hysteria2') {
+    out.ok = true;
+    out.note = 'Hysteria2 为 UDP 协议，面板仅验证地址解析；端口监听请看 agent 回执的「端口未监听」';
+    return out;
+  }
+
+  const t0 = Date.now();
+  try {
+    await tcpProbe(host, port);
+    out.ms = Date.now() - t0;
+    out.ok = true;
+  } catch (err) {
+    // 到这里 DNS 是通的，TCP 不通 = 安全组 / 防火墙 / 服务没起，正是 agent 自检发现不了的那类
+    out.error = `TCP 握手失败：${err.message}（agent 在线时多为安全组/防火墙拦截或端口未放行）`;
+    return out;
+  }
+
+  // ok 只表示「网络路径可达」（DNS+TCP）；证书问题放在 tls.ok 里独立呈现 ——
+  // 服务端把 ok 拖成 false 的话，前端「证书异常」这一档永远显示不出来，
+  // 证书过期会被误报成「面板不可达」，把人引向安全组/端口排查的错方向
+  if ((node.security || '') === 'tls') {
+    const sni = node.sni || node.host || host;
+    out.tls = await tlsProbe(host, port, sni);
+  }
+  return out;
+}
+
+function probeNode(req, res, params) {
+  const node = store.db().nodes.find((n) => n.id === params.id);
+  if (!node) return sendJson(res, 404, { error: '节点不存在' });
+  const host = store.nodeHost(node);
+  if (!host) return sendJson(res, 400, { error: '节点没有可用地址：独立节点未填地址，或所属服务器没有地址' });
+
+  const started = Date.now();
+  runNodeProbe(node)
+    .then((result) => {
+      node.probe = { at: store.iso(), ...result, tookMs: Date.now() - started };
+      store.save();
+      const p = node.probe;
+      logData.info('节点探测完成', {
+        rid: req.__rid,
+        node: node.name,
+        ok: p.ok,
+        ip: p.ip,
+        ms: p.ms,
+        tlsOk: p.tls ? p.tls.ok : undefined,
+        error: p.error || p.tls?.error || undefined,
+      });
+      const tlsErr = p.tls && !p.tls.ok ? `；证书异常：${p.tls.error}` : '';
+      auditAction('node.probe', node.name,
+        p.ok ? `可达 ${p.ms ?? ''}ms${tlsErr}` : `不可达：${p.error || (p.tls && p.tls.error)}`);
+      sendJson(res, 200, { ok: true, probe: p });
+    })
+    .catch((err) => {
+      logData.error('节点探测异常', { rid: req.__rid, node: node.name, err });
+      sendJson(res, 500, { error: '探测失败：' + err.message });
+    });
 }
 
 /* ---------------------------------- 证书 ---------------------------------- */
@@ -1897,6 +2207,13 @@ function deleteCert(req, res, params) {
         .join('、')}${used.length > 3 ? ' 等' : ''}），先把它们换成别的证书`,
     });
   }
+  // 面板自身 HTTPS 正引用着它也不能删：删掉后下一轮热加载会把监听关掉，
+  // 正在用 https:// 的管理员当场失联
+  if (String(db.settings.httpsCertId || '') === c.id) {
+    return sendJson(res, 409, {
+      error: '面板自身的 HTTPS 正在用这张证书，先到「设置 → 面板 HTTPS」换成别的证书或停用 HTTPS',
+    });
+  }
   db.certs.splice(i, 1);
   store.save();
   auditAction('cert.delete', c.name || c.id, (c.domains || []).join(', '));
@@ -2131,6 +2448,8 @@ function deleteServer(req, res, params) {
   const nameOfServer = db.servers[i].name;
   db.servers.splice(i, 1);
   db.nodes = db.nodes.filter((n) => n.serverId !== params.id);
+  // 这台机器的流量对账水位一并清掉，重建同名机器时从零起算
+  try { store.clearReportState(params.id); } catch { /* 水位清理失败不影响删除 */ }
   store.save();
   auditAction('server.delete', nameOfServer, '其下节点一并删除');
   sendJson(res, 200, { ok: true });
@@ -2146,6 +2465,9 @@ function batchDeleteServers(req, res, params, body) {
   const nodes = db.nodes.filter((n) => drop.has(n.serverId)).length;
   db.servers = db.servers.filter((s) => !drop.has(s.id));
   db.nodes = db.nodes.filter((n) => !drop.has(n.serverId));
+  for (const id of ids) {
+    try { store.clearReportState(id); } catch { /* 水位清理失败不影响删除 */ }
+  }
   store.save();
   auditAction(
     'server.batch-delete',
@@ -2269,6 +2591,25 @@ sh -n /opt/nodepanel/agent.sh || die "agent 脚本语法检查失败（面板下
 AGENT_VER=$(sed -n "s/^VERSION='\\(.*\\)'\\$/\\1/p" /opt/nodepanel/agent.sh | sed -n '1p')
 say "版本 \${AGENT_VER:-未知} · $(size_of /opt/nodepanel/agent.sh) · sh -n 通过"
 note "日志目录 /var/log/nodepanel，运行时目录 /run/nodepanel"
+
+# 本机卸载入口：面板生成的卸载命令要联网取，面板被删 / 换域名 / token 失效时
+# 就再也取不到了，机器上会留一个永远在喊「无法连接面板」的孤儿 agent。
+# 这个文件只做转发 —— 真正的清理逻辑在 agent.sh 的 --uninstall 里，
+# 跟着 agent 自更新一起变新，不会随版本腐化。
+cat > /opt/nodepanel/uninstall.sh <<'NODEPANEL_UNINSTALL_EOF'
+#!/bin/sh
+# Node Panel · 本机卸载入口（部署时落地，不依赖面板）
+#   sh /opt/nodepanel/uninstall.sh            卸干净：agent + 节点监听 + 面板下发的配置
+#   sh /opt/nodepanel/uninstall.sh --purge    连日志与配置备份一起删
+if [ ! -f /opt/nodepanel/agent.sh ]; then
+  echo "✗ 找不到 /opt/nodepanel/agent.sh（agent 可能已被手动删除）"
+  echo "  从面板重新取卸载命令：服务器页 / 独立节点页「卸载命令」"
+  exit 1
+fi
+exec sh /opt/nodepanel/agent.sh --uninstall "$@"
+NODEPANEL_UNINSTALL_EOF
+chmod 755 /opt/nodepanel/uninstall.sh
+note "本机卸载入口 /opt/nodepanel/uninstall.sh（断网、面板已删都能用）"
 
 # ------------------------------ 2. Xray 本体 --------------------------------
 # 部署脚本自己装 xray-core，三种情况分开处理，任何一种都不破坏已有安装：
@@ -2771,6 +3112,7 @@ case "$STARTED" in
     ;;
 esac
 printf '  手动一轮   %s\\n' 'sh /opt/nodepanel/agent.sh --once'
+printf '  卸载       %s\\n' 'sh /opt/nodepanel/uninstall.sh'
 printf '\\n'
 `;
 }
@@ -2825,6 +3167,13 @@ done
 if [ "$(id -u)" != "0" ]; then
   echo "✗ 请用 root 执行（需要删除 /opt、/etc 与注销系统服务）"
   exit 1
+fi
+
+# 机器上还留着 agent 本体时，优先交给它自己卸（agent.sh --uninstall）：
+# 清理逻辑只有一份实现，而且它更清楚自己用的是官方名还是伪装名。
+# 下面这份内联逻辑是兜底 —— /opt/nodepanel 已被手删，或 agent 版本还不支持 --uninstall。
+if [ -x /opt/nodepanel/agent.sh ] && grep -q '^  --uninstall)' /opt/nodepanel/agent.sh 2>/dev/null; then
+  exec sh /opt/nodepanel/agent.sh --uninstall "$@"
 fi
 
 AGENT_DIR=/opt/nodepanel
@@ -3407,6 +3756,12 @@ function agentReport(req, res, params, body, session, ctx) {
 
   // agent 每 60 秒上报一次，借这个心跳顺手处理到期续期，面板没人打开也不会掉线
   sweepRenewals();
+
+  // v2（0.1.16+ 的 agent）：累计值 + 单调序号，服务端按差值入账
+  if (body && body.v2 === 1) {
+    return agentReportV2(req, res, scope, body, ctx);
+  }
+
   const db = store.db();
   const byEmail = new Map(db.users.map((u) => ['u' + u.id, u]));
   let applied = 0;
@@ -3461,6 +3816,135 @@ function agentReport(req, res, params, body, session, ctx) {
   alerts.sweep().catch((err) => logAgent.error('告警巡检异常', { err }));
 
   sendJson(res, 200, { ok: true, applied, bytes, nodeBytes });
+}
+
+/**
+ * v2 上报：agent 发的是「自部署以来的累计字节」+ 一个单调递增序号。
+ * 服务端拿本次累计值减上次水位得到本轮增量 —— agent 侧丢一轮上报（网络故障、
+ * 面板重启）只会让这部分量在下一轮补上，不再出现「丢一次就永久丢量」；
+ * 序号用来挡重复与乱序（HTTP 超时后的重传、时钟回拨都不至于重复计费）。
+ *
+ * 与 v1 的关键区别：这里看到的 up/down 是水位，不是增量；直接把它加进
+ * usedBytes 的话会把全部历史流量重复计一遍 —— 排障时先看这一点。
+ */
+/** 未匹配用户告警的降噪状态：scopeId → { count, at }（数量不变且 10 分钟内只打 debug） */
+const unmatchedNoise = new Map();
+
+function agentReportV2(req, res, scope, body, ctx) {
+  const db = store.db();
+  const seq = Math.max(0, Math.round(Number(body.seq) || 0));
+  // 实例代数：agent 的 totals 文件被删（重装 / 手动清理）后重新生成。
+  // 没有它，重装后旧 seq 比水位小会被当重复「永久丢弃」；删记录重接入会把
+  // 全量历史重算一遍 —— 两个方向都是静默错账
+  const gen = String(body.gen || '').trim().slice(0, 40);
+  const seqKey = '@seq@' + gen;
+  const lastSeqRow = store.reportSeqOf(scope.id, seqKey);
+
+  // 解析行（建基线与差值入账都要用）
+  const rows = [];
+  for (const t of Array.isArray(body.totals) ? body.totals : []) {
+    if (!Array.isArray(t) || t.length < 3) continue;
+    rows.push({ k: String(t[0]), up: Math.max(0, Math.round(Number(t[1]) || 0)), down: Math.max(0, Math.round(Number(t[2]) || 0)) });
+  }
+  for (const t of Array.isArray(body.nodes) ? body.nodes : []) {
+    if (!Array.isArray(t) || t.length < 3) continue;
+    rows.push({ k: 'node:' + String(t[0]), up: Math.max(0, Math.round(Number(t[1]) || 0)), down: Math.max(0, Math.round(Number(t[2]) || 0)) });
+  }
+
+  // 新的实例代数：这台机器的计数器从头开始了（重装 agent / 换库恢复 / 删记录重接入）。
+  // 只建基线不入账 —— 全量累计值对旧水位不可比，直接差值会把历史重算一遍。
+  // 代价是丢一个上报周期（≈60 秒）的量，新部署首轮累计值本来就接近 0。
+  if (gen && lastSeqRow === null) {
+    store.clearReportState(scope.id);
+    for (const row of rows) store.setReportState(scope.id, row.k, row.up, row.down, seq);
+    store.setReportState(scope.id, seqKey, 0, 0, seq);
+    store.save();
+    logAgent.info('流量上报（v2）：新的实例代数，本轮只建基线', {
+      rid: ctx.rid,
+      scope: scope.name,
+      gen: gen.slice(0, 8) + '…',
+      seq,
+      rows: rows.length,
+    });
+    return sendJson(res, 200, { ok: true, baseline: true, rows: rows.length, seq });
+  }
+
+  const lastSeq = lastSeqRow || 0;
+  if (!seq || seq <= lastSeq) {
+    logAgent.debug('流量上报（v2）：序号重复或回退，整批丢弃', {
+      rid: ctx.rid,
+      scope: scope.name,
+      seq,
+      lastSeq,
+    });
+    // 幂等：重复上报也回 200，agent 不需要为此重试
+    return sendJson(res, 200, { ok: true, duplicate: true, seq: lastSeq });
+  }
+
+  const byEmail = new Map(db.users.map((u) => ['u' + u.id, u]));
+  const date = store.todayKey();
+  let applied = 0;
+  let bytes = 0;
+  let nodeBytes = 0;
+  let unmatched = 0;
+
+  for (const row of rows) {
+    const prev = store.reportStateOf(scope.id, row.k) || { up: 0, down: 0 };
+    // 累计值变小 = 计数器清零（Xray 重启 / 实例重建）：视为从零重新累计，全额入账
+    const dUp = row.up >= prev.up ? row.up - prev.up : row.up;
+    const dDown = row.down >= prev.down ? row.down - prev.down : row.down;
+    const delta = dUp + dDown;
+
+    // 水位先推进（哪怕下面找不到用户）：序号已接受，这条数据不该再被处理第二遍
+    store.setReportState(scope.id, row.k, row.up, row.down, seq);
+    if (!delta) continue;
+
+    if (row.k.startsWith('node:')) {
+      store.bumpNodeDaily(row.k.slice(5), delta, date);
+      nodeBytes += delta;
+      applied++;
+      continue;
+    }
+
+    const user = byEmail.get(row.k);
+    if (!user) {
+      unmatched++;
+      continue;
+    }
+    user.usedBytes = (user.usedBytes || 0) + delta;
+    store.bumpUserDaily(user.id, delta, date);
+    bytes += delta;
+    applied++;
+  }
+
+  // 哨兵行记录「已接受的序号」：这批就算一行都没匹配上，序号也推进，
+  // 否则同一批数据每 60 秒都被重新差值一遍
+  store.setReportState(scope.id, seqKey, 0, 0, seq);
+
+  if (bytes > 0) store.addDaily(bytes);
+  store.save();
+
+  // 用户被删后 agent 侧 totals 还留着他的行：未匹配数量不变时降为 debug，
+  // 否则每 60 秒一条「有未匹配用户」会把日志刷成噪音
+  if (rows.length && unmatched) {
+    const seen = unmatchedNoise.get(scope.id);
+    if (!seen || seen.count !== unmatched || Date.now() - seen.at > 10 * 60 * 1000) {
+      unmatchedNoise.set(scope.id, { count: unmatched, at: Date.now() });
+      logAgent.warn('流量上报（v2）有未匹配用户', {
+        rid: ctx.rid,
+        scope: scope.name,
+        rows: rows.length,
+        unmatched,
+        seq,
+        hint: '通常是用户已删除但 agent 的累计文件还留着该行，属预期噪音',
+      });
+    }
+  }
+  logAgent.debug('流量上报（v2）', { rid: ctx.rid, scope: scope.name, seq, rows: rows.length, applied, bytes, nodeBytes });
+
+  alerts.sweep().catch((err) => logAgent.error('告警巡检异常', { err }));
+
+  sendJson(res, 200, { ok: true, applied, bytes, nodeBytes, seq });
 }
 
 /** 解析 agent 的纯文本上报：每行 `email up down` 或 `node:<id> up down`，空行与 # 注释忽略 */
@@ -3719,7 +4203,18 @@ function demoTick(req, res, params, body) {
 /* --------------------------------- 设置 ---------------------------------- */
 
 function getSettings(req, res) {
-  sendJson(res, 200, { settings: store.db().settings, admin: { username: store.db().admin.username } });
+  sendJson(res, 200, {
+    settings: store.db().settings,
+    admin: {
+      username: store.db().admin.username,
+      totpEnabled: !!store.db().admin.totpEnabled,
+      recoveryLeft: (store.db().admin.recoveryCodes || []).filter((c) => c && !c.used).length,
+    },
+    // HTTPS 是否真的在服务（listen 成功）；失败原因给前端做红字提示
+    httpsActive: httpsReady,
+    httpsError,
+    httpsPort: TLS_PORT,
+  });
 }
 
 function updateSettings(req, res, params, body) {
@@ -3735,17 +4230,42 @@ function updateSettings(req, res, params, body) {
     }
   }
 
+  // 面板 HTTPS：引用证书页的证书实体。校验通过后立即生效（无需重启）：
+  // 改证书热加载、清空关闭监听
+  let httpsChanged = false;
+  let nextCertId = s.httpsCertId || '';
+  if (body.httpsCertId !== undefined) {
+    nextCertId = String(body.httpsCertId || '').trim();
+    if (nextCertId) {
+      const c = store.db().certs.find((x) => x.id === nextCertId);
+      if (!c || !c.certPem || !c.keyPem) {
+        return sendJson(res, 400, { error: '请选择一张已签发（含私钥）的证书' });
+      }
+    }
+    httpsChanged = nextCertId !== (s.httpsCertId || '');
+  }
+
   if (body.siteName !== undefined) s.siteName = String(body.siteName).trim() || s.siteName;
   if (body.notice !== undefined) s.notice = String(body.notice);
   s.subBase = nextSubBase;
+  if (httpsChanged) s.httpsCertId = nextCertId;
 
   store.save();
+  if (httpsChanged) {
+    try {
+      syncHttpsServer();
+    } catch (err) {
+      // syncHttpsServer 内部已兜底；这里再拦一层，设置保存不该被 HTTPS 状态拖失败
+      log.error('应用 HTTPS 设置时出错（面板以 HTTP 运行）', { err });
+    }
+    auditAction('settings.https', '面板 HTTPS', nextCertId ? `启用（引用证书）` : '关闭');
+  }
   auditAction('settings.update', '站点设置', [
     body.siteName !== undefined ? '改名' : '',
     body.subBase !== undefined ? `订阅域名 ${s.subBase || '(自动)'}` : '',
     body.notice !== undefined ? '改公告' : '',
   ].filter(Boolean).join(' · '));
-  sendJson(res, 200, { ok: true, settings: s });
+  sendJson(res, 200, { ok: true, settings: s, httpsActive: httpsReady, httpsError });
 }
 
 /* -------------------------------- 消息通知 -------------------------------- */
@@ -4231,7 +4751,10 @@ function subscriptionPayload(user, req) {
   const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
   const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
   const isNodeVisible = (n) => store.nodeUsableBy(n, user);
-  const links = sub.buildLinks(nodesForLinks, servers, user, isNodeVisible);
+  // 入口单独挂了套餐时，判断规则必须和配置层 usersForNode 一致（含等级继承），
+  // 否则会出现「订阅里没有、节点里却注入了这个用户」
+  const isEntryVisible = (n, e) => store.planCovers(store.planOf(user), e.planIds);
+  const links = sub.buildLinks(nodesForLinks, servers, user, isNodeVisible, isEntryVisible);
 
   const base = baseUrl(req);
   // 今日用量：订阅页放一行，用户能自己判断「今天是不是用多了」
@@ -4259,10 +4782,16 @@ function subscriptionPayload(user, req) {
       autoRenew: !!pub.autoRenew,
       nodeCount: links.length,
     },
-    settings: { siteName: db.settings.siteName, notice: db.settings.notice },
+    settings: {
+      siteName: db.settings.siteName,
+      notice: db.settings.notice,
+      // 订阅页据此决定要不要给「自助重置」入口留提示（没配邮件渠道时点击会得到明确报错）
+      selfReset: !!(db.notify_channels || []).some((c) => c.enabled && c.type === 'email'),
+    },
     links,
     subUrl: `${base}/s/${user.token}`,
     clashUrl: `${base}/s/${user.token}?format=clash`,
+    singboxUrl: `${base}/s/${user.token}?format=singbox`,
     updatedAt: store.iso(),
   };
 }
@@ -4271,6 +4800,121 @@ function subApi(req, res, params, body, session, ctx) {
   const user = userByToken(params.token);
   if (!user) return sendJson(res, 404, { error: '订阅不存在' });
   sendJson(res, 200, subscriptionPayload(user, ctx.req));
+}
+
+/* --------------------- 订阅页自助重置订阅链接（0.1.16） --------------------- */
+
+/**
+ * 用户侧的自救通道：怀疑订阅 token 泄露时，不用等管理员，
+ * 「账号绑定的邮箱 + 验证码」两道轻量身份即可换发新链接，旧链接当场失效。
+ *
+ * 邮箱由管理员在用户编辑里填写；验证码通过「通知渠道」里启用的邮件渠道发送。
+ * 风险面：知道订阅 token + 掌握该邮箱收件箱的人本就能看到订阅内容，重置不扩大泄露。
+ */
+const resetPending = new Map(); // token → { code, expires, tries }
+const resetSentAt = new Map(); // token → 上次发送时间（60 秒冷却）
+const RESET_TTL = 10 * 60 * 1000;
+const RESET_MAX_TRIES = 5;
+// 过期清理：这几个 Map 的键是订阅 token / 用户名，用不到就永远留在内存里
+//（loginFails 早有同款清理）。挂 10 分钟一轮，量级极小。
+const RESET_SWEEP_MS = 10 * 60 * 1000;
+const resetSweepTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of resetPending) if (!v || now > v.expires) resetPending.delete(k);
+  for (const [k, v] of resetSentAt) if (!v || now - v > 60 * 60 * 1000) resetSentAt.delete(k);
+  for (const [k, v] of totpPending) if (!v || now > v.expires) totpPending.delete(k);
+}, RESET_SWEEP_MS);
+resetSweepTimer.unref();
+
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+function maskEmail(email) {
+  const text = String(email || '');
+  const at = text.indexOf('@');
+  if (at <= 0) return '***';
+  return text.slice(0, 2) + '***' + text.slice(at);
+}
+
+async function subResetRequest(req, res, params, body) {
+  const token = String(body.token || '');
+  const user = userByToken(token);
+  if (!user) return sendJson(res, 404, { error: '订阅不存在或已被重置' });
+  if (!user.enabled) return sendJson(res, 400, { error: '账号已停用，请联系管理员' });
+  if (!user.email || !EMAIL_RE.test(user.email)) {
+    return sendJson(res, 400, { error: '该账号未设置有效邮箱，请联系管理员重置' });
+  }
+
+  // 邮箱必须与账号绑定的一致：token 是第一道，这里是第二道
+  const email = String(body.email || '').trim().toLowerCase();
+  if (!email || email !== String(user.email).trim().toLowerCase()) {
+    return sendJson(res, 400, { error: '邮箱与该账号绑定的不一致' });
+  }
+
+  const channel = (store.db().notify_channels || []).find((c) => c.enabled && c.type === 'email');
+  if (!channel) {
+    return sendJson(res, 400, { error: '面板未配置邮件渠道，暂时无法自助重置，请联系管理员' });
+  }
+
+  const last = resetSentAt.get(token) || 0;
+  if (Date.now() - last < 60 * 1000) {
+    return sendJson(res, 429, { error: '发送太频繁，请 1 分钟后再试' });
+  }
+
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  const siteName = store.db().settings.siteName || 'Node Panel';
+  const r = await notify.deliver(channel, {
+    event: 'user.reset',
+    level: 'info',
+    title: '订阅链接重置验证码',
+    text:
+      `账号「${user.name}」正在申请重置订阅链接。\n\n` +
+      `验证码：${code}\n有效期：10 分钟\n\n` +
+      `如果这不是你本人的操作，请忽略本邮件 —— 验证码未被使用前，订阅链接不会变化。\n` +
+      `（来自 ${siteName}）`,
+  });
+  if (!r || !r.ok) {
+    logData.error('重置验证码发送失败', { rid: req.__rid, user: user.name, error: r && r.error });
+    return sendJson(res, 502, { error: `邮件发送失败：${(r && r.error) || '未知错误'}` });
+  }
+
+  resetSentAt.set(token, Date.now());
+  resetPending.set(token, { code, expires: Date.now() + RESET_TTL, tries: 0 });
+  auditAction('user.reset.request', user.name, '订阅页申请自助重置');
+  logData.info('重置验证码已发送', { rid: req.__rid, user: user.name, channel: channel.name });
+  sendJson(res, 200, { ok: true, sentTo: maskEmail(user.email) });
+}
+
+function subResetConfirm(req, res, params, body) {
+  const token = String(body.token || '');
+  const user = userByToken(token);
+  if (!user) return sendJson(res, 404, { error: '订阅不存在或已被重置' });
+  // 申请验证码之后账号被停用：确认阶段再拦一道，停用不该有新凭证流出
+  if (!user.enabled) return sendJson(res, 400, { error: '账号已停用，请联系管理员' });
+
+  const p = resetPending.get(token);
+  if (!p || Date.now() > p.expires) {
+    resetPending.delete(token);
+    return sendJson(res, 400, { error: '验证码已失效，请重新获取' });
+  }
+  if (p.tries >= RESET_MAX_TRIES) {
+    resetPending.delete(token);
+    return sendJson(res, 400, { error: '尝试次数过多，验证码已作废，请重新获取' });
+  }
+  if (!tokenEq(p.code, String(body.code || '').trim())) {
+    p.tries++;
+    return sendJson(res, 400, { error: '验证码不正确' });
+  }
+
+  // 验证通过：换发 token 与 UUID（与端侧注入的凭证保持同步），旧链接即刻失效
+  resetPending.delete(token);
+  resetSentAt.delete(token);
+  const oldToken = user.token;
+  user.token = store.rnd(16);
+  user.uuid = store.newUuid();
+  store.save();
+  auditAction('user.selfrotate', user.name, '订阅页自助重置订阅链接');
+  logData.warn('订阅链接已自助重置', { rid: req.__rid, user: user.name, tokenFrom: oldToken.slice(0, 4) + '***' });
+  sendJson(res, 200, { ok: true, subUrl: `${baseUrl(req)}/s/${user.token}` });
 }
 
 function subPage(req, res, params, body, session, ctx) {
@@ -4300,10 +4944,38 @@ function subPage(req, res, params, body, session, ctx) {
     const nodes = orderedNodes(db.nodes.filter((n) => n.enabled));
     const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
     const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
-    const yaml = sub.toClash(nodesForLinks, servers, user, db.settings.siteName, (n) => store.nodeUsableBy(n, user));
+    const yaml = sub.toClash(
+      nodesForLinks,
+      servers,
+      user,
+      db.settings.siteName,
+      (n) => store.nodeUsableBy(n, user),
+      (n, e) => store.planCovers(store.planOf(user), e.planIds),
+    );
     return sendText(res, 200, yaml, 'text/yaml; charset=utf-8', {
       ...userinfo,
       'Content-Disposition': 'inline; filename="config.yaml"',
+    });
+  }
+
+  // sing-box 原生 JSON（SFI / SFM / sing-box 系安卓客户端的订阅格式）：
+  // 必须是纯 JSON，头部注释都会让客户端的严格解析失败
+  if (format === 'singbox') {
+    const db = store.db();
+    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled));
+    const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
+    const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
+    const json = sub.toSingBox(
+      nodesForLinks,
+      servers,
+      user,
+      db.settings.siteName,
+      (n) => store.nodeUsableBy(n, user),
+      (n, e) => store.planCovers(store.planOf(user), e.planIds),
+    );
+    return sendText(res, 200, json, 'application/json; charset=utf-8', {
+      ...userinfo,
+      'Content-Disposition': 'inline; filename="config.json"',
     });
   }
 
@@ -4338,6 +5010,9 @@ const ROUTES = [
   ['POST', '/api/logout', logout, false],
   ['GET', '/api/me', me, true],
   ['POST', '/api/admin/password', changePassword, true],
+  ['POST', '/api/admin/totp/setup', totpSetup, true],
+  ['POST', '/api/admin/totp/enable', totpEnable, true],
+  ['POST', '/api/admin/totp/disable', totpDisable, true],
 
   ['GET', '/api/overview', overview, true],
 
@@ -4377,6 +5052,7 @@ const ROUTES = [
   ['DELETE', '/api/nodes/:id', deleteNode, true],
   ['GET', '/api/nodes/:id/preview', nodePreview, true],
   ['POST', '/api/nodes/:id/rotate', rotateNodeToken, true],
+  ['POST', '/api/nodes/:id/probe', probeNode, true],
   ['GET', '/api/nodes/:id/install', nodeInstallScript, false],
   ['GET', '/api/nodes/:id/uninstall', nodeUninstallScript, false],
 
@@ -4420,6 +5096,8 @@ const ROUTES = [
   ['POST', '/api/agent/receipt', agentReceipt, false],
 
   ['GET', '/api/sub/:token', subApi, false],
+  ['POST', '/api/sub/reset-request', subResetRequest, false],
+  ['POST', '/api/sub/reset-confirm', subResetConfirm, false],
 ];
 
 function matchPath(pattern, pathname) {
@@ -4434,7 +5112,7 @@ function matchPath(pattern, pathname) {
   return params;
 }
 
-const server = http.createServer(async (req, res) => {
+async function requestHandler(req, res) {
   const started = Date.now();
   // 请求号：同一次请求里 handler / catch / finish 三条日志靠它串起来
   const rid = crypto.randomBytes(3).toString('hex');
@@ -4461,6 +5139,28 @@ const server = http.createServer(async (req, res) => {
   });
 
   try {
+    /* HTTP→HTTPS 跳转（仅当 HTTPS 确实在服务时）：
+       - 浏览器导航（Accept 含 text/html 的 GET，非 API/订阅路径）默认 301 到 HTTPS；
+       - agent / 订阅 / 健康探针不走跳转：agent 的 curl 不带 -L，收到 301 会把
+         跳转页当正文处理，升级窗口期里整批节点会一起「掉线」。
+         这些调用方要用 HTTPS，把机器上的 PANEL_URL / 订阅地址换成 https:// 即可；
+       - PANEL_HTTP_REDIRECT=1 强制全路径跳转（纯 HTTPS 部署），=0 彻底关闭；
+       - 判据是 httpsReady（listen 成功）而不是 httpsServer（创建成功）——
+         端口被占时把浏览器跳到一个没有服务的死端口，比不跳转糟得多。 */
+    if (httpsReady && req.method === 'GET' && !req.socket.encrypted) {
+      const mode = process.env.PANEL_HTTP_REDIRECT || '';
+      const apiLike = pathname.startsWith('/api/') || pathname.startsWith('/s/') || pathname.startsWith('/i/');
+      const browserLike = /text\/html/i.test(String(req.headers.accept || ''));
+      if (mode === '1' || (mode !== '0' && browserLike && !apiLike)) {
+        // Host 头拼进 Location 前过一遍校验（防开放重定向），非法值回退本机
+        const rawHost = String(req.headers.host || '').replace(/:\d+$/, '');
+        const hostNoPort = isValidHost(rawHost) ? rawHost : 'localhost';
+        const target = `https://${hostNoPort}${TLS_PORT === 443 ? '' : ':' + TLS_PORT}${req.url}`;
+        res.writeHead(301, { Location: target, 'Content-Length': '0' });
+        return res.end();
+      }
+    }
+
     const subMatch = matchPath('/s/:token', pathname);
     if (subMatch && req.method === 'GET') {
       return subPage(req, res, subMatch, {}, null, { req, query: url.searchParams });
@@ -4524,7 +5224,125 @@ const server = http.createServer(async (req, res) => {
     }
     if (!res.headersSent) sendJson(res, status, { error: err.message || '服务器内部错误' });
   }
-});
+}
+
+const server = http.createServer(requestHandler);
+
+/* ------------------------- 面板自身 HTTPS（0.1.16） ------------------------- */
+
+/**
+ * 证书来源两级：
+ *   1. 环境变量 PANEL_TLS_CERT / PANEL_TLS_KEY（PEM 文件路径）——容器 / systemd 场景；
+ *   2. 设置里的 httpsCertId —— 直接引用「证书」页已签发/已导入的证书实体。
+ *      面板侧 ACME 续期后 certPem 更新，热加载定时器会把新证书换进 TLS 上下文。
+ * 两者都没有时面板维持纯 HTTP（与旧版行为一致），不影响 agent 与订阅。
+ */
+let httpsServer = null;
+let httpsCreds = null;
+// httpsReady 才代表「真的在服务 HTTPS」：httpsServer 创建成功 ≠ listen 成功。
+// 端口被占（EADDRINUSE）时 listen 异步报错 —— 跳转 / httpsActive / 启动横幅
+// 若以 !!httpsServer 为准，会把浏览器 301 到一个没有服务的死端口。
+let httpsReady = false;
+let httpsError = '';
+
+function resolveHttpsCreds() {
+  if (TLS_CERT_FILE && TLS_KEY_FILE) {
+    try {
+      return {
+        cert: fs.readFileSync(TLS_CERT_FILE, 'utf8'),
+        key: fs.readFileSync(TLS_KEY_FILE, 'utf8'),
+        source: '环境变量证书文件',
+      };
+    } catch (err) {
+      log.error('读取 TLS 证书文件失败，面板暂以 HTTP 运行', { cert: TLS_CERT_FILE, key: TLS_KEY_FILE, err });
+      return null;
+    }
+  }
+  const db = store.db();
+  const id = String(db.settings.httpsCertId || '').trim();
+  if (!id) return null;
+  const c = db.certs.find((x) => x.id === id);
+  if (!c || !c.certPem || !c.keyPem) {
+    log.warn('设置引用的 HTTPS 证书不可用（不存在或未签发），面板以 HTTP 运行', { certId: id });
+    return null;
+  }
+  return { cert: c.certPem, key: c.keyPem, source: `证书「${c.name}」` };
+}
+
+/**
+ * 任何失败都不抛出、不阻断 HTTP 监听 —— 环境变量证书恰恰是容器 / systemd 的主路径，
+ * 坏 PEM（公私钥不配对 / 截断）时 createSecureContext 同步抛错，没有这层兜底的话
+ * main() 里的 listen 根本执行不到，进程静默退出且退出码为 0。
+ */
+function syncHttpsServer() {
+  let creds = null;
+  try {
+    creds = resolveHttpsCreds();
+  } catch (err) {
+    log.error('解析 HTTPS 证书配置失败，面板以 HTTP 运行', { err });
+  }
+
+  // 没有可用证书：关掉监听（设置里清空 httpsCertId 走这里）
+  if (!creds) {
+    if (httpsServer) {
+      httpsServer.close(() => log.warn('HTTPS 证书已被清空，监听已关闭'));
+    }
+    httpsServer = null;
+    httpsCreds = null;
+    httpsReady = false;
+    httpsError = '';
+    return;
+  }
+
+  // 证书内容变了且正在服务：热加载，不打断握手
+  const changed = !httpsCreds || httpsCreds.key !== creds.key || httpsCreds.cert !== creds.cert;
+  if (httpsServer && httpsReady && changed) {
+    try {
+      httpsServer.setSecureContext({ key: creds.key, cert: creds.cert });
+      httpsCreds = creds;
+      log.info('HTTPS 证书已热加载', { source: creds.source });
+    } catch (err) {
+      // 坏的新证书：沿用旧证书继续服务，等下一轮（续期后内容会再变）
+      log.error('HTTPS 证书热加载失败，沿用旧证书', { err, source: creds.source });
+    }
+    return;
+  }
+
+  // 没在服务：新建监听（含 error 后自动重建 —— 端口冲突解除后 5 分钟内自动恢复）
+  if (!httpsServer) {
+    try {
+      const s = https.createServer({ key: creds.key, cert: creds.cert }, requestHandler);
+      httpsServer = s;
+      httpsCreds = creds;
+      httpsReady = false;
+      s.on('error', (err) => {
+        httpsReady = false;
+        httpsError = String((err && err.message) || err);
+        log.error('HTTPS 监听异常，面板以 HTTP 运行', { port: TLS_PORT, err });
+        // EADDRINUSE 等错误后 server 不可恢复：关掉置空，下轮 sync 尝试重建
+        try {
+          s.close();
+        } catch { /* 可能已关闭 */ }
+        if (httpsServer === s) {
+          httpsServer = null;
+          httpsCreds = null;
+        }
+      });
+      s.listen(TLS_PORT, HOST, () => {
+        httpsReady = true;
+        httpsError = '';
+        log.info('面板 HTTPS 已监听', { port: TLS_PORT, source: creds.source });
+      });
+    } catch (err) {
+      // createSecureContext 在这里同步抛错（坏 PEM / 公私钥不配对）
+      httpsServer = null;
+      httpsCreds = null;
+      httpsReady = false;
+      httpsError = String((err && err.message) || err);
+      log.error('HTTPS 启动失败（证书无法解析），面板以 HTTP 运行', { err, source: creds.source });
+    }
+  }
+}
 
 /* --------------------------------- 启动 ---------------------------------- */
 
@@ -4577,11 +5395,30 @@ function main() {
     }
   }, 30 * 60 * 1000);
   sessionTimer.unref();
+  // HTTPS 证书热加载：环境变量文件与「证书」页续期两种来源都覆盖到。
+  // 5 分钟一轮足够 —— ACME 续期是小时级事件，证书内容没变时这里零开销；
+  // 端口冲突解除后也是靠这轮定时器自动把 HTTPS 接回来。
+  // 放在 listen 之后：syncHttpsServer 内部虽有兜底，但任何启动期异常都不该
+  // 有机会挡在 server.listen 前面（HTTP 是唯一入口，死它就全死）。
+  const httpsTimer = setInterval(() => {
+    try {
+      syncHttpsServer();
+    } catch (err) {
+      log.error('HTTPS 状态同步异常（面板以 HTTP 运行）', { err });
+    }
+  }, 5 * 60 * 1000);
+  httpsTimer.unref();
   server.listen(PORT, HOST, () => {
+    try {
+      syncHttpsServer();
+    } catch (err) {
+      log.error('HTTPS 启动异常（面板以 HTTP 运行）', { err });
+    }
     log.info('面板已启动', {
       version: APP_VERSION,
       schema: store.SCHEMA_VERSION,
       listen: `${HOST}:${PORT}`,
+      tls: httpsServer ? `${HOST}:${TLS_PORT}${httpsReady ? '' : '（启动中）'}` : undefined,
       db: store.DB_FILE,
       logLevel: log.levelName,
       users: store.db().users.length,
@@ -4594,6 +5431,15 @@ function main() {
     console.log(`  ${db.settings.siteName}   v${APP_VERSION}  (schema v${store.SCHEMA_VERSION})`);
     console.log(`${line}`);
     console.log(`  管理面板  http://localhost:${PORT}/`);
+    if (httpsReady) {
+      console.log(`  安全入口  https://localhost:${TLS_PORT}/  （来源：${httpsCreds.source}）`);
+    } else if (httpsServer) {
+      console.log(`  安全入口  HTTPS 正在启动（端口 ${TLS_PORT}），结果见日志`);
+    } else {
+      console.log('  安全入口  未启用 HTTPS（设置 → 面板 HTTPS，或 PANEL_TLS_CERT/PANEL_TLS_KEY）');
+    }
+    if (httpsError) console.log(`  HTTPS 异常  ${httpsError.slice(0, 80)}（面板以 HTTP 运行）`);
+    if (db.admin && db.admin.totpEnabled) console.log('  二步验证  已开启（登录需要密码 + 动态码）');
     if (needsPasswordChange()) {
       console.log(`  默认账号  ${db.admin.username} / ${store.DEFAULT_PASSWORD}   ⚠ 出厂密码，登录后必须先改掉`);
     } else {
@@ -4630,6 +5476,7 @@ function main() {
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     log.info('收到退出信号，正在关闭', { signal: sig, uptimeS: Math.round((Date.now() - STARTED_AT) / 1000) });
+    if (httpsServer) httpsServer.close();
     store.close();
     process.exit(0);
   });
@@ -4638,11 +5485,14 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 // 进程级兜底：没被 try/catch 兜住的异常至少要在日志里留下痕迹 ——
 // 「Panel 突然不响应 / 重启了」时，journalctl 里没有堆栈就只能靠猜。
 // 不主动 exit：多数来源是单个定时器或某个遗留的 Promise，退出会让整站直接不可用。
+// 注意措辞别把话说满：若异常发生时事件循环已空（典型：启动期同步抛错、还没挂上
+// 任何定时器/监听），进程会随即以退出码 0 结束 —— 多数 supervisor 视其为「正常结束」
+// 而不拉起。真到那一步，上面的堆栈就是唯一线索。
 process.on('unhandledRejection', (reason) => {
   log.error('未处理的 Promise 拒绝', { err: reason instanceof Error ? reason : { msg: String(reason) } });
 });
 process.on('uncaughtException', (err) => {
-  log.error('未捕获异常（进程继续运行，建议尽快排查）', { err });
+  log.error('未捕获异常（若事件循环已空，进程将随退出码 0 结束；建议尽快排查）', { err });
 });
 
 main();
