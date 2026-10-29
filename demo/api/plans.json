@@ -1,7 +1,7 @@
 {
   "items": [
     {
-      "id": "ed57b82d2251",
+      "id": "27c88ccdd583",
       "name": "体验版",
       "desc": "入门线路，适合轻量使用",
       "color": "#34d399",
@@ -14,13 +14,13 @@
         "endAt": null
       },
       "autoRenew": true,
-      "createdAt": "2026-10-28T10:08:05.041Z",
+      "createdAt": "2026-10-29T09:49:34.012Z",
       "validityLabel": "30 天",
       "autoRenewLabel": "自动续期",
       "nodeCount": 1,
       "nodes": [
         {
-          "id": "c55a6314c8fb",
+          "id": "2332cf03bb31",
           "name": "JP-SS",
           "protocol": "ss"
         }
@@ -28,7 +28,7 @@
       "userCount": 1
     },
     {
-      "id": "b360aab67926",
+      "id": "133d37e3b257",
       "name": "标准版",
       "desc": "亚洲优化线路 + Hysteria2 高速节点",
       "color": "#4c8dff",
@@ -41,18 +41,18 @@
         "endAt": null
       },
       "autoRenew": true,
-      "createdAt": "2026-10-28T10:08:05.041Z",
+      "createdAt": "2026-10-29T09:49:34.012Z",
       "validityLabel": "30 天",
       "autoRenewLabel": "自动续期",
       "nodeCount": 2,
       "nodes": [
         {
-          "id": "bf63061349c2",
+          "id": "d65615c91734",
           "name": "HK-VLESS-WS",
           "protocol": "vless"
         },
         {
-          "id": "01b1d3e82064",
+          "id": "16e8519d253d",
           "name": "JP-VMESS",
           "protocol": "vmess"
         }
@@ -60,7 +60,7 @@
       "userCount": 1
     },
     {
-      "id": "e88330c3d59c",
+      "id": "db1b7a6e393f",
       "name": "旗舰版",
       "desc": "全部线路，含 Reality 与独立节点",
       "color": "#a78bfa",
@@ -73,28 +73,28 @@
         "endAt": null
       },
       "autoRenew": true,
-      "createdAt": "2026-10-28T10:08:05.042Z",
+      "createdAt": "2026-10-29T09:49:34.012Z",
       "validityLabel": "30 天",
       "autoRenewLabel": "自动续期",
       "nodeCount": 4,
       "nodes": [
         {
-          "id": "bf63061349c2",
+          "id": "d65615c91734",
           "name": "HK-VLESS-WS",
           "protocol": "vless"
         },
         {
-          "id": "7710bf6d00ac",
+          "id": "c9b4cc734086",
           "name": "HK-TROJAN",
           "protocol": "trojan"
         },
         {
-          "id": "01b1d3e82064",
+          "id": "16e8519d253d",
           "name": "JP-VMESS",
           "protocol": "vmess"
         },
         {
-          "id": "c55a6314c8fb",
+          "id": "2332cf03bb31",
           "name": "JP-SS",
           "protocol": "ss"
         }

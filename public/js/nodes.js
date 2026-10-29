@@ -107,7 +107,7 @@ RENDERERS.nodes = async () => {
           ${n.enabled ? '' : '<span class="badge badge-warn" style="margin-left:4px">停用</span>'}
           ${n.hidden ? '<span class="badge badge-dim" style="margin-left:4px">直连隐藏</span>' : ''}
         </td>
-        <td>${syncBadge(n.sync, n.name)}</td>
+        <td>${syncBadge(n.sync, n.name)}<br>${probeBadge(n.probe)}</td>
         ${
           NODE_SORTING
             ? '<td></td>'
@@ -115,6 +115,7 @@ RENDERERS.nodes = async () => {
           <div class="row-actions">
             ${n.mode === 'standalone' ? `<button class="btn btn-sm btn-primary" data-act="node-deploy" data-id="${n.id}">部署</button>` : ''}
             ${n.mode === 'standalone' ? `<button class="btn btn-sm btn-ghost" data-act="node-uninstall" data-id="${n.id}">卸载</button>` : ''}
+            <button class="btn btn-sm btn-ghost" data-act="node-probe" data-id="${n.id}" title="从面板发起 TCP/TLS 握手探测，验证安全组与证书">探测</button>
             ${n.enabled
               ? '<button class="btn btn-sm btn-ghost" data-act="node-enabled" data-id="' + n.id + '" title="停用后端口停止监听、订阅同步移除">停用</button>'
               : '<button class="btn btn-sm btn-primary" data-act="node-enabled" data-id="' + n.id + '">启用</button>'}
@@ -1028,8 +1029,19 @@ function bindNodeForm(mask) {
               <span class="caret">▼</span>
             </button>
           </div>
-          <span class="hint" style="margin:0;white-space:nowrap">不选 = 继承节点套餐</span>
+          <span class="hint" style="margin:0;white-space:nowrap">${e.planIds.length ? '' : '不选 = 继承节点套餐'}</span>
         </div>
+        ${
+          // 入口套餐只影响订阅里显示哪几条链接，不参与鉴权：
+          // 流量最终落在本节点的 inbound 上，节点只认 UUID，分不出请求从哪个入口来。
+          // 不说清楚的话，管理员会以为这样就能单独控权限，等降级后才发现拦不住。
+          e.planIds.length
+            ? `<div class="hint" style="margin:7px 0 0;color:var(--warn);line-height:1.6">
+                入口套餐只决定订阅里显示哪几条链接，<b>拦不住人</b>：能直连本节点的用户都能通过这个入口访问。
+                要让中转成为高等级专属，请另建一个高等级节点（同机换端口即可），把入口挂在那个节点上。
+               </div>`
+            : ''
+        }
       </div>`;
       })
       .join('');

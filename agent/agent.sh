@@ -25,19 +25,26 @@
 #   HYSTERIA_DIR     Hysteria2 配置目录，默认 /etc/hysteria（伪装部署为 /etc/streamd）
 #   HYSTERIA_BIN     hysteria 可执行文件，默认 /usr/local/bin/hysteria（伪装部署为
 #                    /usr/local/bin/streamd —— 名字改了，二进制本身没动）
+#   ORPHAN_GRACE     面板回 401 持续多少秒后转低频重试，默认 21600（6 小时）。
+#                    401 的含义是「面板上没有这个 token 了」（服务器 / 节点记录被删，
+#                    或 token 被重置），和「连不上面板」是两回事 —— 后者永远按正常
+#                    间隔重试，绝不能因为网络抖动就降低一台活节点的轮询频率
+#   ORPHAN_INTERVAL  转低频之后的轮询间隔秒数，默认 1800（30 分钟）
 #   STATE_DIR        状态目录，默认 /opt/nodepanel
 #   RUN_DIR          运行时目录（pid），默认 /run/nodepanel
 #   LOG_DIR          日志目录，默认 /var/log/nodepanel
 #
 # 用法：
-#   sh agent.sh           常驻循环（systemd / OpenRC 用这个）
-#   sh agent.sh --once    只跑一轮（cron 用这个）
+#   sh agent.sh            常驻循环（systemd / OpenRC 用这个）
+#   sh agent.sh --once     只跑一轮（cron 用这个）
+#   sh agent.sh --uninstall [--purge]
+#                          在本机把自己卸干净（不联网、不依赖面板）
 #   sh agent.sh --version
 # ============================================================================
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.15'
+VERSION='0.1.16'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -80,7 +87,7 @@ env_read() {
 if [ -f "$ENV_FILE" ]; then
   for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
                   HYSTERIA_BIN HYSTERIA_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX \
-                  ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD; do
+                  ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD ORPHAN_GRACE ORPHAN_INTERVAL; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
     # 赋值语境下不做分词，带空格的值能原样存进变量
@@ -107,6 +114,15 @@ HTTP_TIMEOUT=${HTTP_TIMEOUT:-15}
 LOG_MAX=${LOG_MAX:-5242880}
 # 关掉公网 IP 上报：面板在反代后面、或者只想手动填地址时用
 REPORT_IP=${REPORT_IP:-1}
+# 401 宽限期与降级后的轮询间隔。宽限期要足够长：面板换域名、临时迁移、从备份恢复
+# 都可能让 token 短暂对不上，几分钟的宽限会把一整片节点误判成「已被删除」
+ORPHAN_GRACE=${ORPHAN_GRACE:-21600}
+ORPHAN_INTERVAL=${ORPHAN_INTERVAL:-1800}
+
+# 401 状态：0=正常；1=已过宽限期，本轮起转低频重试
+NP_ORPHAN=0
+# 本轮取包拿到的 HTTP 状态码（000 = 连不上 / 拿不到），由 fetch_bundle 写入
+NP_HTTP_CODE=''
 
 # 看版本不需要配置：装好没装好、装的是哪一版，先问这个最省事
 case "${1:-}" in
@@ -114,15 +130,39 @@ case "${1:-}" in
     echo "nodepanel-agent $VERSION (shell)"
     exit 0
     ;;
+  --uninstall)
+    # 卸载会删掉脚本自己所在的目录：先把自己拷到 /tmp 再 exec，
+    # 免得某些 shell 边读边执行时读到已经被 unlink 的文件。
+    # 真正的清理逻辑在 np_uninstall（文件末尾），这里只负责换个安全的位置执行它
+    _np_tmp="/tmp/.nodepanel-uninstall.$$"
+    if cp -f "$SELF_PATH" "$_np_tmp" 2>/dev/null && chmod 700 "$_np_tmp" 2>/dev/null; then
+      # AGENT_ENV 必须带过去：副本的 SELF_DIR 是 /tmp，读不到原来的 agent.env，
+      # 就不知道 XRAY_ALIAS / HYSTERIA_DIR 这些伪装名，清理会漏掉真正在跑的那套
+      _np_env=$(cd "$SELF_DIR" 2>/dev/null && pwd)/agent.env
+      AGENT_ENV=$_np_env exec sh "$_np_tmp" __np_uninstall "$@"
+    fi
+    echo "✗ 无法把脚本复制到 /tmp，卸载中止（面板上的卸载命令同样能用）" >&2
+    exit 1
+    ;;
 esac
 
-if [ -z "$PANEL_URL" ] || [ -z "$AGENT_TOKEN" ]; then
+# 卸载不需要配置：面板删了、token 失效了、agent.env 被手删了，都得能卸
+case "${1:-}" in
+  __np_uninstall) NP_MODE='uninstall' ;;
+  *) NP_MODE='run' ;;
+esac
+
+if [ "$NP_MODE" = 'run' ] && { [ -z "$PANEL_URL" ] || [ -z "$AGENT_TOKEN" ]; }; then
   echo "✗ 缺少 PANEL_URL 或 AGENT_TOKEN，请检查 $SELF_DIR/agent.env" >&2
   exit 1
 fi
 PANEL_URL=${PANEL_URL%/}
 
-mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR" 2>/dev/null
+# 卸载模式不要建目录：正要删的东西被重新 mkdir 出来，
+# 会让「本来就没有 /var/log/nodepanel」的机器卸完反而多一个空目录
+if [ "$NP_MODE" = 'run' ]; then
+  mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR" 2>/dev/null
+fi
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -155,6 +195,41 @@ http_get() {
       wget -q -T "$_t" -O - --header="$_h" "$_u" 2>/dev/null
     else
       wget -q -T "$_t" -O - "$_u" 2>/dev/null
+    fi
+  fi
+}
+
+# 带状态码的 GET：body 落到第三个参数指定的文件，stdout 只留 HTTP 状态码。
+#
+# 为什么不能直接用 http_get：curl -f 遇到 4xx 直接失败并丢掉 body，
+# 于是「面板明确回 401：这个 token 我已经不认了」被抹平成「连不上」——
+# 面板上删了服务器 / 节点之后，agent 就永远只剩一句「✗ 无法连接面板」，
+# 既不知道自己在面板上已经不存在了，也没法做出任何反应。
+#
+# 拿不到状态码时返回 000：连不上、DNS 失败、面板没起、只有 wget 且撞上 4xx，
+# 全归到这一类 —— 调用方必须把它当「暂时状态」，绝不能当成「我被删了」。
+http_probe() {
+  _u=$1
+  _h=${2:-}
+  _o=$3
+  : > "$_o" 2>/dev/null
+  [ -n "$HTTP" ] || { printf '000'; return 0; }
+  if [ "$HTTP" = 'curl' ]; then
+    # -w '%{http_code}' 在连不上时输出 000、退出码非 0，两种都按 000 处理
+    if [ -n "$_h" ]; then
+      _code=$(curl -sS -m "$HTTP_TIMEOUT" -o "$_o" -w '%{http_code}' -H "$_h" "$_u" 2>/dev/null) || _code=000
+    else
+      _code=$(curl -sS -m "$HTTP_TIMEOUT" -o "$_o" -w '%{http_code}' "$_u" 2>/dev/null) || _code=000
+    fi
+    case "$_code" in '' | *[!0-9]*) _code=000 ;; esac
+    printf '%s' "$_code"
+  else
+    # wget 分支拿不到状态码（4xx 也只是一句失败），只能区分「成功 / 没成功」，
+    # 401 的判定在只有 wget 的机器上会退化成旧行为，不影响正常取包
+    if [ -n "$_h" ]; then
+      wget -q -T "$HTTP_TIMEOUT" -O "$_o" --header="$_h" "$_u" 2>/dev/null && printf '200' || printf '000'
+    else
+      wget -q -T "$HTTP_TIMEOUT" -O "$_o" "$_u" 2>/dev/null && printf '200' || printf '000'
     fi
   fi
 }
@@ -906,24 +981,110 @@ verify_started_hy() {
 # ------------------------------- 配置包 -------------------------------------
 
 fetch_bundle() {
+  # 第一个参数是 body 的落盘位置：状态码从 stdout 回，内容进文件，
+  # 这样 4xx 的响应体也不会被 curl -f 丢掉
   _url="$PANEL_URL/api/agent/bundle?token=$AGENT_TOKEN&v=$VERSION&hash=${NP_HASH:-}"
   _ip=''
   [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
-  http_get "$_url" "Authorization: Bearer $AGENT_TOKEN"
+  http_probe "$_url" "Authorization: Bearer $AGENT_TOKEN" "$1"
+}
+
+# 401 = 面板上已经没有这个 token（服务器 / 节点记录被删，或 token 被重置）。
+# 这是唯一可信的「我被摘掉了」信号；连不上（000）绝不能算。
+#
+# 判定之后不做「自杀」：systemd 的 Restart=always 会把进程再拉起来、
+# KillMode=process 又让自停命令和停止信号互相打架，cron 模式下更是没法安全摘掉
+# 自己那行 crontab；更要紧的是，面板从备份恢复 / 换域名时 token 会短暂对不上，
+# 那会把一整片活节点误停。所以这里只做两件不伤人的事：
+#   1) 日志从每轮一条收敛成一条（带恢复与卸载的出路）
+#   2) 轮询降到 ORPHAN_INTERVAL，面板记录恢复后自己回来，不用登机器
+# 第一个参数是最小记录间隔（秒），后面是日志正文。
+# 去重不能只靠内存变量：--once（cron）模式下每轮都是新进程
+orphan_log() {
+  _gap=$1
+  shift
+  _now=$(date +%s)
+  _last=$(cat "$STATE_DIR/.orphan.log" 2>/dev/null)
+  case "$_last" in '' | *[!0-9]*) _last=0 ;; esac
+  [ $((_now - _last)) -ge "$_gap" ] || return 0
+  printf '%s\n' "$_now" > "$STATE_DIR/.orphan.log" 2>/dev/null
+  log "$@"
+}
+
+orphan_note() {
+  _now=$(date +%s)
+  # .orphan 存两列：401 起点、是否已跨过宽限期（1 = 已经降级过）
+  _first=''
+  _tripped=''
+  # 2>/dev/null 必须写在 < 前面：重定向按从左到右处理，文件不存在时
+  # 先报错的那条已经打到 stderr 了，后面的 2>/dev/null 根本来不及生效
+  read _first _tripped 2>/dev/null < "$STATE_DIR/.orphan"
+  case "$_first" in
+    '' | *[!0-9]*)
+      _first=$_now
+      printf '%s 0\n' "$_first" > "$STATE_DIR/.orphan" 2>/dev/null
+      ;;
+  esac
+  _age=$((_now - _first))
+
+  if [ "$_age" -ge "$ORPHAN_GRACE" ]; then
+    NP_ORPHAN=1
+    if [ "$_tripped" != '1' ]; then
+      # 跨过宽限期的这一轮必须立刻说清楚（后面转成一天一条）
+      printf '%s 1\n' "$_first" > "$STATE_DIR/.orphan" 2>/dev/null
+      # 两行合成一次 log：日志按「一次记录」去重，分两次调会把第二行吃掉
+      orphan_log 0 "✗ 面板持续不认这台机器（HTTP 401，已 $((_age / 60)) 分钟）：服务器 / 节点记录可能已被删除
+  已转为每 ${ORPHAN_INTERVAL}s 低频重试（面板恢复后自动回来）；要彻底摘掉：sh $STATE_DIR/uninstall.sh"
+    else
+      orphan_log 86400 "✗ 面板仍不认这台机器（HTTP 401，已 $((_age / 3600)) 小时）：记录可能已被删除；卸载：sh $STATE_DIR/uninstall.sh"
+    fi
+  else
+    orphan_log 3600 "✗ 面板不认这台机器（HTTP 401）：token 失效或记录已删除；$((ORPHAN_GRACE / 60)) 分钟后转低频重试"
+  fi
+
+  RC_ERR="面板不认这台机器（HTTP 401）"
+  return 1
+}
+
+# 拿回 200 就说明 token 又是有效的（重新部署 / 面板恢复），把宽限期从头算
+orphan_clear() {
+  NP_ORPHAN=0
+  [ -f "$STATE_DIR/.orphan" ] || return 0
+  rm -f "$STATE_DIR/.orphan" "$STATE_DIR/.orphan.log" 2>/dev/null
+  log "✓ 面板恢复认可这台机器，轮询间隔回到 ${INTERVAL}s"
 }
 
 # 返回 0 = 应用了配置，1 = 没变化或失败
 apply_bundle() {
-  _out=$(fetch_bundle)
+  _body="$RUN_DIR/bundle.body.$$"
+  NP_HTTP_CODE=$(fetch_bundle "$_body")
+  _out=$(cat "$_body" 2>/dev/null)
+  rm -f "$_body" 2>/dev/null
   LAST_FETCH_OK=0
+
+  case "$NP_HTTP_CODE" in
+    401)
+      orphan_note
+      return 1
+      ;;
+    000 | '')
+      # 暂时状态：网络断了、DNS 挂了、面板没起、反代在重启。
+      # 这种情况永远按正常间隔重试 —— 面板恢复的瞬间就该连上
+      log "✗ 无法连接面板：$PANEL_URL"
+      RC_ERR="无法连接面板 $PANEL_URL"
+      return 1
+      ;;
+  esac
+
   if [ -z "$_out" ]; then
-    log "✗ 无法连接面板：$PANEL_URL"
-    RC_ERR="无法连接面板 $PANEL_URL"
+    log "✗ 面板返回空内容（HTTP $NP_HTTP_CODE）：$PANEL_URL"
+    RC_ERR="面板返回空内容（HTTP $NP_HTTP_CODE）"
     return 1
   fi
   # 能拿到内容就说明通道是通的，回执才有意义
   LAST_FETCH_OK=1
+  orphan_clear
 
   case "$_out" in
     '#UNCHANGED'*) return 1 ;;
@@ -1107,10 +1268,12 @@ collect_stats() {
   collect_hysteria >> "$_raw" 2>/dev/null
 
   # 用户行与节点行分开汇总：email up down / node:<id> up down
+  # 注意 node: 行（collect_xray_nodes / collect_hysteria 输出）已是最终格式「key up down」，
+  # 而 email 行是中间格式「email uplink|downlink 字节」—— 分支处理不能混
   awk '
     {
       if ($1 ~ /^node:/) {
-        nup[$1] += ($2 == "uplink" ? $3 : 0); ndown[$1] += ($2 == "downlink" ? $3 : 0); nseen[$1] = 1
+        nup[$1] += $2 + 0; ndown[$1] += $3 + 0; nseen[$1] = 1
       } else {
         up[$1] += ($2 == "uplink" ? $3 : 0); down[$1] += ($2 == "downlink" ? $3 : 0); seen[$1] = 1
       }
@@ -1123,7 +1286,107 @@ collect_stats() {
   rm -f "$_raw"
 }
 
+# ------------------------------ 流量对账（v2） -------------------------------
+# 0.1.16 起（面板下发 NP_REPORT_V2=1 时启用）：本轮增量先并入磁盘上的累计值，
+# 上报改发「累计值 + 单调递增序号 + 实例代数 gen」，服务端拿差值入账 ——
+# 丢一轮上报只是让这部分量晚一轮到账，不再像纯增量模式那样丢一次就永久丢量。
+# 序号每次尝试上报都 +1 并先落盘：HTTP 超时重传由服务端按序号挡住。
+# gen 与 totals 同生命周期：重装（STATE_DIR 被删）后重新生成，面板看到新 gen
+# 就知道「这台机器的计数器从头开始了」—— 只建基线不入账，两个方向都不会错账
+# （旧 seq 比面板水位小会被当重复丢弃；删记录重接入会把全量历史重算一遍）。
+
+gen_of() {
+  cat "$STATE_DIR/totals.gen" 2>/dev/null
+}
+
+gen_make() {
+  # 8 字节随机 hex；/dev/urandom 不可用时回退 时间戳-PID（同一台机器上仍唯一）
+  _g=$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+  case "$_g" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) _g="$(date +%s 2>/dev/null)-$$" ;;
+  esac
+  printf '%s\n' "$_g" > "$STATE_DIR/totals.gen" 2>/dev/null
+  printf '%s' "$_g"
+}
+
+merge_totals() {
+  _totals="$STATE_DIR/totals"
+  # 累计文件首轮还不存在：先建空文件，否则下面的 awk 两文件里第一个打不开，
+  # gawk/busybox 直接 fatal 退出（还被 2>/dev/null 吞掉），totals 永远建不起来
+  if [ ! -f "$_totals" ]; then
+    : > "$_totals" 2>/dev/null || return 0
+    gen_make > /dev/null
+  fi
+  : > "$_totals.new" 2>/dev/null || return 0
+  # 第一文件是旧累计，第二文件是本轮增量（都已是「key up down」最终格式）
+  awk '
+    function add(k, u, d) { up[k] += u; down[k] += d; seen[k] = 1 }
+    NR == FNR { add($1, $2 + 0, $3 + 0); next }
+    { add($1, $2 + 0, $3 + 0) }
+    END { for (k in seen) printf "%s %d %d\n", k, up[k] + 0, down[k] + 0 }
+  ' "$_totals" "$RUN_DIR/stats.agg" > "$_totals.new" 2>/dev/null
+  if [ -s "$_totals.new" ] || [ -s "$_totals" ]; then
+    mv "$_totals.new" "$_totals" 2>/dev/null || rm -f "$_totals.new" 2>/dev/null
+  else
+    rm -f "$_totals.new" 2>/dev/null
+  fi
+  : > "$RUN_DIR/stats.agg"
+}
+
+report_v2() {
+  _totals="$STATE_DIR/totals"
+  [ -s "$_totals" ] || return 0
+
+  _seq=$(cat "$STATE_DIR/.seq" 2>/dev/null)
+  case "$_seq" in '' | *[!0-9]*) _seq=0 ;; esac
+  _seq=$((_seq + 1))
+  printf '%s\n' "$_seq" > "$STATE_DIR/.seq" 2>/dev/null
+
+  # gen 丢了（手删）就补一个：面板会把它当新代数建基线，丢的只是 60 秒的量
+  _gen=$(gen_of)
+  [ -n "$_gen" ] || _gen=$(gen_make)
+
+  _ip=''
+  [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
+  _url="$PANEL_URL/api/agent/report?token=$AGENT_TOKEN&v=$VERSION"
+  [ -n "$_ip" ] && _url="$_url&ip=$_ip"
+
+  _f="$RUN_DIR/report.$$.json"
+  {
+    printf '{"v2":1,"seq":%d,"gen":"%s","totals":[' "$_seq" "$_gen"
+    awk 'BEGIN { ORS = "" } $1 !~ /^node:/ { printf "%s[\"%s\",%d,%d]", sep, $1, $2, $3; sep = "," }' "$_totals"
+    printf '],"nodes":['
+    awk 'BEGIN { ORS = "" } $1 ~ /^node:/ { printf "%s[\"%s\",%d,%d]", sep, substr($1, 6), $2, $3; sep = "," }' "$_totals"
+    printf ']}\n'
+  } > "$_f" 2>/dev/null
+
+  if http_post_json "$_url" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
+    log "↑ 已上报累计流量（序号 $_seq）"
+  else
+    log "✗ 流量上报失败（累计值已保留，下一轮自动补报）"
+  fi
+  rm -f "$_f"
+}
+
 report() {
+  # 孤儿模式（面板持续回 401）：上报必然失败，静默跳过 —— v2 的累计值完好保留在
+  # totals 里，面板记录恢复 / 重新部署后按 gen 建基线自动接上；每 60 秒一条
+  # 「✗ 流量上报失败」只会把降频后的日志又刷成噪音
+  if [ "$NP_ORPHAN" = '1' ]; then
+    if [ "$NP_REPORT_V2" = '1' ]; then
+      merge_totals
+    fi
+    return 0
+  fi
+
+  # v1（旧面板）：纯增量上报，成功才清零 —— 丢一轮就永久丢，v2 的动因就是它
+  if [ "$NP_REPORT_V2" = '1' ]; then
+    merge_totals
+    report_v2
+    return
+  fi
+
   [ -s "$RUN_DIR/stats.agg" ] || return 0
   _url="$PANEL_URL/api/agent/report?token=$AGENT_TOKEN&v=$VERSION"
   _ip=''
@@ -1153,7 +1416,7 @@ receipt_escape() {
 send_receipt() {
   # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发。
   # 指纹清单也进签名：证书重签 → 指纹变化 → 回执立即重发，面板订阅里的 pcs 才不会拿着旧指纹
-  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' < "$RUN_DIR/selfcerts.list" 2>/dev/null)"
+  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")"
   _last=''
   _ts=0
   if [ -f "$STATE_DIR/.receipt" ]; then
@@ -1311,6 +1574,190 @@ tick() {
   agent_self_update
 }
 
+# --------------------------------- 卸载 -------------------------------------
+# 面板上的「卸载命令」是面板现场生成的脚本，必须联网才能取到
+# （curl …/api/servers/<id>/uninstall?token=…）。面板被删、换域名、token 失效时
+# 这条路就断了，机器上会留一个永远在喊「无法连接面板」的孤儿 agent。
+#
+# 0.1.16 起把同一套清理逻辑做成本地入口：部署脚本会写一份
+# $STATE_DIR/uninstall.sh 转发到这里，断网也能一条命令摘干净。
+# 清理顺序和面板那份完全一致 —— 先停服务（Restart=always 会把进程再拉回来），
+# 再删文件；Xray 只动「确实带 StatsService 的那份配置」，不误删管理员自己的。
+np_uninstall() {
+  _purge=0
+  for _arg in "$@"; do
+    case "$_arg" in
+      --purge | -p) _purge=1 ;;
+      -h | --help)
+        echo "用法：sh $STATE_DIR/uninstall.sh [--purge]"
+        echo "  默认     停掉并清理 agent、Hysteria2 实例、Xray 配置与自签证书（配置会先备份）"
+        echo "  --purge  连 $LOG_DIR 与配置备份一起删掉"
+        return 0
+        ;;
+      --uninstall | __np_uninstall) ;;
+      *) echo "! 忽略未知参数：$_arg" ;;
+    esac
+  done
+
+  if [ "$(id -u 2>/dev/null)" != '0' ]; then
+    echo "✗ 请用 root 执行（需要删除 $STATE_DIR、/etc 与注销系统服务）"
+    return 1
+  fi
+
+  _bak="$XRAY_CONFIG.nodepanel.bak"
+
+  echo "→ 停止并注销 nodepanel-agent"
+
+  if [ -f /etc/systemd/system/nodepanel-agent.service ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop nodepanel-agent >/dev/null 2>&1
+      systemctl disable nodepanel-agent >/dev/null 2>&1
+    fi
+    rm -f /etc/systemd/system/nodepanel-agent.service
+    if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1; fi
+    echo "  ✓ 已移除 systemd 服务"
+  fi
+
+  if [ -f /etc/init.d/nodepanel-agent ]; then
+    if command -v rc-service >/dev/null 2>&1; then rc-service nodepanel-agent stop >/dev/null 2>&1; fi
+    if command -v rc-update >/dev/null 2>&1; then rc-update del nodepanel-agent default >/dev/null 2>&1; fi
+    rm -f /etc/init.d/nodepanel-agent
+    echo "  ✓ 已移除 OpenRC 服务"
+  fi
+
+  if command -v crontab >/dev/null 2>&1; then
+    if crontab -l 2>/dev/null | grep -q 'nodepanel/agent.sh'; then
+      crontab -l 2>/dev/null | grep -v 'nodepanel/agent.sh' | crontab - 2>/dev/null
+      echo "  ✓ 已移除 crontab 定时任务"
+    fi
+  fi
+
+  # 兜底：手工 nohup 起来的进程。本脚本是从 /tmp 的副本跑的，不会误杀自己
+  if command -v pkill >/dev/null 2>&1; then
+    if pkill -f "$STATE_DIR/agent.sh" 2>/dev/null; then
+      echo "  ✓ 已结束残留的 agent 进程"
+    fi
+  fi
+
+  echo "→ 停止由 agent 托管的 Hysteria2 实例"
+  for _pidfile in "$RUN_DIR"/*.pid; do
+    [ -f "$_pidfile" ] || continue
+    _pid=$(cat "$_pidfile" 2>/dev/null)
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+      kill "$_pid" 2>/dev/null
+      _i=0
+      while [ "$_i" -lt 15 ] && kill -0 "$_pid" 2>/dev/null; do
+        sleep 0.2 2>/dev/null || sleep 1
+        _i=$((_i + 1))
+      done
+      kill -9 "$_pid" 2>/dev/null
+      echo "  ✓ 已停止 $(basename "$_pidfile" .pid)"
+    fi
+    rm -f "$_pidfile"
+  done
+
+  if ls "$HYSTERIA_DIR"/node-*.yaml >/dev/null 2>&1; then
+    rm -f "$HYSTERIA_DIR"/node-*.yaml
+    echo "  ✓ 已删除 agent 下发的 Hysteria2 配置（$HYSTERIA_DIR/node-*.yaml）"
+  fi
+
+  # pid 文件丢了（手删 / 机器重启）时按命令行兜底，只匹配 agent 自己下发的实例
+  if command -v pkill >/dev/null 2>&1; then
+    if pkill -f "$HYSTERIA_BIN server -c $HYSTERIA_DIR/node-" 2>/dev/null \
+       || pkill -f '/usr/local/bin/streamd server -c /etc/streamd/node-' 2>/dev/null \
+       || pkill -f 'hysteria server -c /etc/hysteria/node-' 2>/dev/null; then
+      echo "  ✓ 已结束残留的 Hysteria2 实例"
+    fi
+  fi
+
+  echo "→ 删除 agent 文件与运行时目录"
+  rm -rf "$STATE_DIR" "$RUN_DIR"
+  echo "  ✓ 已删除 $STATE_DIR 与 $RUN_DIR"
+
+  if [ -d /etc/nodepanel ]; then
+    rm -rf /etc/nodepanel
+    echo "  ✓ 已删除自签证书目录 /etc/nodepanel"
+  fi
+
+  echo "→ 停掉 Xray 并清理面板生成的配置"
+  # 服务名不一定是 xray：伪装名 / xray-core / x-ui 都见过
+  _unit=''
+  if command -v systemctl >/dev/null 2>&1; then
+    for _u in "$XRAY_ALIAS" xray xray-core x-ui; do
+      if systemctl list-unit-files 2>/dev/null | grep -q "^$_u\.service"; then
+        _unit=$_u
+        break
+      fi
+    done
+  fi
+  if [ -z "$_unit" ] && [ -f "/etc/init.d/$XRAY_ALIAS" ]; then _unit=$XRAY_ALIAS; fi
+  if [ -z "$_unit" ] && [ -f /etc/init.d/xray ]; then _unit=xray; fi
+
+  # 只动「确实是面板写的」那份配置：面板生成的配置一定带 StatsService。
+  # 机器上原有的、管理员自己的 xray 配置一律不碰 —— 卸载命令不该误删别人的服务
+  if [ ! -f "$XRAY_CONFIG" ]; then
+    echo "  · 没有 $XRAY_CONFIG（这台机器可能还没部署过节点），跳过"
+  elif ! grep -q 'StatsService' "$XRAY_CONFIG" 2>/dev/null; then
+    echo "  · $XRAY_CONFIG 不是面板生成的（没有 StatsService），Xray 与配置都保留"
+  else
+    if [ -n "$_unit" ]; then
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop "$_unit" >/dev/null 2>&1
+        systemctl disable "$_unit" >/dev/null 2>&1
+      elif command -v rc-service >/dev/null 2>&1; then
+        rc-service "$_unit" stop >/dev/null 2>&1
+        command -v rc-update >/dev/null 2>&1 && rc-update del "$_unit" default >/dev/null 2>&1
+      fi
+      echo "  ✓ 已停止并取消开机自启 $_unit"
+    fi
+
+    if cp -f "$XRAY_CONFIG" "$_bak" 2>/dev/null; then
+      echo "  ✓ 已备份 Xray 配置到 $_bak"
+    fi
+    rm -f "$XRAY_CONFIG"
+    echo "  ✓ 已移除面板生成的 $XRAY_CONFIG"
+
+    # 没有服务单元时（手工 nohup 起的），按进程名收尾 —— 否则端口会一直被占着
+    if [ -z "$_unit" ] && command -v pkill >/dev/null 2>&1; then
+      if pkill -x "$XRAY_ALIAS" 2>/dev/null || pkill -x xray 2>/dev/null; then
+        echo "  ✓ 已结束手工启动的 Xray 进程"
+      fi
+    fi
+  fi
+
+  if [ "$_purge" = '1' ]; then
+    echo "→ 深度清理（--purge）"
+    rm -rf "$LOG_DIR"
+    echo "  ✓ 已删除日志目录 $LOG_DIR"
+    rm -f "$_bak"
+    echo "  ✓ 已删除配置备份 $_bak"
+  else
+    echo ""
+    echo "· 保留 $LOG_DIR（要一起清掉就加 --purge 重跑）"
+    echo "· 保留 $_bak（面板覆盖前的配置备份，不需要可手动删）"
+  fi
+
+  if [ -x "/usr/local/bin/$XRAY_ALIAS" ] || [ -x /usr/local/bin/xray ]; then
+    echo "· 保留 Xray 二进制与 geo 数据（可能是你自己装的；"
+    echo "  确认是面板装的那份，可执行：rm -rf /usr/local/bin/$XRAY_ALIAS /usr/local/share/$XRAY_ALIAS）"
+  fi
+
+  echo ""
+  echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
+  echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即可恢复接入。"
+  return 0
+}
+
+# 卸载模式在函数都定义好之后才执行：它会删掉 $STATE_DIR，
+# 所以必须等这个脚本自己全部读完（--uninstall 已经把自己拷到 /tmp 了）
+if [ "$NP_MODE" = 'uninstall' ]; then
+  np_uninstall "$@"
+  _np_rc=$?
+  # 从 /tmp 副本跑的话顺手把自己删掉：真正要删的东西已经在 np_uninstall 里处理完了
+  case "$SELF_PATH" in /tmp/.nodepanel-uninstall.*) rm -f "$SELF_PATH" 2>/dev/null ;; esac
+  exit "$_np_rc"
+fi
+
 log "Node Panel Agent $VERSION 启动"
 log "面板：$PANEL_URL"
 log "HTTP：${HTTP:-未找到 curl/wget}"
@@ -1337,5 +1784,11 @@ fi
 trap 'log "收到退出信号，agent 停止"; exit 0' TERM INT
 while :; do
   tick
-  sleep "$INTERVAL"
+  # 面板已经不认这台机器时转低频：日志不刷屏、请求不空转，
+  # 面板记录一旦恢复（重新部署 / 从备份恢复），最多一个 ORPHAN_INTERVAL 就自己回来
+  if [ "$NP_ORPHAN" = '1' ]; then
+    sleep "$ORPHAN_INTERVAL"
+  else
+    sleep "$INTERVAL"
+  fi
 done

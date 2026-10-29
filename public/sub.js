@@ -80,21 +80,34 @@ function recommendClient(d) {
   const ua = navigator.userAgent;
   const sub = encodeURIComponent(d.subUrl);
   const clash = encodeURIComponent(d.clashUrl);
+  const singbox = encodeURIComponent(d.singboxUrl || d.subUrl + '?format=singbox');
 
+  // sing-box 系客户端（SFI / SFM / 官方 App）：要的是原生 JSON 配置，
+  // 导入链接必须指向 ?format=singbox，不能给 base64 订阅
+  if (/sing-box|SFI|SFM/i.test(ua) && !/Shadowrocket/i.test(ua)) {
+    return {
+      name: 'sing-box',
+      hint: '检测到 sing-box 系客户端，点一下导入原生配置（JSON 格式）',
+      actions: [
+        { label: '导入 sing-box', href: 'sing-box://import-remote-profile?url=' + singbox, primary: true },
+        { label: '下载 Clash 配置', href: d.clashUrl },
+      ],
+    };
+  }
   if (/iPhone|iPad|iPod/i.test(ua)) {
     return {
       name: 'Shadowrocket',
-      hint: 'iOS 上把小火箭装好后，点一下就能把订阅加进去',
+      hint: 'iOS 上把小火箭装好后，点一下就能把订阅加进去；用 SFI / SFM 的话走下面的 sing-box 按钮',
       actions: [
         { label: '导入 Shadowrocket', href: 'sub://' + b64(d.subUrl), primary: true },
-        { label: '导入 sing-box', href: 'sing-box://import-remote-profile?url=' + sub },
+        { label: '导入 sing-box (SFI/SFM)', href: 'sing-box://import-remote-profile?url=' + singbox },
       ],
     };
   }
   if (/Android/i.test(ua)) {
     return {
       name: 'v2rayNG',
-      hint: 'Android 装好 v2rayNG（或 Clash Meta），点一下直接订阅',
+      hint: 'Android 装好 v2rayNG（或 Clash Meta / SFA），点一下直接订阅',
       actions: [
         { label: '导入 v2rayNG', href: 'v2rayng://install-config?url=' + sub, primary: true },
         { label: '导入 Clash Meta', href: 'clash://install-config?url=' + clash },
@@ -104,10 +117,10 @@ function recommendClient(d) {
   if (/Macintosh|Mac OS X/i.test(ua)) {
     return {
       name: 'ClashX',
-      hint: 'macOS 推荐 ClashX / Clash Verge，点一下导入配置',
+      hint: 'macOS 推荐 ClashX / Clash Verge；用 sing-box 的话走下面的按钮（原生 JSON 配置）',
       actions: [
         { label: '导入 Clash', href: 'clash://install-config?url=' + clash, primary: true },
-        { label: '导入 sing-box', href: 'sing-box://import-remote-profile?url=' + sub },
+        { label: '导入 sing-box', href: 'sing-box://import-remote-profile?url=' + singbox },
       ],
     };
   }
@@ -228,6 +241,7 @@ function render(d) {
       <div class="sub-actions" style="margin-top:0">
         ${recBtns}
         <a class="btn" href="${esc(d.clashUrl)}" target="_blank">下载 Clash 配置</a>
+        <a class="btn" href="${esc(d.singboxUrl || d.subUrl + '?format=singbox')}" target="_blank">下载 sing-box 配置</a>
         <button class="btn btn-ghost" data-copy="${esc(d.links.map((l) => l.uri).join('\n'))}">复制全部节点链接</button>
       </div>
 
@@ -240,6 +254,35 @@ function render(d) {
         手动导入就在客户端选「订阅设置 → 添加订阅」粘贴地址。
         这条链接是你的凭证，别转发给别人；节点变化后客户端更新订阅即可生效。
       </p>
+    </div>
+
+    <div class="sub-card" style="margin-top:16px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <div style="font-size:13px;font-weight:600;flex:1;min-width:200px">怀疑订阅链接泄露？</div>
+        <button class="btn btn-sm btn-ghost" id="reset-toggle" type="button">自助重置</button>
+      </div>
+      <div id="reset-panel" hidden>
+        <p class="hint" style="margin:10px 0 12px">
+          重置会<b>立刻作废当前链接</b>（UUID 一并换发，约 60 秒内全节点生效），并生成一条新订阅地址。
+          需要验证码（发到管理员为你绑定的邮箱）。
+          ${d.settings.selfReset === false ? '当前面板未配置邮件渠道，自助重置暂不可用，请联系管理员。' : ''}
+        </p>
+        <div class="field">
+          <label style="font-size:12px;color:var(--muted)">绑定邮箱</label>
+          <div style="display:flex;gap:8px">
+            <input type="email" id="reset-email" placeholder="user@example.com" style="flex:1" autocomplete="email">
+            <button class="btn btn-sm" id="reset-send" type="button">发送验证码</button>
+          </div>
+        </div>
+        <div class="field">
+          <label style="font-size:12px;color:var(--muted)">验证码（10 分钟内有效）</label>
+          <div style="display:flex;gap:8px">
+            <input type="text" id="reset-code" inputmode="numeric" placeholder="6 位数字" style="flex:1;letter-spacing:2px" autocomplete="one-time-code">
+            <button class="btn btn-sm btn-primary" id="reset-confirm" type="button">确认重置</button>
+          </div>
+        </div>
+        <div id="reset-result"></div>
+      </div>
     </div>
 
     ${d.settings.notice ? `<div class="alert alert-warn" style="margin-top:16px">${esc(d.settings.notice)}</div>` : ''}
@@ -258,13 +301,90 @@ function render(d) {
     const res = await fetch('/api/sub/' + encodeURIComponent(token));
     if (!res.ok) throw new Error('订阅不存在或已失效');
     const data = await res.json();
-    render(data);
+     render(data);
   } catch (err) {
     root.innerHTML = `<div class="sub-card"><div class="empty"><b>无法加载订阅</b>${esc(err.message)}</div></div>`;
   }
 })();
 
+/* ---------------------- 自助重置订阅链接（0.1.16） ----------------------- */
+
+const resetApi = async (path, body) => {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || '请求失败，请稍后再试');
+  return data;
+};
+
+// 重置面板的三个按钮都是 render() 异步生成的，脚本加载时还不存在，
+// 直接 getElementById 绑监听会静默落空 —— 统一走 document 级事件委托
+function resetToggleClick() {
+  const panel = document.getElementById('reset-panel');
+  if (panel) panel.hidden = !panel.hidden;
+}
+
+async function resetSendClick() {
+  const email = (document.getElementById('reset-email')?.value || '').trim();
+  const result = document.getElementById('reset-result');
+  const btn = document.getElementById('reset-send');
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    if (result) result.innerHTML = '<p class="hint" style="color:var(--bad)">请先填写正确的邮箱地址</p>';
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '发送中…'; }
+  try {
+    const r = await resetApi('/api/sub/reset-request', { token, email });
+    if (result) result.innerHTML = `<p class="hint" style="color:var(--ok)">验证码已发送到 ${esc(r.sentTo || email)}，10 分钟内有效。没收到的话先翻垃圾箱，再找管理员确认邮箱地址。</p>`;
+    const code = document.getElementById('reset-code');
+    if (code) code.focus();
+  } catch (err) {
+    if (result) result.innerHTML = `<p class="hint" style="color:var(--bad)">${esc(err.message)}</p>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '发送验证码'; }
+  }
+}
+
+async function resetConfirmClick() {
+  const code = (document.getElementById('reset-code')?.value || '').trim();
+  const result = document.getElementById('reset-result');
+  const btn = document.getElementById('reset-confirm');
+  if (!/^\d{6}$/.test(code)) {
+    if (result) result.innerHTML = '<p class="hint" style="color:var(--bad)">请输入 6 位数字验证码</p>';
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '重置中…'; }
+  try {
+    const r = await resetApi('/api/sub/reset-confirm', { token, code });
+    // 旧 token 已失效：本页数据全部过期，直接把新地址亮出来让用户抄走
+    if (result) {
+      result.innerHTML = `
+        <div class="alert alert-ok"><b>订阅链接已重置</b>　旧链接即刻失效（约 60 秒内全节点生效）。请把下面的新地址更新到客户端订阅里。</div>
+        <div class="code-wrap">
+          <pre class="code" style="font-size:11.5px">${esc(r.subUrl)}</pre>
+          <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(r.subUrl)}">复制</button>
+        </div>
+        <p class="hint">建议收藏新地址：<a href="${esc(r.subUrl)}" style="color:var(--accent)">${esc(r.subUrl)}</a></p>`;
+    }
+    const send = document.getElementById('reset-send');
+    const confirmBtn = document.getElementById('reset-confirm');
+    if (send) send.disabled = true;
+    if (confirmBtn) confirmBtn.disabled = true;
+    toast('订阅链接已重置');
+  } catch (err) {
+    if (result) result.innerHTML = `<p class="hint" style="color:var(--bad)">${esc(err.message)}</p>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '确认重置'; }
+  }
+}
+
 document.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-copy]');
-  if (btn) copyText(btn.dataset.copy);
+  const copyBtn = e.target.closest('[data-copy]');
+  if (copyBtn) copyText(copyBtn.dataset.copy);
+  if (e.target.id === 'reset-toggle') resetToggleClick();
+  if (e.target.id === 'reset-send') resetSendClick();
+  if (e.target.id === 'reset-confirm') resetConfirmClick();
 });

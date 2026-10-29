@@ -2,17 +2,17 @@
   "items": [],
   "plans": [
     {
-      "id": "ed57b82d2251",
+      "id": "27c88ccdd583",
       "name": "体验版",
       "color": "#34d399"
     },
     {
-      "id": "b360aab67926",
+      "id": "133d37e3b257",
       "name": "标准版",
       "color": "#4c8dff"
     },
     {
-      "id": "e88330c3d59c",
+      "id": "db1b7a6e393f",
       "name": "旗舰版",
       "color": "#a78bfa"
     }
