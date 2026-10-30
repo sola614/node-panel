@@ -137,14 +137,21 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   }, T);
   const user = await json('/api/users', {
     method: 'POST',
-    body: JSON.stringify({ name: 'UI-用户', planId: plan.item.id, quotaGB: 1 }),
+    body: JSON.stringify({ name: 'UI-用户', planId: plan.item.id, quotaGB: 1, password: 'ui-user-pass-123' }),
   }, T);
 
-  // 订阅页要靠 Accept: text/html 才返回 HTML，所以手动取页面再交给 jsdom
+  // 订阅页要靠 Accept: text/html 才返回 HTML，所以手动取页面再交给 jsdom。
+  // 订阅页有登录门：先登录拿会话，注入 localStorage（sub.js 会带上它拉数据）
+  const userSession = await fetch(`${BASE}/api/sub/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: user.item.token, password: 'ui-user-pass-123' }),
+  }).then((r) => r.json());
   const subHtml = await fetch(`${BASE}/s/${user.item.token}`, { headers: { Accept: 'text/html' } })
     .then((r) => r.text());
   const dom3 = await openPage(`${BASE}/s/${user.item.token}`, {
     html: subHtml,
+    before: { np_sub_session: userSession.session },
     ready: (doc) => !!doc.querySelector('[data-theme-toggle]'),
   });
   const d3 = dom3.window.document;
@@ -497,7 +504,7 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   const TAG = 'UI' + String(Date.now()).slice(-5);
   const uiUsers = [];
   for (const n of [TAG + '-甲', TAG + '-乙', TAG + '-丙']) {
-    const r = await json('/api/users', { method: 'POST', body: JSON.stringify({ name: n }) }, T);
+    const r = await json('/api/users', { method: 'POST', body: JSON.stringify({ name: n, password: 'ui-batch-pass-123' }) }, T);
     uiUsers.push(r.item);
   }
   const uiSrv = await json('/api/servers', { method: 'POST', body: JSON.stringify({ name: 'UI-机器', host: '10.9.9.9' }) }, T);
@@ -996,6 +1003,28 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   await waitFor(() => d9.querySelector('#f-name'), '复制用户弹窗');
   ok('复制用户预填「副本」名字', /副本$/.test(d9.querySelector('#f-name').value), d9.querySelector('#f-name').value);
   ok('复制用户不带已用流量', Number(d9.querySelector('#f-used').value) === 0);
+  // 0.1.16：表单有订阅页登录密码项，且不再有邮箱字段
+  ok('用户表单提供登录密码输入', !!d9.querySelector('#f-password'));
+  ok('用户表单不再有邮箱字段', !d9.querySelector('#f-email'));
+  ok('用户表单没有「清除密码」选项（必填策略）', !d9.querySelector('#f-clear-pw'));
+
+  // 一键生成密码：16 位，大小写 + 数字 + 常用符号，四类各至少一个
+  const genBtn = d9.querySelector('[data-gen-pass="#f-password"]');
+  ok('用户表单密码框旁有「生成」按钮', !!genBtn);
+  if (genBtn) {
+    click(genBtn, w9);
+    const pwInput = d9.querySelector('#f-password');
+    const first = pwInput.value;
+    // 字符集要与 users.js 的 randomPassword 保持一致（前端脚本没法 require，只能照抄）
+    ok('点「生成」填入 16 位密码', /^[A-Za-z0-9!@#$%^&*()_=+-]{16}$/.test(first), first);
+    ok('生成的密码四类字符齐全',
+      /[a-z]/.test(first) && /[A-Z]/.test(first) && /[0-9]/.test(first) && /[!@#$%^&*()_=+-]/.test(first),
+      first);
+    ok('生成后直接以明文显示', pwInput.type === 'text');
+    click(genBtn, w9);
+    ok('再点一次换一个新密码', pwInput.value.length === 16 && pwInput.value !== first);
+  }
+
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(150);
 
@@ -1052,7 +1081,9 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   const d10 = dom10.window.document;
   ok('落地页展示套餐与剩余名额', d10.querySelector('#root').textContent.includes('名额'));
   ok('落地页带名字输入框', !!d10.querySelector('#c-name'));
+  ok('落地页带登录密码输入（领取必填）', !!d10.querySelector('#c-password'));
   d10.querySelector('#c-name').value = TAG + '-受邀者';
+  d10.querySelector('#c-password').value = 'ui-claim-pass-123';
   d10.querySelector('#claim-form').dispatchEvent(new dom10.window.Event('submit', { bubbles: true, cancelable: true }));
   await waitFor(() => /领取成功/.test(d10.querySelector('#root').textContent), '领取成功');
   ok('领取成功后给出订阅地址', /\/s\/[a-f0-9]{32}/.test(d10.querySelector('#root').textContent));
@@ -1126,6 +1157,7 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   await waitFor(() => dTotp.querySelector('#totp-verify'), 'TOTP 绑定弹窗');
   ok('绑定弹窗展示 Base32 密钥与导入 URI',
     !!dTotp.querySelector('.code') && /otpauth:\/\/totp\//.test(dTotp.querySelector('#view').textContent || '') || /otpauth/.test(dTotp.body.textContent));
+  ok('绑定弹窗展示扫码二维码（内联 SVG，密钥不出面板）', !!dTotp.querySelector('.modal-body svg'));
   ok('绑定弹窗要求输入登录密码（防会话劫持者绑定自己的认证器）', !!dTotp.querySelector('#totp-pass'));
   // 取消弹窗不开启（避免污染后续登录态）：走 modal-foot 的 [data-close]
   const maskTotp = dTotp.querySelector('.modal-mask');
@@ -1134,32 +1166,74 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   await sleep(200);
   domTotp.window.close();
 
-  console.log('\n── 订阅页：sing-box 导入与自助重置入口 ──');
+  console.log('\n── 订阅页：sing-box 导入 · 登录门 · 自助重置 ──');
+  // 建号即带密码（必填）：先登录拿会话，再开页面验证完整信息视图
   const uiUser2 = await json('/api/users', {
     method: 'POST',
-    body: JSON.stringify({ name: TAG + '-订阅页2', quotaGB: 10 }),
+    body: JSON.stringify({ name: TAG + '-订阅页2', quotaGB: 10, password: 'ui-sub-pass-123' }),
   }, T);
   const subHtml2 = await fetch(`${BASE}/s/${uiUser2.item.token}`, { headers: { Accept: 'text/html' } })
     .then((r) => r.text());
+  const uiUser2Session = await fetch(`${BASE}/api/sub/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: uiUser2.item.token, password: 'ui-sub-pass-123' }),
+  }).then((r) => r.json());
   const dom12 = await openPage(`${BASE}/s/${uiUser2.item.token}`, {
     html: subHtml2,
-    before: {},
-    ready: (doc) => !!doc.querySelector('.sub-card'),
+    before: { np_sub_session: uiUser2Session.session },
+    ready: (doc) => !!doc.querySelector('#reset-btn'),
   });
   const d12 = dom12.window.document;
   const w12 = dom12.window;
   const actionsText = (d12.querySelector('.sub-actions') || {}).textContent || '';
+  ok('登录后订阅页展示完整信息（数据卡片）', !!d12.querySelector('.sub-card'));
   ok('订阅页提供「下载 sing-box 配置」入口', /sing-box/.test(actionsText));
   // jsdom 默认 UA 走「Windows/其他」分支（推荐 Clash，无 sing-box 一键导入，设计如此），
   // 这里验证 sing-box 下载按钮指向 ?format=singbox 的原生 JSON 订阅
   ok('sing-box 配置下载指向 format=singbox',
     [...d12.querySelectorAll('a')].some((a) => (a.getAttribute('href') || '').includes('format=singbox')));
-  ok('订阅页有「自助重置」入口（默认折叠）', !!d12.querySelector('#reset-toggle') && d12.querySelector('#reset-panel').hidden);
-  click(d12.querySelector('#reset-toggle'), w12);
-  await sleep(100);
-  ok('点开后显示邮箱与验证码输入', !d12.querySelector('#reset-panel').hidden &&
-    !!d12.querySelector('#reset-email') && !!d12.querySelector('#reset-code'));
+  ok('登录后的重置区提供「重置订阅链接」按钮', !!d12.querySelector('#reset-btn'));
+
+  // 退出登录：回到登录表单，本地会话清掉，服务端那把钥匙也一并作废
+  const logoutBtn = d12.querySelector('#sub-logout');
+  ok('登录后订阅页有「退出登录」', !!logoutBtn);
+  if (logoutBtn) {
+    click(logoutBtn, w12);
+    await waitFor(() => d12.querySelector('#sub-login-form'), '退出后回到登录表单');
+    ok('退出后回到登录表单', !!d12.querySelector('#sub-login-form'));
+    ok('退出后清掉本地会话', ls(w12, 'np_sub_session') === null);
+    const stale = await fetch(`${BASE}/api/sub/${uiUser2.item.token}`, {
+      headers: { Authorization: 'Bearer ' + uiUser2Session.session },
+    });
+    ok('退出后服务端会话同时失效', stale.status === 401);
+  }
   dom12.window.close();
+
+  // 未登录打开订阅页：先见登录表单（数据接口 401 loginRequired → renderLogin）
+  const dom12b = await openPage(`${BASE}/s/${uiUser2.item.token}`, {
+    html: subHtml2,
+    before: {},
+    ready: (doc) => !!doc.querySelector('#sub-login-form') || !!doc.querySelector('.sub-card'),
+  });
+  const d12b = dom12b.window.document;
+  const w12b = dom12b.window;
+  ok('未登录先渲染登录表单（先登录再查看）', !!d12b.querySelector('#sub-login-form'));
+  ok('登录表单有密码输入与提交按钮', !!d12b.querySelector('#sub-login-pass'));
+  // 输错密码：表单重绘并显示错误（不跳转、不渲染数据）
+  d12b.querySelector('#sub-login-pass').value = 'wrong-pass';
+  d12b.querySelector('#sub-login-form').dispatchEvent(new w12b.Event('submit', { bubbles: true, cancelable: true }));
+  await waitFor(() => /密码不正确/.test(d12b.body.textContent), '登录错误提示');
+  ok('错误密码留在登录页并显示原因', !!d12b.querySelector('#sub-login-form') && /密码不正确/.test(d12b.body.textContent));
+  // 输对密码：登录成功后渲染完整订阅信息
+  d12b.querySelector('#sub-login-pass').value = 'ui-sub-pass-123';
+  d12b.querySelector('#sub-login-form').dispatchEvent(new w12b.Event('submit', { bubbles: true, cancelable: true }));
+  // 注意不能用 .sub-card 当就绪信号：renderLogin 的登录卡片本身也是 .sub-card，
+  // 必须等数据页特有的 #reset-btn 出现
+  await waitFor(() => d12b.querySelector('#reset-btn'), '登录后的数据页');
+  ok('正确密码登录后渲染完整订阅信息', !!d12b.querySelector('.sub-card') && !d12b.querySelector('#sub-login-form'),
+    `card=${!!d12b.querySelector('.sub-card')} form=${!!d12b.querySelector('#sub-login-form')}`);
+  dom12b.window.close();
   await fetch(`${BASE}/api/users/${uiUser2.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
 
   console.log('\n── 登录页：两步验证输入框默认隐藏 ──');
@@ -1167,9 +1241,33 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   const d13 = dom13.window.document;
   ok('未开启 TOTP 时动态码输入框隐藏', d13.querySelector('#login-totp-field').hidden === true);
   ok('动态码输入框 DOM 已就绪（开启后无需刷新）', !!d13.querySelector('#login-totp'));
+
+  /* ========================= 6. 密码框的小眼睛 ========================= */
+  console.log('\n── 密码框的小眼睛 ──');
+  {
+    const pass = d13.querySelector('#login-pass');
+    const eye = pass && pass.parentElement.querySelector('.pw-eye');
+    ok('登录页密码框挂上了眼睛按钮', !!eye && pass.parentElement.classList.contains('pw-wrap'));
+    ok('眼睛默认是「显示密码」', !!eye && eye.getAttribute('aria-label') === '显示密码' && pass.type === 'password');
+    pass.value = 'secret-123';
+    if (eye) click(eye, dom13.window);
+    ok('点一下切成明文且内容不丢', pass.type === 'text' && pass.value === 'secret-123');
+    if (eye) click(eye, dom13.window);
+    ok('再点一下切回密文', pass.type === 'password' && pass.value === 'secret-123');
+    ok('页面里没有漏挂的密码框', d13.querySelectorAll('input[type=password]:not([data-pw-eye])').length === 0);
+
+    // 动态渲染出来的密码框（弹窗、切页）走的是 MutationObserver 这条路
+    const box = d13.createElement('div');
+    box.className = 'field';
+    box.innerHTML = '<input type="password" id="dyn-pass">';
+    d13.body.appendChild(box);
+    await sleep(150);
+    const dyn = d13.querySelector('#dyn-pass');
+    ok('动态插入的密码框也会自动挂眼睛', !!dyn && !!dyn.parentElement.querySelector('.pw-eye'));
+  }
   dom13.window.close();
 
-  /* ============================ 6. 清理 ============================ */
+  /* ============================ 7. 清理 ============================ */
   await fetch(`${BASE}/api/users/${user.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
   await fetch(`${BASE}/api/plans/${plan.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
   await fetch(`${BASE}/api/settings`, {

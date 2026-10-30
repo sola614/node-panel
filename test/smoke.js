@@ -36,10 +36,35 @@ const ok = (name, cond, extra = '') => {
   }
 };
 
+/** 测试用户的统一订阅页登录密码（订阅 JSON 接口有登录门，call 会自动带会话） */
+const SUB_PASS = 'smoke-user-pass-123';
+const subSessions = new Map(); // 订阅 token → 登录会话
+const subPasswords = new Map(); // 订阅 token → 登录密码（默认 SUB_PASS）
+
+async function subLoginOnce(subToken, password) {
+  const res = await fetch(`${BASE}/api/sub/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: subToken, password: password || subPasswords.get(subToken) || SUB_PASS }),
+  });
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`测试登录订阅页失败: ${d.error || res.status}`);
+  subSessions.set(subToken, d.session);
+  return d.session;
+}
+
 async function call(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (opts.body) headers['Content-Type'] = 'application/json';
   if (token) headers.Authorization = 'Bearer ' + token;
+  // 订阅页数据接口有登录门（先登录再查看）：GET /api/sub/<token> 自动换成该用户的会话
+  //（管理 token 对订阅接口无效，必须覆盖而不是追加）。POST /api/sub/login|reset 不匹配；
+  // 「未登录」用例全部用原生 fetch 显式裸调，不受影响
+  if ((opts.method || 'GET') === 'GET' && /^\/api\/sub\/[0-9a-f]{8,}/.test(path)) {
+    const subToken = path.split('/api/sub/')[1].split('?')[0];
+    if (!subSessions.has(subToken)) await subLoginOnce(subToken);
+    headers.Authorization = 'Bearer ' + subSessions.get(subToken);
+  }
   const res = await fetch(BASE + path, { ...opts, headers });
   const text = await res.text();
   let data;
@@ -77,48 +102,6 @@ function totpCodeOf(secret) {
   const off = d[d.length - 1] & 0x0f;
   const code = (((d[off] & 0x7f) << 24) | (d[off + 1] << 16) | (d[off + 2] << 8) | d[off + 3]) % 1000000;
   return String(code).padStart(6, '0');
-}
-
-/** 极简 fake SMTP：只回够用的应答，把 DATA 正文收下来（验证码从正文里抠） */
-function startFakeSmtp() {
-  return new Promise((resolve) => {
-    const state = { messages: [] };
-    const server = net.createServer((socket) => {
-      socket.write('220 fake.local ESMTP ready\r\n');
-      let buf = '';
-      let inData = false;
-      socket.on('data', (chunk) => {
-        buf += chunk.toString('utf8');
-        for (;;) {
-          if (inData) {
-            const end = buf.indexOf('\r\n.\r\n');
-            if (end < 0) return;
-            state.messages.push(buf.slice(0, end));
-            buf = buf.slice(end + 5);
-            inData = false;
-            socket.write('250 2.0.0 Ok: queued\r\n');
-            continue;
-          }
-          const nl = buf.indexOf('\r\n');
-          if (nl < 0) return;
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 2);
-          const cmd = line.slice(0, 4).toUpperCase();
-          if (cmd === 'EHLO' || cmd === 'HELO') socket.write('250 fake.local\r\n');
-          else if (cmd === 'MAIL' || cmd === 'RCPT') socket.write('250 Ok\r\n');
-          else if (cmd === 'DATA') {
-            inData = true;
-            socket.write('354 End data with <CR><LF>.<CR><LF>\r\n');
-          } else if (cmd === 'QUIT') {
-            socket.write('221 Bye\r\n');
-            socket.end();
-          } else socket.write('250 Ok\r\n');
-        }
-      });
-      socket.on('error', () => {});
-    });
-    server.listen(0, '127.0.0.1', () => resolve({ server, state, port: server.address().port, get messages() { return state.messages; } }));
-  });
 }
 
 (async () => {
@@ -159,6 +142,24 @@ function startFakeSmtp() {
     if (adminUser) {
       const del = await call('/api/users/' + adminUser.id, { method: 'DELETE' });
       ok('默认管理员账号不可删除', del.status === 400, del.data && del.data.error ? `(${del.data.error})` : '');
+    }
+
+    /* 默认管理员用户在用户表里不存密码：订阅页复用面板管理密码。
+       这两条必须同时成立 —— 能进订阅页，但拿不到管理台 token。 */
+    if (adminUser) {
+      const gate = await fetch(`${BASE}/api/sub/${adminUser.token}`);
+      const gateData = await gate.json().catch(() => ({}));
+      ok('管理员用户的订阅页同样要求登录',
+        gate.status === 401 && gateData.loginRequired === true && gateData.hasPassword === true,
+        gateData.error || '');
+      const al = await fetch(`${BASE}/api/sub/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: adminUser.token, password: ADMIN_PASS }),
+      });
+      const alData = await al.json().catch(() => ({}));
+      ok('管理员用户可用面板密码登录订阅页', al.status === 200 && !!alData.session, alData.error || '');
+      const asAdmin = await fetch(`${BASE}/api/me`, { headers: { Authorization: 'Bearer ' + (alData.session || '') } });
+      ok('订阅会话进不了管理台（非管理员）', asAdmin.status === 401);
     }
   }
 
@@ -275,9 +276,16 @@ function startFakeSmtp() {
   const mkUser = async (name, planId_, quotaGB) => {
     const r = await call('/api/users', {
       method: 'POST',
-      body: json({ name, planId: planId_, quotaGB, expireAt: new Date(Date.now() + 7 * 864e5).toISOString() }),
+      body: json({
+        name,
+        planId: planId_,
+        quotaGB,
+        password: SUB_PASS,
+        expireAt: new Date(Date.now() + 7 * 864e5).toISOString(),
+      }),
     });
     cleanup.push(['/api/users/' + r.data.item.id]);
+    subPasswords.set(r.data.item.token, SUB_PASS);
     return r.data.item;
   };
 
@@ -294,7 +302,7 @@ function startFakeSmtp() {
   ok('套餐用户可见自动续期状态', u1.autoRenew === true && u1.renewCount === 0);
 
   // 给已有用户挂套餐：周期从此刻起算，不会按 createdAt 算成「早就到期」
-  const uSwitch = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-改套餐用户', quotaGB: 5 }) });
+  const uSwitch = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-改套餐用户', quotaGB: 5, password: SUB_PASS }) });
   ok('无套餐用户默认不自动续期', uSwitch.data.item.autoRenew === false);
   const switchedPlan = await call('/api/users/' + uSwitch.data.item.id, { method: 'PUT', body: json({ planId }) });
   ok('新挂套餐从此刻起算一期',
@@ -339,12 +347,12 @@ function startFakeSmtp() {
   ok('可以重新打开自动续期', renewOn.data.item.autoRenew === true);
 
   // 自定义到期：所有归属用户共享同一个截止时间
-  const uCustom = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-自定义到期用户', planId: customPlan.id }) });
+  const uCustom = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-自定义到期用户', planId: customPlan.id, password: SUB_PASS }) });
   ok('自定义到期时间原样落到用户', uCustom.data.item.expireAt === customEnd, `(${uCustom.data.item.expireAt})`);
   await call('/api/users/' + uCustom.data.item.id, { method: 'DELETE' });
 
   // 月付：按自然月推算（不是 90 天）
-  const uMonth = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-月付用户', planId: monthPlan.id }) });
+  const uMonth = await call('/api/users', { method: 'POST', body: json({ name: 'SMOKE-月付用户', planId: monthPlan.id, password: SUB_PASS }) });
   const expAt = new Date(uMonth.data.item.expireAt);
   const crtAt = new Date(uMonth.data.item.createdAt);
   const monthDiff = (expAt.getFullYear() - crtAt.getFullYear()) * 12 + (expAt.getMonth() - crtAt.getMonth());
@@ -1091,9 +1099,16 @@ function startFakeSmtp() {
   await call('/api/notify/channels/' + tgCh.data.item.id, { method: 'DELETE' });
 
   /* ---------- 13. 批量建号与批量操作 ---------- */
+  const bulkNoPass = await call('/api/users/bulk', {
+    method: 'POST',
+    body: json({ count: 2, prefix: 'SMOKE-无密码' }),
+  });
+  ok('批量建号缺统一初始密码被拒', bulkNoPass.status === 400 && /初始登录密码/.test(bulkNoPass.data.error || ''),
+    bulkNoPass.data.error || '');
+
   const bulkCount = await call('/api/users/bulk', {
     method: 'POST',
-    body: json({ count: 3, prefix: 'SMOKE-批量', startAt: 1, planId }),
+    body: json({ count: 3, prefix: 'SMOKE-批量', startAt: 1, planId, password: SUB_PASS }),
   });
   const bulkNames = bulkCount.data.items.map((x) => x.name);
   ok('批量建号（按数量）', bulkCount.status === 200 && bulkCount.data.items.length === 3,
@@ -1101,10 +1116,20 @@ function startFakeSmtp() {
   ok('批量建号返回订阅链接', bulkCount.data.items.every((x) => /^https?:\/\/.+\/s\/[a-f0-9]{32}$/.test(x.subUrl)));
   ok('批量建号自动补零', bulkNames[0] === 'SMOKE-批量01', bulkNames[0]);
   ok('批量建号继承套餐', bulkCount.data.planName === 'SMOKE-套餐', bulkCount.data.planName);
+  // 批量号带统一密码：第一批账号能登录订阅页
+  {
+    const b0 = bulkCount.data.items[0];
+    subPasswords.set(b0.token, SUB_PASS);
+    const bl = await fetch(`${BASE}/api/sub/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: b0.token, password: SUB_PASS }),
+    });
+    ok('批量建的账号可登录订阅页（统一初始密码）', bl.status === 200);
+  }
 
   const dupBulk = await call('/api/users/bulk', {
     method: 'POST',
-    body: json({ names: 'SMOKE-甲,SMOKE-乙,SMOKE-甲,SMOKE-批量01' }),
+    body: json({ names: 'SMOKE-甲,SMOKE-乙,SMOKE-甲,SMOKE-批量01', password: SUB_PASS }),
   });
   ok('批量建号（按名单）去重', dupBulk.data.items.length === 2, `建了 ${dupBulk.data.items.length} 个`);
   ok('批量建号跳过重复与同名', dupBulk.data.skipped.length === 2 &&
@@ -1112,7 +1137,7 @@ function startFakeSmtp() {
     dupBulk.data.skipped.some((s) => /已存在/.test(s.reason)),
     dupBulk.data.skipped.map((s) => s.reason).join(' / '));
 
-  const tooLong = await call('/api/users/bulk', { method: 'POST', body: json({ names: 'X'.repeat(61) }) });
+  const tooLong = await call('/api/users/bulk', { method: 'POST', body: json({ names: 'X'.repeat(61), password: SUB_PASS }) });
   ok('超长名字被跳过而不是报错', tooLong.data.skipped.length === 1 && tooLong.data.skipped[0].reason.includes('60'));
 
   const batchIds = bulkCount.data.items.map((x) => x.id);
@@ -1146,27 +1171,35 @@ function startFakeSmtp() {
     invInfo.data.plan.name === 'SMOKE-套餐', JSON.stringify(invInfo.data.plan));
   ok('邀请公开信息不泄露 token', JSON.stringify(invInfo.data).indexOf('token') === -1);
 
+  const claimNoPass = await call('/api/invite/' + invCode + '/claim', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-受邀无密码' }),
+  });
+  ok('领取时缺登录密码被拒', claimNoPass.status === 400 && /登录密码/.test(claimNoPass.data.error || ''),
+    claimNoPass.data.error || '');
+
   const claim1 = await call('/api/invite/' + invCode + '/claim', {
     method: 'POST',
-    body: json({ name: 'SMOKE-受邀者' }),
+    body: json({ name: 'SMOKE-受邀者', password: 'invite-pass-123' }),
   });
   ok('用邀请码自助建号', claim1.status === 200 && claim1.data.name === 'SMOKE-受邀者' &&
     !!claim1.data.subUrl, claim1.data.planName);
   const claimed = (await call('/api/users')).data.items.find((u) => u.name === 'SMOKE-受邀者');
   ok('受邀用户落到配置的套餐里', claimed && claimed.planName === 'SMOKE-套餐');
+  ok('受邀用户自带登录密码（hasPassword）', claimed && claimed.hasPassword === true);
   const claimDup = await call('/api/invite/' + invCode + '/claim', {
     method: 'POST',
-    body: json({ name: 'SMOKE-受邀者' }),
+    body: json({ name: 'SMOKE-受邀者', password: 'invite-pass-123' }),
   });
   ok('重名领号返回 409', claimDup.status === 409);
   const claim2 = await call('/api/invite/' + invCode + '/claim', {
     method: 'POST',
-    body: json({ name: 'SMOKE-受邀者2' }),
+    body: json({ name: 'SMOKE-受邀者2', password: 'invite-pass-123' }),
   });
   ok('第二个名额仍可领', claim2.status === 200 && claim2.data.remaining === 0);
   const claim3 = await call('/api/invite/' + invCode + '/claim', {
     method: 'POST',
-    body: json({ name: 'SMOKE-第三人' }),
+    body: json({ name: 'SMOKE-第三人', password: 'invite-pass-123' }),
   });
   ok('名额用尽后拒绝领取', claim3.status === 410, JSON.stringify(claim3.data));
   ok('名额用尽后信息接口也是 410', (await call('/api/invite/' + invCode)).status === 410);
@@ -1191,7 +1224,7 @@ function startFakeSmtp() {
     const r = await call('/api/invite/' + invCode + '/claim', {
       method: 'POST',
       headers: FLOOD,
-      body: json({ name: 'SMOKE-刷号' + i }),
+      body: json({ name: 'SMOKE-刷号' + i, password: 'invite-pass-123' }),
     });
     if (r.status === 429) { hit429 = i + 1; break; }
   }
@@ -1200,7 +1233,7 @@ function startFakeSmtp() {
     (await call('/api/invite/' + invCode + '/claim', {
       method: 'POST',
       headers: { 'X-Forwarded-For': '203.0.113.88' },
-      body: json({ name: 'SMOKE-受邀者3' }),
+      body: json({ name: 'SMOKE-受邀者3', password: 'invite-pass-123' }),
     })).status !== 429);
 
   /* ---------- 13.2 节点回执 ---------- */
@@ -1258,7 +1291,7 @@ function startFakeSmtp() {
     (await call('/api/backups/..%2Fpanel.db/download')).status === 400);
 
   const userCountBeforeRestore = (await call('/api/users')).data.items.length;
-  await call('/api/users/bulk', { method: 'POST', body: json({ count: 2, prefix: 'SMOKE-待回滚' }) });
+  await call('/api/users/bulk', { method: 'POST', body: json({ count: 2, prefix: 'SMOKE-待回滚', password: SUB_PASS }) });
   const userCountDirty = (await call('/api/users')).data.items.length;
   ok('恢复前先造脏数据', userCountDirty === userCountBeforeRestore + 2);
 
@@ -1424,7 +1457,7 @@ function startFakeSmtp() {
   ok('批量删服务器连带节点', bdSrvRes.status === 200 && bdSrvRes.data.nodes === 1, `nodes=${bdSrvRes.data.nodes}`);
 
   const bdPlan = await call('/api/plans', { method: 'POST', body: json({ name: '批量删除套餐', quotaGB: 5 }) });
-  const bdUser = await call('/api/users', { method: 'POST', body: json({ name: '批量删套餐用户', planId: bdPlan.data.item.id }) });
+  const bdUser = await call('/api/users', { method: 'POST', body: json({ name: '批量删套餐用户', planId: bdPlan.data.item.id, password: SUB_PASS }) });
   const bdPlanRes = await call('/api/plans/batch-delete', { method: 'POST', body: json({ ids: [bdPlan.data.item.id] }) });
   ok('批量删套餐并把用户降级', bdPlanRes.status === 200 && bdPlanRes.data.affected === 1, `affected=${bdPlanRes.data.affected}`);
   const bdUserAfter = (await call('/api/users')).data.items.find((u) => u.id === bdUser.data.item.id);
@@ -1471,11 +1504,11 @@ function startFakeSmtp() {
 
   const lvUserLow = await call('/api/users', {
     method: 'POST',
-    body: json({ name: 'SMOKE-低配用户', planId: lvLow.data.item.id }),
+    body: json({ name: 'SMOKE-低配用户', planId: lvLow.data.item.id, password: SUB_PASS }),
   });
   const lvUserHigh = await call('/api/users', {
     method: 'POST',
-    body: json({ name: 'SMOKE-高配用户', planId: lvHigh.data.item.id }),
+    body: json({ name: 'SMOKE-高配用户', planId: lvHigh.data.item.id, password: SUB_PASS }),
   });
   cleanup.push(['/api/users/' + lvUserLow.data.item.id]);
   cleanup.push(['/api/users/' + lvUserHigh.data.item.id]);
@@ -1528,7 +1561,7 @@ function startFakeSmtp() {
   cleanup.push(['/api/nodes/' + entryNode.data.item.id]);
   const lvUserHigh2 = await call('/api/users', {
     method: 'POST',
-    body: json({ name: 'SMOKE-高配用户2', planId: lvHigh.data.item.id }),
+    body: json({ name: 'SMOKE-高配用户2', planId: lvHigh.data.item.id, password: SUB_PASS }),
   });
   cleanup.push(['/api/users/' + lvUserHigh2.data.item.id]);
 
@@ -1740,6 +1773,10 @@ function startFakeSmtp() {
     ok('TOTP 生成待绑定密钥', setup.status === 200 && /^[A-Z2-7]{32}$/.test(setup.data.secret || ''),
       setup.data.secret ? `(${setup.data.secret.slice(0, 6)}…)` : '');
     ok('TOTP 返回认证器导入 URI', setup.status === 200 && String(setup.data.otpauth || '').startsWith('otpauth://totp/'));
+    // 扫码二维码：内联 SVG（手写 QR 编码器渲染），密钥不经过任何第三方
+    ok('TOTP 返回扫码二维码（内联 SVG）',
+      /^<svg /.test(String(setup.data.qrSvg || '')) && /crispEdges/.test(String(setup.data.qrSvg || '')),
+      `${(setup.data.qrSvg || '').length} B`);
 
     // 开启需要登录密码：会话被劫持者绑自己的认证器 = 把真管理员锁在门外
     const goodCode = totpCodeOf(setup.data.secret);
@@ -1998,98 +2035,215 @@ function startFakeSmtp() {
     ok('探测结果随节点列表下发', probed && probed.probe && probed.probe.ok === true);
   }
 
-  /* ---------- 15.9 订阅页自助重置订阅链接（0.1.16） ---------- */
+  /* ---------- 15.9 订阅页登录 + 自助重置订阅链接（0.1.16，密码必填方案） ---------- */
   {
+    // 新增必填：单建缺密码被拒（mkUser 都带 SUB_PASS，这里用裸 POST 验证服务端校验）
+    const noPassCreate = await call('/api/users', {
+      method: 'POST',
+      body: json({ name: 'SMOKE-无密码新建', quotaGB: 10, expireAt: new Date(Date.now() + 7 * 864e5).toISOString() }),
+    });
+    ok('新增用户缺登录密码被拒', noPassCreate.status === 400 && /请设置登录密码/.test(noPassCreate.data.error || ''),
+      noPassCreate.data.error || '');
+
     const ru = await mkUser('SMOKE-自助重置用户', null, 100);
-    const req1 = await call('/api/sub/reset-request', {
+    // mkUser 建的号自带密码（SUB_PASS）：先改成一个独立密码，别和全局会话缓存打架
+    const setPw = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ password: 'user-pass-123' }) });
+    subPasswords.set(ru.token, 'user-pass-123');
+    ok('管理员可修改用户登录密码', setPw.status === 200 && setPw.data.item.hasPassword === true);
+    ok('用户接口不下发密码哈希', !setPw.data.item.password && !('password' in setPw.data.item));
+    const shortPw = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ password: '123' }) });
+    ok('过短的用户密码被拒', shortPw.status === 400 && /至少 6 位/.test(shortPw.data.error || ''), shortPw.data.error || '');
+
+    // 登录门：未登录访问订阅数据接口一律 401（与管理台「先登录再查看」同语义）
+    const gated = await fetch(`${BASE}/api/sub/${ru.token}`);
+    const gatedData = await gated.json();
+    ok('未登录访问订阅数据被拦（先登录再查看）',
+      gated.status === 401 && gatedData.loginRequired === true && gatedData.hasPassword === true);
+    // 客户端订阅格式不受登录门影响（客户端没有界面输密码）
+    const plainSub = await fetch(`${BASE}/s/${ru.token}?format=base64`);
+    ok('客户端 base64 订阅不受登录门影响', plainSub.status === 200);
+    const clashSub = await fetch(`${BASE}/s/${ru.token}?format=clash`);
+    ok('客户端 Clash 订阅不受登录门影响', clashSub.status === 200);
+    const sbSub = await fetch(`${BASE}/s/${ru.token}?format=singbox`);
+    ok('客户端 sing-box 订阅不受登录门影响', sbSub.status === 200);
+
+    // 登录：错密码 401 且不发会话；不存在的订阅 404（区别于密码错）
+    const badLogin = await call('/api/sub/login', { method: 'POST', body: json({ token: ru.token, password: 'wrong-pass' }) });
+    ok('错误密码登录被拒', badLogin.status === 401 && /密码不正确/.test(badLogin.data.error || ''), badLogin.data.error || '');
+    const login404 = await call('/api/sub/login', { method: 'POST', body: json({ token: 'nonexistent-token', password: 'x'.repeat(8) }) });
+    ok('不存在的订阅登录报 404（区别于密码错）', login404.status === 404);
+
+    // 正确密码 → 会话；带会话的数据接口放行
+    const login = await call('/api/sub/login', { method: 'POST', body: json({ token: ru.token, password: 'user-pass-123' }) });
+    ok('正确密码登录成功并发会话', login.status === 200 && /^[0-9a-f]{48}$/.test(login.data.session || ''));
+    const authed = await fetch(`${BASE}/api/sub/${ru.token}`, { headers: { Authorization: 'Bearer ' + login.data.session } });
+    const authedData = await authed.json();
+    ok('带会话的订阅数据接口放行', authed.status === 200 && authedData.user.name === 'SMOKE-自助重置用户');
+    // 会话绑定用户：拿去访问别人的订阅无效（对方要自己的会话）
+    const other = await mkUser('SMOKE-会话隔离用户', null, 100);
+    const crossSub = await fetch(`${BASE}/api/sub/${other.token}`, { headers: { Authorization: 'Bearer ' + login.data.session } });
+    const crossData = await crossSub.json();
+    ok('会话不能访问别人的订阅（登录门不因会话而放开）', crossSub.status === 401 && crossData.loginRequired === true);
+
+    // 未登录直接重置 → 401；登录后重置 → 换发新链接，旧链接即刻失效，会话仍有效（绑定 userId）
+    const anonReset = await call('/api/sub/reset', { method: 'POST', body: json({ token: ru.token }) });
+    ok('未登录不能重置订阅链接', anonReset.status === 401 && anonReset.data.loginRequired === true);
+    const reset = await fetch(`${BASE}/api/sub/reset`, {
       method: 'POST',
-      body: json({ token: ru.token, email: 'someone@example.com' }),
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + login.data.session },
+      body: JSON.stringify({ token: ru.token }),
     });
-    ok('未设置邮箱的账号不能自助重置', req1.status === 400, req1.data.error || '');
+    const resetData = await reset.json();
+    ok('登录成功即可一键重置订阅链接', reset.status === 200 && /\/s\//.test(resetData.subUrl || ''), resetData.subUrl || '');
+    const oldSub = await fetch(`${BASE}/api/sub/${ru.token}`);
+    ok('旧订阅链接即刻失效', oldSub.status === 404);
+    const newToken = (resetData.subUrl || '').split('/s/')[1] || '';
+    // 重置后旧 token 的登录入口也没了；新 token 用同一会话免登录直出
+    const newSub = await fetch(`${BASE}/api/sub/${newToken}`, { headers: { Authorization: 'Bearer ' + login.data.session } });
+    const newSubData = await newSub.json();
+    ok('新订阅链接可用且会话仍有效（绑定 userId）', newSub.status === 200 && newSubData.user.name === 'SMOKE-自助重置用户');
+    // 新 token 未带会话时仍要求登录（登录门对新链接照常生效）
+    const newGated = await fetch(`${BASE}/api/sub/${newToken}`);
+    const newGatedData = await newGated.json();
+    ok('新链接未带会话仍要求登录', newGated.status === 401 && newGatedData.loginRequired === true);
 
-    const setEmail = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ email: 'smoke-user@example.com' }) });
-    ok('管理员可为用户设置邮箱', setEmail.status === 200 && setEmail.data.item.email === 'smoke-user@example.com');
-    const badEmail = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ email: 'not-a-mail' }) });
-    ok('非法邮箱格式被拒绝', badEmail.status === 400, badEmail.data.error || '');
-
-    const req2 = await call('/api/sub/reset-request', {
+    // 停用账号：登录与重置都被拦
+    await call('/api/users/' + ru.id, { method: 'PUT', body: json({ enabled: false }) });
+    const disabledLogin = await call('/api/sub/login', { method: 'POST', body: json({ token: newToken, password: 'user-pass-123' }) });
+    ok('停用账号登录被拒', disabledLogin.status === 400 && /停用/.test(disabledLogin.data.error || ''), disabledLogin.data.error || '');
+    const disabledReset = await fetch(`${BASE}/api/sub/reset`, {
       method: 'POST',
-      body: json({ token: ru.token, email: 'smoke-user@example.com' }),
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + login.data.session },
+      body: JSON.stringify({ token: newToken }),
     });
-    ok('没有邮件渠道时给出明确指引', req2.status === 400 && /邮件渠道/.test(req2.data.error || ''), req2.data.error || '');
+    const disabledResetData = await disabledReset.json();
+    ok('停用账号的重置请求被拒', disabledReset.status === 400 && /停用/.test(disabledResetData.error || ''));
+    await call('/api/users/' + ru.id, { method: 'PUT', body: json({ enabled: true }) });
 
-    // 起 fake SMTP + 建邮件渠道，走完整闭环
-    const fakeMail = await startFakeSmtp();
-    const channel = await call('/api/notify/channels', {
-      method: 'POST',
-      body: json({
-        name: 'SMOKE-邮件渠道', type: 'email', enabled: true, events: [],
-        config: { host: '127.0.0.1', port: fakeMail.port, secure: 'none', from: 'panel@example.com', to: 'admin@example.com' },
-      }),
-    });
-    ok('邮件渠道创建成功', channel.status === 200, channel.data.error || '');
-    if (channel.status === 200) cleanup.push(['/api/notify/channels/' + channel.data.item.id]);
+    // 密码留空 = 不修改（密码仍在）
+    const keepPw = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ password: '' }) });
+    ok('编辑时密码留空不修改', keepPw.status === 200 && keepPw.data.item.hasPassword === true);
 
-    const wrongMail = await call('/api/sub/reset-request', {
-      method: 'POST',
-      body: json({ token: ru.token, email: 'other@example.com' }),
-    });
-    ok('邮箱与绑定不一致时拒绝发送', wrongMail.status === 400 && /不一致/.test(wrongMail.data.error || ''));
-
-    const req3 = await call('/api/sub/reset-request', {
-      method: 'POST',
-      body: json({ token: ru.token, email: 'smoke-user@example.com' }),
-    });
-    ok('验证码邮件已发送（收件人打码）', req3.status === 200 && /^sm\*\*\*@example\.com$/.test(req3.data.sentTo || ''),
-      `(${req3.data.sentTo || ''})`);
-
-    const throttled = await call('/api/sub/reset-request', {
-      method: 'POST',
-      body: json({ token: ru.token, email: 'smoke-user@example.com' }),
-    });
-    ok('发送有 60 秒冷却', throttled.status === 429, `(${throttled.status})`);
-
-    // 从 fake SMTP 收到的正文里抠出 6 位验证码（正文按 base64 传输，先解码再找）
-    const mailBody = fakeMail.messages[fakeMail.messages.length - 1] || '';
-    const decoded = mailBody.replace(/[A-Za-z0-9+/=]{40,}/g, (m) => {
-      try {
-        return Buffer.from(m, 'base64').toString('utf8');
-      } catch {
-        return m;
-      }
-    });
-    const codeMatch = decoded.match(/验证码：\s*(\d{6})/);
-    ok('验证码出现在邮件正文里', !!codeMatch);
-
-    const badConfirm = await call('/api/sub/reset-confirm', {
-      method: 'POST',
-      body: json({ token: ru.token, code: '000000' }),
-    });
-    ok('错误验证码不能重置', badConfirm.status === 400, badConfirm.data.error || '');
-
-    // 申请验证码之后账号被停用：确认阶段拦下（停用不该有新凭证流出）
-    if (codeMatch) {
-      await call('/api/users/' + ru.id, { method: 'PUT', body: json({ enabled: false }) });
-      const disabledConfirm = await call('/api/sub/reset-confirm', {
-        method: 'POST',
-        body: json({ token: ru.token, code: codeMatch[1] }),
-      });
-      ok('停用账号的确认请求被拒', disabledConfirm.status === 400 && /停用/.test(disabledConfirm.data.error || ''),
-        disabledConfirm.data.error || '');
-      await call('/api/users/' + ru.id, { method: 'PUT', body: json({ enabled: true }) });
-
-      const confirm = await call('/api/sub/reset-confirm', {
-        method: 'POST',
-        body: json({ token: ru.token, code: codeMatch[1] }),
-      });
-      ok('正确验证码换发新订阅链接', confirm.status === 200 && /\/s\//.test(confirm.data.subUrl || ''));
-      const oldSub = await call(`/api/sub/${ru.token}`);
-      ok('旧订阅链接即刻失效', oldSub.status === 404);
-      const newToken = (confirm.data.subUrl || '').split('/s/')[1] || '';
-      const newSub = await call(`/api/sub/${newToken}`);
-      ok('新订阅链接可用', newSub.status === 200 && newSub.data.user.name === 'SMOKE-自助重置用户');
+    // 登录限流：连续错 5 次（成功登录会清零计数，这里从头数）后，正确密码也 429
+    for (let i = 0; i < 5; i++) {
+      await call('/api/sub/login', { method: 'POST', body: json({ token: newToken, password: 'bad-pass-0' + i }) });
     }
-    fakeMail.server.close();
+    const flood = await call('/api/sub/login', { method: 'POST', body: json({ token: newToken, password: 'user-pass-123' }) });
+    ok('连错 5 次后正确密码也被限流（防爆破）', flood.status === 429, `(status=${flood.status})`);
+
+    // 密码不可清除：clearPassword 被拒（收回访问的正确姿势是停用账号）
+    const clearPw = await call('/api/users/' + ru.id, { method: 'PUT', body: json({ clearPassword: true }) });
+    ok('清除密码被拒绝（必填策略）', clearPw.status === 400 && /不可清除/.test(clearPw.data.error || ''),
+      clearPw.data.error || '');
+    const stillGated = await fetch(`${BASE}/api/sub/${newToken}`);
+    ok('密码仍然生效（未被动过）', stillGated.status === 401);
+
+    // 退出登录：会话要在服务端作废 —— 只清前端 localStorage 等于钥匙还插在锁孔里。
+    // 放在这一段最后，因为下面的用例不再用这个会话。
+    const bye = await fetch(`${BASE}/api/sub/logout`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + login.data.session },
+    });
+    ok('退出登录接口返回 ok', bye.status === 200);
+    const afterBye = await fetch(`${BASE}/api/sub/${newToken}`, {
+      headers: { Authorization: 'Bearer ' + login.data.session },
+    });
+    const afterByeData = await afterBye.json();
+    ok('退出后原会话即刻失效', afterBye.status === 401 && afterByeData.loginRequired === true,
+      afterByeData.error || '');
+    const anonBye = await fetch(`${BASE}/api/sub/logout`, { method: 'POST' });
+    ok('没带会话的退出也返回 ok（幂等）', anonBye.status === 200);
+
+    // 存量无密码账号（老库升级的遗留态）：页面同样被拦，提示联系管理员而不是渲染登录表单。
+    // 新建路径已无法产生无密码账号，主实例又是「内存对象图为真相」（直改库会被覆盖）——
+    // 起一个独立短命实例走真实的老库升级路径：建号（带密码）→ 停服清密码 → 重启验证
+    {
+      const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'np-smoke-legacy-'));
+      const legacyDb = path.join(legacyDir, 'panel.db');
+      const legacyEnv = {
+        ...process.env,
+        PORT: '18098',
+        PANEL_DB_FILE: legacyDb,
+        PANEL_ADMIN_PASSWORD: 'legacy-pass-123',
+        PANEL_LOG_LEVEL: 'error',
+      };
+      const boot = () =>
+        new Promise((resolve) => {
+          const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], { env: legacyEnv, stdio: 'ignore' });
+          const t0 = Date.now();
+          const poll = setInterval(async () => {
+            try {
+              const h = await fetch('http://127.0.0.1:18098/api/health');
+              if (h.ok) { clearInterval(poll); resolve(child); }
+            } catch { /* 还没起来 */ }
+            if (Date.now() - t0 > 20000) { clearInterval(poll); child.kill('SIGTERM'); resolve(null); }
+          }, 300);
+        });
+      const stop = (child) => new Promise((resolve) => {
+        if (!child) return resolve();
+        child.on('exit', () => resolve());
+        child.kill('SIGTERM');
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退 */ } resolve(); }, 3000);
+      });
+
+      const c1 = await boot();
+      if (!c1) {
+        console.log('  · 独立实例未起来，跳过存量无密码用例');
+      } else {
+        // 第一世：建一个带密码的用户
+        const lLogin = await fetch('http://127.0.0.1:18098/api/login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'admin', password: 'legacy-pass-123' }),
+        }).then((r) => r.json());
+        const lUser = await fetch('http://127.0.0.1:18098/api/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + lLogin.token },
+          body: JSON.stringify({ name: '存量老用户', quotaGB: 10, password: 'old-pass-123' }),
+        }).then((r) => r.json());
+        await stop(c1);
+
+        // 停服期间直改库清密码（等价于「老库里这列本来就是空的」）
+        const { DatabaseSync } = require('node:sqlite');
+        const ldb = new DatabaseSync(legacyDb);
+        ldb.prepare("UPDATE users SET password = '' WHERE id = ?").run(lUser.item.id);
+        ldb.close();
+
+        // 第二世：升级后的面板读到无密码用户
+        const c2 = await boot();
+        if (!c2) {
+          console.log('  · 独立实例重启失败，跳过存量无密码用例');
+        } else {
+          // 重启后管理会话（内存）已失效，重新登录拿 token
+          const lLogin2 = await fetch('http://127.0.0.1:18098/api/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'admin', password: 'legacy-pass-123' }),
+          }).then((r) => r.json());
+          const legacyGated = await fetch(`http://127.0.0.1:18098/api/sub/${lUser.item.token}`);
+          const legacyData = await legacyGated.json();
+          ok('存量无密码账号也被拦（一律先登录）',
+            legacyGated.status === 401 && legacyData.loginRequired === true && legacyData.hasPassword === false,
+            legacyData.error || '');
+          const legacyLogin = await fetch('http://127.0.0.1:18098/api/sub/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: lUser.item.token, password: 'old-pass-123' }),
+          }).then((r) => r.json());
+          ok('存量无密码账号登录报「联系管理员」', /未设置登录密码/.test(legacyLogin.error || ''),
+            legacyLogin.error || '');
+          // 管理员补设密码后恢复正常
+          await fetch(`http://127.0.0.1:18098/api/users/${lUser.item.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + lLogin2.token },
+            body: JSON.stringify({ password: 'fixed-pass-123' }),
+          });
+          const fixed = await fetch('http://127.0.0.1:18098/api/sub/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: lUser.item.token, password: 'fixed-pass-123' }),
+          });
+          ok('管理员补设密码后可正常登录', fixed.status === 200);
+          await stop(c2);
+        }
+      }
+      fs.rmSync(legacyDir, { recursive: true, force: true });
+    }
   }
 
   /* ---------- 15.10 面板自身 HTTPS（0.1.16，独立实例） ---------- */

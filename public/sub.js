@@ -199,6 +199,9 @@ function render(d) {
         <span class="badge ${u.status === 'active' ? 'badge-ok' : u.status === 'over' || u.status === 'disabled' ? 'badge-bad' : 'badge-warn'}">
           <i class="dot"></i>${esc(u.statusLabel)}
         </span>
+        ${u.hasPassword
+          ? '<button class="btn btn-sm btn-ghost" id="sub-logout" type="button" title="退出后需要重新输入密码才能查看">退出登录</button>'
+          : ''}
         <button class="theme-btn" data-theme-toggle type="button" title="切换到日间模式" aria-label="切换到日间模式">
           <span class="ico">☀</span>
         </button>
@@ -259,30 +262,16 @@ function render(d) {
     <div class="sub-card" style="margin-top:16px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <div style="font-size:13px;font-weight:600;flex:1;min-width:200px">怀疑订阅链接泄露？</div>
-        <button class="btn btn-sm btn-ghost" id="reset-toggle" type="button">自助重置</button>
+        ${d.user.hasPassword
+          ? '<button class="btn btn-sm btn-ghost" id="reset-btn" type="button">重置订阅链接</button>'
+          : '<span class="hint">账号未设置登录密码，无法自助重置（联系管理员）</span>'}
       </div>
-      <div id="reset-panel" hidden>
-        <p class="hint" style="margin:10px 0 12px">
-          重置会<b>立刻作废当前链接</b>（UUID 一并换发，约 60 秒内全节点生效），并生成一条新订阅地址。
-          需要验证码（发到管理员为你绑定的邮箱）。
-          ${d.settings.selfReset === false ? '当前面板未配置邮件渠道，自助重置暂不可用，请联系管理员。' : ''}
-        </p>
-        <div class="field">
-          <label style="font-size:12px;color:var(--muted)">绑定邮箱</label>
-          <div style="display:flex;gap:8px">
-            <input type="email" id="reset-email" placeholder="user@example.com" style="flex:1" autocomplete="email">
-            <button class="btn btn-sm" id="reset-send" type="button">发送验证码</button>
-          </div>
-        </div>
-        <div class="field">
-          <label style="font-size:12px;color:var(--muted)">验证码（10 分钟内有效）</label>
-          <div style="display:flex;gap:8px">
-            <input type="text" id="reset-code" inputmode="numeric" placeholder="6 位数字" style="flex:1;letter-spacing:2px" autocomplete="one-time-code">
-            <button class="btn btn-sm btn-primary" id="reset-confirm" type="button">确认重置</button>
-          </div>
-        </div>
-        <div id="reset-result"></div>
-      </div>
+      ${d.user.hasPassword ? `
+      <p class="hint" style="margin:10px 0 0" id="reset-note">
+        重置会<b>立刻作废当前链接</b>（UUID 一并换发，约 60 秒内全节点生效），并生成一条新订阅地址。
+        重置后本页自动跳到新地址。
+      </p>
+      <div id="reset-result"></div>` : ''}
     </div>
 
     ${d.settings.notice ? `<div class="alert alert-warn" style="margin-top:16px">${esc(d.settings.notice)}</div>` : ''}
@@ -296,95 +285,162 @@ function render(d) {
   if (window.NPTheme) window.NPTheme.paint();
 }
 
-(async () => {
-  try {
-    const res = await fetch('/api/sub/' + encodeURIComponent(token));
-    if (!res.ok) throw new Error('订阅不存在或已失效');
-    const data = await res.json();
-     render(data);
-  } catch (err) {
-    root.innerHTML = `<div class="sub-card"><div class="empty"><b>无法加载订阅</b>${esc(err.message)}</div></div>`;
-  }
-})();
+/* ------------------- 订阅页登录 + 自助重置订阅链接（0.1.16） ------------------- */
 
-/* ---------------------- 自助重置订阅链接（0.1.16） ----------------------- */
+// 登录态：后端按 userId 发的会话（7 天）。存 localStorage —— 重置后跳到新 token
+// 的页面时仍处于登录态，无需再输一次密码
+let subSession = '';
+try { subSession = localStorage.getItem('np_sub_session') || ''; } catch { /* 隐私模式 */ }
 
-const resetApi = async (path, body) => {
+const subApi = async (path, body, authed = false) => {
   const res = await fetch(path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(authed && subSession ? { Authorization: 'Bearer ' + subSession } : {}),
+    },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || '请求失败，请稍后再试');
+  if (!res.ok) {
+    const err = new Error(data.error || '请求失败，请稍后再试');
+    err.loginRequired = !!data.loginRequired;
+    throw err;
+  }
   return data;
 };
 
-// 重置面板的三个按钮都是 render() 异步生成的，脚本加载时还不存在，
-// 直接 getElementById 绑监听会静默落空 —— 统一走 document 级事件委托
-function resetToggleClick() {
-  const panel = document.getElementById('reset-panel');
-  if (panel) panel.hidden = !panel.hidden;
+/**
+ * 登录页：账号设了密码但还没登录时，数据接口回 401 loginRequired → 画这个。
+ * msg 的配色由 isError 决定：密码错是红的，「已退出登录」这种中性提示不该报警。
+ */
+function renderLogin(msg = '', isError = true) {
+  root.innerHTML = `
+    <div class="sub-card" style="max-width:380px;margin:0 auto;text-align:left">
+      <div style="text-align:center;margin-bottom:14px">
+        <div class="brand-mark" style="margin:0 auto 8px">N</div>
+        <b style="font-size:14px">该订阅已开启登录保护</b>
+        <p class="hint" style="margin:6px 0 0">请输入管理员为你设置的登录密码</p>
+      </div>
+      <form id="sub-login-form">
+        <div class="field">
+          <label>登录密码</label>
+          <input type="password" id="sub-login-pass" placeholder="登录密码" autocomplete="current-password" autofocus>
+        </div>
+        ${msg ? `<p class="hint" style="color:${isError ? 'var(--bad)' : 'var(--muted)'};margin:0 0 10px">${esc(msg)}</p>` : ''}
+        <button class="btn btn-primary btn-block" type="submit" id="sub-login-btn" style="padding:11px">登 录</button>
+      </form>
+      <p class="hint" style="text-align:center;margin-top:14px">忘记密码请联系管理员</p>
+    </div>`;
+  if (window.NPTheme) window.NPTheme.paint();
+  document.getElementById('sub-login-pass')?.focus();
 }
 
-async function resetSendClick() {
-  const email = (document.getElementById('reset-email')?.value || '').trim();
-  const result = document.getElementById('reset-result');
-  const btn = document.getElementById('reset-send');
-  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-    if (result) result.innerHTML = '<p class="hint" style="color:var(--bad)">请先填写正确的邮箱地址</p>';
-    return;
-  }
-  if (btn) { btn.disabled = true; btn.textContent = '发送中…'; }
+async function subLoginSubmit() {
+  const pass = document.getElementById('sub-login-pass')?.value || '';
+  const btn = document.getElementById('sub-login-btn');
+  if (!pass) return renderLogin('请输入密码');
+  if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
   try {
-    const r = await resetApi('/api/sub/reset-request', { token, email });
-    if (result) result.innerHTML = `<p class="hint" style="color:var(--ok)">验证码已发送到 ${esc(r.sentTo || email)}，10 分钟内有效。没收到的话先翻垃圾箱，再找管理员确认邮箱地址。</p>`;
-    const code = document.getElementById('reset-code');
-    if (code) code.focus();
+    const r = await subApi('/api/sub/login', { token, password: pass });
+    subSession = r.session || '';
+    try { localStorage.setItem('np_sub_session', subSession); } catch { /* 隐私模式 */ }
+    await loadData();
   } catch (err) {
-    if (result) result.innerHTML = `<p class="hint" style="color:var(--bad)">${esc(err.message)}</p>`;
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '发送验证码'; }
+    renderLogin(err.message || '登录失败');
   }
 }
 
-async function resetConfirmClick() {
-  const code = (document.getElementById('reset-code')?.value || '').trim();
-  const result = document.getElementById('reset-result');
-  const btn = document.getElementById('reset-confirm');
-  if (!/^\d{6}$/.test(code)) {
-    if (result) result.innerHTML = '<p class="hint" style="color:var(--bad)">请输入 6 位数字验证码</p>';
-    return;
+/** 无密码账号（老库升级的遗留态）：没有密码可输，登录必然失败 → 直接给指引 */
+function renderNoPassword(message) {
+  root.innerHTML = `
+    <div class="sub-card" style="max-width:380px;margin:0 auto;text-align:center">
+      <div style="margin-bottom:10px">
+        <div class="brand-mark" style="margin:0 auto 8px">N</div>
+        <b style="font-size:14px">该账号还没有登录密码</b>
+      </div>
+      <p class="hint" style="margin:0 0 6px">${esc(message || '订阅页需要登录后查看，请联系管理员为你设置登录密码。')}</p>
+      <p class="hint" style="margin:0">客户端订阅不受影响 —— 在 App 里照常更新订阅即可。</p>
+    </div>`;
+  if (window.NPTheme) window.NPTheme.paint();
+}
+
+async function loadData() {
+  try {
+    const res = await fetch('/api/sub/' + encodeURIComponent(token), {
+      headers: subSession ? { Authorization: 'Bearer ' + subSession } : {},
+    });
+    if (res.status === 401) {
+      const data = await res.json().catch(() => ({}));
+      if (data.loginRequired) {
+        // hasPassword=false：没有密码可输（老库遗留账号），登录表单没有意义
+        if (data.hasPassword === false) return renderNoPassword(data.error);
+        return renderLogin();
+      }
+      throw new Error(data.error || '请先登录');
+    }
+    if (!res.ok) throw new Error('订阅不存在或已失效');
+    render(await res.json());
+  } catch (err) {
+    root.innerHTML = `<div class="sub-card"><div class="empty"><b>无法加载订阅</b>${esc(err.message)}</div></div>`;
   }
+}
+
+/** 登录后的一键重置：旧链接即刻失效，页面跳去新地址（会话仍有效，不用再登录） */
+async function resetClick() {
+  const btn = document.getElementById('reset-btn');
+  const result = document.getElementById('reset-result');
   if (btn) { btn.disabled = true; btn.textContent = '重置中…'; }
   try {
-    const r = await resetApi('/api/sub/reset-confirm', { token, code });
-    // 旧 token 已失效：本页数据全部过期，直接把新地址亮出来让用户抄走
+    const r = await subApi('/api/sub/reset', { token }, true);
     if (result) {
       result.innerHTML = `
-        <div class="alert alert-ok"><b>订阅链接已重置</b>　旧链接即刻失效（约 60 秒内全节点生效）。请把下面的新地址更新到客户端订阅里。</div>
-        <div class="code-wrap">
+        <div class="alert alert-ok" style="margin-top:10px"><b>订阅链接已重置</b>　即将跳转到新地址…</div>
+        <div class="code-wrap" style="margin-top:10px">
           <pre class="code" style="font-size:11.5px">${esc(r.subUrl)}</pre>
           <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(r.subUrl)}">复制</button>
-        </div>
-        <p class="hint">建议收藏新地址：<a href="${esc(r.subUrl)}" style="color:var(--accent)">${esc(r.subUrl)}</a></p>`;
+        </div>`;
     }
-    const send = document.getElementById('reset-send');
-    const confirmBtn = document.getElementById('reset-confirm');
-    if (send) send.disabled = true;
-    if (confirmBtn) confirmBtn.disabled = true;
     toast('订阅链接已重置');
+    // 旧 token 已作废，本页数据全部过期：跳到新 token（带上当前登录态，无需重登）
+    setTimeout(() => location.replace(r.subUrl), 1500);
   } catch (err) {
-    if (result) result.innerHTML = `<p class="hint" style="color:var(--bad)">${esc(err.message)}</p>`;
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '确认重置'; }
+    if (result) result.innerHTML = `<p class="hint" style="color:var(--bad);margin-top:10px">${esc(err.message)}</p>`;
+    if (btn) { btn.disabled = false; btn.textContent = '重置订阅链接'; }
   }
 }
 
+/**
+ * 退出登录：服务端会话与本地副本一起清。
+ *
+ * 只清 localStorage 是不够的 —— 那把 7 天的钥匙还挂在服务端，别人手里如果已经
+ * 抄走了 token 照样能用。所以先让服务端删，再清本地；服务端那一步失败也不拦人，
+ * 否则用户就被困在这一页了。
+ */
+async function subLogout() {
+  const btn = document.getElementById('sub-logout');
+  if (btn) { btn.disabled = true; btn.textContent = '退出中…'; }
+  try {
+    await subApi('/api/sub/logout', {}, true);
+  } catch { /* 网络/服务端异常：本地照样退出 */ }
+  subSession = '';
+  try { localStorage.removeItem('np_sub_session'); } catch { /* 隐私模式 */ }
+  renderLogin('已退出登录，重新查看请再输入一次密码', false);
+}
+
+// 按钮是 render() 异步生成的，脚本加载时不存在 —— 统一走 document 级事件委托
 document.addEventListener('click', (e) => {
   const copyBtn = e.target.closest('[data-copy]');
   if (copyBtn) copyText(copyBtn.dataset.copy);
-  if (e.target.id === 'reset-toggle') resetToggleClick();
-  if (e.target.id === 'reset-send') resetSendClick();
-  if (e.target.id === 'reset-confirm') resetConfirmClick();
+  if (e.target.id === 'reset-btn') resetClick();
+  if (e.target.closest('#sub-logout')) subLogout();
 });
+
+document.addEventListener('submit', (e) => {
+  if (e.target.id === 'sub-login-form') {
+    e.preventDefault();
+    subLoginSubmit();
+  }
+});
+
+loadData();

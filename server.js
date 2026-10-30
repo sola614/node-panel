@@ -28,6 +28,7 @@ const agentBundle = require('./lib/agentBundle');
 const notify = require('./lib/notify');
 const alerts = require('./lib/alerts');
 const totp = require('./lib/totp');
+const qrcode = require('./lib/qrcode');
 const logger = require('./lib/log');
 
 const log = logger.create('http');
@@ -486,11 +487,21 @@ function totpSetup(req, res) {
   const secret = totp.generateSecret();
   totpPending.set(admin.username, { secret, expires: Date.now() + TOTP_PENDING_TTL });
   logAuth.info('已生成待确认的 TOTP 密钥', { rid: req.__rid, user: admin.username });
+  const otpauth = totp.otpauthUrl(secret, admin.username, store.db().settings.siteName || 'node-panel');
+  // 认证器扫码用二维码（内联 SVG，纯手写 QR 编码器生成，密钥不出面板）
+  // 渲染失败（URI 超出 V10 容量）时给空串，前端回退展示手输密钥 —— 不让扫码层挡住绑定流程
+  let qrSvg = '';
+  try {
+    qrSvg = qrcode.toSvg(otpauth, { scale: 5, margin: 4 });
+  } catch (err) {
+    logAuth.warn('TOTP 二维码渲染失败，回退手输密钥', { rid: req.__rid, user: admin.username, err });
+  }
   sendJson(res, 200, {
     ok: true,
     secret,
-    // 认证器「添加账号 → 输入设置密钥」用 secret；扫码导入用 otpauth URI
-    otpauth: totp.otpauthUrl(secret, admin.username, store.db().settings.siteName || 'node-panel'),
+    // 认证器「添加账号 → 输入设置密钥」用 secret；扫码导入用二维码 / otpauth URI
+    otpauth,
+    qrSvg,
     expiresInMin: 10,
   });
 }
@@ -793,14 +804,14 @@ function listUsers(req, res, params, body, session, ctx) {
 }
 
 /** 建一个用户对象（不落库）：单个新增、批量建号、邀请领取共用同一套字段规则 */
-function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = '', email = '', enabled = true, extra = {} }) {
+function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = '', password = '', enabled = true, extra = {} }) {
   const u = {
     id: store.uid(),
     name: String(name || '').trim(),
     uuid: store.newUuid(),
     token: store.rnd(16),
-    // 订阅页自助重置订阅链接的验证码收件地址（可选，管理员在编辑里填）
-    email: String(email || '').trim(),
+    // 订阅页登录密码（scrypt 哈希；空 = 未设置，订阅页保持免登录）
+    password: password ? store.hashPassword(String(password)) : '',
     planId: planId || null,
     enabled: enabled !== false,
     // 有套餐时额度与到期由套餐决定；无套餐才允许手填
@@ -818,6 +829,11 @@ function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = 
   return u;
 }
 
+/** 用户密码的形状校验：必填、6–64 位（订阅页登录用） */
+function validUserPassword(pw) {
+  return typeof pw === 'string' && pw.length >= 6 && pw.length <= 64;
+}
+
 function createUser(req, res, params, body) {
   const name = String(body.name || '').trim();
   if (!name) return sendJson(res, 400, { error: '请填写用户名称' });
@@ -827,8 +843,9 @@ function createUser(req, res, params, body) {
   if (nameTaken(store.db().users, name)) {
     return sendJson(res, 409, { error: '这个用户名已经存在了' });
   }
-  if (body.email !== undefined && body.email !== null && String(body.email).trim() && !EMAIL_RE.test(String(body.email).trim())) {
-    return sendJson(res, 400, { error: '邮箱格式不正确' });
+  // 密码必填：订阅页一律先登录再查看，没有密码的用户无法登录（存量无密码账号只能联系管理员补设）
+  if (!validUserPassword(body.password)) {
+    return sendJson(res, 400, { error: '请设置登录密码（至少 6 位，订阅页登录用）' });
   }
   const u = buildUser({
     name,
@@ -837,7 +854,7 @@ function createUser(req, res, params, body) {
     usedGB: body.usedGB,
     expireAt: body.expireAt,
     note: body.note,
-    email: body.email,
+    password: body.password,
     enabled: body.enabled !== false,
   });
   store.db().users.push(u);
@@ -856,10 +873,16 @@ function updateUser(req, res, params, body) {
   }
   if (body.enabled !== undefined) u.enabled = !!body.enabled;
   if (body.note !== undefined) u.note = String(body.note);
-  if (body.email !== undefined) {
-    const email = String(body.email).trim();
-    if (email && !EMAIL_RE.test(email)) return sendJson(res, 400, { error: '邮箱格式不正确' });
-    u.email = email;
+  // 登录密码：留空 = 不修改（编辑表单默认行为）；密码一旦设置不可清除 ——
+  // 想收回访问就停用账号，清除密码会让订阅页退回「免登录直出」，与必填策略矛盾
+  if (body.clearPassword) {
+    return sendJson(res, 400, { error: '密码设置后不可清除；如需收回访问，请停用该账号' });
+  }
+  if (body.password !== undefined && body.password !== null && String(body.password) !== '') {
+    if (!validUserPassword(body.password)) {
+      return sendJson(res, 400, { error: '登录密码至少 6 位（留空表示不修改）' });
+    }
+    u.password = store.hashPassword(String(body.password));
   }
   if (body.resetTraffic) u.usedBytes = 0;
 
@@ -1013,6 +1036,10 @@ function bulkCreateUsers(req, res, params, body, session, ctx) {
     if (skipped.length) return sendJson(res, 200, { ok: true, items: [], skipped, planName });
     return sendJson(res, 400, { error: '没有可创建的名字' });
   }
+  // 统一初始密码（必填）：订阅页一律先登录，批量号也要有密码；发链接时把密码一并交给用户
+  if (!validUserPassword(body.password)) {
+    return sendJson(res, 400, { error: '请填写统一的初始登录密码（至少 6 位，订阅页登录用）' });
+  }
 
   const base = baseUrl(ctx.req);
   const created = [];
@@ -1022,6 +1049,7 @@ function bulkCreateUsers(req, res, params, body, session, ctx) {
       planId,
       quotaGB: body.quotaGB,
       note: body.note || '',
+      password: body.password,
       enabled: body.enabled !== false,
     });
     db.users.push(u);
@@ -1354,11 +1382,16 @@ function claimInvite(req, res, params, body, session, ctx) {
     logData.warn('邀请领取失败：重名', { rid: ctx.rid, code, ip, name });
     return sendJson(res, 409, { error: '这个名字已经有人用了，换一个吧' });
   }
+  // 领取时自己设登录密码（必填）：订阅页一律先登录，领取后凭它打开订阅页
+  if (!validUserPassword(body.password)) {
+    return sendJson(res, 400, { error: '请设置登录密码（至少 6 位），打开订阅页时要用' });
+  }
 
   const u = buildUser({
     name,
     planId: inv.planId,
     note: inv.note ? `邀请领取 · ${inv.note}` : '邀请领取',
+    password: body.password,
   });
   db.users.push(u);
   inv.usedCount = Number(inv.usedCount) + 1;
@@ -4737,6 +4770,24 @@ function userByToken(token) {
   return store.db().users.find((u) => u.token === token) || null;
 }
 
+/**
+ * 订阅页的「有效密码哈希」。
+ *
+ * 默认管理员用户（users 里 isAdmin 那条）在用户表里不存密码：它只是面板 admin
+ * 账号在用户列表里的影子，所以订阅页直接复用面板管理密码 —— 改一次两边同步，
+ * 不用维护两份。但这不等于「能进后台」：管理台登录认的是 admin.username +
+ * admin.password 那一对，订阅页登录只发订阅会话（subSessions），
+ * 拿不到任何管理台 token。
+ *
+ * 管理员若在「用户 → 编辑」里给这条记录单独设了密码，则以单独密码为准（显式覆盖）。
+ */
+function subPasswordHash(user) {
+  if (user.password) return user.password;
+  if (!user.isAdmin) return '';
+  const admin = store.db().admin;
+  return (admin && admin.password) || '';
+}
+
 function subscriptionPayload(user, req) {
   sweepRenewals();
   const db = store.db();
@@ -4781,12 +4832,13 @@ function subscriptionPayload(user, req) {
       todayBytes,
       autoRenew: !!pub.autoRenew,
       nodeCount: links.length,
+      // 订阅页据此渲染：有可用密码的用户登录后给「一键重置」；没有的给指引
+      // （默认管理员用户走 subPasswordHash → 与面板密码一致，这里同样是 true）
+      hasPassword: !!subPasswordHash(user),
     },
     settings: {
       siteName: db.settings.siteName,
       notice: db.settings.notice,
-      // 订阅页据此决定要不要给「自助重置」入口留提示（没配邮件渠道时点击会得到明确报错）
-      selfReset: !!(db.notify_channels || []).some((c) => c.enabled && c.type === 'email'),
     },
     links,
     subUrl: `${base}/s/${user.token}`,
@@ -4799,122 +4851,146 @@ function subscriptionPayload(user, req) {
 function subApi(req, res, params, body, session, ctx) {
   const user = userByToken(params.token);
   if (!user) return sendJson(res, 404, { error: '订阅不存在' });
+  // 登录门（仅此 JSON 接口 —— 它是订阅页的数据源）：与管理台一样先登录再查看。
+  // 客户端拉订阅走 /s/:token?format=base64|clash|singbox 等纯文本分支，不受影响。
+  // 无密码账号（老库升级的遗留态）也被拦：hasPassword=false 让前端渲染
+  // 「联系管理员设置密码」而不是登录表单 —— 没有密码可输，登录必然失败。
+  // 默认管理员用户例外：它的密码由 subPasswordHash 从面板 admin 账号取，所以照常给表单
+  if (!subSessionUser(ctx.req, user)) {
+    const hash = subPasswordHash(user);
+    return sendJson(res, 401, {
+      error: hash ? '请先登录' : '该账号未设置登录密码，请联系管理员设置后再访问',
+      loginRequired: true,
+      hasPassword: !!hash,
+    });
+  }
   sendJson(res, 200, subscriptionPayload(user, ctx.req));
 }
 
-/* --------------------- 订阅页自助重置订阅链接（0.1.16） --------------------- */
+/* ------------------- 订阅页登录 + 自助重置订阅链接（0.1.16） ------------------- */
 
 /**
- * 用户侧的自救通道：怀疑订阅 token 泄露时，不用等管理员，
- * 「账号绑定的邮箱 + 验证码」两道轻量身份即可换发新链接，旧链接当场失效。
+ * 用户侧的身份模型：订阅 token（知道链接即凭证）+ 登录密码（管理员在用户编辑里设置）。
+ * 两者都掌握才算「登录」，登录后即可一键重置订阅链接（换发 token 与 UUID，
+ * 旧链接即刻失效）—— 取代最初的「邮箱 + 验证码」方案（要管理员维护邮箱、
+ * 面板配邮件渠道，链路太长）。
  *
- * 邮箱由管理员在用户编辑里填写；验证码通过「通知渠道」里启用的邮件渠道发送。
- * 风险面：知道订阅 token + 掌握该邮箱收件箱的人本就能看到订阅内容，重置不扩大泄露。
+ * 登录态是内存 session（随机 token → userId，默认 7 天）：绑定 userId 而不是
+ * 订阅 token，重置换发新链接后会话仍然有效，页面跳转到新地址无需重新登录。
+ * 未设密码的用户保持免登录的旧行为 —— 密码本身就是管理员决定「要不要启用
+ * 订阅页登录」的开关。默认管理员用户（isAdmin）不单独存密码，走 subPasswordHash
+ * 复用面板管理密码；它进不了管理台，因为管理台登录校验的是 admin 表那一对。
  */
-const resetPending = new Map(); // token → { code, expires, tries }
-const resetSentAt = new Map(); // token → 上次发送时间（60 秒冷却）
-const RESET_TTL = 10 * 60 * 1000;
-const RESET_MAX_TRIES = 5;
-// 过期清理：这几个 Map 的键是订阅 token / 用户名，用不到就永远留在内存里
-//（loginFails 早有同款清理）。挂 10 分钟一轮，量级极小。
-const RESET_SWEEP_MS = 10 * 60 * 1000;
-const resetSweepTimer = setInterval(() => {
+const subSessions = new Map(); // sessionToken → { userId, expires }
+const SUB_SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
+const SUB_LOGIN_MAX_FAIL = 5;
+const SUB_LOGIN_LOCK_MS = 10 * 60 * 1000;
+const subLoginFails = new Map(); // userId → { count, firstAt }
+
+/** 请求头里带的会话是否属于这个用户（未过期、userId 匹配） */
+function subSessionUser(req, user) {
+  const auth = String(req.headers.authorization || '');
+  if (!auth.startsWith('Bearer ')) return null;
+  const s = subSessions.get(auth.slice(7));
+  if (!s || Date.now() > s.expires) {
+    if (s) subSessions.delete(auth.slice(7));
+    return null;
+  }
+  return s.userId === user.id ? s : null;
+}
+
+function noteSubLoginFail(userId) {
+  const f = subLoginFails.get(userId) || { count: 0, firstAt: Date.now() };
+  f.count++;
+  if (f.count === 1) f.firstAt = Date.now();
+  subLoginFails.set(userId, f);
+}
+
+// 过期清理（loginFails 早有同款）：会话、登录失败计数、TOTP 待绑定密钥
+const SUB_SWEEP_MS = 10 * 60 * 1000;
+const subSweepTimer = setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of resetPending) if (!v || now > v.expires) resetPending.delete(k);
-  for (const [k, v] of resetSentAt) if (!v || now - v > 60 * 60 * 1000) resetSentAt.delete(k);
+  for (const [k, v] of subSessions) if (!v || now > v.expires) subSessions.delete(k);
+  for (const [k, v] of subLoginFails) {
+    if (!v || now - v.firstAt > SUB_LOGIN_LOCK_MS) subLoginFails.delete(k);
+  }
   for (const [k, v] of totpPending) if (!v || now > v.expires) totpPending.delete(k);
-}, RESET_SWEEP_MS);
-resetSweepTimer.unref();
+}, SUB_SWEEP_MS);
+subSweepTimer.unref();
 
-const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
-
-function maskEmail(email) {
-  const text = String(email || '');
-  const at = text.indexOf('@');
-  if (at <= 0) return '***';
-  return text.slice(0, 2) + '***' + text.slice(at);
-}
-
-async function subResetRequest(req, res, params, body) {
+function subLogin(req, res, params, body) {
   const token = String(body.token || '');
   const user = userByToken(token);
+  // 订阅不存在与密码错误分开报：前者意味着链接已被重置/删除，提示语把人带向管理员
   if (!user) return sendJson(res, 404, { error: '订阅不存在或已被重置' });
   if (!user.enabled) return sendJson(res, 400, { error: '账号已停用，请联系管理员' });
-  if (!user.email || !EMAIL_RE.test(user.email)) {
-    return sendJson(res, 400, { error: '该账号未设置有效邮箱，请联系管理员重置' });
+  const hash = subPasswordHash(user);
+  if (!hash) {
+    return sendJson(res, 400, { error: '该账号未设置登录密码，请联系管理员设置后再访问' });
   }
 
-  // 邮箱必须与账号绑定的一致：token 是第一道，这里是第二道
-  const email = String(body.email || '').trim().toLowerCase();
-  if (!email || email !== String(user.email).trim().toLowerCase()) {
-    return sendJson(res, 400, { error: '邮箱与该账号绑定的不一致' });
+  // 登录限流：与面板登录同量级（5 次 / 10 分钟），防对着订阅页爆破密码
+  const fail = subLoginFails.get(user.id);
+  if (fail && fail.count >= SUB_LOGIN_MAX_FAIL && Date.now() - fail.firstAt < SUB_LOGIN_LOCK_MS) {
+    logData.warn('订阅页登录被限流', { rid: req.__rid, user: user.name, tries: fail.count });
+    return sendJson(res, 429, { error: '尝试次数过多，请 10 分钟后再试' });
   }
 
-  const channel = (store.db().notify_channels || []).find((c) => c.enabled && c.type === 'email');
-  if (!channel) {
-    return sendJson(res, 400, { error: '面板未配置邮件渠道，暂时无法自助重置，请联系管理员' });
+  if (!body.password || !store.checkPassword(String(body.password), hash)) {
+    noteSubLoginFail(user.id);
+    const left = SUB_LOGIN_MAX_FAIL - (subLoginFails.get(user.id) || { count: 0 }).count;
+    logData.warn('订阅页登录失败', { rid: req.__rid, user: user.name, left: left > 0 ? left : 0 });
+    return sendJson(res, 401, { error: '密码不正确' });
   }
 
-  const last = resetSentAt.get(token) || 0;
-  if (Date.now() - last < 60 * 1000) {
-    return sendJson(res, 429, { error: '发送太频繁，请 1 分钟后再试' });
-  }
-
-  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-  const siteName = store.db().settings.siteName || 'Node Panel';
-  const r = await notify.deliver(channel, {
-    event: 'user.reset',
-    level: 'info',
-    title: '订阅链接重置验证码',
-    text:
-      `账号「${user.name}」正在申请重置订阅链接。\n\n` +
-      `验证码：${code}\n有效期：10 分钟\n\n` +
-      `如果这不是你本人的操作，请忽略本邮件 —— 验证码未被使用前，订阅链接不会变化。\n` +
-      `（来自 ${siteName}）`,
+  subLoginFails.delete(user.id);
+  const sessionToken = crypto.randomBytes(24).toString('hex');
+  subSessions.set(sessionToken, { userId: user.id, expires: Date.now() + SUB_SESSION_TTL });
+  auditAction('user.sublogin', user.name, '订阅页登录');
+  logData.info('订阅页登录成功', { rid: req.__rid, user: user.name });
+  sendJson(res, 200, {
+    ok: true,
+    session: sessionToken,
+    expiresAt: new Date(Date.now() + SUB_SESSION_TTL).toISOString(),
   });
-  if (!r || !r.ok) {
-    logData.error('重置验证码发送失败', { rid: req.__rid, user: user.name, error: r && r.error });
-    return sendJson(res, 502, { error: `邮件发送失败：${(r && r.error) || '未知错误'}` });
-  }
-
-  resetSentAt.set(token, Date.now());
-  resetPending.set(token, { code, expires: Date.now() + RESET_TTL, tries: 0 });
-  auditAction('user.reset.request', user.name, '订阅页申请自助重置');
-  logData.info('重置验证码已发送', { rid: req.__rid, user: user.name, channel: channel.name });
-  sendJson(res, 200, { ok: true, sentTo: maskEmail(user.email) });
 }
 
-function subResetConfirm(req, res, params, body) {
+function subReset(req, res, params, body, session, ctx) {
   const token = String(body.token || '');
   const user = userByToken(token);
   if (!user) return sendJson(res, 404, { error: '订阅不存在或已被重置' });
-  // 申请验证码之后账号被停用：确认阶段再拦一道，停用不该有新凭证流出
+  // 停用账号不发新凭证
   if (!user.enabled) return sendJson(res, 400, { error: '账号已停用，请联系管理员' });
-
-  const p = resetPending.get(token);
-  if (!p || Date.now() > p.expires) {
-    resetPending.delete(token);
-    return sendJson(res, 400, { error: '验证码已失效，请重新获取' });
+  // 未设密码的用户没有「登录」概念，无从校验身份，不提供自助重置
+  if (!subPasswordHash(user)) {
+    return sendJson(res, 400, { error: '该账号未设置登录密码，无法自助重置，请联系管理员' });
   }
-  if (p.tries >= RESET_MAX_TRIES) {
-    resetPending.delete(token);
-    return sendJson(res, 400, { error: '尝试次数过多，验证码已作废，请重新获取' });
-  }
-  if (!tokenEq(p.code, String(body.code || '').trim())) {
-    p.tries++;
-    return sendJson(res, 400, { error: '验证码不正确' });
+  // 唯一凭证：属于这个用户的有效登录会话 —— 登录成功即可重置
+  if (!subSessionUser(ctx.req, user)) {
+    return sendJson(res, 401, { error: '请先登录', loginRequired: true });
   }
 
-  // 验证通过：换发 token 与 UUID（与端侧注入的凭证保持同步），旧链接即刻失效
-  resetPending.delete(token);
-  resetSentAt.delete(token);
   const oldToken = user.token;
   user.token = store.rnd(16);
   user.uuid = store.newUuid();
   store.save();
-  auditAction('user.selfrotate', user.name, '订阅页自助重置订阅链接');
+  auditAction('user.selfrotate', user.name, '订阅页登录后自助重置订阅链接');
   logData.warn('订阅链接已自助重置', { rid: req.__rid, user: user.name, tokenFrom: oldToken.slice(0, 4) + '***' });
   sendJson(res, 200, { ok: true, subUrl: `${baseUrl(req)}/s/${user.token}` });
+}
+
+/**
+ * 订阅页「退出登录」：把服务端的会话也删掉。
+ *
+ * 只清 localStorage 是不够的 —— 会话是 7 天的内存 token，留在服务端就等于
+ * 那把钥匙还在锁孔里；浏览器里删了副本，服务端照样认。所以两边一起清。
+ * 幂等：没带 token / 带了个野 token 都返回 ok，前端不必为「退出失败」设计分支。
+ */
+function subLogout(req, res) {
+  const auth = String(req.headers.authorization || '');
+  const sessionToken = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (sessionToken) subSessions.delete(sessionToken);
+  sendJson(res, 200, { ok: true });
 }
 
 function subPage(req, res, params, body, session, ctx) {
@@ -5096,8 +5172,9 @@ const ROUTES = [
   ['POST', '/api/agent/receipt', agentReceipt, false],
 
   ['GET', '/api/sub/:token', subApi, false],
-  ['POST', '/api/sub/reset-request', subResetRequest, false],
-  ['POST', '/api/sub/reset-confirm', subResetConfirm, false],
+  ['POST', '/api/sub/login', subLogin, false],
+  ['POST', '/api/sub/reset', subReset, false],
+  ['POST', '/api/sub/logout', subLogout, false],
 ];
 
 function matchPath(pattern, pathname) {

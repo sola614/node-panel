@@ -1,193 +1,6 @@
 {
   "items": [
     {
-      "network": "tcp",
-      "path": "",
-      "host": "jp1.example.com",
-      "security": "none",
-      "sni": "",
-      "certFile": "",
-      "keyFile": "",
-      "method": "aes-256-gcm",
-      "password": "",
-      "mode": "server",
-      "address": "",
-      "token": "",
-      "enabled": true,
-      "createdAt": "2026-10-29T09:49:34.012Z",
-      "ipMode": "manual",
-      "reportedIp": "",
-      "certMode": "path",
-      "certPem": "",
-      "keyPem": "",
-      "selfCN": "",
-      "fp": "chrome",
-      "vlessEncryption": false,
-      "entries": [],
-      "hidden": false,
-      "id": "16e8519d253d",
-      "serverId": "4c9304e0d9c6",
-      "name": "JP-VMESS",
-      "protocol": "vmess",
-      "port": 8080,
-      "planIds": [
-        "133d37e3b257",
-        "db1b7a6e393f"
-      ],
-      "serverName": "东京-01",
-      "online": false,
-      "sync": {
-        "state": "unknown",
-        "label": "未回执",
-        "desired": "596df2af3dfba062",
-        "at": null,
-        "hash": "",
-        "error": "",
-        "xray": "",
-        "hy": "",
-        "unbound": "",
-        "nodes": 0,
-        "users": 0,
-        "agentVersion": ""
-      },
-      "addressSource": "",
-      "label": "东京-01 · JP-VMESS",
-      "plans": [
-        {
-          "id": "133d37e3b257",
-          "name": "标准版",
-          "color": "#4c8dff"
-        },
-        {
-          "id": "db1b7a6e393f",
-          "name": "旗舰版",
-          "color": "#a78bfa"
-        }
-      ]
-    },
-    {
-      "network": "tcp",
-      "path": "",
-      "host": "jp1.example.com",
-      "security": "none",
-      "sni": "",
-      "certFile": "",
-      "keyFile": "",
-      "method": "aes-256-gcm",
-      "password": "1b5bddf965a55b31",
-      "mode": "server",
-      "address": "",
-      "token": "",
-      "enabled": true,
-      "createdAt": "2026-10-29T09:49:34.012Z",
-      "ipMode": "manual",
-      "reportedIp": "",
-      "certMode": "path",
-      "certPem": "",
-      "keyPem": "",
-      "selfCN": "",
-      "fp": "chrome",
-      "vlessEncryption": false,
-      "entries": [],
-      "hidden": false,
-      "id": "2332cf03bb31",
-      "serverId": "4c9304e0d9c6",
-      "name": "JP-SS",
-      "protocol": "ss",
-      "port": 8388,
-      "planIds": [
-        "27c88ccdd583",
-        "db1b7a6e393f"
-      ],
-      "serverName": "东京-01",
-      "online": false,
-      "sync": {
-        "state": "unknown",
-        "label": "未回执",
-        "desired": "596df2af3dfba062",
-        "at": null,
-        "hash": "",
-        "error": "",
-        "xray": "",
-        "hy": "",
-        "unbound": "",
-        "nodes": 0,
-        "users": 0,
-        "agentVersion": ""
-      },
-      "addressSource": "",
-      "label": "东京-01 · JP-SS",
-      "plans": [
-        {
-          "id": "27c88ccdd583",
-          "name": "体验版",
-          "color": "#34d399"
-        },
-        {
-          "id": "db1b7a6e393f",
-          "name": "旗舰版",
-          "color": "#a78bfa"
-        }
-      ]
-    },
-    {
-      "network": "tcp",
-      "path": "",
-      "host": "203.0.113.30",
-      "security": "reality",
-      "sni": "www.microsoft.com",
-      "certFile": "",
-      "keyFile": "",
-      "method": "aes-256-gcm",
-      "password": "",
-      "mode": "standalone",
-      "address": "sg1.example.com",
-      "token": "437e644fbcfde07d3f47b8c3c387e54149ab71ed",
-      "enabled": true,
-      "createdAt": "2026-10-29T09:49:34.012Z",
-      "ipMode": "auto",
-      "reportedIp": "203.0.113.30",
-      "certMode": "path",
-      "certPem": "",
-      "keyPem": "",
-      "selfCN": "",
-      "fp": "chrome",
-      "vlessEncryption": false,
-      "entries": [],
-      "hidden": false,
-      "id": "9d260e0f0d67",
-      "name": "SG-REALITY",
-      "protocol": "vless",
-      "port": 443,
-      "reality": {
-        "dest": "www.microsoft.com:443",
-        "serverNames": "www.microsoft.com",
-        "privateKey": "YAZz4ssTCy6eVZQ2c8U95m3K3dzWx6AytuNODQAcblc",
-        "publicKey": "vXHUOrlF2lm1ghJfpgATEoLrAs6wtGNDgxtXqlxmSiE",
-        "shortId": "5407e7fe",
-        "flow": "xtls-rprx-vision"
-      },
-      "serverName": "独立部署",
-      "online": false,
-      "sync": {
-        "state": "unknown",
-        "label": "未回执",
-        "desired": "17cf948489771352",
-        "at": null,
-        "hash": "",
-        "error": "",
-        "xray": "",
-        "hy": "",
-        "unbound": "",
-        "nodes": 0,
-        "users": 0,
-        "agentVersion": ""
-      },
-      "addressSource": "上报",
-      "label": "SG-REALITY",
-      "plans": []
-    },
-    {
       "network": "grpc",
       "path": "grpcsvc",
       "host": "203.0.113.10",
@@ -201,7 +14,7 @@
       "address": "",
       "token": "",
       "enabled": true,
-      "createdAt": "2026-10-29T09:49:34.012Z",
+      "createdAt": "2026-10-30T07:02:37.464Z",
       "ipMode": "manual",
       "reportedIp": "",
       "certMode": "self",
@@ -212,20 +25,20 @@
       "vlessEncryption": false,
       "entries": [],
       "hidden": false,
-      "id": "c9b4cc734086",
-      "serverId": "7508fafdfd5f",
+      "id": "1c6fae70dd58",
+      "serverId": "08702f4fdb53",
       "name": "HK-TROJAN",
       "protocol": "trojan",
       "port": 8443,
       "planIds": [
-        "db1b7a6e393f"
+        "17077306b9a1"
       ],
       "serverName": "香港-01",
       "online": true,
       "sync": {
         "state": "pending",
         "label": "待同步",
-        "desired": "210cf7420b8bf18d",
+        "desired": "2e1f2266c6ec1abc",
         "at": null,
         "hash": "",
         "error": "",
@@ -240,7 +53,72 @@
       "label": "香港-01 · HK-TROJAN",
       "plans": [
         {
-          "id": "db1b7a6e393f",
+          "id": "17077306b9a1",
+          "name": "旗舰版",
+          "color": "#a78bfa"
+        }
+      ]
+    },
+    {
+      "network": "tcp",
+      "path": "",
+      "host": "jp1.example.com",
+      "security": "none",
+      "sni": "",
+      "certFile": "",
+      "keyFile": "",
+      "method": "aes-256-gcm",
+      "password": "035a54a3196d1405",
+      "mode": "server",
+      "address": "",
+      "token": "",
+      "enabled": true,
+      "createdAt": "2026-10-30T07:02:37.464Z",
+      "ipMode": "manual",
+      "reportedIp": "",
+      "certMode": "path",
+      "certPem": "",
+      "keyPem": "",
+      "selfCN": "",
+      "fp": "chrome",
+      "vlessEncryption": false,
+      "entries": [],
+      "hidden": false,
+      "id": "344e1f27b759",
+      "serverId": "e12274b5ed0c",
+      "name": "JP-SS",
+      "protocol": "ss",
+      "port": 8388,
+      "planIds": [
+        "a2d46b867a6d",
+        "17077306b9a1"
+      ],
+      "serverName": "东京-01",
+      "online": false,
+      "sync": {
+        "state": "unknown",
+        "label": "未回执",
+        "desired": "6a8e7c89287ff579",
+        "at": null,
+        "hash": "",
+        "error": "",
+        "xray": "",
+        "hy": "",
+        "unbound": "",
+        "nodes": 0,
+        "users": 0,
+        "agentVersion": ""
+      },
+      "addressSource": "",
+      "label": "东京-01 · JP-SS",
+      "plans": [
+        {
+          "id": "a2d46b867a6d",
+          "name": "体验版",
+          "color": "#34d399"
+        },
+        {
+          "id": "17077306b9a1",
           "name": "旗舰版",
           "color": "#a78bfa"
         }
@@ -260,7 +138,7 @@
       "address": "",
       "token": "",
       "enabled": true,
-      "createdAt": "2026-10-29T09:49:34.012Z",
+      "createdAt": "2026-10-30T07:02:37.464Z",
       "ipMode": "manual",
       "reportedIp": "",
       "certMode": "path",
@@ -271,14 +149,14 @@
       "vlessEncryption": false,
       "entries": [
         {
-          "id": "46f30842b266",
+          "id": "70ab019d915f",
           "name": "广州中转",
           "host": "gz-relay.example.com",
           "planIds": [],
           "hidden": false
         },
         {
-          "id": "f80be4aa1417",
+          "id": "80802e199773",
           "name": "上海中转",
           "host": "sh-relay.example.com",
           "port": 8443,
@@ -287,21 +165,21 @@
         }
       ],
       "hidden": false,
-      "id": "d65615c91734",
-      "serverId": "7508fafdfd5f",
+      "id": "45d11c83e7f8",
+      "serverId": "08702f4fdb53",
       "name": "HK-VLESS-WS",
       "protocol": "vless",
       "port": 443,
       "planIds": [
-        "133d37e3b257",
-        "db1b7a6e393f"
+        "417315a47005",
+        "17077306b9a1"
       ],
       "serverName": "香港-01",
       "online": true,
       "sync": {
         "state": "pending",
         "label": "待同步",
-        "desired": "210cf7420b8bf18d",
+        "desired": "2e1f2266c6ec1abc",
         "at": null,
         "hash": "",
         "error": "",
@@ -316,16 +194,73 @@
       "label": "香港-01 · HK-VLESS-WS",
       "plans": [
         {
-          "id": "133d37e3b257",
+          "id": "417315a47005",
           "name": "标准版",
           "color": "#4c8dff"
         },
         {
-          "id": "db1b7a6e393f",
+          "id": "17077306b9a1",
           "name": "旗舰版",
           "color": "#a78bfa"
         }
       ]
+    },
+    {
+      "network": "tcp",
+      "path": "",
+      "host": "203.0.113.30",
+      "security": "reality",
+      "sni": "www.microsoft.com",
+      "certFile": "",
+      "keyFile": "",
+      "method": "aes-256-gcm",
+      "password": "",
+      "mode": "standalone",
+      "address": "sg1.example.com",
+      "token": "004fb937379697163e1f06b19e93aa049a678472",
+      "enabled": true,
+      "createdAt": "2026-10-30T07:02:37.464Z",
+      "ipMode": "auto",
+      "reportedIp": "203.0.113.30",
+      "certMode": "path",
+      "certPem": "",
+      "keyPem": "",
+      "selfCN": "",
+      "fp": "chrome",
+      "vlessEncryption": false,
+      "entries": [],
+      "hidden": false,
+      "id": "90f28452c3d6",
+      "name": "SG-REALITY",
+      "protocol": "vless",
+      "port": 443,
+      "reality": {
+        "dest": "www.microsoft.com:443",
+        "serverNames": "www.microsoft.com",
+        "privateKey": "QJrAwMcDM4qxw2muxHsFRO8uhqGVJJHiSmSscVAI-Wk",
+        "publicKey": "JN4rYrACml-Xj1V2ACpWRoygDlz5l1SZP_8bgLkryEY",
+        "shortId": "9957ab53",
+        "flow": "xtls-rprx-vision"
+      },
+      "serverName": "独立部署",
+      "online": false,
+      "sync": {
+        "state": "unknown",
+        "label": "未回执",
+        "desired": "ab36f164d5db2b99",
+        "at": null,
+        "hash": "",
+        "error": "",
+        "xray": "",
+        "hy": "",
+        "unbound": "",
+        "nodes": 0,
+        "users": 0,
+        "agentVersion": ""
+      },
+      "addressSource": "上报",
+      "label": "SG-REALITY",
+      "plans": []
     },
     {
       "network": "tcp",
@@ -339,9 +274,9 @@
       "password": "",
       "mode": "standalone",
       "address": "hk2.example.com",
-      "token": "87546116121183e450cc9869ec821c257fd7325e",
+      "token": "3cd0f3fcbe0dbb63a1cf2002270e329db7cf9eb5",
       "enabled": true,
-      "createdAt": "2026-10-29T09:49:34.012Z",
+      "createdAt": "2026-10-30T07:02:37.464Z",
       "ipMode": "auto",
       "reportedIp": "203.0.113.20",
       "certMode": "path",
@@ -352,13 +287,13 @@
       "vlessEncryption": false,
       "entries": [],
       "hidden": false,
-      "id": "ea728c09869a",
+      "id": "921bfc948bd2",
       "name": "HK-HY2",
       "protocol": "hysteria2",
       "port": 8443,
       "hy2": {
         "obfs": "salamander",
-        "obfsPassword": "af05039be58c466e",
+        "obfsPassword": "bcba909e1e25d247",
         "upMbps": 100,
         "downMbps": 1000,
         "maskUrl": "https://news.ycombinator.com/"
@@ -368,7 +303,7 @@
       "sync": {
         "state": "unknown",
         "label": "未回执",
-        "desired": "30dea37cb72693c9",
+        "desired": "fc1adb9d1dd09897",
         "at": null,
         "hash": "",
         "error": "",
@@ -382,23 +317,88 @@
       "addressSource": "上报",
       "label": "HK-HY2",
       "plans": []
+    },
+    {
+      "network": "tcp",
+      "path": "",
+      "host": "jp1.example.com",
+      "security": "none",
+      "sni": "",
+      "certFile": "",
+      "keyFile": "",
+      "method": "aes-256-gcm",
+      "password": "",
+      "mode": "server",
+      "address": "",
+      "token": "",
+      "enabled": true,
+      "createdAt": "2026-10-30T07:02:37.464Z",
+      "ipMode": "manual",
+      "reportedIp": "",
+      "certMode": "path",
+      "certPem": "",
+      "keyPem": "",
+      "selfCN": "",
+      "fp": "chrome",
+      "vlessEncryption": false,
+      "entries": [],
+      "hidden": false,
+      "id": "abaafe0d0ff4",
+      "serverId": "e12274b5ed0c",
+      "name": "JP-VMESS",
+      "protocol": "vmess",
+      "port": 8080,
+      "planIds": [
+        "417315a47005",
+        "17077306b9a1"
+      ],
+      "serverName": "东京-01",
+      "online": false,
+      "sync": {
+        "state": "unknown",
+        "label": "未回执",
+        "desired": "6a8e7c89287ff579",
+        "at": null,
+        "hash": "",
+        "error": "",
+        "xray": "",
+        "hy": "",
+        "unbound": "",
+        "nodes": 0,
+        "users": 0,
+        "agentVersion": ""
+      },
+      "addressSource": "",
+      "label": "东京-01 · JP-VMESS",
+      "plans": [
+        {
+          "id": "417315a47005",
+          "name": "标准版",
+          "color": "#4c8dff"
+        },
+        {
+          "id": "17077306b9a1",
+          "name": "旗舰版",
+          "color": "#a78bfa"
+        }
+      ]
     }
   ],
   "servers": [
     {
-      "id": "7508fafdfd5f",
+      "id": "08702f4fdb53",
       "name": "香港-01",
       "host": ""
     },
     {
-      "id": "4c9304e0d9c6",
+      "id": "e12274b5ed0c",
       "name": "东京-01",
       "host": "jp1.example.com"
     }
   ],
   "plans": [
     {
-      "id": "27c88ccdd583",
+      "id": "a2d46b867a6d",
       "name": "体验版",
       "color": "#34d399",
       "quotaGB": 10,
@@ -411,7 +411,7 @@
       "days": 30
     },
     {
-      "id": "133d37e3b257",
+      "id": "417315a47005",
       "name": "标准版",
       "color": "#4c8dff",
       "quotaGB": 100,
@@ -424,7 +424,7 @@
       "days": 30
     },
     {
-      "id": "db1b7a6e393f",
+      "id": "17077306b9a1",
       "name": "旗舰版",
       "color": "#a78bfa",
       "quotaGB": 200,

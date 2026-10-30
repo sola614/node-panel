@@ -286,14 +286,81 @@ function userForm(user) {
       <input type="text" id="f-note" value="${esc(u.note || '')}" placeholder="套餐、联系方式等">
     </div>
     <div class="field">
-      <label>邮箱（自助重置订阅链接用）</label>
-      <input type="email" id="f-email" value="${esc(u.email || '')}" placeholder="user@example.com" spellcheck="false" autocomplete="off">
-      <div class="hint">填了邮箱，用户才能在订阅页「自助重置订阅链接」（验证码发到这个邮箱）</div>
+      <label>登录密码（订阅页用）</label>
+      <div class="pw-row">
+        <input type="password" id="f-password" placeholder="${u.id ? (u.isAdmin ? '留空 = 跟随面板管理密码' : u.hasPassword ? '已设置，留空表示不修改' : '请设置（该账号还没有密码）') : '至少 6 位，用户打开订阅页时输入'}" autocomplete="new-password">
+        <button class="btn" type="button" data-gen-pass="#f-password" title="生成 16 位随机密码并复制">生成</button>
+      </div>
+      ${u.id
+        ? u.isAdmin
+          ? '<div class="hint">默认管理员账号不单独存密码：留空时订阅页密码<b>与面板管理密码一致</b>，改面板密码它会跟着变。想单独设一个就在这里填（填了以后以这里的为准）。</div>'
+          : '<div class="hint">用户打开订阅页需先输入此密码登录；登录后可自助重置订阅链接</div>'
+        : '<div class="hint">必填：用户打开订阅页需先输入此密码登录，登录后可自助重置订阅链接</div>'}
     </div>
     <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);cursor:pointer">
       <input type="checkbox" id="f-enabled" ${u.enabled === false ? '' : 'checked'} style="width:auto">
       启用该用户
     </label>`;
+}
+
+/**
+ * 随机密码：默认 16 位，小写 + 大写 + 数字 + 常用特殊符号，四类字符各至少一个。
+ *
+ * 去掉 0O1lI 这些肉眼容易看错的字符 —— 这种密码最终是要人抄给 / 念给用户的，
+ * 歧义字符只会制造「我明明输对了却登不上」的工单。
+ *
+ * 符号只取键盘上不切输入法就能敲出来的那批，且不含引号 / 反斜杠 / 空格：
+ * 这些字符在聊天窗口、表格、命令行里粘贴时容易被转义、被吃掉或者被当成参数分隔符，
+ * 而管理员最终多半就是通过聊天把密码发给用户的。
+ *
+ * 用 crypto 而不是 Math.random：后者在部分环境可预测，没必要留这个口子
+ * （crypto.getRandomValues 在 http 页面也能用，只有 crypto.subtle 才要 HTTPS）。
+ */
+function randomPassword(len = 16) {
+  const lower = 'abcdefghijkmnpqrstuvwxyz'; // 去 l、o
+  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // 去 I、O
+  const digit = '23456789'; // 去 0、1
+  const symbol = '!@#$%^&*()-_=+'; // 常用且不需要转义的符号
+  const all = lower + upper + digit + symbol;
+  const rnd = (n) =>
+    window.crypto && window.crypto.getRandomValues
+      ? window.crypto.getRandomValues(new Uint32Array(1))[0] % n
+      : Math.floor(Math.random() * n);
+  const pick = (set) => set[rnd(set.length)];
+  // 先各塞一个，保证四类字符都有（有些地方会校验「必须含符号 / 数字」）；再随机补齐
+  const chars = [pick(lower), pick(upper), pick(digit), pick(symbol)];
+  while (chars.length < len) chars.push(pick(all));
+  // 打乱：不然前四位的类别是固定的，一眼就能看出规律
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = rnd(i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join('');
+}
+
+/**
+ * 密码框旁边的「生成」按钮（data-gen-pass 指向要填的输入框）。
+ *
+ * 建号时最常做的事就是编一个能发给用户的密码：手搓容易弱、容易跟别的号撞车，
+ * 还容易忘了自己刚编的是什么。这里一步到位 —— 生成、填进框、复制到剪贴板，
+ * 并且把明文亮出来（生成出来就是要转发的，藏在圆点后面没意义）。
+ */
+function bindPasswordGen(scope) {
+  if (!scope || scope.dataset.genBound === '1') return;
+  scope.dataset.genBound = '1';
+  scope.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-gen-pass]');
+    if (!btn) return;
+    const input = $(btn.dataset.genPass, scope);
+    if (!input) return;
+    const pw = randomPassword();
+    input.value = pw;
+    // 通知一下（将来若有实时校验/字数统计，能跟着更新）
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    if (window.NPPw) window.NPPw.reveal(input);
+    input.focus();
+    copyText(pw, `已生成 ${pw.length} 位随机密码并复制`);
+  });
 }
 
 function bindUserForm(mask) {
@@ -362,21 +429,24 @@ function bindUserForm(mask) {
   quota.addEventListener('input', syncUsed);
   if (used) used.addEventListener('input', syncUsed);
   sync();
+  bindPasswordGen(mask);
 }
 
 function readUserForm(mask) {
-  const usedVal = $('#f-used', mask) ? $('#f-used', mask).value : '';
-  const emailEl = $('#f-email', mask);
-  return {
-    name: $('#f-name', mask).value.trim(),
-    planId: $('#f-plan', mask).value || null,
-    quotaGB: Number($('#f-quota', mask).value) || 0,
-    expireAt: $('#f-expire', mask).value ? new Date($('#f-expire', mask).value + 'T23:59:59').toISOString() : null,
-    usedGB: usedVal === '' ? undefined : Number(usedVal),
-    note: $('#f-note', mask).value.trim(),
-    email: emailEl ? emailEl.value.trim() : '',
-    enabled: $('#f-enabled', mask).checked,
-  };
+   const usedVal = $('#f-used', mask) ? $('#f-used', mask).value : '';
+   const passwordEl = $('#f-password', mask);
+   const payload = {
+     name: $('#f-name', mask).value.trim(),
+     planId: $('#f-plan', mask).value || null,
+     quotaGB: Number($('#f-quota', mask).value) || 0,
+     expireAt: $('#f-expire', mask).value ? new Date($('#f-expire', mask).value + 'T23:59:59').toISOString() : null,
+     usedGB: usedVal === '' ? undefined : Number(usedVal),
+     note: $('#f-note', mask).value.trim(),
+     enabled: $('#f-enabled', mask).checked,
+   };
+   // 密码：新增必填（订阅页一律先登录）；编辑留空 = 不修改
+   if (passwordEl && passwordEl.value) payload.password = passwordEl.value;
+   return payload;
 }
 
 async function createUserFlow(template) {
@@ -388,6 +458,7 @@ async function createUserFlow(template) {
     onOk: async (m) => {
       const payload = readUserForm(m);
       if (!payload.name) throw new Error('请填写用户名称');
+      if (!payload.password || payload.password.length < 6) throw new Error('请设置登录密码（至少 6 位，订阅页登录用）');
       await api('/api/users', { method: 'POST', body: JSON.stringify(payload) });
       toast(copy ? '用户已复制（订阅地址是新的）' : '用户已创建', 'ok');
       render();
@@ -554,6 +625,14 @@ function bulkFormHtml() {
         <input type="text" id="b-note" placeholder="如：Q4 批次 / 群友">
       </div>
     </div>
+    <div class="field">
+      <label>统一初始密码（订阅页登录用）</label>
+      <div class="pw-row">
+        <input type="password" id="b-password" placeholder="至少 6 位，本批所有账号共用" autocomplete="new-password">
+        <button class="btn" type="button" data-gen-pass="#b-password" title="生成 16 位随机密码并复制">生成</button>
+      </div>
+      <div class="hint">本批所有账号的初始登录密码，发放订阅链接时一并告知用户；之后可在「编辑」里逐个改</div>
+    </div>
     <p class="hint" style="margin:0">创建后每个用户都会拿到独立的 UUID 与订阅链接，建完可以一键复制全部链接。</p>`;
 }
 
@@ -568,7 +647,11 @@ function bulkCreateFlow() {
       const payload = {
         planId: $('#b-plan', m).value || null,
         note: $('#b-note', m).value.trim(),
+        password: $('#b-password', m).value,
       };
+      if (!payload.password || payload.password.length < 6) {
+        throw new Error('请填写统一的初始登录密码（至少 6 位）');
+      }
       if (mode === 'names') {
         payload.names = $('#b-names', m).value;
         if (!String(payload.names).trim()) throw new Error('请粘贴名单，一行一个名字');
@@ -608,6 +691,7 @@ function bulkCreateFlow() {
     $(sel, mask).addEventListener('input', paintPreview),
   );
   paintPreview();
+  bindPasswordGen(mask);
 }
 
 /** 建号结果：一次性把链接摊开，支持整段复制发给别人 */

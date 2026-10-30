@@ -1,35 +1,35 @@
 {
   "items": [
     {
-      "id": 9,
-      "at": "2026-10-29T09:49:38.754Z",
+      "id": 7,
+      "at": "2026-10-30T07:02:42.749Z",
       "actor": "admin",
       "action": "backup.create",
-      "target": "panel-manual-20261029-094938.db",
+      "target": "panel-manual-20261030-070242.db",
       "detail": "4220 KB",
       "ip": "127.0.0.1"
     },
     {
-      "id": 8,
-      "at": "2026-10-29T09:49:38.720Z",
-      "actor": "admin",
-      "action": "settings.update",
-      "target": "站点设置",
-      "detail": "改公告",
-      "ip": "127.0.0.1"
-    },
-    {
-      "id": 7,
-      "at": "2026-10-29T09:49:38.716Z",
-      "actor": "admin",
-      "action": "settings.update",
-      "target": "站点设置",
-      "detail": "改公告",
-      "ip": "127.0.0.1"
-    },
-    {
       "id": 6,
-      "at": "2026-10-29T09:49:38.686Z",
+      "at": "2026-10-30T07:02:42.714Z",
+      "actor": "admin",
+      "action": "settings.update",
+      "target": "站点设置",
+      "detail": "改公告",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 5,
+      "at": "2026-10-30T07:02:42.698Z",
+      "actor": "admin",
+      "action": "settings.update",
+      "target": "站点设置",
+      "detail": "改公告",
+      "ip": "127.0.0.1"
+    },
+    {
+      "id": 4,
+      "at": "2026-10-30T07:02:42.666Z",
       "actor": "admin",
       "action": "user.rotate",
       "target": "林小满",
@@ -37,26 +37,8 @@
       "ip": "127.0.0.1"
     },
     {
-      "id": 5,
-      "at": "2026-10-29T09:49:38.659Z",
-      "actor": "admin",
-      "action": "user.delete",
-      "target": "临时账号",
-      "detail": "",
-      "ip": "127.0.0.1"
-    },
-    {
-      "id": 4,
-      "at": "2026-10-29T09:49:38.656Z",
-      "actor": "admin",
-      "action": "user.create",
-      "target": "临时账号",
-      "detail": "不限套餐",
-      "ip": "127.0.0.1"
-    },
-    {
       "id": 3,
-      "at": "2026-10-29T09:49:38.639Z",
+      "at": "2026-10-30T07:02:42.636Z",
       "actor": "admin",
       "action": "plan.delete",
       "target": "临时套餐",
@@ -65,7 +47,7 @@
     },
     {
       "id": 2,
-      "at": "2026-10-29T09:49:38.620Z",
+      "at": "2026-10-30T07:02:42.631Z",
       "actor": "admin",
       "action": "plan.create",
       "target": "临时套餐",
@@ -74,7 +56,7 @@
     },
     {
       "id": 1,
-      "at": "2026-10-29T09:49:38.603Z",
+      "at": "2026-10-30T07:02:42.610Z",
       "actor": "admin",
       "action": "login.success",
       "target": "admin",
@@ -82,7 +64,7 @@
       "ip": "127.0.0.1"
     }
   ],
-  "total": 9,
+  "total": 7,
   "keep": 2000,
   "groups": [
     {

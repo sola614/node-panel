@@ -1,6 +1,6 @@
 {
   "name": "node-panel",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "private": false,
   "description": "轻量节点管理面板：用户 / 节点 / 服务器 + 订阅与流量配额",
   "keywords": [
@@ -22,6 +22,7 @@
     "test:agent": "node test/agent.js",
     "test:cert": "node test/cert.js",
     "test:hosts": "node test/hosts.js",
+    "test:qrcode": "node test/qrcode.js",
     "test:ui": "node test/ui.js",
     "test:browser": "node test/browser.js"
   },
@@ -29,8 +30,8 @@
     "node": ">=22.13"
   },
   "devDependencies": {
-    "jsdom": "^30.1.0"
+    "jsdom": "^30.1.0",
+    "jsqr": "^1.4.0"
   },
-  "dependencies": {},
   "license": "MIT"
 }

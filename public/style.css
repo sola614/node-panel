@@ -258,6 +258,43 @@ select { cursor: pointer; appearance: none; background-image: linear-gradient(45
 
 .hint { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
 
+/* --------------------------- 密码框的小眼睛（pw.js） ---------------------------
+ * pw.js 会把每个 input[type=password] 包进 .pw-wrap 并追加一个 .pw-eye 按钮。
+ * 这里只管排版：颜色全走变量，日夜模式自动跟随，不用 pw.js 关心主题。
+ */
+.pw-wrap { position: relative; display: block; }
+/* 右侧留出眼睛的位置，否则长密码会压在图标底下 */
+.pw-wrap > input { padding-right: 38px; }
+
+.pw-eye {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  transform: translateY(-50%);
+  width: 27px;
+  height: 27px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+.pw-eye:hover { color: var(--text); background: var(--tint-3); }
+.pw-eye:active { transform: translateY(-50%) scale(0.94); }
+.pw-eye:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(76, 141, 255, 0.5); }
+.pw-eye svg { width: 16px; height: 16px; display: block; }
+
+/* 密码框 + 右侧按钮（「生成」）并排：pw.js 会把 input 包进 .pw-wrap，
+   所以两条选择器都要给 flex —— 包裹前是 input，包裹后是 .pw-wrap */
+.pw-row { display: flex; align-items: stretch; gap: 8px; }
+.pw-row > input,
+.pw-row > .pw-wrap { flex: 1; min-width: 0; }
+.pw-row > .btn { flex-shrink: 0; }
+
 /* ------------------------------- 按钮 --------------------------------- */
 
 .btn {
@@ -1241,6 +1278,9 @@ input[readonly]:focus { border-color: var(--line); box-shadow: none; }
   .modal { max-height: 92vh; }
   .sub-wrap { padding: 18px 14px 40px; }
   .ring-wrap { gap: 18px; }
+  /* 订阅页头部多了「退出登录」，窄屏放不下时整组换行，别把站点名压扁 */
+  .sub-head { flex-wrap: wrap; }
+  .sub-head-right { flex-wrap: wrap; justify-content: flex-end; }
 }
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }
