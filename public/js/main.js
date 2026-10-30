@@ -974,15 +974,21 @@ async function runAction(act, btn, id) {
       setTimeout(() => logoutLocal(true), 800);
       break;
     }
-    case 'totp-setup': {
+     case 'totp-setup': {
       const r = await api('/api/admin/totp/setup', { method: 'POST', body: '{}' });
       const secretGrouped = (r.secret || '').replace(/(.{4})/g, '$1 ').trim();
       openModal({
         title: '开启二步验证',
         body: `
           <div class="alert alert-warn" style="margin:0 0 14px">
-            在认证器（Google Authenticator / Aegis / 1Password 等）里「添加账号 → 输入设置密钥」，粘贴下面的密钥，账号名随意。
+            用认证器（Google Authenticator / Aegis / 1Password 等）<b>扫描下方二维码</b>；
+            认证器不支持扫码时，用「添加账号 → 输入设置密钥」粘贴密钥。
           </div>
+          ${r.qrSvg
+            ? `<div style="display:flex;justify-content:center;padding:8px;background:var(--card,#fff);border-radius:8px;border:1px solid var(--line-soft)">
+                 <div style="width:200px;height:200px">${r.qrSvg.replace('<svg ', '<svg style="width:100%;height:100%" ')}</div>
+               </div>`
+            : '<div class="alert alert-warn" style="margin:0 0 14px">二维码生成失败（内容过长），请用下面的密钥手动输入。</div>'}
           <div class="field">
             <label>密钥（Base32，${r.expiresInMin || 10} 分钟内有效）</label>
             <div class="code-wrap">

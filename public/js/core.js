@@ -220,18 +220,31 @@ function toast(msg, type = '') {
   }, 2400);
 }
 
-async function copyText(text) {
+/**
+ * 复制到剪贴板。
+ *
+ * navigator.clipboard 只在安全上下文（HTTPS / localhost）里存在 —— 面板大量跑在
+ * 「http://服务器IP:8080」这种场景，所以必须有 execCommand 这条退路；两条都失败时
+ * 如实告诉用户「手动选中复制」，而不是假装复制成功。
+ */
+async function copyText(text, okMsg = '已复制到剪贴板') {
+  let copied = false;
   try {
     await navigator.clipboard.writeText(text);
+    copied = true;
   } catch {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      copied = document.execCommand('copy') !== false;
+      ta.remove();
+    } catch {
+      copied = false;
+    }
   }
-  toast('已复制到剪贴板', 'ok');
+  toast(copied ? okMsg : '复制失败，请手动选中复制', copied ? 'ok' : 'err');
 }
 
 /* ============================== 加载态控制 ============================== */

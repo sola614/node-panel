@@ -107,6 +107,12 @@ function formPage(info) {
                  placeholder="用来在面板里标识你，之后也能找管理员改" spellcheck="false">
           <div class="field-err" id="c-err" hidden></div>
         </div>
+        <div class="field">
+          <label>设置登录密码</label>
+          <input type="password" id="c-password" maxlength="64" autocomplete="new-password"
+                 placeholder="至少 6 位，打开订阅页时要用">
+          <div class="field-err" id="c-pw-err" hidden></div>
+        </div>
         <button class="btn btn-primary btn-block" type="submit" style="padding:11px">领取并生成订阅</button>
       </form>
 
@@ -130,14 +136,22 @@ function formPage(info) {
     e.preventDefault();
     const btn = form.querySelector('button[type=submit]');
     const name = document.getElementById('c-name').value.trim();
+    const password = document.getElementById('c-password').value;
     const errBox = document.getElementById('c-err');
+    const pwErrBox = document.getElementById('c-pw-err');
+    errBox.hidden = true;
+    pwErrBox.hidden = true;
 
     if (!name) {
       errBox.hidden = false;
       errBox.textContent = '请先填一个名字';
       return;
     }
-    errBox.hidden = true;
+    if (!password || password.length < 6) {
+      pwErrBox.hidden = false;
+      pwErrBox.textContent = '请设置登录密码（至少 6 位）';
+      return;
+    }
 
     btn.disabled = true;
     const old = btn.textContent;
@@ -146,7 +160,7 @@ function formPage(info) {
       const res = await fetch('/api/invite/' + encodeURIComponent(code) + '/claim', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, password }),
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(d.error || `领取失败 (${res.status})`);
@@ -155,6 +169,9 @@ function formPage(info) {
       if (/名字已经有人用/.test(err.message)) {
         errBox.hidden = false;
         errBox.textContent = err.message;
+      } else if (/登录密码/.test(err.message)) {
+        pwErrBox.hidden = false;
+        pwErrBox.textContent = err.message;
       } else {
         toast(err.message, 'err');
       }

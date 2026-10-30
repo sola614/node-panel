@@ -17,47 +17,47 @@
   },
   "traffic": {
     "usedBytes": 60022167961,
-    "todayBytes": 17357486590,
+    "todayBytes": 20942479428,
     "days": [
       {
-        "date": "2026-10-23",
-        "bytes": 22589840725
-      },
-      {
         "date": "2026-10-24",
-        "bytes": 18611621046
+        "bytes": 26869399999
       },
       {
         "date": "2026-10-25",
-        "bytes": 23236909763
+        "bytes": 36278685832
       },
       {
         "date": "2026-10-26",
-        "bytes": 25367105658
+        "bytes": 26587645433
       },
       {
         "date": "2026-10-27",
-        "bytes": 16647173476
+        "bytes": 26717700337
       },
       {
         "date": "2026-10-28",
-        "bytes": 32719565487
+        "bytes": 28351148350
       },
       {
         "date": "2026-10-29",
-        "bytes": 17357486590
+        "bytes": 33987772875
+      },
+      {
+        "date": "2026-10-30",
+        "bytes": 20942479428
       }
     ]
   },
   "servers": [
     {
-      "id": "7508fafdfd5f",
+      "id": "08702f4fdb53",
       "name": "香港-01",
       "host": "",
-      "token": "509b54024ff9e6ab5592bcde4292e83160908702",
+      "token": "2e76167ab0d2995a2555647dbb85524b24101603",
       "note": "CN2 GIA · 1Gbps",
-      "createdAt": "2026-10-17T09:49:34.012Z",
-      "lastSeen": "2026-10-29T09:48:49.012Z",
+      "createdAt": "2026-10-18T07:02:37.464Z",
+      "lastSeen": "2026-10-30T07:01:52.464Z",
       "agentVersion": "2.1.0",
       "ipMode": "auto",
       "reportedIp": "203.0.113.10",
@@ -65,12 +65,12 @@
       "nodeCount": 2
     },
     {
-      "id": "4c9304e0d9c6",
+      "id": "e12274b5ed0c",
       "name": "东京-01",
       "host": "jp1.example.com",
-      "token": "e4be82dd730de3716a7288a0095817acb3876269",
+      "token": "7b342d57375ec4f93a338b0bfae7a373483508b9",
       "note": "IIJ · 500Mbps",
-      "createdAt": "2026-10-23T09:49:34.012Z",
+      "createdAt": "2026-10-24T07:02:37.464Z",
       "lastSeen": null,
       "agentVersion": null,
       "ipMode": "manual",
@@ -81,18 +81,19 @@
   ],
   "topUsers": [
     {
-      "id": "2ef01ef566ae",
-      "uuid": "a32191c1-0d07-42db-a24e-7c179f21812f",
-      "token": "56ad020160fc07d67bc4dc2b960c1311",
+      "id": "0a24b6b77b5f",
+      "uuid": "24176be9-0652-4ac9-86ba-cb7da73cbeb7",
+      "token": "93cd11bf0686fabac3d0c7f7b4c5cb18",
       "enabled": true,
-      "planId": "db1b7a6e393f",
+      "planId": "17077306b9a1",
       "quotaGB": 200,
       "usedBytes": 35003983462,
-      "expireAt": "2026-11-28T09:49:34.015Z",
+      "expireAt": "2026-11-29T07:02:37.668Z",
       "note": "年付 · 旗舰版",
-      "createdAt": "2026-10-29T09:49:34.015Z",
+      "createdAt": "2026-10-30T07:02:37.668Z",
       "name": "林小满",
-      "cycleStartAt": "2026-10-29T09:49:34.015Z",
+      "cycleStartAt": "2026-10-30T07:02:37.668Z",
+      "hasPassword": true,
       "quotaBytes": 214748364800,
       "status": "active",
       "statusLabel": "正常",
@@ -107,18 +108,19 @@
       "renewCount": 0
     },
     {
-      "id": "6d0e7c099499",
-      "uuid": "3ae679f3-d595-4fb5-b9cb-92523f361923",
-      "token": "8c63bcb726c194f21306bc389a30eeb1",
+      "id": "2b128b483433",
+      "uuid": "07f0d61f-5ce2-47e1-a94b-6c8218ed5cbc",
+      "token": "2e2feff11fc254ea02d33de7095a8295",
       "enabled": true,
-      "planId": "133d37e3b257",
+      "planId": "417315a47005",
       "quotaGB": 100,
       "usedBytes": 12992276070,
-      "expireAt": "2026-11-28T09:49:34.015Z",
+      "expireAt": "2026-11-29T07:02:37.754Z",
       "note": "标准版",
-      "createdAt": "2026-10-29T09:49:34.015Z",
+      "createdAt": "2026-10-30T07:02:37.754Z",
       "name": "陈拓",
-      "cycleStartAt": "2026-10-29T09:49:34.015Z",
+      "cycleStartAt": "2026-10-30T07:02:37.754Z",
+      "hasPassword": true,
       "quotaBytes": 107374182400,
       "status": "active",
       "statusLabel": "正常",
@@ -133,18 +135,19 @@
       "renewCount": 0
     },
     {
-      "id": "32db739a408d",
-      "uuid": "97e3ce65-4bf4-4f80-a98c-e0cee1a1691f",
-      "token": "132383af2d18c84d54b46924297b065c",
+      "id": "89d73d9c261c",
+      "uuid": "888ce198-c2ab-4ff1-8f4b-6ee6aaf8985f",
+      "token": "2ad072ee205d74f9300b3d4c4499b093",
       "enabled": true,
-      "planId": "27c88ccdd583",
+      "planId": "a2d46b867a6d",
       "quotaGB": 10,
       "usedBytes": 11596411699,
-      "expireAt": "2026-11-28T09:49:34.015Z",
+      "expireAt": "2026-11-29T07:02:37.845Z",
       "note": "已超限，自动停用",
-      "createdAt": "2026-10-29T09:49:34.015Z",
+      "createdAt": "2026-10-30T07:02:37.845Z",
       "name": "周野",
-      "cycleStartAt": "2026-10-29T09:49:34.015Z",
+      "cycleStartAt": "2026-10-30T07:02:37.845Z",
+      "hasPassword": true,
       "quotaBytes": 10737418240,
       "status": "over",
       "statusLabel": "超量",
@@ -159,17 +162,18 @@
       "renewCount": 0
     },
     {
-      "id": "dd2c6eceb294",
-      "uuid": "f86bb004-bbe1-426e-a37c-fedb505a825c",
-      "token": "7abf578c8205b83cff89b52ea33a3d17",
+      "id": "c9d53f0d5045",
+      "uuid": "efab661a-13c8-4320-94c5-33028a73dafb",
+      "token": "1c65c8acc41c2e6ea7f97858790e63fd",
       "enabled": true,
       "planId": null,
       "quotaGB": 5,
       "usedBytes": 429496730,
-      "expireAt": "2026-11-01T09:49:34.015Z",
+      "expireAt": "2026-11-02T07:02:37.845Z",
       "note": "不限套餐",
-      "createdAt": "2026-10-29T09:49:34.015Z",
+      "createdAt": "2026-10-30T07:02:37.937Z",
       "name": "测试号",
+      "hasPassword": true,
       "quotaBytes": 5368709120,
       "status": "active",
       "statusLabel": "正常",
@@ -184,18 +188,19 @@
       "renewCount": 0
     },
     {
-      "id": "738ecd0ff81c",
-      "uuid": "215a0869-55c3-445f-ab84-411cf35f6341",
-      "token": "f197c3253b48332978130f8bf6532b9f",
+      "id": "f8b6ab6581d9",
+      "uuid": "f40e4f2f-de8d-4cb7-94ca-8cca13f4feb0",
+      "token": "6558af408826c6156b1c4a5d97095cf8",
       "enabled": true,
       "planId": null,
       "quotaGB": 0,
       "usedBytes": 0,
       "expireAt": null,
       "note": "默认管理员账号",
-      "createdAt": "2026-10-29T09:49:34.015Z",
+      "createdAt": "2026-10-30T07:02:37.572Z",
       "name": "admin",
       "isAdmin": true,
+      "hasPassword": true,
       "quotaBytes": 0,
       "status": "active",
       "statusLabel": "正常",
@@ -212,18 +217,19 @@
   ],
   "alerts": [
     {
-      "id": "32db739a408d",
-      "uuid": "97e3ce65-4bf4-4f80-a98c-e0cee1a1691f",
-      "token": "132383af2d18c84d54b46924297b065c",
+      "id": "89d73d9c261c",
+      "uuid": "888ce198-c2ab-4ff1-8f4b-6ee6aaf8985f",
+      "token": "2ad072ee205d74f9300b3d4c4499b093",
       "enabled": true,
-      "planId": "27c88ccdd583",
+      "planId": "a2d46b867a6d",
       "quotaGB": 10,
       "usedBytes": 11596411699,
-      "expireAt": "2026-11-28T09:49:34.015Z",
+      "expireAt": "2026-11-29T07:02:37.845Z",
       "note": "已超限，自动停用",
-      "createdAt": "2026-10-29T09:49:34.015Z",
+      "createdAt": "2026-10-30T07:02:37.845Z",
       "name": "周野",
-      "cycleStartAt": "2026-10-29T09:49:34.015Z",
+      "cycleStartAt": "2026-10-30T07:02:37.845Z",
+      "hasPassword": true,
       "quotaBytes": 10737418240,
       "status": "over",
       "statusLabel": "超量",
