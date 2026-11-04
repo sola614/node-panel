@@ -41,6 +41,10 @@ const HOST = process.env.HOST || '0.0.0.0';
 const TLS_PORT = Number(process.env.PANEL_TLS_PORT || 8443);
 const TLS_CERT_FILE = process.env.PANEL_TLS_CERT || '';
 const TLS_KEY_FILE = process.env.PANEL_TLS_KEY || '';
+// 纯 HTTPS 部署时关掉明文 HTTP 监听（反代 / 面板自带 HTTPS 都已在前面挡着）。
+// 只在「HTTPS 确实起来了」时才真正跳过 8080：否则面板会把自己关在门外 ——
+// 没有任何监听就没有任何入口，连改配置的界面都打不开。
+const HTTP_DISABLE = /^(1|true|yes|on)$/i.test(String(process.env.PANEL_HTTP_DISABLE || ''));
 // 超过这个耗时记一条 warn：慢请求往往是被忽略的性能问题的最早信号
 const SLOW_MS = Number(process.env.PANEL_SLOW_MS || 1000);
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -4249,6 +4253,10 @@ function getSettings(req, res) {
     httpsActive: httpsReady,
     httpsError,
     httpsPort: TLS_PORT,
+    // 当前证书来自哪儿：环境变量证书会压过设置里的选择，前端要能说清
+    // 「为什么我把下拉框改成不启用，HTTPS 还开着」
+    httpsSource: (httpsCreds && httpsCreds.source) || '',
+    httpsFromEnv: !!(TLS_CERT_FILE && TLS_KEY_FILE),
   });
 }
 
@@ -4285,6 +4293,23 @@ function updateSettings(req, res, params, body) {
   s.subBase = nextSubBase;
   if (httpsChanged) s.httpsCertId = nextCertId;
 
+  // 订阅显示：命名模板 + 首行信息节点。模板长度设上限 —— 它会被拼进
+  // 每个节点的名字里，几百字的长模板能把客户端列表撑爆。
+  let subDisplayChanged = false;
+  if (body.nameTplDirect !== undefined) {
+    s.nameTplDirect = String(body.nameTplDirect).trim().slice(0, 80);
+    subDisplayChanged = true;
+  }
+  if (body.nameTplRelay !== undefined) {
+    s.nameTplRelay = String(body.nameTplRelay).trim().slice(0, 80);
+    subDisplayChanged = true;
+  }
+  if (body.subInfoNode !== undefined) {
+    s.subInfoNode = body.subInfoNode ? '1' : '0';
+    subDisplayChanged = true;
+  }
+  if (subDisplayChanged) applySubNameTemplates();
+
   store.save();
   if (httpsChanged) {
     try {
@@ -4299,8 +4324,17 @@ function updateSettings(req, res, params, body) {
     body.siteName !== undefined ? '改名' : '',
     body.subBase !== undefined ? `订阅域名 ${s.subBase || '(自动)'}` : '',
     body.notice !== undefined ? '改公告' : '',
+    body.nameTplDirect !== undefined || body.nameTplRelay !== undefined ? '改节点命名' : '',
+    body.subInfoNode !== undefined ? `订阅首行流量 ${s.subInfoNode === '1' ? '开' : '关'}` : '',
   ].filter(Boolean).join(' · '));
-  sendJson(res, 200, { ok: true, settings: s, httpsActive: httpsReady, httpsError });
+  sendJson(res, 200, {
+    ok: true,
+    settings: s,
+    httpsActive: httpsReady,
+    httpsError,
+    httpsSource: (httpsCreds && httpsCreds.source) || '',
+    httpsFromEnv: !!(TLS_CERT_FILE && TLS_KEY_FILE),
+  });
 }
 
 /* -------------------------------- 消息通知 -------------------------------- */
@@ -4858,7 +4892,12 @@ function subApi(req, res, params, body, session, ctx) {
   // 无密码账号（老库升级的遗留态）也被拦：hasPassword=false 让前端渲染
   // 「联系管理员设置密码」而不是登录表单 —— 没有密码可输，登录必然失败。
   // 默认管理员用户例外：它的密码由 subPasswordHash 从面板 admin 账号取，所以照常给表单
-  if (!subSessionUser(ctx.req, user)) {
+  //
+  // 例外：**带着有效管理台会话**直接放行。从面板用户列表点「打开」的必然是管理员，
+  // 而管理员在那一页本来就能看到订阅地址，再让他输一遍用户的密码纯属重复劳动。
+  const subSess = subSessionUser(ctx.req, user);
+  const adminSess = subSess ? null : getSession(ctx.req);
+  if (!subSess && !adminSess) {
     const hash = subPasswordHash(user);
     return sendJson(res, 401, {
       error: hash ? '请先登录' : '该账号未设置登录密码，请联系管理员设置后再访问',
@@ -4866,7 +4905,11 @@ function subApi(req, res, params, body, session, ctx) {
       hasPassword: !!hash,
     });
   }
-  sendJson(res, 200, subscriptionPayload(user, ctx.req));
+  const payload = subscriptionPayload(user, ctx.req);
+  // 前端据此显示「管理员预览」角标并隐藏「退出登录」（管理台会话不是订阅会话，
+  // 点退出只会清掉用户的登录态，容易让人误解）
+  if (adminSess) payload.adminView = true;
+  sendJson(res, 200, payload);
 }
 
 /* ------------------- 订阅页登录 + 自助重置订阅链接（0.1.16） ------------------- */
@@ -4877,14 +4920,16 @@ function subApi(req, res, params, body, session, ctx) {
  * 旧链接即刻失效）—— 取代最初的「邮箱 + 验证码」方案（要管理员维护邮箱、
  * 面板配邮件渠道，链路太长）。
  *
- * 登录态是内存 session（随机 token → userId，默认 7 天）：绑定 userId 而不是
+ * 登录态是内存 session（随机 token → userId，默认 30 分钟）：绑定 userId 而不是
  * 订阅 token，重置换发新链接后会话仍然有效，页面跳转到新地址无需重新登录。
  * 未设密码的用户保持免登录的旧行为 —— 密码本身就是管理员决定「要不要启用
  * 订阅页登录」的开关。默认管理员用户（isAdmin）不单独存密码，走 subPasswordHash
  * 复用面板管理密码；它进不了管理台，因为管理台登录校验的是 admin 表那一对。
  */
 const subSessions = new Map(); // sessionToken → { userId, expires }
-const SUB_SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
+// 30 分钟：订阅页是个「偶尔打开看一眼」的页面，长期挂着登录态只会放大
+// 共享设备 / 链接被截图抄走的风险。过期后重输一次密码即可。
+const SUB_SESSION_TTL = 30 * 60 * 1000;
 const SUB_LOGIN_MAX_FAIL = 5;
 const SUB_LOGIN_LOCK_MS = 10 * 60 * 1000;
 const subLoginFails = new Map(); // userId → { count, firstAt }
@@ -4963,20 +5008,29 @@ function subReset(req, res, params, body, session, ctx) {
   if (!user) return sendJson(res, 404, { error: '订阅不存在或已被重置' });
   // 停用账号不发新凭证
   if (!user.enabled) return sendJson(res, 400, { error: '账号已停用，请联系管理员' });
-  // 未设密码的用户没有「登录」概念，无从校验身份，不提供自助重置
-  if (!subPasswordHash(user)) {
-    return sendJson(res, 400, { error: '该账号未设置登录密码，无法自助重置，请联系管理员' });
-  }
-  // 唯一凭证：属于这个用户的有效登录会话 —— 登录成功即可重置
-  if (!subSessionUser(ctx.req, user)) {
-    return sendJson(res, 401, { error: '请先登录', loginRequired: true });
+
+  // 管理员走管理台会话即可重置（不受「该账号没密码」限制 —— 没密码的账号
+  // 恰恰更需要管理员帮忙换链接）。普通用户仍要求「登录成功」这一道凭证。
+  const adminSess = getSession(ctx.req);
+  if (!adminSess) {
+    // 未设密码的用户没有「登录」概念，无从校验身份，不提供自助重置
+    if (!subPasswordHash(user)) {
+      return sendJson(res, 400, { error: '该账号未设置登录密码，无法自助重置，请联系管理员' });
+    }
+    if (!subSessionUser(ctx.req, user)) {
+      return sendJson(res, 401, { error: '请先登录', loginRequired: true });
+    }
   }
 
   const oldToken = user.token;
   user.token = store.rnd(16);
   user.uuid = store.newUuid();
   store.save();
-  auditAction('user.selfrotate', user.name, '订阅页登录后自助重置订阅链接');
+  auditAction(
+    'user.selfrotate',
+    user.name,
+    adminSess ? '管理员在订阅页重置订阅链接' : '订阅页登录后自助重置订阅链接',
+  );
   logData.warn('订阅链接已自助重置', { rid: req.__rid, user: user.name, tokenFrom: oldToken.slice(0, 4) + '***' });
   sendJson(res, 200, { ok: true, subUrl: `${baseUrl(req)}/s/${user.token}` });
 }
@@ -4984,7 +5038,7 @@ function subReset(req, res, params, body, session, ctx) {
 /**
  * 订阅页「退出登录」：把服务端的会话也删掉。
  *
- * 只清 localStorage 是不够的 —— 会话是 7 天的内存 token，留在服务端就等于
+ * 只清 localStorage 是不够的 —— 会话是 30 分钟的内存 token，留在服务端就等于
  * 那把钥匙还在锁孔里；浏览器里删了副本，服务端照样认。所以两边一起清。
  * 幂等：没带 token / 带了个野 token 都返回 ok，前端不必为「退出失败」设计分支。
  */
@@ -4995,6 +5049,48 @@ function subLogout(req, res) {
   sendJson(res, 200, { ok: true });
 }
 
+/**
+ * 把设置里的命名模板同步给订阅生成器。
+ * lib/sub.js 是纯函数模块（不依赖 store），模板只能由调用方注入；
+ * 启动时和「设置」保存后各推一次即可。
+ */
+function applySubNameTemplates() {
+  const s = store.db().settings;
+  sub.setNameTemplates({ direct: s.nameTplDirect, relay: s.nameTplRelay });
+}
+
+/** 字节 → GB 文案，给订阅首行的信息节点用 */
+function fmtGB(bytes) {
+  const gb = Number(bytes) / store.GB;
+  if (!Number.isFinite(gb) || gb <= 0) return '0 GB';
+  if (gb >= 100) return `${Math.round(gb)} GB`;
+  if (gb >= 10) return `${gb.toFixed(1)} GB`;
+  return `${gb.toFixed(2)} GB`;
+}
+
+/**
+ * 订阅首行的「剩余流量 / 到期」文案。设置项 subInfoNode 关闭时返回空串，
+ * 此时三种订阅格式都不插信息节点（响应头 Subscription-Userinfo 照旧返回，
+ * 客户端自带的流量条不受影响）。
+ */
+function subInfoText(user) {
+  if (store.db().settings.subInfoNode !== '1') return '';
+  const pub = store.publicUser(user);
+  const parts = [];
+  if (pub.quotaBytes > 0) {
+    parts.push(`剩余 ${fmtGB(pub.remainingBytes)} / ${fmtGB(pub.quotaBytes)}`);
+  } else {
+    parts.push(`已用 ${fmtGB(pub.usedBytes)} · 不限量`);
+  }
+  if (pub.expireAt) {
+    const d = new Date(pub.expireAt);
+    parts.push(Number.isNaN(d.getTime()) ? '长期有效' : `到期 ${d.toISOString().slice(0, 10)}`);
+  } else {
+    parts.push('长期有效');
+  }
+  return parts.join(' · ');
+}
+
 function subPage(req, res, params, body, session, ctx) {
   const user = userByToken(params.token);
   const format = ctx.query.get('format');
@@ -5003,6 +5099,7 @@ function subPage(req, res, params, body, session, ctx) {
   if (!user) return sendText(res, 404, '订阅不存在或已被删除');
 
   const payload = subscriptionPayload(user, ctx.req);
+  const info = subInfoText(user);
 
   // 客户端靠这两个头实现「自动更新订阅」与「流量/到期显示」
   const userinfo = {
@@ -5013,7 +5110,7 @@ function subPage(req, res, params, body, session, ctx) {
   };
 
   if (format === 'base64' || format === 'v2ray' || format === 'txt') {
-    return sendText(res, 200, sub.toBase64Subscription(payload.links), 'text/plain; charset=utf-8', userinfo);
+    return sendText(res, 200, sub.toBase64Subscription(payload.links, info), 'text/plain; charset=utf-8', userinfo);
   }
 
   if (format === 'clash') {
@@ -5029,6 +5126,7 @@ function subPage(req, res, params, body, session, ctx) {
       db.settings.siteName,
       (n) => store.nodeUsableBy(n, user),
       (n, e) => store.planCovers(store.planOf(user), e.planIds),
+      { info },
     );
     return sendText(res, 200, yaml, 'text/yaml; charset=utf-8', {
       ...userinfo,
@@ -5050,6 +5148,7 @@ function subPage(req, res, params, body, session, ctx) {
       db.settings.siteName,
       (n) => store.nodeUsableBy(n, user),
       (n, e) => store.planCovers(store.planOf(user), e.planIds),
+      { info },
     );
     return sendText(res, 200, json, 'application/json; charset=utf-8', {
       ...userinfo,
@@ -5060,7 +5159,7 @@ function subPage(req, res, params, body, session, ctx) {
   if (format === 'json') return sendJson(res, 200, payload);
 
   if (!accept.includes('text/html')) {
-    return sendText(res, 200, sub.toBase64Subscription(payload.links), 'text/plain; charset=utf-8', userinfo);
+    return sendText(res, 200, sub.toBase64Subscription(payload.links, info), 'text/plain; charset=utf-8', userinfo);
   }
 
   return serveFile(res, path.join(PUBLIC_DIR, 'sub.html'));
@@ -5224,9 +5323,18 @@ async function requestHandler(req, res) {
          跳转页当正文处理，升级窗口期里整批节点会一起「掉线」。
          这些调用方要用 HTTPS，把机器上的 PANEL_URL / 订阅地址换成 https:// 即可；
        - PANEL_HTTP_REDIRECT=1 强制全路径跳转（纯 HTTPS 部署），=0 彻底关闭；
+         这个开关只对「面板自己就是边缘」的场景有效，反代后面同样被忽略（见下）；
        - 判据是 httpsReady（listen 成功）而不是 httpsServer（创建成功）——
-         端口被占时把浏览器跳到一个没有服务的死端口，比不跳转糟得多。 */
-    if (httpsReady && req.method === 'GET' && !req.socket.encrypted) {
+         端口被占时把浏览器跳到一个没有服务的死端口，比不跳转糟得多；
+       - 反代后面（带 X-Forwarded-Proto）一律不跳：TLS 是在 nginx / Caddy 那一层
+         终止的，回源到面板走的是明文 HTTP，此时若按「没加密」把浏览器 301 到
+         面板自己的 TLS 端口（默认 8443），就跳到一个对外通常没开的端口 ——
+         表现正是「访问域名却跳到 localhost:8443 打不开」。边缘那层的 80→443
+         跳转由反代自己负责，面板不该插手。 */
+    const fwdProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+    const behindProxy = fwdProto !== '';
+    const alreadySecure = !!req.socket.encrypted || fwdProto === 'https';
+    if (httpsReady && req.method === 'GET' && !alreadySecure && !behindProxy) {
       const mode = process.env.PANEL_HTTP_REDIRECT || '';
       const apiLike = pathname.startsWith('/api/') || pathname.startsWith('/s/') || pathname.startsWith('/i/');
       const browserLike = /text\/html/i.test(String(req.headers.accept || ''));
@@ -5235,7 +5343,10 @@ async function requestHandler(req, res) {
         const rawHost = String(req.headers.host || '').replace(/:\d+$/, '');
         const hostNoPort = isValidHost(rawHost) ? rawHost : 'localhost';
         const target = `https://${hostNoPort}${TLS_PORT === 443 ? '' : ':' + TLS_PORT}${req.url}`;
-        res.writeHead(301, { Location: target, 'Content-Length': '0' });
+        // 必须显式 no-store：301 默认是「永久缓存」，浏览器会把这个跳转记一辈子。
+        // 跳转目标是跟着运行时配置变的（TLS 端口、证书在不在），配置一改，
+        // 老访客的浏览器还在拿旧 Location 跳，表现就是「明明关了 HTTPS 还在跳」。
+        res.writeHead(301, { Location: target, 'Content-Length': '0', 'Cache-Control': 'no-store' });
         return res.end();
       }
     }
@@ -5353,7 +5464,15 @@ function resolveHttpsCreds() {
  * 坏 PEM（公私钥不配对 / 截断）时 createSecureContext 同步抛错，没有这层兜底的话
  * main() 里的 listen 根本执行不到，进程静默退出且退出码为 0。
  */
-function syncHttpsServer() {
+function syncHttpsServer(onSettled) {
+  // 启动期要等 TLS listen 的结论（成功才敢跳过 HTTP 监听），
+  // 所以每个出口都把结果回调出去；热加载 / 定时同步不传回调，行为不变。
+  const settle = (ok) => {
+    if (!onSettled) return;
+    try {
+      onSettled(ok);
+    } catch { /* 回调自己的异常不该影响监听状态 */ }
+  };
   let creds = null;
   try {
     creds = resolveHttpsCreds();
@@ -5370,6 +5489,7 @@ function syncHttpsServer() {
     httpsCreds = null;
     httpsReady = false;
     httpsError = '';
+    settle(false);
     return;
   }
 
@@ -5384,6 +5504,7 @@ function syncHttpsServer() {
       // 坏的新证书：沿用旧证书继续服务，等下一轮（续期后内容会再变）
       log.error('HTTPS 证书热加载失败，沿用旧证书', { err, source: creds.source });
     }
+    settle(true);
     return;
   }
 
@@ -5406,11 +5527,17 @@ function syncHttpsServer() {
           httpsServer = null;
           httpsCreds = null;
         }
+        settle(false);
+        // 纯 HTTPS 部署里 HTTPS 一掉就没入口了，必须把 HTTP 接回来兜底
+        restoreHttpIfNeeded();
       });
       s.listen(TLS_PORT, HOST, () => {
         httpsReady = true;
         httpsError = '';
         log.info('面板 HTTPS 已监听', { port: TLS_PORT, source: creds.source });
+        settle(true);
+        // 之前为兜底临时开过 HTTP 的话，现在按配置收回去
+        closeHttpIfNeeded();
       });
     } catch (err) {
       // createSecureContext 在这里同步抛错（坏 PEM / 公私钥不配对）
@@ -5435,6 +5562,8 @@ function main() {
     console.error(`✗ 启动失败：${err.message}\n`);
     process.exit(1);
   }
+  // 订阅命名模板要在任何一次订阅生成之前注入（lib/sub.js 不依赖 store）
+  applySubNameTemplates();
   // 出厂密码阶段：所有业务接口都返回 403，日志里先说清楚，免得别人以为面板坏了
   if (needsPasswordChange()) {
     log.warn('出厂默认密码未修改：业务接口已全部拦截', { admin: store.db().admin.username });
@@ -5487,6 +5616,65 @@ function main() {
     }
   }, 5 * 60 * 1000);
   httpsTimer.unref();
+  bootListen();
+}
+
+/* --------------------------- 监听启动 / 横幅 --------------------------- */
+
+/**
+ * 决定先起 HTTP 还是先起 HTTPS。
+ *
+ * 默认顺序是「HTTP 先 listen，再在回调里拉 HTTPS」—— HTTP 是保底入口，
+ * 任何启动期异常都不该挡在它前面。
+ *
+ * 但 PANEL_HTTP_DISABLE=1（纯 HTTPS 部署）要求反过来：必须先确认 HTTPS 真的
+ * listen 成功，才敢不监听 8080。否则证书坏了 / 端口被占，面板就成了一个
+ * 「没有任何入口」的进程 —— 连改配置的界面都打不开，只能进容器救。
+ */
+function bootListen() {
+  if (!HTTP_DISABLE) {
+    startHttp();
+    return;
+  }
+  let credsOk = false;
+  try {
+    credsOk = !!resolveHttpsCreds();
+  } catch { /* 证书读不了，按「不可用」处理 */ }
+  if (!credsOk) {
+    log.warn('PANEL_HTTP_DISABLE 已设置但没有可用证书，忽略该设置并继续监听 HTTP', { port: PORT });
+    startHttp();
+    return;
+  }
+  syncHttpsServer((ok) => {
+    if (ok) {
+      log.info('已按 PANEL_HTTP_DISABLE 跳过 HTTP 监听（纯 HTTPS 入口）', { tls: `${HOST}:${TLS_PORT}` });
+      printBanner();
+      return;
+    }
+    log.warn('PANEL_HTTP_DISABLE 已设置但 HTTPS 没能起来，已回退监听 HTTP', { port: PORT, err: httpsError });
+    startHttp();
+  });
+}
+
+/** HTTPS 掉线时把 HTTP 接回来：纯 HTTPS 部署最怕的不是降级，是彻底失联 */
+function restoreHttpIfNeeded() {
+  if (!HTTP_DISABLE || server.listening) return;
+  log.warn('HTTPS 掉线，临时恢复 HTTP 监听（不让 PANEL_HTTP_DISABLE 把面板关在门外）', {
+    port: PORT,
+    err: httpsError,
+  });
+  startHttp();
+}
+
+/** HTTPS 恢复后按配置收回 HTTP（幂等） */
+function closeHttpIfNeeded() {
+  if (!HTTP_DISABLE || !server.listening) return;
+  log.info('HTTPS 已恢复，按 PANEL_HTTP_DISABLE 关闭 HTTP 监听', { port: PORT });
+  server.close();
+}
+
+function startHttp() {
+  if (server.listening) return;
   server.listen(PORT, HOST, () => {
     try {
       syncHttpsServer();
@@ -5504,51 +5692,64 @@ function main() {
       nodes: store.db().nodes.length,
       servers: store.db().servers.length,
     });
-    const line = '─'.repeat(54);
-    const db = store.db();
-    console.log(`\n${line}`);
-    console.log(`  ${db.settings.siteName}   v${APP_VERSION}  (schema v${store.SCHEMA_VERSION})`);
-    console.log(`${line}`);
-    console.log(`  管理面板  http://localhost:${PORT}/`);
-    if (httpsReady) {
-      console.log(`  安全入口  https://localhost:${TLS_PORT}/  （来源：${httpsCreds.source}）`);
-    } else if (httpsServer) {
-      console.log(`  安全入口  HTTPS 正在启动（端口 ${TLS_PORT}），结果见日志`);
-    } else {
-      console.log('  安全入口  未启用 HTTPS（设置 → 面板 HTTPS，或 PANEL_TLS_CERT/PANEL_TLS_KEY）');
-    }
-    if (httpsError) console.log(`  HTTPS 异常  ${httpsError.slice(0, 80)}（面板以 HTTP 运行）`);
-    if (db.admin && db.admin.totpEnabled) console.log('  二步验证  已开启（登录需要密码 + 动态码）');
-    if (needsPasswordChange()) {
-      console.log(`  默认账号  ${db.admin.username} / ${store.DEFAULT_PASSWORD}   ⚠ 出厂密码，登录后必须先改掉`);
-    } else {
-      console.log(`  默认账号  ${db.admin.username}（密码已设置）`);
-    }
-    console.log(`  数据库    ${store.DB_FILE}（SQLite）`);
-    const adminUser = db.users.find((u) => u.isAdmin);
-    console.log(`  套餐 ${db.plans.length} 个 · 服务器 ${db.servers.length} 台 · 节点 ${db.nodes.length} 个 · 用户 ${db.users.length} 位`);
-    if (!db.plans.length && !db.servers.length && !db.nodes.length) {
-      console.log('  提示      空库启动：先在「服务器」页添加机器并执行部署命令');
-    }
-    if (adminUser) {
-      // 订阅链接里的 token 是凭证：默认只提示位置，需要完整链接时再开 debug
-      if (log.enabled('debug')) {
-        console.log(`  管理员自用订阅  http://localhost:${PORT}/s/${adminUser.token}（用户列表首行）`);
-      } else {
-        console.log('  管理员自用订阅  见用户列表首行（要在这里打印完整链接：PANEL_LOG_LEVEL=debug）');
-      }
-    }
-    const sample = db.users.find((u) => !u.isAdmin);
-    if (sample && log.enabled('debug')) {
-      console.log(`  示例订阅  http://localhost:${PORT}/s/${sample.token}`);
-    }
-    const ns = db.settings.notifyEnabled === '1';
-    const chCount = db.notify_channels.filter((c) => c.enabled).length;
-    console.log(
-      `  通知      ${ns ? `已开启，${chCount} 个渠道` : '未开启（设置 → 消息通知）'}`,
-    );
-    console.log(`${line}\n`);
+    printBanner();
   });
+}
+
+let bannerPrinted = false;
+
+/** 启动横幅：只打一次 —— HTTPS 掉线后重新接回 HTTP 时不该再刷一遍 */
+function printBanner() {
+  if (bannerPrinted) return;
+  bannerPrinted = true;
+  const line = '─'.repeat(54);
+  const db = store.db();
+  // HTTP 被禁用时本地地址要按 HTTPS 拼，否则横幅会印一个根本没在监听的端口
+  const baseLocal = server.listening ? `http://localhost:${PORT}` : `https://localhost:${TLS_PORT}`;
+  console.log(`\n${line}`);
+  console.log(`  ${db.settings.siteName}   v${APP_VERSION}  (schema v${store.SCHEMA_VERSION})`);
+  console.log(`${line}`);
+  if (server.listening) {
+    console.log(`  管理面板  ${baseLocal}/`);
+  } else {
+    console.log('  管理面板  HTTP 已禁用（PANEL_HTTP_DISABLE=1），仅 HTTPS 入口');
+  }
+  if (httpsReady) {
+    console.log(`  安全入口  https://localhost:${TLS_PORT}/  （来源：${httpsCreds.source}）`);
+  } else if (httpsServer) {
+    console.log(`  安全入口  HTTPS 正在启动（端口 ${TLS_PORT}），结果见日志`);
+  } else {
+    console.log('  安全入口  未启用 HTTPS（设置 → 面板 HTTPS，或 PANEL_TLS_CERT/PANEL_TLS_KEY）');
+  }
+  if (httpsError) console.log(`  HTTPS 异常  ${httpsError.slice(0, 80)}`);
+  if (db.admin && db.admin.totpEnabled) console.log('  二步验证  已开启（登录需要密码 + 动态码）');
+  if (needsPasswordChange()) {
+    console.log(`  默认账号  ${db.admin.username} / ${store.DEFAULT_PASSWORD}   ⚠ 出厂密码，登录后必须先改掉`);
+  } else {
+    console.log(`  默认账号  ${db.admin.username}（密码已设置）`);
+  }
+  console.log(`  数据库    ${store.DB_FILE}（SQLite）`);
+  const adminUser = db.users.find((u) => u.isAdmin);
+  console.log(`  套餐 ${db.plans.length} 个 · 服务器 ${db.servers.length} 台 · 节点 ${db.nodes.length} 个 · 用户 ${db.users.length} 位`);
+  if (!db.plans.length && !db.servers.length && !db.nodes.length) {
+    console.log('  提示      空库启动：先在「服务器」页添加机器并执行部署命令');
+  }
+  if (adminUser) {
+    // 订阅链接里的 token 是凭证：默认只提示位置，需要完整链接时再开 debug
+    if (log.enabled('debug')) {
+      console.log(`  管理员自用订阅  ${baseLocal}/s/${adminUser.token}（用户列表首行）`);
+    } else {
+      console.log('  管理员自用订阅  见用户列表首行（要在这里打印完整链接：PANEL_LOG_LEVEL=debug）');
+    }
+  }
+  const sample = db.users.find((u) => !u.isAdmin);
+  if (sample && log.enabled('debug')) {
+    console.log(`  示例订阅  ${baseLocal}/s/${sample.token}`);
+  }
+  const ns = db.settings.notifyEnabled === '1';
+  const chCount = db.notify_channels.filter((c) => c.enabled).length;
+  console.log(`  通知      ${ns ? `已开启，${chCount} 个渠道` : '未开启（设置 → 消息通知）'}`);
+  console.log(`${line}\n`);
 }
 
 // 退出时把 WAL 合并回主文件，避免留下 -wal/-shm 残留

@@ -44,6 +44,41 @@ RENDERERS.settings = async () => {
       </div>
 
       <div class="card">
+        <div class="card-head"><h3>订阅显示</h3></div>
+        <div class="card-body">
+          <div class="form-row">
+            <div class="field">
+              <label>直连节点命名</label>
+              <input type="text" id="set-tpl-direct" value="${esc(s.nameTplDirect || '')}" placeholder="{node}" spellcheck="false" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>中转节点命名</label>
+              <input type="text" id="set-tpl-relay" value="${esc(s.nameTplRelay || '')}" placeholder="{node1}|{entry}" spellcheck="false" autocomplete="off">
+            </div>
+          </div>
+          <div class="hint">
+            占位符：<code>{server}</code> 服务器名 · <code>{node}</code> 节点全名 ·
+            <code>{node1}</code> 节点主名（<code>|</code> 前第一段）·
+            <code>{entry}</code> 入口全名 · <code>{entry1}</code> 入口主名。
+            留空用默认值。
+            <br>例：节点 <code>香港1|IPV6|下载推荐</code> + 入口 <code>广港IX|游戏|备用</code>，
+            中转模板 <code>{node1}|{entry}</code> → <code>香港1|广港IX|游戏|备用</code>；
+            想带服务器名就用 <code>{server} · {node}</code>。
+          </div>
+          <label class="ve-label" style="margin-top:14px">
+            <input type="checkbox" id="set-info-node" ${s.subInfoNode === '1' ? 'checked' : ''}>
+            在订阅首行插入「剩余流量 / 到期」信息节点
+          </label>
+          <div class="hint">
+            它是条连不通的假节点（指向 127.0.0.1:1），只用来在客户端节点列表第一行显示流量。
+            不勾选也不影响流量显示 —— 订阅响应头里的 Subscription-Userinfo 一直在返回，
+            Clash Verge / v2rayN / Shadowrocket 都能读到。
+          </div>
+          <button class="btn btn-primary" data-act="save-sub" style="margin-top:12px">保存订阅显示</button>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-head"><h3>管理员安全</h3></div>
         <div class="card-body">
           <div class="field">
@@ -103,6 +138,13 @@ RENDERERS.settings = async () => {
                   : '未监听'}
               · 证书续期后自动热加载，agent 不受影响
             </div>
+            ${d.httpsFromEnv
+              ? `<div class="alert alert-warn" style="margin-top:10px;font-size:12px">
+                   当前证书来自环境变量 <code>PANEL_TLS_CERT</code> / <code>PANEL_TLS_KEY</code>。
+                   环境变量的优先级高于这里的选择，所以在这个下拉框里选「不启用」<b>不会</b>关掉 HTTPS ——
+                   要关闭请去掉这两个环境变量后重启容器 / 服务。
+                 </div>`
+              : ''}
           </div>
           <button class="btn btn-primary" data-act="save-https">应用 HTTPS 设置</button>
           <p class="hint">保存后立即生效，无需重启。浏览器访问 http:// 会自动跳到 https://；agent 与订阅地址不受跳转影响（要加密就把机器上的 PANEL_URL 换成 https://）。</p>
@@ -965,6 +1007,18 @@ async function runAction(act, btn, id) {
       toast('设置已保存', 'ok');
       break;
     }
+    case 'save-sub': {
+      await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          nameTplDirect: $('#set-tpl-direct').value,
+          nameTplRelay: $('#set-tpl-relay').value,
+          subInfoNode: $('#set-info-node').checked,
+        }),
+      });
+      toast('订阅显示已保存，客户端重新拉取订阅后生效', 'ok');
+      break;
+    }
     case 'change-pw': {
       await api('/api/admin/password', {
         method: 'POST',
@@ -1072,7 +1126,19 @@ async function runAction(act, btn, id) {
         method: 'PUT',
         body: JSON.stringify({ httpsCertId: certId }),
       });
-      toast(certId ? (r.httpsActive ? 'HTTPS 已启用并生效（无需重启）' : '证书不可用，请检查证书状态') : '已切换回纯 HTTP', r.httpsActive || !certId ? 'ok' : 'err');
+      // 环境变量证书会压过设置里的选择：这时「不启用」是空操作，必须说清楚，
+      // 否则管理员会以为关掉了，实际 HTTPS 还开着、浏览器还在被跳转
+      const blockedByEnv = r.httpsFromEnv && !certId;
+      toast(
+        blockedByEnv
+          ? '环境变量证书仍在生效：HTTPS 未关闭，请去掉 PANEL_TLS_CERT / PANEL_TLS_KEY 后重启'
+          : certId
+            ? r.httpsActive
+              ? 'HTTPS 已启用并生效（无需重启）'
+              : '证书不可用，请检查证书状态'
+            : '已切换回纯 HTTP',
+        blockedByEnv || (certId && !r.httpsActive) ? 'err' : 'ok',
+      );
       render();
       break;
     }

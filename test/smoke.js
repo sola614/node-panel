@@ -57,9 +57,10 @@ async function call(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (opts.body) headers['Content-Type'] = 'application/json';
   if (token) headers.Authorization = 'Bearer ' + token;
-  // 订阅页数据接口有登录门（先登录再查看）：GET /api/sub/<token> 自动换成该用户的会话
-  //（管理 token 对订阅接口无效，必须覆盖而不是追加）。POST /api/sub/login|reset 不匹配；
-  // 「未登录」用例全部用原生 fetch 显式裸调，不受影响
+  // 订阅页数据接口有登录门（先登录再查看）：GET /api/sub/<token> 自动换成该用户的会话。
+  // 这里刻意覆盖而不是追加 —— 管理台 token 现在也能放行（管理员免密预览），
+  // 但用户侧用例要验证的正是「用户会话」这一条路径。
+  // POST /api/sub/login|reset 不匹配；「未登录」用例全部用原生 fetch 显式裸调，不受影响
   if ((opts.method || 'GET') === 'GET' && /^\/api\/sub\/[0-9a-f]{8,}/.test(path)) {
     const subToken = path.split('/api/sub/')[1].split('?')[0];
     if (!subSessions.has(subToken)) await subLoginOnce(subToken);
@@ -897,6 +898,48 @@ function totpCodeOf(secret) {
     `(${relayLinks.filter((l) => !l.relay).map((l) => l.host).join(',') || '无直连'})`);
   ok('隐藏的入口不出现在订阅', !relayLinks.some((l) => l.host === 'relay-c.example.com'));
 
+  // 命名模板（0.1.19）：默认不拼服务器名；中转只借节点「主名」，
+  // 节点自己的标签（| 之后那段）不继承到中转上
+  const nodeBaseName = relayNode.data.item.name;
+  const relayLink = relayLinks.find((l) => l.relay) || {};
+  const wantRelayName = `${nodeBaseName.split('|')[0]}|入口A`;
+  ok('中转节点名 = 节点主名|入口名（不继承节点标签、不拼服务器名）',
+    relayLink.name === wantRelayName, `(${relayLink.name} ≠ ${wantRelayName})`);
+  ok('直连节点名保留自身完整名字',
+    relayLinks.some((l) => !l.relay && l.name === nodeBaseName),
+    `(${relayLinks.filter((l) => !l.relay).map((l) => l.name).join(',')})`);
+
+  // 自定义模板：把服务器名加回去，验证模板真的生效
+  const tplSaved = await call('/api/settings', {
+    method: 'PUT',
+    body: json({ nameTplRelay: '{server} · {node} · {entry}' }),
+  });
+  ok('可以自定义中转命名模板', tplSaved.status === 200);
+  const subTpl = await call(`/api/sub/${u2.token}`);
+  const relayTpl = (subTpl.data.links || []).find((l) => l.relay && l.name.includes('入口A'));
+  ok('自定义模板生效（服务器名 · 节点全名 · 入口名）',
+    !!relayTpl && relayTpl.name === `${server.data.item.name} · ${nodeBaseName} · 入口A`,
+    `(${relayTpl && relayTpl.name})`);
+  await call('/api/settings', { method: 'PUT', body: json({ nameTplRelay: '' }) });
+
+  // 订阅首行「剩余流量」信息节点：默认关闭，开启后首行多一条 trojan 假节点
+  const subRaw = (t) => fetch(`${BASE}/s/${u2.token}?format=base64`).then((r) => r.text());
+  const firstLine = async () => {
+    const text = await subRaw();
+    return Buffer.from(text, 'base64').toString('utf8').split('\n')[0];
+  };
+  ok('默认不在订阅首行插信息节点', !(await firstLine()).includes('剩余'));
+  await call('/api/settings', { method: 'PUT', body: json({ subInfoNode: true }) });
+  const infoFirst = await firstLine();
+  ok('开启后首行是流量信息节点',
+    infoFirst.startsWith('trojan://127.0.0.1:1') || /^trojan:\/\/[^@]+@127\.0\.0\.1:1/.test(infoFirst),
+    `(${infoFirst.slice(0, 40)})`);
+  ok('信息节点文案含剩余流量与到期',
+    decodeURIComponent(infoFirst).includes('剩余') && decodeURIComponent(infoFirst).includes('到期'),
+    `(${decodeURIComponent(infoFirst).slice(0, 60)})`);
+  await call('/api/settings', { method: 'PUT', body: json({ subInfoNode: false }) });
+  ok('关闭后首行恢复为真实节点', !(await firstLine()).includes('剩余'));
+
   // 入口自有套餐：入口B 只归空套餐，空套餐用户应看到它，套餐用户不应看到
   const subU3 = await call(`/api/sub/${u3.token}`);
   const u3Links = (subU3.data.links || []).filter((l) => l.name.includes('SMOKE-TLS'));
@@ -919,7 +962,8 @@ function totpCodeOf(secret) {
   const clashHidden = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
   // 注意：smoke.example.com 同时还是该节点的 SNI，中转代理会继承它，
   // 所以不能用它判断直连是否消失，要认直连代理的完整名字
-  const directProxyName = '"SMOKE-服务器 · SMOKE-TLS"';
+  // （0.1.19 起默认命名模板是 {node}，不再拼服务器名）
+  const directProxyName = '"SMOKE-TLS"';
   ok('Clash 订阅同样只保留中转入口',
     clashHidden.includes('relay-a.example.com') && !clashHidden.includes(directProxyName));
 
@@ -1574,7 +1618,7 @@ function totpCodeOf(secret) {
   const l2Names = (subL2.data.links || []).map((l) => l.name);
   ok('低等级用户只看到入口、看不到高等级直连',
     l2Names.some((n) => n.includes('低配入口')) &&
-      !l2Names.some((n) => n === 'SMOKE-等级机 · SMOKE-入口等级'),
+      !l2Names.some((n) => n === 'SMOKE-入口等级'),
     l2Names.join(','));
 
   /* ---------- 15. 证书（只走 draft 状态，不触发真实签发） ---------- */
@@ -2079,14 +2123,54 @@ function totpCodeOf(secret) {
     const authed = await fetch(`${BASE}/api/sub/${ru.token}`, { headers: { Authorization: 'Bearer ' + login.data.session } });
     const authedData = await authed.json();
     ok('带会话的订阅数据接口放行', authed.status === 200 && authedData.user.name === 'SMOKE-自助重置用户');
+
+    // 会话时长 30 分钟：订阅页是「偶尔打开看一眼」的页面，长期挂着只会放大
+    // 共享设备 / 链接被抄走的风险
+    const ttlMin = Math.round((new Date(login.data.expiresAt).getTime() - Date.now()) / 60000);
+    ok('订阅页会话有效期 30 分钟', ttlMin > 28 && ttlMin <= 30, `(${ttlMin} 分钟)`);
+
+    // 管理台会话直接放行：从面板用户列表点「打开」的必然是管理员，
+    // 而他在那一页本来就能看到订阅地址，再输一遍用户密码是重复劳动
+    const adminViewUser = await mkUser('SMOKE-管理员预览', null, 10);
+    const adminSub = await fetch(`${BASE}/api/sub/${adminViewUser.token}`, {
+      headers: { Authorization: 'Bearer ' + token },
+    });
+    const adminSubData = await adminSub.json();
+    ok('管理台会话可免密查看订阅页',
+      adminSub.status === 200 && adminSubData.adminView === true && adminSubData.user.name === 'SMOKE-管理员预览',
+      `(${adminSub.status})`);
+    // 伪造的管理台 token 一样得走登录门（放行只认「有效的管理台会话」）
+    const fakeAdmin = await fetch(`${BASE}/api/sub/${adminViewUser.token}`, {
+      headers: { Authorization: 'Bearer ' + 'f'.repeat(48) },
+    });
+    ok('伪造的管理台会话不放行', fakeAdmin.status === 401);
+    // 管理员也能在订阅页重置链接（复用同一个接口，审计里记成「管理员重置」）
+    const adminReset = await fetch(`${BASE}/api/sub/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ token: adminViewUser.token }),
+    });
+    ok('管理台会话可重置订阅链接', adminReset.status === 200);
+    const adminResetData = await adminReset.json();
+    const rotatedToken = (adminResetData.subUrl || '').split('/s/')[1] || '';
+    const afterRotate = await fetch(`${BASE}/api/sub/${rotatedToken}`, {
+      headers: { Authorization: 'Bearer ' + token },
+    });
+    ok('管理员重置后新链接仍可免密查看', afterRotate.status === 200);
+
     // 会话绑定用户：拿去访问别人的订阅无效（对方要自己的会话）
     const other = await mkUser('SMOKE-会话隔离用户', null, 100);
     const crossSub = await fetch(`${BASE}/api/sub/${other.token}`, { headers: { Authorization: 'Bearer ' + login.data.session } });
     const crossData = await crossSub.json();
     ok('会话不能访问别人的订阅（登录门不因会话而放开）', crossSub.status === 401 && crossData.loginRequired === true);
 
-    // 未登录直接重置 → 401；登录后重置 → 换发新链接，旧链接即刻失效，会话仍有效（绑定 userId）
-    const anonReset = await call('/api/sub/reset', { method: 'POST', body: json({ token: ru.token }) });
+    // 未登录直接重置 → 401。必须用裸 fetch：call() 会自动带上管理员 token，
+    // 而管理员现在是能重置的（免密预览），那样就测不出「未登录」这条路径了
+    const anonReset = await fetch(`${BASE}/api/sub/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: ru.token }),
+    }).then(async (r) => ({ status: r.status, data: await r.json().catch(() => ({})) }));
     ok('未登录不能重置订阅链接', anonReset.status === 401 && anonReset.data.loginRequired === true);
     const reset = await fetch(`${BASE}/api/sub/reset`, {
       method: 'POST',
@@ -2295,6 +2379,29 @@ function totpCodeOf(secret) {
         const redir = await fetch(`http://127.0.0.1:${httpPort}/`, { headers: { Accept: 'text/html' }, redirect: 'manual' });
         ok('浏览器访问 HTTP 301 跳转 HTTPS', redir.status === 301 && /^https:\/\/127\.0\.0\.1:18443\//.test(redir.headers.get('location') || ''),
           `(${redir.headers.get('location') || ''})`);
+        // 301 不带 no-store 会被浏览器永久缓存：之后管理员关掉面板 HTTPS，
+        // 老访客的浏览器仍照旧 Location 跳到一个没人监听的端口
+        ok('跳转响应带 Cache-Control: no-store（关掉 HTTPS 后不被旧缓存继续跳）',
+          /no-store/.test(redir.headers.get('cache-control') || ''),
+          `(${redir.headers.get('cache-control') || ''})`);
+        // 反代（nginx / Caddy）终止 TLS 后回源是明文，必须靠 X-Forwarded-Proto 认出
+        // 「用户其实走的是 HTTPS」。不认这个头就会把浏览器 301 到面板自己的 TLS 端口，
+        // 而那个端口对外通常没开 —— 表现是访问域名却跳到 localhost:8443 打不开。
+        const proxied = await fetch(`http://127.0.0.1:${httpPort}/`, {
+          headers: { Accept: 'text/html', 'X-Forwarded-Proto': 'https' },
+          redirect: 'manual',
+        });
+        ok('反代转发（X-Forwarded-Proto: https）不再跳面板 TLS 端口',
+          proxied.status !== 301 && !/18443/.test(proxied.headers.get('location') || ''),
+          `(status=${proxied.status} location=${proxied.headers.get('location') || ''})`);
+        // 反代边缘自己负责 80→443 时（转发头为 http），面板同样不该插手
+        const proxiedHttp = await fetch(`http://127.0.0.1:${httpPort}/`, {
+          headers: { Accept: 'text/html', 'X-Forwarded-Proto': 'http' },
+          redirect: 'manual',
+        });
+        ok('反代转发（X-Forwarded-Proto: http）由边缘跳转，面板不抢',
+          proxiedHttp.status !== 301,
+          `(status=${proxiedHttp.status})`);
         const noRedir = await fetch(`http://127.0.0.1:${httpPort}/api/health`);
         ok('agent/健康探针路径不被跳转（升级窗口期不掉线）', noRedir.status === 200);
         const viaHttps = await fetch(`https://127.0.0.1:${tlsPort}/api/health`);
@@ -2308,6 +2415,74 @@ function totpCodeOf(secret) {
         ok('HTTPS 上可登录', loginJson.status === 200);
       }
       child.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 500));
+
+      /* ---- PANEL_HTTP_DISABLE：纯 HTTPS 部署时关掉明文监听 ---- */
+      const offPort = 18096;
+      const offTlsPort = 18446;
+      const childOff = spawn(
+        process.execPath,
+        [path.join(__dirname, '..', 'server.js')],
+        {
+          env: {
+            ...process.env,
+            PORT: String(offPort),
+            PANEL_TLS_PORT: String(offTlsPort),
+            PANEL_DB_FILE: path.join(tlsDir, 'off.db'),
+            PANEL_ADMIN_PASSWORD: 'https-smoke-pass',
+            PANEL_LOG_LEVEL: 'error',
+            PANEL_TLS_CERT: certPem,
+            PANEL_TLS_KEY: keyPem,
+            PANEL_HTTP_DISABLE: '1',
+          },
+          stdio: 'ignore',
+        },
+      );
+      let offHealthy = false;
+      for (let i = 0; i < 30 && !offHealthy; i++) {
+        await new Promise((r) => setTimeout(r, 300));
+        try {
+          const h = await fetch(`https://127.0.0.1:${offTlsPort}/api/health`);
+          offHealthy = h.ok;
+        } catch { /* 还没起来 */ }
+      }
+      ok('PANEL_HTTP_DISABLE：HTTPS 仍可正常服务', offHealthy);
+      // 8080 被真的关掉了：不是「跳转」，是连接都建立不起来
+      const httpClosed = await fetch(`http://127.0.0.1:${offPort}/api/health`).then(() => false).catch(() => true);
+      ok('PANEL_HTTP_DISABLE：HTTP 端口不再监听', httpClosed);
+      childOff.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 500));
+
+      // 开了开关但没证书：必须回退监听 HTTP，不能把面板关在门外
+      const noCertPort = 18095;
+      const childNoCert = spawn(
+        process.execPath,
+        [path.join(__dirname, '..', 'server.js')],
+        {
+          env: {
+            ...process.env,
+            PORT: String(noCertPort),
+            PANEL_TLS_PORT: String(18447),
+            PANEL_DB_FILE: path.join(tlsDir, 'nocert.db'),
+            PANEL_ADMIN_PASSWORD: 'https-smoke-pass',
+            PANEL_LOG_LEVEL: 'error',
+            PANEL_HTTP_DISABLE: '1',
+            PANEL_TLS_CERT: '',
+            PANEL_TLS_KEY: '',
+          },
+          stdio: 'ignore',
+        },
+      );
+      let fallbackOk = false;
+      for (let i = 0; i < 30 && !fallbackOk; i++) {
+        await new Promise((r) => setTimeout(r, 300));
+        try {
+          const h = await fetch(`http://127.0.0.1:${noCertPort}/api/health`);
+          fallbackOk = h.ok;
+        } catch { /* 还没起来 */ }
+      }
+      ok('PANEL_HTTP_DISABLE 无证书时回退监听 HTTP（不失联）', fallbackOk);
+      childNoCert.kill('SIGTERM');
       await new Promise((r) => setTimeout(r, 500));
 
       // 坏证书（非法 PEM）：createSecureContext 同步抛错 —— 必须回退纯 HTTP 继续服务，

@@ -1210,6 +1210,21 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   }
   dom12.window.close();
 
+  // 管理员免密预览（0.1.19）：浏览器里带着管理台会话（np_token）打开订阅页，
+  // 直接渲染数据页；右上角有「管理员预览」角标，且不出现「退出登录」
+  //（那按钮清的是用户的订阅会话，对管理员来说只会造成误解）
+  const domAdmin = await openPage(`${BASE}/s/${uiUser2.item.token}`, {
+    html: subHtml2,
+    before: { np_token: T },
+    ready: (doc) => !!doc.querySelector('#reset-btn'),
+  });
+  const dAdmin = domAdmin.window.document;
+  ok('管理员打开订阅页无需输密码',
+    !dAdmin.querySelector('#sub-login-form') && !!dAdmin.querySelector('.sub-card'));
+  ok('管理员预览有角标', /管理员预览/.test(dAdmin.body.textContent));
+  ok('管理员预览不显示「退出登录」', !dAdmin.querySelector('#sub-logout'));
+  domAdmin.window.close();
+
   // 未登录打开订阅页：先见登录表单（数据接口 401 loginRequired → renderLogin）
   const dom12b = await openPage(`${BASE}/s/${uiUser2.item.token}`, {
     html: subHtml2,

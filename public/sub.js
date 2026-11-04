@@ -196,10 +196,11 @@ function render(d) {
         </div>
       </div>
       <div class="sub-head-right">
+        ${d.adminView ? '<span class="badge badge-blue" title="以管理台身份查看，无需订阅密码">管理员预览</span>' : ''}
         <span class="badge ${u.status === 'active' ? 'badge-ok' : u.status === 'over' || u.status === 'disabled' ? 'badge-bad' : 'badge-warn'}">
           <i class="dot"></i>${esc(u.statusLabel)}
         </span>
-        ${u.hasPassword
+        ${u.hasPassword && !d.adminView
           ? '<button class="btn btn-sm btn-ghost" id="sub-logout" type="button" title="退出后需要重新输入密码才能查看">退出登录</button>'
           : ''}
         <button class="theme-btn" data-theme-toggle type="button" title="切换到日间模式" aria-label="切换到日间模式">
@@ -262,11 +263,11 @@ function render(d) {
     <div class="sub-card" style="margin-top:16px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <div style="font-size:13px;font-weight:600;flex:1;min-width:200px">怀疑订阅链接泄露？</div>
-        ${d.user.hasPassword
+        ${d.user.hasPassword || d.adminView
           ? '<button class="btn btn-sm btn-ghost" id="reset-btn" type="button">重置订阅链接</button>'
           : '<span class="hint">账号未设置登录密码，无法自助重置（联系管理员）</span>'}
       </div>
-      ${d.user.hasPassword ? `
+      ${d.user.hasPassword || d.adminView ? `
       <p class="hint" style="margin:10px 0 0" id="reset-note">
         重置会<b>立刻作废当前链接</b>（UUID 一并换发，约 60 秒内全节点生效），并生成一条新订阅地址。
         重置后本页自动跳到新地址。
@@ -287,17 +288,33 @@ function render(d) {
 
 /* ------------------- 订阅页登录 + 自助重置订阅链接（0.1.16） ------------------- */
 
-// 登录态：后端按 userId 发的会话（7 天）。存 localStorage —— 重置后跳到新 token
+// 登录态：后端按 userId 发的会话（30 分钟）。存 localStorage —— 重置后跳到新 token
 // 的页面时仍处于登录态，无需再输一次密码
 let subSession = '';
 try { subSession = localStorage.getItem('np_sub_session') || ''; } catch { /* 隐私模式 */ }
+
+/**
+ * 管理台会话（np_token）：从面板用户列表点「打开」跳过来时，浏览器里已经有它。
+ * 带上就能免密查看 —— 服务端只认有效的管理台会话，过期/伪造一律当没带。
+ * 普通用户在自己浏览器里没有这个 key，所以不会因此绕过登录门。
+ */
+let panelToken = '';
+try { panelToken = localStorage.getItem('np_token') || ''; } catch { /* 隐私模式 */ }
+
+/** 订阅会话优先；没有就退回管理台会话（管理员预览） */
+const authHeaders = () =>
+  subSession
+    ? { Authorization: 'Bearer ' + subSession }
+    : panelToken
+      ? { Authorization: 'Bearer ' + panelToken }
+      : {};
 
 const subApi = async (path, body, authed = false) => {
   const res = await fetch(path, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(authed && subSession ? { Authorization: 'Bearer ' + subSession } : {}),
+      ...(authed ? authHeaders() : {}),
     },
     body: JSON.stringify(body),
   });
@@ -368,7 +385,7 @@ function renderNoPassword(message) {
 async function loadData() {
   try {
     const res = await fetch('/api/sub/' + encodeURIComponent(token), {
-      headers: subSession ? { Authorization: 'Bearer ' + subSession } : {},
+      headers: authHeaders(),
     });
     if (res.status === 401) {
       const data = await res.json().catch(() => ({}));
@@ -413,7 +430,7 @@ async function resetClick() {
 /**
  * 退出登录：服务端会话与本地副本一起清。
  *
- * 只清 localStorage 是不够的 —— 那把 7 天的钥匙还挂在服务端，别人手里如果已经
+ * 只清 localStorage 是不够的 —— 那把 30 分钟的钥匙还挂在服务端，别人手里如果已经
  * 抄走了 token 照样能用。所以先让服务端删，再清本地；服务端那一步失败也不拦人，
  * 否则用户就被困在这一页了。
  */

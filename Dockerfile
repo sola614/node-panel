@@ -38,9 +38,11 @@ RUN mkdir -p /app/data && chown -R node:node /app
 VOLUME ["/app/data"]
 EXPOSE 8080
 
-# 用 node 自带的 fetch 做探针，镜像里不需要装 curl
+# 用 node 自带的 fetch 做探针，镜像里不需要装 curl。
+# 先探 HTTP 再探 HTTPS：开了 PANEL_HTTP_DISABLE 时只有 TLS 在听，
+# 探针若只认 8080 会把健康的容器标成 unhealthy。
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "const p=process.env.PORT||8080,t=process.env.PANEL_TLS_PORT||8443;const ok=u=>fetch(u).then(r=>r.ok).catch(()=>false);(async()=>{if(await ok('http://127.0.0.1:'+p+'/api/health'))process.exit(0);process.env.NODE_TLS_REJECT_UNAUTHORIZED='0';if(await ok('https://127.0.0.1:'+t+'/api/health'))process.exit(0);process.exit(1)})()"
 
 # 以 root 启动，由入口脚本降权到 node：这样绑定挂载的数据目录也能被修好属主
 USER root
