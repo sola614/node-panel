@@ -814,7 +814,7 @@ function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = 
     password: password ? store.hashPassword(String(password)) : '',
     planId: planId || null,
     enabled: enabled !== false,
-    // 有套餐时额度与到期由套餐决定；无套餐才允许手填
+    // 有套餐时额度由套餐决定；到期时间允许管理员手动覆盖（不传则由套餐推算）
     quotaGB: planId ? 0 : Number(quotaGB) || 0,
     // 已用流量允许管理员直接给（迁移老用户、对账补录都用得上），默认 0
     usedBytes: Number.isFinite(Number(usedGB)) && Number(usedGB) > 0 ? Math.round(Number(usedGB) * store.GB) : 0,
@@ -826,6 +826,8 @@ function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = 
   // 有套餐就是一期的新起点，自动续期从这里往后推
   if (u.planId) u.cycleStartAt = u.createdAt;
   store.applyPlanToUser(u);
+  // 管理员手动指定了到期时间时，覆盖套餐推算出来的默认值
+  if (expireAt) u.expireAt = new Date(expireAt).toISOString();
   return u;
 }
 
@@ -904,22 +906,22 @@ function updateUser(req, res, params, body) {
     u.cycleStartAt = u.planId ? store.iso() : null;
     u.renewCount = 0;
     u.lastRenewAt = null;
-    // 无套餐时才接受手填的额度与到期
+    // 无套餐时才接受手填的额度
     if (!u.planId) {
       if (body.quotaGB !== undefined) u.quotaGB = Number(body.quotaGB) || 0;
-      u.expireAt = body.expireAt !== undefined
-        ? (body.expireAt ? new Date(body.expireAt).toISOString() : null)
-        : store.daysFromNow(30);
     }
   } else if (!u.planId) {
     if (body.quotaGB !== undefined) u.quotaGB = Number(body.quotaGB) || 0;
-    if (body.expireAt !== undefined) {
-      u.expireAt = body.expireAt ? new Date(body.expireAt).toISOString() : null;
-    }
   }
 
-  // 有套餐：额度与到期永远跟随套餐
+  // 有套餐：额度由套餐决定，到期时间先用套餐推算默认值
   if (u.planId) store.applyPlanToUser(u);
+  // 管理员手动指定了到期时间时，覆盖套餐推算出来的默认值（有套餐也允许改）
+  if (body.expireAt !== undefined) {
+    u.expireAt = body.expireAt ? new Date(body.expireAt).toISOString() : null;
+  } else if (!u.planId && !planChanged) {
+    // 无套餐且没传到期时间：保持原值不变（之前的行为）
+  }
 
   store.save();
   const bits = [];

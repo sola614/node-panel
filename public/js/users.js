@@ -396,26 +396,25 @@ function bindUserForm(mask) {
       quota.readOnly = true;
       $('#f-quota-hint', mask).textContent = '继承自套餐，不可修改';
       // 到期时间：没换套餐的老用户直接显示真实到期日（可能已经自动续过几期），
-      // 换套餐 / 新用户才按「现在 + 一个周期」估算，月/季/年按自然日历算
+      // 换套餐 / 新用户才按「现在 + 一个周期」估算，月/季/年按自然日历算。
+      // 预填套餐默认值，但允许管理员手动修改（延期 / 缩短期限）
       const at = !planTouched && mask.dataset.expireAt
         ? new Date(mask.dataset.expireAt)
         : validityExpireAt(plan.validity, Date.now());
       if (at) expire.value = at.toISOString().slice(0, 10);
-      expire.readOnly = true;
       const renews = Number(mask.dataset.renewCount) || 0;
       const cycleText = plan.autoRenew
         ? `每 ${validityLabel(plan.validity)}自动续期`
         : '到期停用（未开启自动续期）';
-      $('#f-expire-hint', mask).textContent = at ? `继承自套餐：${cycleText}` : '继承自套餐：永久有效';
+      $('#f-expire-hint', mask).textContent = at ? `默认跟随套餐：${cycleText}，可手动调整` : '默认跟随套餐：永久有效，可手动调整';
       $('#f-plan-hint', mask).textContent = renews > 0
-        ? `额度与有效期由套餐决定 · 已自动续期 ${renews} 期`
+        ? `额度由套餐决定 · 已自动续期 ${renews} 期`
         : plan.autoRenew
-          ? '额度与有效期由套餐决定 · 到期自动续期'
-          : '额度与有效期由套餐决定 · 到期后停用';
+          ? '额度由套餐决定 · 到期自动续期'
+          : '额度由套餐决定 · 到期后停用';
     } else {
       quota.readOnly = false;
       $('#f-quota-hint', mask).textContent = '填 0 表示不限流量';
-      expire.readOnly = false;
       $('#f-expire-hint', mask).textContent = '';
       $('#f-plan-hint', mask).textContent = '不选套餐则手动配置额度与到期';
     }

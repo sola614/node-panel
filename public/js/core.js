@@ -566,7 +566,8 @@ function logoutLocal(silent) {
 
 $('#force-pw-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const btn = $('#force-pw-form button');
+  // 同上：pw.js 的眼睛按钮在 form 里排在前面，要用 type=submit 精确选中
+  const btn = $('#force-pw-form button[type="submit"]');
   await withLoading(
     btn,
     async () => {
@@ -591,7 +592,9 @@ $('#force-pw-form').addEventListener('submit', async (e) => {
 
 $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const btn = $('#login-form button');
+  // 不能用 '#login-form button' —— pw.js 给密码框注入的 .pw-eye 按钮也在 form 里，
+  // 而且 DOM 顺序排在提交按钮前面，querySelector 会选到眼睛按钮而不是登录按钮
+  const btn = $('#login-form button[type="submit"]');
   await withLoading(
     btn,
     async () => {
