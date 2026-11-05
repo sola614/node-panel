@@ -79,6 +79,26 @@ RENDERERS.settings = async () => {
       </div>
 
       <div class="card">
+        <div class="card-head"><h3>统一结算日</h3></div>
+        <div class="card-body">
+          <div class="field">
+            <label>每月结算日</label>
+            <select id="set-billing-day">
+              <option value="0" ${String(s.billingDay || '0') === '0' ? 'selected' : ''}>关闭（按建号日起租）</option>
+              ${Array.from({ length: 28 }, (_, i) => `<option value="${i + 1}" ${String(s.billingDay || '0') === String(i + 1) ? 'selected' : ''}>每月 ${i + 1} 号</option>`).join('')}
+            </select>
+          </div>
+          <div class="hint">
+            开启后，新建用户与换套餐都从最近的结算日起租：例如今天 5 号设为 1 号，
+            5 号新建的用户首期到下月 1 号（自然月制，首期不足整月），以后每月 1 号到期并自动清零流量。
+            存量用户请在用户列表勾选后点「对齐结算日」。
+            只能选 1–28：29/30/31 在短月会落到月末，反而不对齐；按天套餐不参与。
+          </div>
+          <button class="btn btn-primary" data-act="save-billing" style="margin-top:12px">保存结算日</button>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-head"><h3>管理员安全</h3></div>
         <div class="card-body">
           <div class="field">
@@ -1017,6 +1037,14 @@ async function runAction(act, btn, id) {
         }),
       });
       toast('订阅显示已保存，客户端重新拉取订阅后生效', 'ok');
+      break;
+    }
+    case 'save-billing': {
+      await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ billingDay: $('#set-billing-day').value }),
+      });
+      toast('结算日已保存：新用户与换套餐自动生效，存量用户请点「对齐结算日」', 'ok');
       break;
     }
     case 'change-pw': {

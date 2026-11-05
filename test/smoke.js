@@ -439,6 +439,63 @@ function totpCodeOf(secret) {
   ok('批量改套餐把 custom 重置为 plan',
     afterBatch.expireMode === 'plan' && afterBatch.autoRenew === true, `(${afterBatch.expireMode})`);
 
+  /* ---------- 统一结算日 + 批量改到期日 ---------- */
+  const saveBilling = (day) => call('/api/settings', { method: 'PUT', body: json({ billingDay: day }) });
+  ok('结算日 29 被拒（短月会落到月末）', (await saveBilling(29)).status === 400);
+  ok('结算日设为 1 号', (await saveBilling(1)).status === 200);
+
+  // 用月付套餐：按天套餐没有「每月几号」的概念，对齐操作会跳过
+  const billUser = await call('/api/users', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-结算日用户', planId: monthPlan.id, password: SUB_PASS }),
+  });
+  cleanup.push(['/api/users/' + billUser.data.item.id]);
+  const billExp = new Date(billUser.data.item.expireAt);
+  ok('结算日开户：到期落在 1 号', billExp.getDate() === 1, `(${billUser.data.item.expireAt})`);
+  ok('结算日开户：首期在未来', billExp.getTime() > Date.now());
+
+  // 先续两期，再对齐 —— 防止「改锚点不动 renewCount 白送好几个月」
+  for (let i = 0; i < 2; i++) {
+    await call('/api/users/batch', {
+      method: 'POST', body: json({ ids: [billUser.data.item.id], action: 'renew' }),
+    });
+  }
+  const beforeAlign = (await call('/api/users')).data.items.find((u) => u.id === billUser.data.item.id);
+  ok('对齐前确实已续多期', beforeAlign.renewCount >= 2, `(${beforeAlign.renewCount})`);
+
+  const bAlign = await call('/api/users/batch', {
+    method: 'POST', body: json({ ids: [billUser.data.item.id], action: 'align' }),
+  });
+  ok('批量对齐结算日成功',
+    bAlign.status === 200 && bAlign.data.done === 1 && (bAlign.data.aligned || []).length === 1);
+  const alignedU = (await call('/api/users')).data.items.find((u) => u.id === billUser.data.item.id);
+  ok('对齐后到期仍在 1 号', new Date(alignedU.expireAt).getDate() === 1, `(${alignedU.expireAt})`);
+  ok('对齐后期数已重算，不白送', alignedU.renewCount <= 1, `(${alignedU.renewCount})`);
+  ok('对齐后仍是跟随套餐', alignedU.expireMode === 'plan' && alignedU.autoRenew === true);
+
+  const targetDay = new Date(Date.now() + 45 * 864e5).toISOString().slice(0, 10);
+  ok('批量改到期日缺日期被拒', (await call('/api/users/batch', {
+    method: 'POST', body: json({ ids: [billUser.data.item.id], action: 'expire' }),
+  })).status === 400);
+  const bExpire = await call('/api/users/batch', {
+    method: 'POST', body: json({ ids: [billUser.data.item.id], action: 'expire', expireAt: targetDay }),
+  });
+  ok('批量改到期日成功', bExpire.status === 200 && bExpire.data.done === 1);
+  const expU = (await call('/api/users')).data.items.find((u) => u.id === billUser.data.item.id);
+  ok('批量改到期日切到 custom', expU.expireMode === 'custom' && expU.expireAt.startsWith(targetDay),
+    `(${expU.expireAt})`);
+
+  const adminU = (await call('/api/users')).data.items.find((u) => u.isAdmin);
+  const bSkip = await call('/api/users/batch', {
+    method: 'POST', body: json({ ids: [adminU.id], action: 'expire', expireAt: targetDay }),
+  });
+  ok('无套餐用户被跳过', bSkip.data.done === 0 && (bSkip.data.skipped || []).length === 1);
+
+  // 必须关掉，否则后面所有新建用户都会按结算日起租
+  await saveBilling(0);
+  ok('结算日可关闭，后续用例不受影响',
+    (await call('/api/settings')).data.settings.billingDay === '0');
+
   // 老接口传 days 仍然等价于「N 天」
   const legacy = await call('/api/plans/' + planId, { method: 'PUT', body: json({ days: 5 }) });
   ok('老参数 days 仍等价于按天', legacy.data.item.validity.type === 'day' && legacy.data.item.validity.num === 5);

@@ -265,6 +265,38 @@ ok('切回跟随套餐后按周期重新推算',
   new Date(uMode.expireAt).getTime() > Date.now() + 20 * DAY, `(${String(uMode.expireAt).slice(0, 10)})`);
 ok('切回跟随套餐后自动续期恢复', store.publicUser(uMode).autoRenew === true);
 
+/* ---------------- 13. 统一结算日 ---------------- */
+console.log('\n统一结算日');
+const fixedNow = new Date(2026, 10, 5, 12, 0, 0).getTime(); // 本地 2026-11-05 中午
+ok('结算日 0 / 29 返回 null',
+  store.billingAnchorAt(0, fixedNow) === null && store.billingAnchorAt(29, fixedNow) === null);
+const anchor1 = new Date(store.billingAnchorAt(1, fixedNow));
+ok('5 号配 1 号 → 锚点是本月 1 号',
+  anchor1.getDate() === 1 && anchor1.getMonth() === 10 && anchor1.getTime() <= fixedNow);
+const anchor15 = new Date(store.billingAnchorAt(15, fixedNow));
+ok('5 号配 15 号 → 锚点退到上月 15 号',
+  anchor15.getDate() === 15 && anchor15.getMonth() === 9 && anchor15.getTime() <= fixedNow);
+
+// 已续多期的老用户：只改锚点不动期数会凭空白送好几个月
+const uAlign = mkUser(pMode, { createdDaysAgo: 200, usedGB: 7 });
+uAlign.renewCount = 10;
+store.applyPlanToUser(uAlign);
+const alignUsed = uAlign.usedBytes;
+ok('对齐前是已续 10 期的老用户', uAlign.renewCount === 10);
+ok('对齐成功', store.alignUserBilling(uAlign, 1, fixedNow).ok === true);
+ok('对齐后期数归零（不白送 10 期）', uAlign.renewCount === 0, `(${uAlign.renewCount})`);
+ok('对齐后到期日落在 1 号', new Date(uAlign.expireAt).getDate() === 1, `(${uAlign.expireAt})`);
+ok('对齐后到期日在未来', new Date(uAlign.expireAt).getTime() > fixedNow);
+ok('对齐不立即清空已用流量', uAlign.usedBytes === alignUsed);
+
+const uCustomAlign = mkUser(pMode, {
+  createdDaysAgo: 10, expireMode: 'custom', expireAt: new Date(fixedNow + 5 * DAY).toISOString(),
+});
+ok('自定义到期用户拒绝对齐', store.alignUserBilling(uCustomAlign, 1, fixedNow).reason === 'custom');
+const pNoBilling = mkPlan('按天·结算日', { type: 'day', num: 30 });
+const uNoBilling = mkUser(pNoBilling, { createdDaysAgo: 1 });
+ok('按天套餐不参与对齐', store.alignUserBilling(uNoBilling, 1, fixedNow).reason === 'nocycle');
+
 store.close();
 try {
   fs.rmSync(TMP, { recursive: true, force: true });

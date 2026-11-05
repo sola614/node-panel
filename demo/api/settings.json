@@ -7,6 +7,7 @@
     "nameTplRelay": "{node1}|{entry}",
     "subInfoNode": "0",
     "httpsCertId": "",
+    "billingDay": "0",
     "notifyEnabled": "0",
     "notifyEvents": "user.expiring,user.expired,user.over,server.offline,node.offline",
     "notifyLeadDays": "3",

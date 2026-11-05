@@ -5,6 +5,7 @@
     "notice": "请合理使用节点资源，禁止扫描、爆破、滥发垃圾信息等行为。",
     "subBase": "",
     "httpsCertId": "",
+    "billingDay": "0",
     "notifyEnabled": "0",
     "notifyEvents": "user.expiring,user.expired,user.over,server.offline,node.offline",
     "notifyLeadDays": "3",
@@ -13,7 +14,7 @@
     "notifyRecovery": "1"
   },
   "version": 8,
-  "appVersion": "0.1.16",
+  "appVersion": "0.1.21",
   "mustChangePassword": false,
   "totpEnabled": false,
   "uptime": 5611

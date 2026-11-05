@@ -158,6 +158,30 @@ user    → { planId, cycleStartAt, renewCount, expireAt }
 接口：`POST /api/users` 与 `PUT /api/users/:id` 接受 `expireMode` 字段（`'plan'` / `'custom'`）；
 `GET /api/users` 返回 `expireMode`。
 
+### 统一结算日
+
+默认每个用户从**建号那天**起租：5 号开户就每月 5 号到期、流量也在 5 号清零，一批用户的
+重置日散落在月初月末各处。设置页开启「统一结算日」后，新建用户与换套餐都从最近的结算日
+起租——例如今天 5 号设为 1 号，5 号新建的用户首期到**下月 1 号**（自然月制，首期不足整月），
+此后每月 1 号到期并自动清零流量。
+
+实现上**没有**新增结算日字段或定时任务：到期日本来就是 `cycleStartAt + 周期 × 期数`，
+`addMonths` 保持「日」不变，把起租锚点定在 1 号，后面每一期就都是 1 号；流量清零绑定在
+续期（`renewUserIfDue`）上，自然跟着对齐。
+
+- 可选 **1–28**，填 0 关闭（恢复按建号日起租）。29/30/31 在短月会被夹到月末，反而不对齐
+- 只影响按月 / 季 / 年推进的套餐；按天、永久、指定到期日的套餐不参与
+- **存量用户不会自动变**：在用户列表勾选后点「对齐结算日」，重设起租锚点并**重算期数**
+  —— 只改锚点不动 `renewCount` 会给已续多期的用户凭空多送几个月。对齐会改动本期到期日，
+  但**不立即清空已用流量**，留到新到期日自然重置
+- 自定义到期（`custom`）用户不参与对齐：它本来就是一次性日期
+
+批量操作另有「改到期日」：给选中用户统一设一个到期日并切到 `custom`，到点即停、不续期。
+它与「对齐结算日」是两件事——前者改一次性日期，后者改周期锚点。两个操作都会跳过无套餐用户。
+
+接口：`GET` / `PUT /api/settings` 的 `billingDay`；`POST /api/users/batch` 的
+`action: 'expire'`（需 `expireAt`）与 `action: 'align'`。
+
 接口：`POST /api/plans` 与 `PUT /api/plans/:id` 都接受 `autoRenew: true|false`；
 `GET /api/plans` 与 `/api/users` 会返回 `autoRenew`，用户对象另带 `renewCount`（已续期次数）、
 `cycleStartAt`（起租时间）、`lastRenewAt`（上次续期时间）。

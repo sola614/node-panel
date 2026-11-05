@@ -815,6 +815,17 @@ function parseExpireAt(v) {
   return d.toISOString();
 }
 
+/** 全局结算日（1–28），0 = 关闭。settings 是 key-value 表，老库缺 key 时按关闭处理 */
+function billingDay() {
+  const n = Math.floor(Number(store.db().settings.billingDay) || 0);
+  return n >= 1 && n <= 28 ? n : 0;
+}
+
+/** 起租锚点：开启结算日时对齐到「最近一个已过去的结算日」，否则沿用传进来的时刻 */
+function cycleAnchor(fallback) {
+  return store.billingAnchorAt(billingDay()) || fallback;
+}
+
 /** 建一个用户对象（不落库）：单个新增、批量建号、邀请领取共用同一套字段规则 */
 function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, expireMode, note = '', password = '', enabled = true, extra = {} }) {
   // 到期模式：有套餐且明确选了「自定义」才走一次性到期；其余跟随套餐
@@ -840,8 +851,9 @@ function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, expireM
     createdAt: store.iso(),
     ...extra,
   };
-  // 有套餐就是一期的新起点，自动续期从这里往后推
-  if (u.planId) u.cycleStartAt = u.createdAt;
+  // 有套餐就是一期的新起点，自动续期从这里往后推。
+  // 开了统一结算日就锚到结算日（5 号开户 → 首期到下月 1 号），否则按建号日
+  if (u.planId) u.cycleStartAt = cycleAnchor(u.createdAt);
   store.applyPlanToUser(u);
   // 自定义到期：套餐只决定额度，到期日用管理员填的那一天（不参与自动续期）
   if (customExpire) u.expireAt = parseExpireAt(expireAt);
@@ -927,9 +939,10 @@ function updateUser(req, res, params, body) {
   const planChanged = body.planId !== undefined && body.planId !== u.planId;
   if (planChanged) {
     u.planId = body.planId || null;
-    // 换 / 新分配套餐 = 新一期开始：起租时间重置为现在，续期计数清零。
-    // 否则给老用户挂套餐会按 createdAt 算出「上一期就已到期」，立刻被自动续期吃掉一整个周期。
-    u.cycleStartAt = u.planId ? store.iso() : null;
+    // 换 / 新分配套餐 = 新一期开始：起租时间重置为现在（开了结算日则锚到结算日），
+    // 续期计数清零。否则给老用户挂套餐会按 createdAt 算出「上一期就已到期」，
+    // 立刻被自动续期吃掉一整个周期。
+    u.cycleStartAt = u.planId ? cycleAnchor(store.iso()) : null;
     u.renewCount = 0;
     u.lastRenewAt = null;
     // 无套餐时才接受手填的额度
@@ -963,9 +976,9 @@ function updateUser(req, res, params, body) {
     modeChanged = true;
   }
 
-  // 从自定义切回跟随套餐 = 开新一期，从此刻重新起算
+  // 从自定义切回跟随套餐 = 开新一期，从此刻（或结算日锚点）重新起算
   if (modeChanged && u.expireMode === 'plan' && u.planId) {
-    u.cycleStartAt = store.iso();
+    u.cycleStartAt = cycleAnchor(store.iso());
     u.renewCount = 0;
     u.lastRenewAt = null;
   }
@@ -1162,7 +1175,7 @@ function bulkCreateUsers(req, res, params, body, session, ctx) {
 }
 
 /**
- * 批量操作：启停 / 删除 / 重置流量 / 换套餐 / 续期一期。
+ * 批量操作：启停 / 删除 / 重置流量 / 换套餐 / 续期一期 / 改到期日 / 对齐结算日。
  * 默认管理员用户永远不会被删除或停用 —— 和单个操作的规则保持一致。
  */
 function batchUsers(req, res, params, body) {
@@ -1176,14 +1189,25 @@ function batchUsers(req, res, params, body) {
   const done = [];
   const skipped = [];
   const renewedExtra = [];
+  const aligned = [];
   let affectedPlan = null;
+  let batchExpireAt = null;
+  let alignDay = 0;
 
   if (action === 'plan') {
     const planId = body.planId || null;
     if (planId && !db.plans.some((p) => p.id === planId)) return sendJson(res, 400, { error: '套餐不存在' });
     affectedPlan = planId ? db.plans.find((p) => p.id === planId) : null;
+  } else if (action === 'expire') {
+    // 批量设自定义到期：日期必填且合法，口径与单个编辑 / 新建一致
+    if (!body.expireAt) return sendJson(res, 400, { error: '请选择自定义到期日' });
+    batchExpireAt = parseExpireAt(body.expireAt);
+    if (batchExpireAt === false) return sendJson(res, 400, { error: '日期格式不正确' });
+  } else if (action === 'align') {
+    alignDay = billingDay();
+    if (!alignDay) return sendJson(res, 400, { error: '请先在设置里配置统一结算日' });
   }
-  if (!['enable', 'disable', 'delete', 'reset', 'plan', 'renew'].includes(action)) {
+  if (!['enable', 'disable', 'delete', 'reset', 'plan', 'renew', 'expire', 'align'].includes(action)) {
     return sendJson(res, 400, { error: '不支持的操作' });
   }
 
@@ -1207,8 +1231,8 @@ function batchUsers(req, res, params, body) {
       u.usedBytes = 0;
     } else if (action === 'plan') {
       u.planId = body.planId || null;
-      // 换套餐 = 新一期开始（和单个编辑同一套规则）
-      u.cycleStartAt = u.planId ? store.iso() : null;
+      // 换套餐 = 新一期开始（和单个编辑同一套规则，含结算日锚点）
+      u.cycleStartAt = u.planId ? cycleAnchor(store.iso()) : null;
       u.renewCount = 0;
       u.lastRenewAt = null;
       // 换套餐时回到跟随套餐模式，否则旧的自定义到期日会挂在新套餐上
@@ -1237,6 +1261,26 @@ function batchUsers(req, res, params, body) {
       u.usedBytes = 0;
       u.lastRenewAt = store.iso();
       if (r.steps > 1) renewedExtra.push(`${u.name}（补 ${r.steps} 期）`);
+    } else if (action === 'expire') {
+      // 自定义到期要求有套餐：无套餐用户会被 updateUser 强制回 plan，这里先拦掉
+      if (!u.planId) {
+        skipped.push({ name: u.name, reason: '没有套餐，不能设自定义到期' });
+        continue;
+      }
+      u.expireMode = 'custom';
+      u.expireAt = batchExpireAt;
+    } else if (action === 'align') {
+      const r = store.alignUserBilling(u, alignDay);
+      if (!r.ok) {
+        skipped.push({
+          name: u.name,
+          reason: r.reason === 'custom' ? '该用户是自定义到期，不参与周期对齐'
+            : r.reason === 'noplan' ? '没有套餐，无法对齐结算日'
+              : '套餐没有按月推进的周期（按天 / 永久 / 指定到期日）',
+        });
+        continue;
+      }
+      aligned.push({ name: u.name, from: r.from, to: r.to });
     }
     done.push(u.name);
   }
@@ -1245,6 +1289,7 @@ function batchUsers(req, res, params, body) {
   const ACTION_LABEL = {
     enable: '批量启用', disable: '批量停用', delete: '批量删除',
     reset: '批量重置流量', plan: `批量改套餐${affectedPlan ? ' → ' + affectedPlan.name : ''}`, renew: '批量续期',
+    expire: '批量改到期日', align: `批量对齐结算日 → 每月 ${alignDay} 号`,
   };
   const extra = renewedExtra.length ? `，其中 ${renewedExtra.length} 个补齐了欠费周期` : '';
   logData.info('批量用户操作', {
@@ -1261,7 +1306,7 @@ function batchUsers(req, res, params, body) {
     ACTION_LABEL[action],
     `成功 ${done.length} 个${extra}${skipped.length ? `，跳过 ${skipped.length} 个` : ''}`,
   );
-  sendJson(res, 200, { ok: true, done: done.length, skipped, extra: renewedExtra });
+  sendJson(res, 200, { ok: true, done: done.length, skipped, extra: renewedExtra, aligned });
 }
 
 /* -------------------------------- 邀请领取 -------------------------------- */
@@ -4351,6 +4396,16 @@ function getSettings(req, res) {
 
 function updateSettings(req, res, params, body) {
   const s = store.db().settings;
+
+  // 先校验再落盘：结算日放在最前面，避免校验失败时前面的字段已改了内存对象
+  if (body.billingDay !== undefined) {
+    const n = Math.floor(Number(body.billingDay) || 0);
+    // 29/30/31 在短月会被 addMonths 夹到月末，反而不对齐
+    if (!Number.isFinite(n) || n < 0 || n > 28) {
+      return sendJson(res, 400, { error: '结算日只能是 1–28，或填 0 关闭' });
+    }
+    s.billingDay = String(n);
+  }
 
   // 先校验再落盘：域名填错时整次保存回滚，不留半套配置
   let nextSubBase = s.subBase;

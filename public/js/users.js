@@ -157,6 +157,8 @@ RENDERERS.users = async () => {
         <button class="btn btn-sm btn-ghost" data-act="user-bulk-act" data-op="reset">重置流量</button>
         <button class="btn btn-sm btn-ghost" data-act="user-bulk-act" data-op="renew">续期一期</button>
         <button class="btn btn-sm btn-ghost" data-act="user-bulk-act" data-op="plan">改套餐</button>
+        <button class="btn btn-sm btn-ghost" data-act="user-bulk-act" data-op="expire">改到期日</button>
+        <button class="btn btn-sm btn-ghost" data-act="user-bulk-act" data-op="align">对齐结算日</button>
         <button class="btn btn-sm btn-danger" data-act="user-bulk-act" data-op="delete">删除</button>
         <button class="btn btn-sm btn-ghost" data-act="user-bulk-clear" style="margin-left:auto">取消选择</button>
       </div>
@@ -170,7 +172,7 @@ RENDERERS.users = async () => {
     </div>
     <p class="hint" style="margin-top:14px">
       用户只能看到其套餐内的节点；超额、过期或停用的用户会立即从所有节点配置与订阅中消失。
-      勾选左侧复选框可以批量启停、重置流量、续期或删除。
+      勾选左侧复选框可以批量启停、重置流量、改套餐、改到期日、对齐结算日、续期或删除。
     </p>`;
 
   paintUsersTable();
@@ -243,7 +245,9 @@ function validityLabel(v) {
 
 function userForm(user) {
   const u = user || {};
-  const expire = u.expireAt ? u.expireAt.slice(0, 10) : new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10);
+  // 用本地日期而不是 ISO 的 slice(0,10)：结算日锚点是「本地 1 号 00:00」，
+  // 在东八区存成 ISO 是上月最后一天 16:00Z，直接切片会让编辑框显示成上月末
+  const expire = fmtDate(u.expireAt || new Date(Date.now() + 30 * 864e5).toISOString());
   const usedGB = u.usedBytes ? Math.round((u.usedBytes / GB) * 100) / 100 : 0;
   const plans = state.data.planList || [];
   const planOpts = [`<option value="">不限套餐（可见全部节点）</option>`]
@@ -797,6 +801,8 @@ const BATCH_LABEL = {
   reset: '重置流量',
   renew: '续期一期',
   plan: '改套餐',
+  expire: '改到期日',
+  align: '对齐结算日',
   delete: '删除',
 };
 
@@ -809,9 +815,11 @@ async function runUserBatch(op, extra = {}) {
   });
   const skipped = (r.skipped || []).length;
   const filled = (r.extra || []).length;
+  const aligned = (r.aligned || []).length;
   toast(
     `${BATCH_LABEL[op] || '处理'}：成功 ${r.done} 位` +
       `${filled ? `，其中 ${filled} 位补齐了欠费周期` : ''}` +
+      `${aligned ? `，起租时间与到期日已重算${r.aligned[0].to ? `（如 ${r.aligned[0].to.slice(0, 10)}）` : ''}` : ''}` +
       `${skipped ? `，跳过 ${skipped} 位（${r.skipped[0].reason}…）` : ''}`,
     skipped ? '' : 'ok',
   );
@@ -845,6 +853,40 @@ function userBatchFlow(op) {
         await runUserBatch('plan', { planId: $('#bp-plan', m).value || null });
       },
     });
+    return;
+  }
+
+  if (op === 'expire') {
+    const t = new Date();
+    const nm = new Date(t.getFullYear(), t.getMonth() + 1, 1);
+    const def = `${nm.getFullYear()}-${String(nm.getMonth() + 1).padStart(2, '0')}-01`;
+    openModal({
+      title: `改到期日 · ${USER_SELECTED.size} 位用户`,
+      body: `
+        <div class="field">
+          <label>统一到期日</label>
+          <input type="date" id="bp-expire" value="${def}">
+          <div class="hint">选中的用户会切成「自定义到期」模式：到点即停、不参与自动续期。没有套餐的用户会被跳过。</div>
+        </div>`,
+      okText: '应用',
+      onOk: async (m) => {
+        const at = $('#bp-expire', m).value;
+        if (!at) throw new Error('请选择自定义到期日');
+        await runUserBatch('expire', { expireAt: at });
+      },
+    });
+    return;
+  }
+
+  if (op === 'align') {
+    confirmDialog(
+      '对齐结算日',
+      `把选中的 ${USER_SELECTED.size} 位用户按设置里的结算日重新起租：起租时间、期数与到期日都会重算，` +
+        '之后每期到期（以及流量清零）都落在同一天。流量不会立即清零，留到新到期日自然重置。' +
+        '自定义到期、没有套餐、按天 / 永久套餐的用户会被跳过。',
+      () => runUserBatch('align'),
+      false,
+    );
     return;
   }
 
