@@ -327,6 +327,54 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('套餐卡片标注「到期停用」', /到期停用/.test(d6.querySelector('#view').textContent));
   dom6.window.close();
 
+  /* ================= 4.55 用户弹窗的到期方式（0.1.20） ================= */
+  console.log('\n── 用户弹窗：到期方式 ──');
+  const dom6b = await openPage(BASE + '/', {
+    before: { np_token: T },
+    ready: (doc) => !doc.querySelector('#app').classList.contains('hidden'),
+  });
+  const w6b = dom6b.window;
+  const d6b = w6b.document;
+  click(d6b.querySelector('.nav-item[data-view="users"]'), w6b);
+  await waitFor(() => d6b.querySelector('[data-act="user-new"]'), '用户页渲染');
+  click(d6b.querySelector('[data-act="user-new"]'), w6b);
+  await waitFor(() => d6b.querySelector('#f-expire-mode'), '用户弹窗出现');
+
+  const modeSel = d6b.querySelector('#f-expire-mode');
+  const modeField = d6b.querySelector('#f-expire-mode-field');
+  const expireField = d6b.querySelector('#f-expire-field');
+  const planSel = d6b.querySelector('#f-plan');
+  const setPlan = async (pid) => {
+    planSel.value = pid;
+    planSel.dispatchEvent(new w6b.Event('change', { bubbles: true }));
+    await sleep(30);
+  };
+  const setMode = async (v) => {
+    modeSel.value = v;
+    modeSel.dispatchEvent(new w6b.Event('change', { bubbles: true }));
+    await sleep(30);
+  };
+
+  // 默认不限套餐：没有「跟随套餐」可选，直接填日期
+  ok('不限套餐时隐藏「到期方式」', modeField.hidden === true);
+  ok('不限套餐时直接显示到期日', expireField.hidden === false);
+
+  const anyPlan = planSel.querySelector('option[value]:not([value=""])');
+  ok('用户弹窗能选到套餐', !!anyPlan);
+  if (anyPlan) {
+    await setPlan(anyPlan.value);
+    ok('选了套餐才出现「到期方式」', modeField.hidden === false);
+    ok('默认是「跟随套餐」且隐藏日期框',
+      modeSel.value === 'plan' && expireField.hidden === true);
+    await setMode('custom');
+    ok('选「自定义」后露出日期框', expireField.hidden === false);
+    ok('自定义到期有提示「不再自动续期」',
+      /不再跟随套餐续期/.test(d6b.querySelector('#f-expire-mode-hint').textContent));
+    await setMode('plan');
+    ok('切回「跟随套餐」重新收起日期框', expireField.hidden === true);
+  }
+  dom6b.window.close();
+
   /* ======================= 4.6 通知设置与渠道表单 ======================= */
   console.log('\n── 通知设置 ──');
   // 起一个真的收包服务：新建渠道 → 点「测试」→ 校验面板发出的载荷
@@ -1224,6 +1272,20 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('管理员预览有角标', /管理员预览/.test(dAdmin.body.textContent));
   ok('管理员预览不显示「退出登录」', !dAdmin.querySelector('#sub-logout'));
   domAdmin.window.close();
+
+  // 回归（0.1.20）：服务端重启后订阅会话全失效，但 localStorage 里还留着旧的
+  // np_sub_session。老逻辑拿着这个死 token 去请求，401 之后直接弹登录表单 ——
+  // 明明浏览器里躺着一个有效的管理台会话却没人用它。现在必须自动回退。
+  const domStale = await openPage(`${BASE}/s/${uiUser2.item.token}`, {
+    html: subHtml2,
+    before: { np_sub_session: 'f'.repeat(48), np_token: T },
+    ready: (doc) => !!doc.querySelector('#reset-btn') || !!doc.querySelector('#sub-login-form'),
+  });
+  const dStale = domStale.window.document;
+  ok('订阅会话失效时自动回退管理台会话（不弹登录）',
+    !dStale.querySelector('#sub-login-form') && !!dStale.querySelector('#reset-btn'));
+  ok('失效的订阅会话被就地清掉', ls(domStale.window, 'np_sub_session') === null);
+  domStale.window.close();
 
   // 未登录打开订阅页：先见登录表单（数据接口 401 loginRequired → renderLogin）
   const dom12b = await openPage(`${BASE}/s/${uiUser2.item.token}`, {

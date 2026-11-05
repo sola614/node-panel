@@ -807,8 +807,20 @@ function listUsers(req, res, params, body, session, ctx) {
   });
 }
 
+/** 校验日期字符串是否合法（非空时必须能被 Date 解析），返回 ISO 字符串或 null */
+function parseExpireAt(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return false; // false = 非法，调用方据此返回 400
+  return d.toISOString();
+}
+
 /** 建一个用户对象（不落库）：单个新增、批量建号、邀请领取共用同一套字段规则 */
-function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = '', password = '', enabled = true, extra = {} }) {
+function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, expireMode, note = '', password = '', enabled = true, extra = {} }) {
+  // 到期模式：有套餐且明确选了「自定义」才走一次性到期；其余跟随套餐
+  const customExpire = !!planId && expireMode === 'custom';
+  // 自定义到期必须有日期（前端有校验，但 API 直调可能绕过）
+  if (customExpire && !expireAt) return { error: '请选择自定义到期日' };
   const u = {
     id: store.uid(),
     name: String(name || '').trim(),
@@ -822,7 +834,8 @@ function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = 
     quotaGB: planId ? 0 : Number(quotaGB) || 0,
     // 已用流量允许管理员直接给（迁移老用户、对账补录都用得上），默认 0
     usedBytes: Number.isFinite(Number(usedGB)) && Number(usedGB) > 0 ? Math.round(Number(usedGB) * store.GB) : 0,
-    expireAt: planId ? null : expireAt ? new Date(expireAt).toISOString() : store.daysFromNow(30),
+    expireMode: customExpire ? 'custom' : 'plan',
+    expireAt: planId ? null : parseExpireAt(expireAt) || store.daysFromNow(30),
     note: String(note || ''),
     createdAt: store.iso(),
     ...extra,
@@ -830,8 +843,8 @@ function buildUser({ name, planId = null, quotaGB = 0, usedGB, expireAt, note = 
   // 有套餐就是一期的新起点，自动续期从这里往后推
   if (u.planId) u.cycleStartAt = u.createdAt;
   store.applyPlanToUser(u);
-  // 管理员手动指定了到期时间时，覆盖套餐推算出来的默认值
-  if (expireAt) u.expireAt = new Date(expireAt).toISOString();
+  // 自定义到期：套餐只决定额度，到期日用管理员填的那一天（不参与自动续期）
+  if (customExpire) u.expireAt = parseExpireAt(expireAt);
   return u;
 }
 
@@ -853,16 +866,25 @@ function createUser(req, res, params, body) {
   if (!validUserPassword(body.password)) {
     return sendJson(res, 400, { error: '请设置登录密码（至少 6 位，订阅页登录用）' });
   }
+  // 非法日期格式 → 400（new Date('bad').toISOString() 会抛 RangeError → 500）
+  if (body.expireAt !== undefined && body.expireAt) {
+    if (Number.isNaN(new Date(body.expireAt).getTime())) {
+      return sendJson(res, 400, { error: '日期格式不正确' });
+    }
+  }
   const u = buildUser({
     name,
     planId: body.planId,
     quotaGB: body.quotaGB,
     usedGB: body.usedGB,
     expireAt: body.expireAt,
+    expireMode: body.expireMode,
     note: body.note,
     password: body.password,
     enabled: body.enabled !== false,
   });
+  // buildUser 可能返回 { error } （custom 无日期等）
+  if (u.error) return sendJson(res, 400, u);
   store.db().users.push(u);
   store.save();
   auditAction('user.create', name, u.planId ? '绑定套餐' : '不限套餐');
@@ -918,13 +940,66 @@ function updateUser(req, res, params, body) {
     if (body.quotaGB !== undefined) u.quotaGB = Number(body.quotaGB) || 0;
   }
 
-  // 有套餐：额度由套餐决定，到期时间先用套餐推算默认值
+  // 到期模式：plan = 跟随套餐（周期派生 + 自动续期），
+  // custom = 管理员指定的一次性到期日，不参与自动续期，到点即停
+  let modeChanged = false;
+  if (body.expireMode !== undefined) {
+    const next = body.expireMode === 'custom' ? 'custom' : 'plan';
+    if (next !== u.expireMode) {
+      u.expireMode = next;
+      modeChanged = true;
+    }
+  } else if (planChanged) {
+    // 仅 API 直调未传模式时走此分支（批量改套餐走的是 batchUsers 自有分支）：
+    // 回到跟随套餐，否则旧的自定义日期会挂在新套餐上，谁也说不清它该是哪天
+    if (u.expireMode !== 'plan') {
+      u.expireMode = 'plan';
+      modeChanged = true;
+    }
+  }
+  // 没有套餐就没有「跟随套餐」可言
+  if (!u.planId && u.expireMode !== 'plan') {
+    u.expireMode = 'plan';
+    modeChanged = true;
+  }
+
+  // 从自定义切回跟随套餐 = 开新一期，从此刻重新起算
+  if (modeChanged && u.expireMode === 'plan' && u.planId) {
+    u.cycleStartAt = store.iso();
+    u.renewCount = 0;
+    u.lastRenewAt = null;
+  }
+
+  // 有套餐：额度由套餐决定；到期时间由模式决定（custom 时这里只同步额度）
   if (u.planId) store.applyPlanToUser(u);
-  // 管理员手动指定了到期时间时，覆盖套餐推算出来的默认值（有套餐也允许改）
-  if (body.expireAt !== undefined) {
-    u.expireAt = body.expireAt ? new Date(body.expireAt).toISOString() : null;
-  } else if (!u.planId && !planChanged) {
-    // 无套餐且没传到期时间：保持原值不变（之前的行为）
+
+  // 非法日期 → 400（new Date('bad').toISOString() 会抛 RangeError → 500）
+  if (body.expireAt !== undefined && body.expireAt) {
+    if (Number.isNaN(new Date(body.expireAt).getTime())) {
+      return sendJson(res, 400, { error: '日期格式不正确' });
+    }
+  }
+
+  // plan 模式下有套餐时，手动到期日被忽略（跟随套餐派生）—— 留条审计线索
+  let expireIgnored = false;
+  if (u.expireMode === 'custom') {
+    // 到期日不能为空，两条路径都要拦：显式切到 custom 却不传日期，以及已是 custom
+    // 的用户被 API 直调把日期清空。两者都会造出「自定义到期 = 永久有效且永不续期」
+    // 的矛盾状态（前端总会带上 expireMode 和日期，只有直调能触发）。
+    // 只改别的字段、完全不碰 expireAt 的请求不受影响。
+    const emptyDate = !body.expireAt;
+    if (emptyDate && (body.expireMode === 'custom' || body.expireAt !== undefined)) {
+      return sendJson(res, 400, { error: '请选择自定义到期日' });
+    }
+    if (body.expireAt !== undefined) {
+      u.expireAt = parseExpireAt(body.expireAt);
+    }
+  } else if (!u.planId && body.expireAt !== undefined) {
+    // 无套餐：到期时间始终手填
+    u.expireAt = body.expireAt ? parseExpireAt(body.expireAt) : null;
+  } else if (u.planId && body.expireAt !== undefined) {
+    // plan + 有套餐：到期时间由套餐周期派生，手动传的值不生效
+    expireIgnored = true;
   }
 
   store.save();
@@ -933,6 +1008,11 @@ function updateUser(req, res, params, body) {
   if (body.resetTraffic) bits.push('重置流量');
   if (body.usedGB !== undefined && body.usedGB !== null && body.usedGB !== '') bits.push(`已用改为 ${Number(body.usedGB)} GB`);
   if (planChanged) bits.push('换套餐');
+  if (modeChanged) bits.push(u.expireMode === 'custom' ? '到期改为自定义' : '到期改为跟随套餐');
+  if (u.expireMode === 'custom' && body.expireAt !== undefined) {
+    bits.push(`自定义到期 ${u.expireAt ? u.expireAt.slice(0, 10) : '长期'}`);
+  }
+  if (expireIgnored) bits.push('到期时间已忽略（跟随套餐模式）');
   auditAction('user.update', u.name, bits.join(' · ') || '更新资料');
   sendJson(res, 200, { ok: true, item: store.publicUser(u) });
 }
@@ -1058,6 +1138,7 @@ function bulkCreateUsers(req, res, params, body, session, ctx) {
       password: body.password,
       enabled: body.enabled !== false,
     });
+    if (u.error) { skipped.push({ name, reason: u.error }); continue; }
     db.users.push(u);
     created.push({
       id: u.id,
@@ -1130,6 +1211,8 @@ function batchUsers(req, res, params, body) {
       u.cycleStartAt = u.planId ? store.iso() : null;
       u.renewCount = 0;
       u.lastRenewAt = null;
+      // 换套餐时回到跟随套餐模式，否则旧的自定义到期日会挂在新套餐上
+      u.expireMode = 'plan';
       if (u.planId) store.applyPlanToUser(u);
       else {
         if (body.quotaGB !== undefined) u.quotaGB = Number(body.quotaGB) || 0;
@@ -1142,7 +1225,12 @@ function batchUsers(req, res, params, body) {
       if (!r.ok) {
         skipped.push({
           name: u.name,
-          reason: r.reason === 'noplan' ? '没有套餐，无法续期' : '该套餐是永久 / 自定义到期，没有周期可续',
+          reason:
+            r.reason === 'noplan'
+              ? '没有套餐，无法续期'
+              : u.expireMode === 'custom'
+                ? '该用户是自定义到期，请在编辑里直接改到期日'
+                : '该套餐是永久 / 自定义到期，没有周期可续',
         });
         continue;
       }
@@ -1399,6 +1487,7 @@ function claimInvite(req, res, params, body, session, ctx) {
     note: inv.note ? `邀请领取 · ${inv.note}` : '邀请领取',
     password: body.password,
   });
+  if (u.error) return sendJson(res, 400, u);
   db.users.push(u);
   inv.usedCount = Number(inv.usedCount) + 1;
   inv.lastUsedAt = store.iso();

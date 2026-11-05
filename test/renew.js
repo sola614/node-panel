@@ -53,7 +53,7 @@ const mkPlan = (name, validity, autoRenew) => {
   return p;
 };
 
-const mkUser = (plan, { createdDaysAgo = 60, usedGB = 5 } = {}) => {
+const mkUser = (plan, { createdDaysAgo = 60, usedGB = 5, expireMode, expireAt } = {}) => {
   const created = store.iso(Date.now() - createdDaysAgo * DAY);
   const u = {
     id: store.uid(),
@@ -71,9 +71,12 @@ const mkUser = (plan, { createdDaysAgo = 60, usedGB = 5 } = {}) => {
     cycleStartAt: created,
     renewCount: 0,
     lastRenewAt: null,
+    expireMode: expireMode || 'plan',
   };
   store.db().users.push(u);
   store.applyPlanToUser(u);
+  // 自定义模式要在 applyPlanToUser 之后再落日期（它就是权威值）
+  if (expireMode === 'custom' && expireAt) u.expireAt = expireAt;
   return u;
 };
 
@@ -235,6 +238,32 @@ ok('跳过时用量不被清零', uCus.usedBytes === cusUsed, String(uCus.usedBy
 const uNoPlan = mkUser(pManual, { createdDaysAgo: 5 });
 uNoPlan.planId = null;
 ok('没有套餐时返回 noplan', store.extendUserCycle(uNoPlan).reason === 'noplan');
+
+/* ---------------- 12. 到期模式：跟随套餐 / 自定义（0.1.20） ---------------- */
+console.log('\n到期模式');
+const pMode = mkPlan('月付·到期模式', { type: 'month', num: 1 });
+const customAt = new Date(Date.now() + 5 * DAY).toISOString();
+const uMode = mkUser(pMode, { createdDaysAgo: 60, usedGB: 4, expireMode: 'custom', expireAt: customAt });
+ok('自定义到期不被套餐周期覆盖', uMode.expireAt === customAt, `(${String(uMode.expireAt).slice(0, 10)})`);
+ok('自定义到期仍继承套餐额度', uMode.quotaGB === pMode.quotaGB, `(${uMode.quotaGB}GB)`);
+const modeUsed = uMode.usedBytes;
+// 时间旅行到 400 天后：套餐周期早过了，但自定义日期说了算
+ok('自定义到期即使过期也不自动续期',
+  store.renewUserIfDue(uMode, Date.now() + 400 * DAY) === false &&
+    uMode.expireAt === customAt && uMode.usedBytes === modeUsed);
+ok('自定义到期用户手动续期被跳过', store.extendUserCycle(uMode, Date.now() + 400 * DAY).reason === 'custom');
+ok('publicUser 标出自定义到期',
+  store.publicUser(uMode).expireMode === 'custom' &&
+    store.publicUser(uMode).autoRenew === false &&
+    store.publicUser(uMode).expireLocked === false);
+// 切回跟随套餐 = 开新一期，从此刻重新起算
+uMode.expireMode = 'plan';
+uMode.cycleStartAt = store.iso();
+uMode.renewCount = 0;
+store.applyPlanToUser(uMode);
+ok('切回跟随套餐后按周期重新推算',
+  new Date(uMode.expireAt).getTime() > Date.now() + 20 * DAY, `(${String(uMode.expireAt).slice(0, 10)})`);
+ok('切回跟随套餐后自动续期恢复', store.publicUser(uMode).autoRenew === true);
 
 store.close();
 try {

@@ -360,6 +360,85 @@ function totpCodeOf(secret) {
   ok('月付用户按自然月推算到期', monthDiff === 3, `(${uMonth.data.item.expireAt})`);
   await call('/api/users/' + uMonth.data.item.id, { method: 'DELETE' });
 
+  /* ---------- 到期模式：跟随套餐 / 自定义（0.1.20） ---------- */
+  const customDay = new Date(Date.now() + 5 * 864e5).toISOString();
+  const uModeC = await call('/api/users', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-自定义到期模式', planId, password: SUB_PASS, expireMode: 'custom', expireAt: customDay }),
+  });
+  cleanup.push(['/api/users/' + uModeC.data.item.id]);
+  ok('可以创建「自定义到期」用户',
+    uModeC.status === 200 && uModeC.data.item.expireMode === 'custom', `(${uModeC.data.item.expireMode})`);
+  ok('自定义到期按管理员填的日期落库',
+    Math.abs(new Date(uModeC.data.item.expireAt) - new Date(customDay)) < 1000,
+    `(${uModeC.data.item.expireAt})`);
+  ok('自定义到期不自动续期', uModeC.data.item.autoRenew === false);
+
+  // 切回「跟随套餐」：到期日重新按套餐周期推算，自动续期恢复
+  const backPlan = await call('/api/users/' + uModeC.data.item.id, {
+    method: 'PUT',
+    body: json({ expireMode: 'plan' }),
+  });
+  ok('切回跟随套餐后自动续期恢复',
+    backPlan.status === 200 && backPlan.data.item.expireMode === 'plan' && backPlan.data.item.autoRenew === true);
+  ok('切回跟随套餐后到期日重新推算',
+    Math.abs(new Date(backPlan.data.item.expireAt) - new Date(customDay)) > 60000,
+    `(${backPlan.data.item.expireAt})`);
+
+  /* ---------- 到期模式：失败路径与回归守护（0.1.20 复审 N-1 / N-2） ---------- */
+  const modeId = uModeC.data.item.id;
+  const noDate = await call('/api/users', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-custom无日期', planId, password: SUB_PASS, expireMode: 'custom' }),
+  });
+  ok('custom 无日期被拒（400）',
+    noDate.status === 400 && noDate.data.error === '请选择自定义到期日', `(${noDate.status})`);
+
+  const badDate = await call('/api/users', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-非法日期', planId, password: SUB_PASS, expireMode: 'custom', expireAt: 'bad' }),
+  });
+  ok('POST 非法日期返回 400 而非 500',
+    badDate.status === 400 && badDate.data.error === '日期格式不正确', `(${badDate.status})`);
+
+  // 切回 custom，再模拟 API 直调把日期清空：矛盾状态不能复活
+  const recustom = await call('/api/users/' + modeId, {
+    method: 'PUT', body: json({ expireMode: 'custom', expireAt: customDay }),
+  });
+  ok('可再次切回自定义到期', recustom.status === 200 && recustom.data.item.expireMode === 'custom');
+  const clearDate = await call('/api/users/' + modeId, { method: 'PUT', body: json({ expireAt: '' }) });
+  ok('已是 custom 的用户不能清空到期日（N-1 回归）',
+    clearDate.status === 400 && clearDate.data.error === '请选择自定义到期日', `(${clearDate.status})`);
+  // 顺带守住「只改别的字段、不碰 expireAt」不该被误拦
+  const untouched = await call('/api/users/' + modeId, { method: 'PUT', body: json({ note: 'SMOKE-日期未动' }) });
+  ok('不碰到期日的编辑不受影响，日期仍在',
+    untouched.status === 200 && untouched.data.item.expireMode === 'custom' && !!untouched.data.item.expireAt);
+
+  const badDatePut = await call('/api/users/' + modeId, { method: 'PUT', body: json({ expireAt: 'not-a-date' }) });
+  ok('PUT 非法日期返回 400 而非 500',
+    badDatePut.status === 400 && badDatePut.data.error === '日期格式不正确', `(${badDatePut.status})`);
+
+  // plan 模式下手填到期日被忽略，并在审计里留痕
+  await call('/api/users/' + modeId, { method: 'PUT', body: json({ expireMode: 'plan' }) });
+  const farDay = new Date(Date.now() + 300 * 864e5).toISOString();
+  const ignored = await call('/api/users/' + modeId, { method: 'PUT', body: json({ expireAt: farDay }) });
+  ok('plan 模式手填到期日不生效',
+    ignored.status === 200 && Math.abs(new Date(ignored.data.item.expireAt) - new Date(farDay)) > 864e5,
+    `(${ignored.data.item.expireAt})`);
+  const auditRecent = await call('/api/audit?limit=20');
+  ok('忽略到期日留了审计线索',
+    JSON.stringify(auditRecent.data.items).includes('到期时间已忽略（跟随套餐模式）'));
+
+  // 批量改套餐会把 custom 重置回 plan（与单个编辑行为一致）
+  await call('/api/users/' + modeId, { method: 'PUT', body: json({ expireMode: 'custom', expireAt: customDay }) });
+  const bMode = await call('/api/users/batch', {
+    method: 'POST', body: json({ ids: [modeId], action: 'plan', planId }),
+  });
+  ok('批量改套餐请求成功', bMode.status === 200 && bMode.data.done === 1);
+  const afterBatch = (await call('/api/users')).data.items.find((u) => u.id === modeId);
+  ok('批量改套餐把 custom 重置为 plan',
+    afterBatch.expireMode === 'plan' && afterBatch.autoRenew === true, `(${afterBatch.expireMode})`);
+
   // 老接口传 days 仍然等价于「N 天」
   const legacy = await call('/api/plans/' + planId, { method: 'PUT', body: json({ days: 5 }) });
   ok('老参数 days 仍等价于按天', legacy.data.item.validity.type === 'day' && legacy.data.item.validity.num === 5);

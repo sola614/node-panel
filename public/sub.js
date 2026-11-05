@@ -301,23 +301,51 @@ try { subSession = localStorage.getItem('np_sub_session') || ''; } catch { /* �
 let panelToken = '';
 try { panelToken = localStorage.getItem('np_token') || ''; } catch { /* 隐私模式 */ }
 
-/** 订阅会话优先；没有就退回管理台会话（管理员预览） */
-const authHeaders = () =>
-  subSession
-    ? { Authorization: 'Bearer ' + subSession }
-    : panelToken
-      ? { Authorization: 'Bearer ' + panelToken }
-      : {};
+/**
+ * 两个可能的凭证，按优先级排：订阅会话 → 管理台会话。
+ *
+ * 为什么不能只挑一个：订阅会话存在服务端**内存**里，容器重启 / 进程重启就全没了，
+ * 而浏览器 localStorage 里的那份还留着。于是「先带订阅会话」的老逻辑会拿着一个
+ * 已经死掉的 token 去请求，401 之后直接弹登录表单 —— 明明浏览器里躺着一个有效的
+ * 管理台会话，却没人去用它。这就是「更新镜像后从用户列表打开订阅页仍要密码」的成因。
+ */
+const authVariants = () => {
+  const list = [];
+  if (subSession) list.push({ Authorization: 'Bearer ' + subSession });
+  if (panelToken && panelToken !== subSession) list.push({ Authorization: 'Bearer ' + panelToken });
+  return list;
+};
+
+/** 丢弃已经失效的订阅会话（它已经没用，留着只会让每次请求都多跑一轮） */
+function dropSubSession() {
+  subSession = '';
+  try { localStorage.removeItem('np_sub_session'); } catch { /* 隐私模式 */ }
+}
+
+/**
+ * 带凭证请求：依次试订阅会话、管理台会话，哪个先不 401 就用哪个。
+ * 两个都失效才真的需要登录 —— 那时返回的 401 才是「请输密码」。
+ */
+async function fetchAuthed(url, opts = {}) {
+  const variants = authVariants();
+  if (!variants.length) return fetch(url, opts);
+  let res = null;
+  for (let i = 0; i < variants.length; i++) {
+    res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...variants[i] } });
+    if (res.status !== 401) return res;
+    // 第一个变体就是订阅会话：它 401 了说明已过期/服务端重启过，直接扔掉
+    if (i === 0 && subSession) dropSubSession();
+  }
+  return res;
+}
 
 const subApi = async (path, body, authed = false) => {
-  const res = await fetch(path, {
+  const opts = {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(authed ? authHeaders() : {}),
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  };
+  const res = authed ? await fetchAuthed(path, opts) : await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data.error || '请求失败，请稍后再试');
@@ -384,9 +412,8 @@ function renderNoPassword(message) {
 
 async function loadData() {
   try {
-    const res = await fetch('/api/sub/' + encodeURIComponent(token), {
-      headers: authHeaders(),
-    });
+    // 凭证自动回退：订阅会话过期就换管理台会话再试一次（管理员免密预览）
+    const res = await fetchAuthed('/api/sub/' + encodeURIComponent(token));
     if (res.status === 401) {
       const data = await res.json().catch(() => ({}));
       if (data.loginRequired) {

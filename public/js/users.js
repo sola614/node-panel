@@ -54,7 +54,7 @@ function userRowHtml(u) {
         <td>
           <div style="font-size:12.5px">${fmtDate(u.expireAt)}</div>
           <div class="cell-sub">${u.daysLeft == null ? '长期有效' : u.daysLeft >= 0 ? '剩 ' + u.daysLeft + ' 天' : '已过期'}${
-            u.autoRenew ? ' · 自动续期' : ''
+            u.expireMode === 'custom' ? ' · 自定义到期' : u.autoRenew ? ' · 自动续期' : ''
           }</div>
         </td>
         <td><span class="badge ${STATUS_BADGE[u.status]}">${u.statusLabel}</span></td>
@@ -270,11 +270,19 @@ function userForm(user) {
         <input type="number" id="f-quota" min="0" step="1" value="${u.quotaGB != null ? u.quotaGB : 100}">
         <div class="hint" id="f-quota-hint">填 0 表示不限流量</div>
       </div>
-      <div class="field">
-        <label>到期时间</label>
-        <input type="date" id="f-expire" value="${expire}">
-        <div class="hint" id="f-expire-hint"></div>
+      <div class="field" id="f-expire-mode-field">
+        <label>到期方式</label>
+        <select id="f-expire-mode">
+          <option value="plan" ${u.expireMode === 'custom' ? '' : 'selected'}>跟随套餐（到期自动续期）</option>
+          <option value="custom" ${u.expireMode === 'custom' ? 'selected' : ''}>自定义到期日（到点终止）</option>
+        </select>
+        <div class="hint" id="f-expire-mode-hint"></div>
       </div>
+    </div>
+    <div class="field" id="f-expire-field">
+      <label>到期日</label>
+      <input type="date" id="f-expire" value="${expire}">
+      <div class="hint" id="f-expire-hint"></div>
     </div>
     <div class="field">
       <label>已用流量（GB）</label>
@@ -390,32 +398,56 @@ function bindUserForm(mask) {
     const pid = $('#f-plan', mask).value;
     const plan = (state.data.planList || []).find((p) => p.id === pid);
     const expire = $('#f-expire', mask);
+    const modeSel = $('#f-expire-mode', mask);
+    const modeField = $('#f-expire-mode-field', mask);
+    const expireField = $('#f-expire-field', mask);
 
     if (plan) {
       quota.value = plan.quotaGB || 0;
       quota.readOnly = true;
       $('#f-quota-hint', mask).textContent = '继承自套餐，不可修改';
-      // 到期时间：没换套餐的老用户直接显示真实到期日（可能已经自动续过几期），
-      // 换套餐 / 新用户才按「现在 + 一个周期」估算，月/季/年按自然日历算。
-      // 预填套餐默认值，但允许管理员手动修改（延期 / 缩短期限）
-      const at = !planTouched && mask.dataset.expireAt
+      // 有套餐才有「跟随套餐 / 自定义」这个选择
+      modeField.hidden = false;
+      const custom = modeSel.value === 'custom';
+      // 套餐推算出来的到期日：没换套餐的老用户用真实到期日（可能已自动续过几期），
+      // 换套餐 / 新用户才按「现在 + 一个周期」估算，月/季/年按自然日历算
+      const derived = !planTouched && mask.dataset.expireAt
         ? new Date(mask.dataset.expireAt)
         : validityExpireAt(plan.validity, Date.now());
-      if (at) expire.value = at.toISOString().slice(0, 10);
+      const derivedText = derived ? derived.toISOString().slice(0, 10) : '';
+      if (custom) {
+        expireField.hidden = false;
+        if (!expire.value && derivedText) expire.value = derivedText;
+      } else {
+        // 跟随套餐：到期日不给改，隐藏输入框，只在提示里说明会落到哪天
+        if (derivedText) expire.value = derivedText;
+        expireField.hidden = true;
+      }
       const renews = Number(mask.dataset.renewCount) || 0;
       const cycleText = plan.autoRenew
         ? `每 ${validityLabel(plan.validity)}自动续期`
         : '到期停用（未开启自动续期）';
-      $('#f-expire-hint', mask).textContent = at ? `默认跟随套餐：${cycleText}，可手动调整` : '默认跟随套餐：永久有效，可手动调整';
+      $('#f-expire-mode-hint', mask).textContent = custom
+        ? '到这一天自动终止，不再跟随套餐续期'
+        : derivedText
+          ? `到期 ${derivedText} · ${cycleText}`
+          : '套餐永久有效';
+      $('#f-expire-hint', mask).textContent = custom
+        ? '到期后该用户的订阅与节点立即失效，不会自动续期'
+        : '';
       $('#f-plan-hint', mask).textContent = renews > 0
         ? `额度由套餐决定 · 已自动续期 ${renews} 期`
         : plan.autoRenew
           ? '额度由套餐决定 · 到期自动续期'
           : '额度由套餐决定 · 到期后停用';
     } else {
+      // 没有套餐：「跟随套餐」无从谈起，直接让管理员填日期
       quota.readOnly = false;
       $('#f-quota-hint', mask).textContent = '填 0 表示不限流量';
-      $('#f-expire-hint', mask).textContent = '';
+      modeField.hidden = true;
+      expireField.hidden = false;
+      $('#f-expire-mode-hint', mask).textContent = '';
+      $('#f-expire-hint', mask).textContent = '到期后该用户的订阅与节点立即失效';
       $('#f-plan-hint', mask).textContent = '不选套餐则手动配置额度与到期';
     }
     syncUsed();
@@ -425,6 +457,20 @@ function bindUserForm(mask) {
     planTouched = true;
     sync();
   });
+
+  // 切到「自定义」时用套餐推算的日期做起点，省得从空白开始挑
+  $('#f-expire-mode', mask).addEventListener('change', (e) => {
+    if (e.target.value !== 'custom') return sync();
+    const pid = $('#f-plan', mask).value;
+    const plan = (state.data.planList || []).find((p) => p.id === pid);
+    if (!plan) return sync();
+    const at = !planTouched && mask.dataset.expireAt
+      ? new Date(mask.dataset.expireAt)
+      : validityExpireAt(plan.validity, Date.now());
+    if (at) $('#f-expire', mask).value = at.toISOString().slice(0, 10);
+    sync();
+  });
+
   quota.addEventListener('input', syncUsed);
   if (used) used.addEventListener('input', syncUsed);
   sync();
@@ -434,10 +480,15 @@ function bindUserForm(mask) {
 function readUserForm(mask) {
    const usedVal = $('#f-used', mask) ? $('#f-used', mask).value : '';
    const passwordEl = $('#f-password', mask);
+   const planId = $('#f-plan', mask).value || null;
+   const modeSel = $('#f-expire-mode', mask);
+   // 没有套餐就没有「跟随套餐」可言；有套餐时以管理员选的模式为准
+   const expireMode = planId && modeSel && modeSel.value === 'custom' ? 'custom' : 'plan';
    const payload = {
      name: $('#f-name', mask).value.trim(),
-     planId: $('#f-plan', mask).value || null,
+     planId,
      quotaGB: Number($('#f-quota', mask).value) || 0,
+     expireMode,
      expireAt: $('#f-expire', mask).value ? new Date($('#f-expire', mask).value + 'T23:59:59').toISOString() : null,
      usedGB: usedVal === '' ? undefined : Number(usedVal),
      note: $('#f-note', mask).value.trim(),
@@ -458,6 +509,7 @@ async function createUserFlow(template) {
       const payload = readUserForm(m);
       if (!payload.name) throw new Error('请填写用户名称');
       if (!payload.password || payload.password.length < 6) throw new Error('请设置登录密码（至少 6 位，订阅页登录用）');
+      if (payload.expireMode === 'custom' && !payload.expireAt) throw new Error('请选择自定义到期日');
       await api('/api/users', { method: 'POST', body: JSON.stringify(payload) });
       toast(copy ? '用户已复制（订阅地址是新的）' : '用户已创建', 'ok');
       render();
@@ -496,6 +548,7 @@ Clash   ${esc(u.clashUrl)}</pre>
     onOk: async (m) => {
       const payload = readUserForm(m);
       if (!payload.name) throw new Error('请填写用户名称');
+      if (payload.expireMode === 'custom' && !payload.expireAt) throw new Error('请选择自定义到期日');
       await api('/api/users/' + id, { method: 'PUT', body: JSON.stringify(payload) });
       toast('已保存', 'ok');
       render();
