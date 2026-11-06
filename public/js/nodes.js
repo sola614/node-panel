@@ -602,14 +602,15 @@ function nodeForm(node, servers) {
           </div>
         </div>
         <label class="ve-label" style="margin-top:10px">
-          <input type="checkbox" id="r-compat" ${r.minClientVer ? 'checked' : ''} style="width:auto">
-          兼容旧客户端 / 非 Xray 内核（sing-box、NekoBox 等）
+          <input type="checkbox" id="r-strict" ${r.strictMode ? 'checked' : ''} style="width:auto">
+          严格模式：只接受 Xray 内核客户端（v2rayN / v2rayNG）
         </label>
-        <div class="hint" style="color:var(--danger, #e24b4a)">
-          默认关闭：Xray 会用官方最低客户端版本 v26.3.27，非 Xray 内核的 ClientHello 会被拒绝，
-          表现为 <code>reality verification failed</code>。勾选后服务端下发
-          <code>minClientVer=0.0.0</code> 关掉这道检查。<b>会降低 REALITY 的主动探测防护，
-          增加服务器 IP 被 GFW 识别封锁的风险</b>，仅在确实需要兼容这些客户端时开启。
+        <div class="hint">
+          默认关闭，服务端下发 <code>minClientVer=0.0.0</code>，Clash / mihomo / sing-box 都能连。
+          勾选后回到 Xray 官方最低版本 <code>v26.3.27</code>：mihomo 与 sing-box 在 REALITY
+          握手中固定声明自己是 <code>1.8.2</code>，会被判成「客户端过旧」直接拒掉，客户端只看得到
+          timeout 或 <code>reality verification failed</code>，服务端日志也不说原因。
+          <b>只在确认所有用户都用 Xray 内核时才开启</b>，抗主动探测的收益小于用户连不上的代价。
         </div>
       </div>
     </div>
@@ -1233,7 +1234,7 @@ function readNodeForm(mask) {
           publicKey: $('#r-pub', mask).textContent.trim(),
           shortId: v('#r-sid'),
           flow: v('#r-flow'),
-          minClientVer: $('#r-compat', mask).checked ? '0.0.0' : '',
+          strictMode: $('#r-strict', mask).checked,
         },
       });
     }

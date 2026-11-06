@@ -134,6 +134,46 @@ function recommendClient(d) {
   };
 }
 
+/**
+ * 订阅链接清单。与后端 subFormatList 一一对应（来源是 /api/sub/:token 的 formats），
+ * 老版本缓存里没有 formats 时用三条固定链接兜底，不让页面开天窗。
+ */
+function linkListHtml(d, preferred) {
+  const items = d.formats && d.formats.length
+    ? d.formats
+    : [
+        { key: 'base64', name: '通用订阅', format: 'Base64', clients: 'v2rayN · v2rayNG · Shadowrocket', url: d.subUrl },
+        { key: 'clash', name: 'Clash / Mihomo', format: 'YAML', clients: 'Clash Verge · Clash Meta · ClashX', url: d.clashUrl },
+        { key: 'singbox', name: 'sing-box', format: 'JSON', clients: 'SFA · SFI · SFM', url: d.singboxUrl || d.subUrl + '?format=singbox' },
+      ];
+  return `<div class="link-list">${items
+    .map(
+      (f) => `<div class="link-item">
+        <div class="link-head">
+          <b>${esc(f.name)}</b><span class="chip">${esc(f.format || '')}</span>
+          ${preferred === f.key ? '<span class="badge badge-ok">推荐</span>' : ''}
+        </div>
+        <div class="link-clients">适用：${esc(f.clients || '')}</div>
+        <div class="code-wrap">
+          <pre class="code">${esc(f.url)}</pre>
+          <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(f.url)}">复制</button>
+        </div>
+        <div class="link-foot">
+          <a class="btn btn-sm btn-ghost" href="${esc(f.url)}" target="_blank" rel="noreferrer">打开</a>
+        </div>
+        ${f.tip ? `<p class="hint">${esc(f.tip)}</p>` : ''}
+      </div>`,
+    )
+    .join('')}</div>`;
+}
+
+/** 当前设备最该用哪条：与上面的「一键导入」推荐保持同一套判断 */
+function preferredKeyOf(rec) {
+  if (/sing-box/i.test(rec.name)) return 'singbox';
+  if (/Clash/i.test(rec.name)) return 'clash';
+  return 'base64';
+}
+
 function render(d) {
   const u = d.user;
   const color = statusColor(u.status);
@@ -249,13 +289,11 @@ function render(d) {
         <button class="btn btn-ghost" data-copy="${esc(d.links.map((l) => l.uri).join('\n'))}">复制全部节点链接</button>
       </div>
 
-      <div style="font-size:13px;font-weight:600;margin:20px 0 10px">订阅地址</div>
-      <div class="code-wrap">
-        <pre class="code" style="font-size:11.5px">${esc(d.subUrl)}</pre>
-        <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(d.subUrl)}">复制</button>
-      </div>
+      <div style="font-size:13px;font-weight:600;margin:20px 0 10px">订阅链接</div>
+      ${linkListHtml(d, preferredKeyOf(rec))}
       <p class="hint" style="margin-top:14px">
-        手动导入就在客户端选「订阅设置 → 添加订阅」粘贴地址。
+        手动导入就在客户端选「订阅设置 → 添加订阅」，粘贴对应格式的地址。
+        <b>格式不对客户端会直接报解析失败</b>，按上面的「适用」挑一条即可。
         这条链接是你的凭证，别转发给别人；节点变化后客户端更新订阅即可生效。
       </p>
     </div>

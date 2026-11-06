@@ -242,14 +242,19 @@ apple / icloud 与 `.cn` / `.ru` / `.ir` 域名；同时不像 cloudflare / micr
 大流量站点**，dest 与 SNI 列表要一起改 —— 太冷门的站反而会让主动探测时的转发流量
 显得异常。
 
-Xray 从 v26.3.27 起给 REALITY 加了最低客户端版本校验：不填 `minClientVer` 时默认就是
-`v26.3.27`，会把 sing-box / NekoBox 等非 Xray 内核的 ClientHello 判为过期并拒绝，客户端
-表现为 `reality verification failed`。节点表单里的**「兼容旧客户端 / 非 Xray 内核」**
-开关勾选后，面板下发 `minClientVer=0.0.0` 关掉这道检查：
+Xray **v26.7.11** 起给 REALITY 加了最低客户端版本校验：`minClientVer` 不填就等于
+`26.3.27`。而 mihomo / sing-box 在 REALITY 握手里固定声明自己是「客户端 `1.8.2`」，
+永远小于这个下限，于是在**认证阶段**被 `validation criteria not met` 拒掉 —— 客户端
+只看得到 timeout，服务端日志也不会告诉你原因。
 
-- 默认**关闭**，保持官方安全默认值
-- 开启后**会降低 REALITY 的主动探测防护，增加服务器 IP 被 GFW 识别封锁的风险**
-- 只在确实需要兼容这些客户端时开；否则更推荐让这些用户换用 Xray 内核客户端
+面板默认下发 `minClientVer=0.0.0` 关掉这道检查，节点表单里的**「严格模式：只接受
+Xray 内核客户端」**勾选后才会省略该字段、回到 Xray 官方默认值：
+
+- 默认**关闭**（即兼容），Clash Verge / mihomo / sing-box / v2rayN 都能连
+- 开启严格模式能**降低 REALITY 的主动探测风险**，但 mihomo / sing-box 用户会全部连不上，
+  只在你确认所有用户都用 Xray 内核时才开
+- 它和 0.1.23 起的 `support-x25519mlkem768` 是**两道独立的门**：那道在握手层
+  （auth 解密前），这道在认证层（解密后），缺一不可
 
 ### Hysteria2
 
@@ -950,12 +955,35 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 想要服务器名加回去就写 `{server} · {node}`；模板里的占位符落空时，
 两端多余的分隔符会被自动剪掉。
 
+**按 UA 自动选格式**（0.1.25）：不带 `?format=` 时，面板会看客户端 UA 决定返回什么——
+`clash` / `mihomo` / `stash` 给 YAML，`sing-box` / `SFI` / `SFM` / `SFA` 给原生 JSON，
+其余（v2rayN、v2rayNG、NekoBox、Shadowrocket…）给 Base64；浏览器（`Accept: text/html`）
+仍然给订阅页。显式 `?format=` 永远优先，猜不出来一律退回 Base64。
+这样合租用户把同一条地址填进任何客户端都能直接解析，不必自己挑格式。
+
+**在线订阅转换**（0.1.25）：设置里填「订阅转换服务地址」与「自定义模板地址」后，
+面板额外给一条 `转换地址&url=普通订阅&config=模板地址` 的链接，在用户页/订阅页里
+作为第四种格式展示。留空即不展示；地址只校验 http(s)，面板自己不会去请求它。
+注意转换器要重新解析节点，可能改写指纹与兼容字段 —— 能用面板直出就别走这条。
+
+**订阅页与用户页的链接清单**（0.1.25）：两处共用后端 `subFormatList()` 产出的
+「格式 → 适用客户端」清单，每条都能复制和打开；订阅页会按当前设备 UA 给对应那条打「推荐」。
+
 **订阅首行流量信息**（0.1.19）：设置 → 订阅显示里勾选后，base64 / Clash / sing-box
 三种格式都会在最前面插一条「剩余 x GB / 共 y GB · 到期 z」的信息节点。
 它是条指向 `127.0.0.1:1` 的假节点（选中也连不通，只用于在客户端列表第一行显示），
 所以默认关闭；只进「节点选择」不进「自动选择」，不会拖累测速。
 不勾选也不影响流量显示 —— 上面的响应头一直在返回。
 
+
+**Clash 订阅模板**（0.1.24）：设置 → Clash 订阅模板里贴一段 JSON，就能自定义
+`proxy-groups` 与 `rules`，**节点参数仍由面板原样输出**。这是 subconverter 的替代方案：
+转换器要重新解析再重新序列化，过程中会改写 `client-fingerprint`、丢掉 `udp`/`network`、
+吞掉 REALITY 的 `support-x25519mlkem768` —— 最后一项丢了就是满屏 timeout。
+模板里可用 `{all}`（全部节点）、`{info}`（首行流量节点）、`{filter:香港|日本}`
+（名字含任一关键词的节点），写一次就能适配所有用户。保存时会校验 JSON 语法、
+分组 `type`、分组重名，以及 `rules` 的目标必须是已声明的分组或 `DIRECT`。
+留空即内置的「🚀 节点选择 + ♻️ 自动选择 + `GEOIP,CN` 直连」。
 
 **sing-box 格式**（0.1.16）：输出是纯 JSON（客户端拉远程订阅走严格解析，注释头都会被拒），
 覆盖 vless（Reality 的 `tls.reality` + `tls.utls`）、vmess、trojan、ss、hysteria2，

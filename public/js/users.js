@@ -59,10 +59,7 @@ function userRowHtml(u) {
         </td>
         <td><span class="badge ${STATUS_BADGE[u.status]}">${u.statusLabel}</span></td>
         <td>
-          <div style="display:flex;gap:5px">
-            <button class="btn btn-sm btn-ghost" data-copy="${esc(u.subUrl)}">复制订阅</button>
-            <a class="btn btn-sm btn-ghost" href="${esc(u.subUrl)}" target="_blank">打开</a>
-          </div>
+          <button class="btn btn-sm btn-ghost" data-act="user-subs" data-id="${u.id}" title="查看全部订阅格式">订阅链接</button>
         </td>
         <td>
           <div class="row-actions">
@@ -520,6 +517,51 @@ async function createUserFlow(template) {
     },
   });
   bindUserForm(mask);
+}
+
+/**
+ * 订阅链接清单。
+ *
+ * 数据来自后端 subFormatList：客户端标签只在那一个地方写，
+ * 否则「哪个客户端能用哪条链接」迟早会两处说法不一致，最后误导用户。
+ * 弹窗不设确定/取消按钮 —— 这里没有需要提交的东西，只有复制。
+ */
+function subLinksHtml(formats) {
+  const items = formats && formats.length
+    ? formats
+    : [
+        { name: '通用订阅', format: 'Base64', clients: 'v2rayN · v2rayNG · Shadowrocket', url: '' },
+        { name: 'Clash / Mihomo', format: 'YAML', clients: 'Clash Verge · Clash Meta', url: '' },
+      ];
+  return `<div class="link-list">${items
+    .map(
+      (f) => `<div class="link-item">
+        <div class="link-head"><b>${esc(f.name)}</b><span class="chip">${esc(f.format || '')}</span></div>
+        <div class="link-clients">适用：${esc(f.clients || '')}</div>
+        ${f.url ? `<div class="code-wrap">
+          <pre class="code">${esc(f.url)}</pre>
+          <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(f.url)}">复制</button>
+        </div>
+        <div class="link-foot">
+          <a class="btn btn-sm btn-ghost" href="${esc(f.url)}" target="_blank" rel="noreferrer">打开</a>
+        </div>` : ''}
+        ${f.tip ? `<p class="hint">${esc(f.tip)}</p>` : ''}
+      </div>`,
+    )
+    .join('')}</div>`;
+}
+
+function userSubsFlow(id) {
+  const u = (state.data.users || []).find((x) => x.id === id);
+  if (!u) return;
+  openModal({
+    title: '订阅链接 · ' + u.name,
+    body: subLinksHtml(u.subFormats) + `<p class="hint" style="margin-top:12px">
+      这些链接就是该用户的凭证，转发出去等于把账号给出去。
+      改了节点或套餐后，客户端「更新订阅」即可生效，不用重新添加。
+    </p>`,
+    footer: false,
+  });
 }
 
 /**

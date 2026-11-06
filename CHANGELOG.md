@@ -3,6 +3,107 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.26] - 2026-11-06
+
+REALITY 的默认值反转：**默认就能连**，把「严格模式」变成需要主动选择的那一个。
+
+### 变更
+
+- **REALITY 默认下发 `minClientVer=0.0.0`**：Xray ≥ v26.7.11 在不填该字段时默认
+  `26.3.27`，会把 mihomo / sing-box 这类固定声明「客户端 1.8.2」的内核全判成过期，
+  在认证阶段直接拒掉（客户端只看到 timeout）。而 Clash Verge 才是绝大多数人用的客户端，
+  默认挂掉的代价远大于抗探测收益
+- **节点表单的开关改为「严格模式：只接受 Xray 内核客户端」**（默认不勾）：
+  勾选后省略 `minClientVer`，回到 Xray 官方默认值，mihomo / sing-box 会全部连不上。
+  数据字段从 `reality.minClientVer` 改为布尔 `reality.strictMode`，老节点升级后自动
+  落到兼容（`undefined` → 非严格），不需要迁移
+- 修正文档里「Xray 从 v26.3.27 起加校验」的说法：**版本号是 26.3.27，引入该默认值的
+  版本是 v26.7.11**；并补上「与 `support-x25519mlkem768` 是两道独立的门」的说明，
+  避免再把两者混为一谈
+
+### 实测依据
+
+本地 xray 26.3.27 双 inbound，同密钥 / 同 dest，客户端 mihomo 1.19.33 两个节点
+都开 `support-x25519mlkem768`，只差服务端 `minClientVer`：
+
+| 服务端 minClientVer | 结果 |
+|---|---|
+| `0.0.0` | 396ms / 403ms 通 |
+| `26.3.27` | 失败（`REALITY: processed invalid connection ... validation criteria not met`） |
+
+## [0.1.25] - 2026-11-06
+
+订阅分发这一环真正面向「不会改地址的合租用户」：格式自动匹配、每条链接标明适用客户端、
+需要外部转换服务时也能一键配好。
+
+### 新增
+
+- **按 UA 自动选订阅格式**：请求不是浏览器时，`clash / mihomo / stash` 直接拿 YAML，
+  `sing-box / SFI / SFM / SFA` 拿原生 JSON，其余（v2rayN、v2rayNG、NekoBox、
+  Shadowrocket…）拿 Base64。显式 `?format=` 永远优先；猜不出来一律退回 Base64 ——
+  宁可给最通用的那份，也不要猜错导致客户端只报「订阅解析失败」
+- **订阅页与用户页都列出全部订阅格式**：每条写明格式、适用的客户端、地址，附「复制 / 打开」。
+  订阅页还会按当前设备的 UA 给对应的那条打「推荐」标
+- **用户页「复制订阅 / 打开」改为「订阅链接」弹窗**：一个入口看全四种格式，
+  不用再猜对方该用哪条链接
+- **系统设置 → 在线订阅转换**：填「订阅转换服务地址」与「自定义模板地址」后，
+  面板拼出 `转换地址&url=普通订阅&config=模板地址` 作为第四种格式展示。
+  地址只做 http(s) 校验（面板不会去请求它），留空即不展示
+
+### 说明
+
+- 格式清单由后端 `subFormatList()` 统一产出：客户端标签只写一处，
+  避免两侧文案走样后把用户指到不支持的客户端上
+- 在线订阅转换仍是「重新解析」的那条路：转换器可能改写指纹、`udp`、REALITY 兼容字段。
+  能直连就用面板自带的 Clash 订阅（0.1.24 支持自定义分组与规则）
+
+## [0.1.24] - 2026-11-06
+
+订阅分组不再需要外挂 subconverter。这个功能本身就是被 0.1.23 那类问题逼出来的：
+subconverter 要重新解析节点再重新序列化，凡是它不认识的字段都会被改写或丢弃
+（`client-fingerprint` 被改成 `random`、`udp` / `network` 被吞、
+REALITY 的 `support-x25519mlkem768` 直接消失），而 REALITY 少了这个字段就是满屏
+timeout。最省事的解法不是教用户改转换器，而是让面板自己出分组。
+
+### 新增
+
+- **设置 → Clash 订阅模板**：用一段 JSON 自定义 `proxy-groups` 与 `rules`，
+  节点仍由面板原样输出，参数不经过第二个解析器。
+  支持占位符 `{all}`（全部节点）、`{info}`（首行流量节点）、
+  `{filter:香港|日本}`（名字含任一关键词的节点），所以模板写一次就能适配所有用户
+- 模板在保存时校验：JSON 语法、分组 `type`、分组重名、`rules` 的目标必须是已声明
+  的分组或 `DIRECT`。客户端对坏配置只会说一句 “config error”，等到那时才排查成本太高
+- 运行期兜底：分组引用了本订阅里不存在的节点会自动剔除（剔空则退化为 `DIRECT`），
+  没有 `MATCH` 兜底规则时补到第一个分组 —— 否则客户端会按默认策略全部直连
+
+### 说明
+
+- 模板只影响 Clash 订阅（`?format=clash`）；base64 / sing-box 订阅不受影响
+- 留空即使用内置的「🚀 节点选择 + ♻️ 自动选择 + GEOIP,CN 直连」两组
+
+## [0.1.23] - 2026-11-06
+
+订阅层两个「换了客户端就全挂」的问题：REALITY 在 Xray 26.9.8+ 服务端上不再兼容
+纯 X25519 握手，Hysteria2 的分享链接被第三方转换器转坏。
+
+### 修复
+
+- **REALITY 节点在 Clash / mihomo 上全部 timeout**：Xray-core 从 26.9.8 起，REALITY
+  服务端会先校验 ClientHello 里的 X25519MLKEM768 密钥交换再解 auth。Xray 客户端自动
+  协商，mihomo / Clash Verge **不会**——不开这个开关时服务端连 auth 都解不出来，直接把
+  流量当普通 TLS 转发到伪装站，客户端只看到 `REALITY Authentication: false` 与满屏超时
+  （服务端日志里只有 `forwarded SNI`，没有任何 `AuthKey` / `ClientVer`）。
+  现在 Clash 订阅的 `reality-opts` 与分享链接的 URI 都固定带上
+  `support-x25519mlkem768`，对旧服务端无害（它们本来也接受纯 X25519）。
+  注意：`minClientVer` 是另一道独立的门槛，**清掉它并不能修复这个握手**；
+  sing-box 目前没有等效字段，这类服务端上仍需换用 Xray / mihomo 系客户端
+- **Hysteria2 经 subconverter 转换后连不上**：分享链接原来对整个 `u<id>:<uuid>`
+  做 `encodeURIComponent`，冒号被编成 `%3A`；不解码 userinfo 的转换器会把整串当作
+  密码，服务端 userpass 查不到 `u<id>`。改为分段编码、保留冒号作为分隔符
+- **Reality 分享链接缺 uTLS 指纹**：节点没填 `fp` 时链接里干脆不带，经 subconverter
+  转回 Clash 会变成 `client-fingerprint: random`。现在与 Clash / sing-box 口径统一
+  兜底 `chrome`
+
 ## [0.1.22] - 2026-11-06
 
 REALITY 侧一批兼容性收口：默认伪装站换成不会触发 Xray GFW 警告的站点，

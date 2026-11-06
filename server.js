@@ -274,6 +274,26 @@ function sha256(text) {
 }
 
 /**
+ * 可选的外部地址（订阅转换服务、模板地址）。与订阅域名不同：
+ * 这两项允许带路径和查询串 —— 转换服务地址通常长这样
+ * `https://sub.example.com/sub?target=clash`，把查询串裁掉反而没法用。
+ */
+function normalizeHttpUrl(raw, label) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) return '';
+  let url;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : 'https://' + text);
+  } catch {
+    throw new Error(`${label}格式不正确，请填写完整地址，如 https://sub.example.com/sub?target=clash`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`${label}只支持 http:// 或 https:// 开头的地址`);
+  }
+  return url.toString();
+}
+
+/**
  * 恒时 token 比较。用 === 比对凭证时，攻击者可以通过响应时间逐位猜出 token，
  * 所以 token 一律走这里。长度不等直接判否（token 长度本身不是秘密，面板下发的都是固定长度）。
  */
@@ -779,6 +799,73 @@ function batchDeletePlans(req, res, params, body) {
 
 /* ---------------------------------- 用户 ---------------------------------- */
 
+/**
+ * 在线订阅转换链接：`转换地址&url=订阅地址&config=模板地址`。
+ *
+ * 为什么保留这条后路：面板直出（0.1.23/0.1.24）已经覆盖了绝大多数场景，
+ * 但有人就是想让外部转换服务统一套模板、或者给第三方客户端做分发。
+ * 转换地址里通常已经带了 `?target=clash` 之类的查询串，所以拼 `&` 还是 `?`
+ * 要看它自己有没有 `?`，不能想当然。
+ */
+function convertedSubUrl(base, token, settings) {
+  const conv = String((settings && settings.subConverterUrl) || '').trim();
+  if (!conv) return '';
+  const subUrl = `${base}/s/${token}`;
+  const tpl = String((settings && settings.subTemplateUrl) || '').trim();
+  const sep = conv.includes('?') ? '&' : '?';
+  let out = `${conv}${sep}url=${encodeURIComponent(subUrl)}`;
+  if (tpl) out += `&config=${encodeURIComponent(tpl)}`;
+  return out;
+}
+
+/**
+ * 订阅页 / 管理台共用的「可用订阅格式」清单。
+ *
+ * 放在后端而不是各画一套：客户端标签写错一次就会误导用户，
+ * 而这两处界面本来就该说同一句话。
+ */
+function subFormatList(base, token, settings) {
+  const subUrl = `${base}/s/${token}`;
+  const list = [
+    {
+      key: 'base64',
+      name: '通用订阅',
+      format: 'Base64',
+      clients: 'v2rayN · v2rayNG · NekoBox · Shadowrocket · Karing',
+      tip: '最通用，几乎所有客户端都能导入',
+      url: subUrl,
+    },
+    {
+      key: 'clash',
+      name: 'Clash / Mihomo',
+      format: 'YAML',
+      clients: 'Clash Verge · Clash Meta · ClashX · FlClash',
+      tip: '带分组规则；REALITY 节点已带 mihomo 必需的兼容字段',
+      url: `${subUrl}?format=clash`,
+    },
+    {
+      key: 'singbox',
+      name: 'sing-box',
+      format: 'JSON',
+      clients: 'SFA · SFI · SFM',
+      tip: '原生配置；不支持 REALITY 后量子握手的服务端上可能连不上',
+      url: `${subUrl}?format=singbox`,
+    },
+  ];
+  const conv = convertedSubUrl(base, token, settings);
+  if (conv) {
+    list.push({
+      key: 'convert',
+      name: '订阅转换',
+      format: '外部转换',
+      clients: '任意支持标准订阅的客户端',
+      tip: '由你配置的在线转换服务套用自定义模板生成',
+      url: conv,
+    });
+  }
+  return list;
+}
+
 function listUsers(req, res, params, body, session, ctx) {
   sweepRenewals();
   const db = store.db();
@@ -788,6 +875,8 @@ function listUsers(req, res, params, body, session, ctx) {
       ...store.publicUser(u),
       subUrl: `${base}/s/${u.token}`,
       clashUrl: `${base}/s/${u.token}?format=clash`,
+      convertedUrl: convertedSubUrl(base, u.token, db.settings),
+      subFormats: subFormatList(base, u.token, db.settings),
       nodeCount: store.visibleNodes(u).length,
     })),
     plans: db.plans.map((p) => {
@@ -1611,9 +1700,9 @@ function normalizeNode(body, prev = {}) {
       publicKey: String(r.publicKey || ''),
       shortId: String(r.shortId || ''),
       flow: r.flow === '' ? '' : String(r.flow || 'xtls-rprx-vision'),
-      // 只接受固定值，避免 API 直调塞任意版本串把 Xray 配置搞坏；空 = 用官方默认值
-      minClientVer: r.minClientVer === xray.REALITY_COMPAT_MIN_CLIENT_VER
-        ? xray.REALITY_COMPAT_MIN_CLIENT_VER : '',
+      // strictMode = 回到 Xray 官方最低客户端版本（26.3.27），会拒绝 mihomo / sing-box。
+      // 默认 false：下发 minClientVer=0.0.0，见 lib/xray.js。
+      strictMode: !!r.strictMode,
     };
   } else if (prev.reality) {
     node.reality = prev.reality; // 保留，切回 reality 时不用重填
@@ -4420,6 +4509,20 @@ function updateSettings(req, res, params, body) {
     }
   }
 
+  // 在线订阅转换：转换地址与模板地址都只是拼进链接里给用户复制，
+  // 面板自己不会去请求它们 —— 所以「填错也能存」是危险的（用户点了打不开），
+  // 这里只做到「必须是合法的 http(s) 地址」，可达性留给用户自己点一下验证
+  let nextConverter = s.subConverterUrl || '';
+  let nextTemplate = s.subTemplateUrl || '';
+  if (body.subConverterUrl !== undefined || body.subTemplateUrl !== undefined) {
+    try {
+      if (body.subConverterUrl !== undefined) nextConverter = normalizeHttpUrl(body.subConverterUrl, '订阅转换地址');
+      if (body.subTemplateUrl !== undefined) nextTemplate = normalizeHttpUrl(body.subTemplateUrl, '模板地址');
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
   // 面板 HTTPS：引用证书页的证书实体。校验通过后立即生效（无需重启）：
   // 改证书热加载、清空关闭监听
   let httpsChanged = false;
@@ -4438,6 +4541,8 @@ function updateSettings(req, res, params, body) {
   if (body.siteName !== undefined) s.siteName = String(body.siteName).trim() || s.siteName;
   if (body.notice !== undefined) s.notice = String(body.notice);
   s.subBase = nextSubBase;
+  s.subConverterUrl = nextConverter;
+  s.subTemplateUrl = nextTemplate;
   if (httpsChanged) s.httpsCertId = nextCertId;
 
   // 订阅显示：命名模板 + 首行信息节点。模板长度设上限 —— 它会被拼进
@@ -4457,6 +4562,16 @@ function updateSettings(req, res, params, body) {
   }
   if (subDisplayChanged) applySubNameTemplates();
 
+  // Clash 订阅模板：校验通过才落盘。坏模板不会当场坏事，只会让客户端
+  // 「配置加载失败」，用户完全无从下手，所以宁可在这里 400 拦掉
+  let nextClashTpl = s.clashTemplate || '';
+  if (body.clashTemplate !== undefined) {
+    const r = sub.parseTemplate(body.clashTemplate);
+    if (!r.ok) return sendJson(res, 400, { error: '订阅模板有误：' + r.error });
+    nextClashTpl = String(body.clashTemplate || '').trim();
+  }
+  s.clashTemplate = nextClashTpl;
+
   store.save();
   if (httpsChanged) {
     try {
@@ -4473,6 +4588,10 @@ function updateSettings(req, res, params, body) {
     body.notice !== undefined ? '改公告' : '',
     body.nameTplDirect !== undefined || body.nameTplRelay !== undefined ? '改节点命名' : '',
     body.subInfoNode !== undefined ? `订阅首行流量 ${s.subInfoNode === '1' ? '开' : '关'}` : '',
+    body.clashTemplate !== undefined ? (s.clashTemplate ? '改 Clash 订阅模板' : 'Clash 订阅模板恢复默认') : '',
+    body.subConverterUrl !== undefined || body.subTemplateUrl !== undefined
+      ? `订阅转换 ${s.subConverterUrl || '(未配置)'}${s.subTemplateUrl ? ' + 模板' : ''}`
+      : '',
   ].filter(Boolean).join(' · '));
   sendJson(res, 200, {
     ok: true,
@@ -5027,6 +5146,8 @@ function subscriptionPayload(user, req) {
     subUrl: `${base}/s/${user.token}`,
     clashUrl: `${base}/s/${user.token}?format=clash`,
     singboxUrl: `${base}/s/${user.token}?format=singbox`,
+    // 订阅页与管理台共用这同一份清单（客户端标签只在这里写一次）
+    formats: subFormatList(base, user.token, db.settings),
     updatedAt: store.iso(),
   };
 }
@@ -5238,10 +5359,30 @@ function subInfoText(user) {
   return parts.join(' · ');
 }
 
+/**
+ * 按 UA 猜客户端，自动挑订阅格式。
+ *
+ * 为什么值得做：合租用户九成不会改订阅地址，把 Clash 的 YAML 丢给 v2rayN、
+ * 或把 Base64 丢给 Clash Verge，客户端都只会报一句「订阅解析失败」。
+ * 只在**请求不是浏览器**时猜（浏览器要的是订阅页），而且显式 `?format=` 永远优先。
+ *
+ * 只认特征非常明确的三种：clash 系（含 mihomo、Stash）、sing-box 官方三件套、其余一律 Base64。
+ * 宁可退回最通用的 Base64，也不要猜错 —— NekoBox / v2rayNG / Shadowrocket 都能吃它。
+ */
+function autoFormat(req, accept) {
+  if (String(accept || '').includes('text/html')) return '';
+  const ua = String(req.headers['user-agent'] || '');
+  if (!ua) return '';
+  if (/clash|mihomo|stash/i.test(ua)) return 'clash';
+  if (/sing-box|\bSFI\b|\bSFM\b|\bSFA\b/i.test(ua)) return 'singbox';
+  return '';
+}
+
 function subPage(req, res, params, body, session, ctx) {
   const user = userByToken(params.token);
-  const format = ctx.query.get('format');
   const accept = ctx.req.headers.accept || '';
+  // 显式 format 优先；没写就按 UA 猜（猜不出来还是原来的 Base64）
+  const format = ctx.query.get('format') || autoFormat(ctx.req, accept);
 
   if (!user) return sendText(res, 404, '订阅不存在或已被删除');
 
@@ -5273,7 +5414,7 @@ function subPage(req, res, params, body, session, ctx) {
       db.settings.siteName,
       (n) => store.nodeUsableBy(n, user),
       (n, e) => store.planCovers(store.planOf(user), e.planIds),
-      { info },
+      { info, template: db.settings.clashTemplate },
     );
     return sendText(res, 200, yaml, 'text/yaml; charset=utf-8', {
       ...userinfo,

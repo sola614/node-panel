@@ -227,6 +227,31 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   d5.querySelector('.nav-item[data-view="settings"]').dispatchEvent(new w5.MouseEvent('click', { bubbles: true }));
   await waitFor(() => d5.querySelector('#set-base'), '设置页渲染');
 
+  // Clash 订阅模板卡片：示例必须能直接保存（校验规则挺严，示例写错就等于引导用户踩坑）
+  const tplBox = d5.querySelector('#set-clash-tpl');
+  ok('设置页有「Clash 订阅模板」输入框', !!tplBox);
+  click(d5.querySelector('[data-act="fill-clash-tpl"]'), w5);
+  await sleep(120);
+  const tplParsed = (() => {
+    try {
+      const j = JSON.parse(tplBox.value);
+      return Array.isArray(j['proxy-groups']) && Array.isArray(j.rules);
+    } catch {
+      return false;
+    }
+  })();
+  ok('「填入示例」写入的是合法模板 JSON', tplParsed, `(${String(tplBox.value).slice(0, 24)})`);
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
+  await sleep(300);
+  ok('保存模板会把 JSON 提交到设置接口',
+    seen5.some((r) => r.method === 'PUT' && r.url.endsWith('/api/settings')));
+  // 还原成空模板，后面还有用例共用同一个面板实例
+  tplBox.value = '';
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
+  await sleep(300);
+
   const baseInput = d5.querySelector('#set-base');
   const errBox = d5.querySelector('#set-base-err');
   const saveBtn = d5.querySelector('[data-act="save-settings"]');
@@ -582,6 +607,22 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('列表每行带勾选框', d9.querySelectorAll('#u-tbody .u-pick').length === totalRows);
   ok('顶部显示当前条数', /共\s*\d+\s*位|\d+\s*\/\s*\d+\s*位/.test(d9.querySelector('#u-count').textContent),
     d9.querySelector('#u-count').textContent);
+
+  // 订阅链接改成弹窗：一行按钮进来，每种格式各自可复制、可打开
+  const subsBtn = d9.querySelector('#u-tbody [data-act="user-subs"]');
+  ok('每行都有「订阅链接」按钮', !!subsBtn);
+  click(subsBtn, w9);
+  await sleep(220);
+  const subsModal = d9.querySelector('.modal-mask');
+  const linkItems = subsModal ? subsModal.querySelectorAll('.link-item') : [];
+  ok('点开订阅链接弹出弹窗', !!subsModal);
+  ok('弹窗列出全部订阅格式', linkItems.length >= 3, `(${linkItems.length})`);
+  ok('每种格式都能复制', !!subsModal && subsModal.querySelectorAll('.link-item .copy-btn').length === linkItems.length);
+  ok('每种格式都能打开', !!subsModal && subsModal.querySelectorAll('.link-item .link-foot a[href]').length === linkItems.length);
+  ok('弹窗标注适用客户端', !!subsModal && subsModal.textContent.includes('适用：'));
+  click(subsModal.querySelector('[data-close]'), w9);
+  await sleep(160);
+  ok('弹窗可以关闭', !d9.querySelector('.modal-mask'));
 
   await typeInto(d9.querySelector('#u-q'), TAG + '-甲');
   ok('搜索按名字过滤', rowsOf(d9).length === 1 && rowsOf(d9)[0].textContent.includes(TAG + '-甲'),
@@ -1350,6 +1391,12 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   await waitFor(() => d12b.querySelector('#reset-btn'), '登录后的数据页');
   ok('正确密码登录后渲染完整订阅信息', !!d12b.querySelector('.sub-card') && !d12b.querySelector('#sub-login-form'),
     `card=${!!d12b.querySelector('.sub-card')} form=${!!d12b.querySelector('#sub-login-form')}`);
+  const subLinks = d12b.querySelectorAll('.link-item');
+  ok('订阅页列出全部订阅格式', subLinks.length >= 3, `(${subLinks.length})`);
+  ok('订阅页每条格式都能复制与打开',
+    d12b.querySelectorAll('.link-item .copy-btn').length === subLinks.length &&
+    d12b.querySelectorAll('.link-item .link-foot a[href]').length === subLinks.length);
+  ok('订阅页标注适用客户端', d12b.body.textContent.includes('适用：'));
   dom12b.window.close();
   await fetch(`${BASE}/api/users/${uiUser2.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
 

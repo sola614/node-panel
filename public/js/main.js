@@ -6,6 +6,25 @@
  */
 /* ============================== 设置 ============================== */
 
+/**
+ * 订阅模板示例。放在前端而不是后端：它是「给人抄的起点」，
+ * 真正生效的是设置里存的那份 JSON，后端只做校验。
+ */
+const CLASH_TPL_EXAMPLE = `{
+  "proxy-groups": [
+    { "name": "🚀 节点选择", "type": "select", "proxies": ["♻️ 自动选择", "{all}", "DIRECT"] },
+    { "name": "♻️ 自动选择", "type": "url-test", "proxies": ["{all}"] },
+    { "name": "🎬 流媒体", "type": "select", "proxies": ["{filter:香港|日本}", "🚀 节点选择"] },
+    { "name": "🤖 AI", "type": "select", "proxies": ["{filter:日本|美国}", "🚀 节点选择"] }
+  ],
+  "rules": [
+    "DOMAIN-SUFFIX,openai.com,🤖 AI",
+    "DOMAIN-SUFFIX,netflix.com,🎬 流媒体",
+    "GEOIP,CN,DIRECT",
+    "MATCH,🚀 节点选择"
+  ]
+}`;
+
 RENDERERS.settings = async () => {
   const [d, n, b, cd] = await Promise.all([
     api('/api/settings'),
@@ -75,6 +94,64 @@ RENDERERS.settings = async () => {
             Clash Verge / v2rayN / Shadowrocket 都能读到。
           </div>
           <button class="btn btn-primary" data-act="save-sub" style="margin-top:12px">保存订阅显示</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>Clash 订阅模板</h3>
+          <span class="hint" style="margin:0">分组与规则</span>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            <label>自定义 proxy-groups 与 rules（JSON，留空用内置两组）</label>
+            <textarea id="set-clash-tpl" class="code-area" spellcheck="false" autocomplete="off"
+              placeholder='${esc(CLASH_TPL_EXAMPLE)}'>${esc(s.clashTemplate || '')}</textarea>
+            <div class="field-err" id="set-clash-tpl-err" hidden></div>
+          </div>
+          <div class="hint">
+            面板按这份模板生成 Clash 订阅，<b>节点参数仍由面板原样输出</b> ——
+            不像 subconverter 会二次解析、把 <code>client-fingerprint</code> 改成 random、
+            丢掉 <code>udp</code>/<code>network</code>、吞掉 REALITY 的
+            <code>support-x25519mlkem768</code>。有了模板就不需要再挂 subconverter。
+            <br>可用占位符：<code>{all}</code> 全部节点 · <code>{info}</code> 首行流量节点 ·
+            <code>{filter:香港|日本}</code> 名字含任一关键词的节点。
+            <br><code>rules</code> 的目标必须是下面声明过的分组名或 <code>DIRECT</code>；
+            没写 <code>MATCH</code> 兜底规则时会自动补到第一个分组。
+          </div>
+          <div style="display:flex;gap:10px;margin-top:12px">
+            <button class="btn btn-primary" data-act="save-clash-tpl">保存模板</button>
+            <button class="btn" data-act="fill-clash-tpl">填入示例</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>在线订阅转换</h3>
+          <span class="hint" style="margin:0">可选，留空即不展示</span>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            <label>订阅转换服务地址</label>
+            <input type="text" id="set-conv-url" value="${esc(s.subConverterUrl || '')}"
+              placeholder="https://sub.example.com/sub?target=clash" spellcheck="false" autocomplete="off">
+            <div class="hint">填到「已经带了客户端参数的接口」这一层，比如 <code>.../sub?target=clash</code>。</div>
+          </div>
+          <div class="field">
+            <label>自定义模板地址</label>
+            <input type="text" id="set-conv-tpl" value="${esc(s.subTemplateUrl || '')}"
+              placeholder="https://example.com/my-template.ini" spellcheck="false" autocomplete="off">
+            <div class="hint">转换服务支持的模板文件地址；留空则只拼 <code>url=</code>。</div>
+          </div>
+          <div class="hint" id="set-conv-preview"></div>
+          <button class="btn btn-primary" data-act="save-sub-conv" style="margin-top:12px">保存转换设置</button>
+          <p class="hint">
+            面板会用 <code>转换地址&url=用户的普通订阅&config=模板地址</code> 拼出一条额外链接，
+            在用户页和订阅页里作为「订阅转换」格式展示。
+            <b>这条链接是重新解析过的</b>：转换器可能改写节点参数（指纹、udp、REALITY 兼容字段），
+            能直连就别用它 —— 面板自带的 Clash 订阅（0.1.24 起支持自定义模板）才是参数不失真的那条。
+          </p>
         </div>
       </div>
 
@@ -202,7 +279,30 @@ GET  /api/health                        健康检查（容器探针）</pre>
 
   bindSubBaseField();
   checkSubBaseField(false);
+  paintConvPreview();
 };
+
+/**
+ * 转换链接拼接示例。只是给管理员看清楚最终长什么样，
+ * 真正的拼接（含 encodeURIComponent）在后端 convertedSubUrl() 里做一次，
+ * 前端绝不重复实现 —— 两处实现迟早会走样。
+ */
+function paintConvPreview() {
+  const el = $('#set-conv-preview');
+  if (!el) return;
+  const conv = (($('#set-conv-url') || {}).value || '').trim();
+  const tpl = (($('#set-conv-tpl') || {}).value || '').trim();
+  if (!conv) {
+    el.innerHTML = '未配置：订阅页与用户页只显示面板自带的三种格式。';
+    return;
+  }
+  const base = ((($('#set-base') || {}).value || '').trim() || 'https://面板地址').replace(/\/+$/, '');
+  const sep = conv.includes('?') ? '&' : '?';
+  const sample =
+    `${conv}${sep}url=${encodeURIComponent(base + '/s/<用户 token>')}` +
+    (tpl ? `&config=${encodeURIComponent(tpl)}` : '');
+  el.innerHTML = `拼接示例：<code class="conv-sample">${esc(sample)}</code>`;
+}
 
 /* ------------------------------ 通知设置卡片 ------------------------------ */
 
@@ -697,6 +797,11 @@ const ACT_LOADING = {
   'save-https': '应用中',
 };
 
+document.addEventListener('input', (e) => {
+  const id = e.target && e.target.id;
+  if (id === 'set-conv-url' || id === 'set-conv-tpl') paintConvPreview();
+});
+
 document.addEventListener('click', async (e) => {
   const copyBtn = e.target.closest('[data-copy]');
   if (copyBtn) {
@@ -744,6 +849,9 @@ async function runAction(act, btn, id) {
       break;
     case 'user-copy':
       userCopyFlow(id);
+      break;
+    case 'user-subs':
+      userSubsFlow(id);
       break;
     case 'user-edit':
       await editUserFlow(id);
@@ -1045,6 +1153,60 @@ async function runAction(act, btn, id) {
         }),
       });
       toast('订阅显示已保存，客户端重新拉取订阅后生效', 'ok');
+      break;
+    }
+    case 'save-clash-tpl': {
+      const errBox = $('#set-clash-tpl-err');
+      if (errBox) {
+        errBox.hidden = true;
+        errBox.textContent = '';
+      }
+      try {
+        const r = await api('/api/settings', {
+          method: 'PUT',
+          body: JSON.stringify({ clashTemplate: $('#set-clash-tpl').value }),
+        });
+        if ($('#set-clash-tpl')) $('#set-clash-tpl').value = (r.settings && r.settings.clashTemplate) || '';
+        toast('订阅模板已保存，客户端重新拉取订阅后生效', 'ok');
+      } catch (err) {
+        // 模板错误要贴在输入框下面：只弹一个 toast，用户回头就找不到是哪一行的问题
+        if (errBox) {
+          errBox.textContent = err.message;
+          errBox.hidden = false;
+        } else {
+          throw err;
+        }
+      }
+      break;
+    }
+    case 'fill-clash-tpl': {
+      const box = $('#set-clash-tpl');
+      if (!box) break;
+      if (box.value.trim()) {
+        confirmDialog('填入示例', '当前模板会被替换成示例，确定？', () => {
+          box.value = CLASH_TPL_EXAMPLE;
+          box.focus();
+        });
+      } else {
+        box.value = CLASH_TPL_EXAMPLE;
+        box.focus();
+      }
+      break;
+    }
+    case 'save-sub-conv': {
+      await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          subConverterUrl: $('#set-conv-url').value.trim(),
+          subTemplateUrl: $('#set-conv-tpl').value.trim(),
+        }),
+      });
+      const saved = await api('/api/settings');
+      const st = saved.settings || {};
+      if ($('#set-conv-url')) $('#set-conv-url').value = st.subConverterUrl || '';
+      if ($('#set-conv-tpl')) $('#set-conv-tpl').value = st.subTemplateUrl || '';
+      paintConvPreview();
+      toast('订阅转换设置已保存', 'ok');
       break;
     }
     case 'save-billing': {

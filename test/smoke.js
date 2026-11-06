@@ -526,16 +526,109 @@ function totpCodeOf(secret) {
     !!realityLink && realityLink.uri.includes('security=reality') &&
     realityLink.uri.includes('pbk=') && realityLink.uri.includes('sid=') &&
     realityLink.uri.includes('flow=xtls-rprx-vision'));
+  // Xray 26.9.8+ 的 REALITY 服务端要求 X25519MLKEM768 密钥交换，mihomo 不会自动协商。
+  // 链接里不带这个参数时，Clash 系客户端导入后一律握手失败（表现为全部 timeout）。
+  ok('Reality 链接带 support-x25519mlkem768',
+    !!realityLink && realityLink.uri.includes('support-x25519mlkem768=true'));
+  ok('Reality 链接带 uTLS 指纹兜底',
+    !!realityLink && /[?&]fp=chrome(&|#)/.test(realityLink.uri));
 
   const hy2Link = (sub2.data.links || []).find((l) => l.name.includes('SMOKE-HY2'));
   ok('Hysteria2 链接格式正确',
     !!hy2Link && hy2Link.uri.startsWith('hysteria2://') &&
     hy2Link.uri.includes('obfs=salamander') && hy2Link.uri.includes('obfs-password=obfspass'));
+  // userinfo 的冒号不能被编码：subconverter 之类的转换器不解码 userinfo，
+  // 会把 `u1%3Auuid` 整个当密码，HY2 认证必然失败
+  ok('Hysteria2 链接的 user:pass 分隔符不编码',
+    !!hy2Link && !hy2Link.uri.includes('%3A') && /hysteria2:\/\/u[0-9a-f]+:[0-9a-f-]{36}@/.test(hy2Link.uri),
+    hy2Link ? '(' + hy2Link.uri.split('@')[0] + ')' : '');
 
   const clash = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
   ok('Clash 订阅含 reality-opts 与 hysteria2',
     clash.includes('reality-opts') && clash.includes('public-key') &&
     clash.includes('type: hysteria2') && clash.includes('obfs-password'));
+  ok('Clash 订阅的 REALITY 节点开启 support-x25519mlkem768',
+    clash.includes('support-x25519mlkem768: true'));
+
+  /* ---------- 5.4 Clash 订阅模板：面板直出分组/规则，取代 subconverter ---------- */
+  // 为什么要有这个功能：subconverter 会二次解析节点，改写 client-fingerprint、
+  // 丢掉 udp/network/support-x25519mlkem768。模板只接管分组与规则，节点原样透传。
+  const tplBad = await call('/api/settings', {
+    method: 'PUT',
+    body: json({ clashTemplate: JSON.stringify({ rules: ['DOMAIN-SUFFIX,a.com,不存在的组'] }) }),
+  });
+  ok('模板规则指向未声明分组时被拒绝', tplBad.status === 400, `(${tplBad.status})`);
+  const tplBadJson = await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: '{"rules":' }) });
+  ok('模板 JSON 写坏时被拒绝', tplBadJson.status === 400, `(${tplBadJson.status})`);
+  ok('非法模板不落盘', (await call('/api/settings')).data.settings.clashTemplate === '');
+
+  const tplDoc = {
+    'proxy-groups': [
+      { name: '🚀 节点选择', type: 'select', proxies: ['♻️ 自动选择', '{all}', 'DIRECT'] },
+      { name: '♻️ 自动选择', type: 'url-test', proxies: ['{all}'] },
+      { name: '🎬 流媒体', type: 'select', proxies: ['{filter:SMOKE}', '🚀 节点选择'] },
+    ],
+    rules: ['DOMAIN-SUFFIX,openai.com,🎬 流媒体', 'GEOIP,CN,DIRECT', 'MATCH,🚀 节点选择'],
+  };
+  await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: JSON.stringify(tplDoc) }) });
+  const clashTpl = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  ok('自定义模板出现在订阅里', clashTpl.includes('🎬 流媒体'));
+  ok('{all} 按当前用户展开成真实节点', clashTpl.includes('SMOKE-REALITY'));
+  ok('{filter:} 只留下命中关键词的节点',
+    /🎬 流媒体[\s\S]*?SMOKE-REALITY/.test(clashTpl) && !/🎬 流媒体[\s\S]*?剩余流量/.test(clashTpl));
+  ok('自定义规则生效', clashTpl.includes('DOMAIN-SUFFIX,openai.com,🎬 流媒体'));
+  ok('套模板不影响节点参数（REALITY 字段仍在）',
+    clashTpl.includes('support-x25519mlkem768: true') && clashTpl.includes('client-fingerprint: chrome'));
+
+  await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: '' }) });
+  const clashDefault = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  ok('清空模板后回到内置默认分组',
+    clashDefault.includes('🚀 节点选择') && !clashDefault.includes('🎬 流媒体'));
+
+  /* ---------- 5.5 格式清单 / 按 UA 自动选格式 / 在线订阅转换 ---------- */
+  const subJson = await call(`/api/sub/${u2.token}`);
+  const fmts = (subJson.data && subJson.data.formats) || [];
+  ok('订阅数据带「可用格式」清单', fmts.length >= 3 && fmts.every((f) => f.name && f.url));
+  ok('格式清单标出适用客户端',
+    fmts.some((f) => f.key === 'clash' && /Clash Verge/.test(f.clients || '')));
+
+  // 合租用户基本不会改订阅地址，格式给错就只报「订阅解析失败」，所以按 UA 送对应的那一份
+  const asClient = (ua, extra = '') =>
+    fetch(`${BASE}/s/${u2.token}${extra}`, { headers: { 'User-Agent': ua, Accept: '*/*' } }).then((r) => r.text());
+  ok('Clash 客户端 UA 直接拿到 YAML', (await asClient('ClashforWindows/0.20.39')).includes('proxies:'));
+  ok('mihomo UA 也拿到 YAML', (await asClient('mihomo/1.19.33')).includes('proxies:'));
+  const v2Text = (await asClient('v2rayN/6.31')).trim();
+  ok('v2rayN UA 拿到 Base64 节点列表',
+    !!v2Text && Buffer.from(v2Text, 'base64').toString('utf8').includes('://'),
+    `(${v2Text.slice(0, 16)})`);
+  const sbText = await asClient('sing-box 1.11.0');
+  ok('sing-box UA 拿到原生 JSON', (() => {
+    try { return Array.isArray(JSON.parse(sbText).outbounds); } catch { return false; }
+  })());
+  const browserHtml = await fetch(`${BASE}/s/${u2.token}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/120', Accept: 'text/html' },
+  }).then((r) => r.text());
+  ok('浏览器 UA 仍然给订阅页', browserHtml.includes('<!DOCTYPE html>'));
+  ok('显式 ?format= 优先于 UA 猜测', !(await asClient('ClashforWindows/0.20.39', '?format=base64')).includes('proxies:'));
+
+  const convBad = await call('/api/settings', { method: 'PUT', body: json({ subConverterUrl: 'ftp://x/sub' }) });
+  ok('非 http(s) 的转换地址被拒绝', convBad.status === 400, `(${convBad.status})`);
+
+  const convBase = 'https://sub.example.com/sub?target=clash';
+  const convTpl = 'https://example.com/tpl.ini';
+  await call('/api/settings', { method: 'PUT', body: json({ subConverterUrl: convBase, subTemplateUrl: convTpl }) });
+  const withConv = await call('/api/users');
+  const convUser = (withConv.data.items || []).find((x) => x.id === u2.id) || {};
+  const convFmt = (convUser.subFormats || []).find((f) => f.key === 'convert') || {};
+  ok('转换链接按「转换地址&url=&config=」拼接',
+    String(convFmt.url || '').startsWith(convBase + '&url=') &&
+    String(convFmt.url || '').endsWith('&config=' + encodeURIComponent(convTpl)),
+    `(${String(convFmt.url || '').slice(0, 56)}…)`);
+  ok('转换链接里的订阅地址完整编码', String(convFmt.url || '').includes(encodeURIComponent(`/s/${u2.token}`)));
+  await call('/api/settings', { method: 'PUT', body: json({ subConverterUrl: '', subTemplateUrl: '' }) });
+  const afterClear = await call(`/api/sub/${u2.token}`);
+  ok('清空转换配置后不再展示转换格式',
+    !((afterClear.data && afterClear.data.formats) || []).some((f) => f.key === 'convert'));
 
   /* ---------- 6.1 订阅下发的边界格式（纯函数，不改动实例数据） ---------- */
   const mkLink = (node, host) => sub.buildLink(node, [], { uuid: 'u-test' }, { host, port: 443 });
@@ -551,16 +644,17 @@ function totpCodeOf(secret) {
   ok('开启 VLESS Encryption 时链接带 mlkem768x25519plus',
     veUri.includes('encryption=mlkem768x25519plus'));
 
-  const mkRs = (minClientVer) => xray.streamSettings({
-    security: 'reality', reality: { privateKey: 'k', shortId: 'abcd1234', minClientVer },
+  const mkRs = (reality) => xray.streamSettings({
+    security: 'reality', reality: { privateKey: 'k', shortId: 'abcd1234', ...reality },
   }).realitySettings;
-  const strictRs = mkRs(undefined);
-  ok('未开启兼容时不写 minClientVer（保留官方默认）', strictRs.minClientVer === undefined);
+  const defaultRs = mkRs({});
+  ok('默认下发 minClientVer=0.0.0（兼容 mihomo / sing-box）',
+    defaultRs.minClientVer === '0.0.0', `(${defaultRs.minClientVer})`);
   ok('REALITY 默认伪装站不含 microsoft / cloudflare',
-    strictRs.dest === 'www.samsung.com:443' && strictRs.serverNames[0] === 'www.samsung.com',
-    `(${strictRs.dest})`);
-  ok('兼容开关下发 minClientVer=0.0.0', mkRs('0.0.0').minClientVer === '0.0.0');
-  ok('非法 minClientVer 不会下发', mkRs('9.9.9').minClientVer === undefined);
+    defaultRs.dest === 'www.samsung.com:443' && defaultRs.serverNames[0] === 'www.samsung.com',
+    `(${defaultRs.dest})`);
+  ok('严格模式不写 minClientVer（回到 Xray 默认 26.3.27）',
+    mkRs({ strictMode: true }).minClientVer === undefined);
 
   /* ---------- 7. 配置层套餐隔离（服务器 agent） ---------- */
   const cfgServer = await call(`/api/agent/config?token=${serverToken}&v=test`);
@@ -588,8 +682,8 @@ function totpCodeOf(secret) {
   ok('新建节点不传 dest 时落到默认伪装站 samsung',
     realityInbound.streamSettings.realitySettings.dest === 'www.samsung.com:443' &&
     realityInbound.streamSettings.realitySettings.serverNames[0] === 'www.samsung.com');
-  ok('默认不开启兼容，配置里没有 minClientVer',
-    realityInbound.streamSettings.realitySettings.minClientVer === undefined);
+  ok('默认（非严格模式）配置里下发 minClientVer=0.0.0',
+    realityInbound.streamSettings.realitySettings.minClientVer === '0.0.0');
 
   /* ---------- 9. Hysteria2 配置 ---------- */
   const cfgNode3 = await call(`/api/agent/config?token=${node3Token}&v=test`);

@@ -254,6 +254,16 @@ input:focus, select:focus, textarea:focus {
 }
 
 textarea { resize: vertical; min-height: 70px; }
+/* 订阅模板这类「贴 JSON」的多行输入：等宽字体 + 保留缩进，别让编辑器把它折成一坨 */
+textarea.code-area {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  min-height: 210px;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 2;
+}
 select { cursor: pointer; appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: calc(100% - 17px) 17px, calc(100% - 12px) 17px; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
 
 .hint { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
@@ -934,6 +944,25 @@ tr.tree-child .cell-name { font-weight: 450; }
 .code-wrap .copy-btn { position: absolute; top: 8px; right: 8px; }
 /* 给右上角复制按钮留出空间，长命令自动换行，避免被按钮遮住 */
 .code-wrap > .code { padding-right: 84px; white-space: pre-wrap; word-break: break-all; }
+
+/* ---------------------------- 订阅链接清单 ----------------------------
+   管理台弹窗与订阅页共用：每条 = 名称 + 格式 + 适用客户端 + 链接 + 复制/打开。
+   刻意做得扁平：用户在这一屏只干两件事——看自己该用哪条，然后复制它。 */
+.link-list { display: flex; flex-direction: column; gap: 11px; }
+.link-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: var(--bg-soft);
+}
+.link-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.link-head b { font-size: 13px; font-weight: 600; }
+.link-clients { font-size: 11.5px; color: var(--text-dim); margin-top: 4px; line-height: 1.5; }
+.link-item .code-wrap { margin-top: 9px; }
+.link-item .code { font-size: 11.5px; padding: 9px 84px 9px 11px; }
+.link-foot { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.link-item .hint { margin: 6px 0 0; }
+.conv-sample { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; color: var(--key-fg); }
 
 /* ------------------------------- 服务器卡 ------------------------------ */
 
