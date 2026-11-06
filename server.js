@@ -4469,8 +4469,13 @@ function demoTick(req, res, params, body) {
 /* --------------------------------- 设置 ---------------------------------- */
 
 function getSettings(req, res) {
+  const syncCfg = tplSyncConfig();
   sendJson(res, 200, {
     settings: store.db().settings,
+    // 「下次同步」在服务端算：浏览器与面板可能不同时区，前端自己算会显示成错误的时间
+    tplSyncNext: syncCfg.enabled
+      ? new Date(tplSyncNextAt(Date.now(), syncCfg.day, syncCfg.hour)).toISOString()
+      : '',
     admin: {
       username: store.db().admin.username,
       totpEnabled: !!store.db().admin.totpEnabled,
@@ -4524,6 +4529,34 @@ function updateSettings(req, res, params, body) {
     }
   }
 
+  // 模板定时同步：改了开关/同步日/钟点/地址就当场拉一次，否则用户要傻等一周
+  // 才看得出有没有生效（模板是异步替换的，界面上的「上次同步」就是唯一反馈）
+  let tplSyncTouched = nextTemplate !== (s.subTemplateUrl || '');
+  if (body.subTemplateSyncDay !== undefined) {
+    const day = normTplSyncDay(body.subTemplateSyncDay);
+    if (!day) return sendJson(res, 400, { error: '同步周期只能是「每天」或周一–周日' });
+    if (day !== (normTplSyncDay(s.subTemplateSyncDay) || '1')) {
+      s.subTemplateSyncDay = day;
+      tplSyncTouched = true;
+    }
+  }
+  if (body.subTemplateSyncHour !== undefined) {
+    const hour = normTplSyncHour(body.subTemplateSyncHour);
+    if (hour < 0) return sendJson(res, 400, { error: '同步时刻只能是 0–23 点' });
+    if (hour !== normTplSyncHour(s.subTemplateSyncHour)) {
+      s.subTemplateSyncHour = String(hour);
+      tplSyncTouched = true;
+    }
+  }
+  if (body.subTemplateAutoSync !== undefined) {
+    const on = body.subTemplateAutoSync === true || body.subTemplateAutoSync === '1' || body.subTemplateAutoSync === 'true';
+    const next = on ? '1' : '0';
+    if (next !== (s.subTemplateAutoSync || '0')) {
+      s.subTemplateAutoSync = next;
+      tplSyncTouched = true;
+    }
+  }
+
   // 面板 HTTPS：引用证书页的证书实体。校验通过后立即生效（无需重启）：
   // 改证书热加载、清空关闭监听
   let httpsChanged = false;
@@ -4574,6 +4607,13 @@ function updateSettings(req, res, params, body) {
   s.clashTemplate = nextClashTpl;
 
   store.save();
+  // 保存后立刻拉一次：模板是异步替换的，界面上的「上次同步」是唯一反馈，
+  // 等 5 分钟的巡检空转一轮，用户只会以为开关没生效。不挡响应 —— 拉取最长 15 秒
+  if (tplSyncTouched && s.subTemplateAutoSync === '1') {
+    setTimeout(() => {
+      sweepTemplateSync(true).catch((err) => log.error('订阅模板定时同步异常', { err }));
+    }, 500).unref();
+  }
   if (httpsChanged) {
     try {
       syncHttpsServer();
@@ -4593,15 +4633,69 @@ function updateSettings(req, res, params, body) {
     body.subConverterUrl !== undefined || body.subTemplateUrl !== undefined
       ? `订阅转换 ${s.subConverterUrl || '(未配置)'}${s.subTemplateUrl ? ' + 模板' : ''}`
       : '',
+    body.subTemplateAutoSync !== undefined || body.subTemplateSyncDay !== undefined || body.subTemplateSyncHour !== undefined
+      ? `模板定时同步 ${s.subTemplateAutoSync === '1' ? `开（${tplSyncLabel(tplSyncConfig().day, tplSyncConfig().hour)}）` : '关'}`
+      : '',
   ].filter(Boolean).join(' · '));
   sendJson(res, 200, {
     ok: true,
     settings: s,
+    tplSyncNext: tplSyncConfig().enabled ? new Date(tplSyncNextAt(Date.now(), tplSyncConfig().day, tplSyncConfig().hour)).toISOString() : '',
     httpsActive: httpsReady,
     httpsError,
     httpsSource: (httpsCreds && httpsCreds.source) || '',
     httpsFromEnv: !!(TLS_CERT_FILE && TLS_KEY_FILE),
   });
+}
+
+/**
+ * 拉取并转换一份远程 subconverter 配置。
+ *
+ * 失败一律返回 `{ ok:false, error }` 而不抛异常 —— 手动同步要把它变成 400 给用户看，
+ * 定时同步没有调用方可以接异常，只能记日志、保留旧模板继续跑。
+ */
+async function fetchTemplateConfig(raw) {
+  let target;
+  try {
+    target = normalizeHttpUrl(raw, '自定义模板地址');
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  let text;
+  try {
+    const resp = await fetch(target, {
+      signal: ctrl.signal,
+      redirect: 'follow',
+      headers: { 'User-Agent': 'node-panel/template-sync' },
+    });
+    if (!resp.ok) {
+      return { ok: false, error: `模板地址返回 HTTP ${resp.status}` };
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length > subTemplate.MAX_BYTES) {
+      return { ok: false, error: `模板文件太大（${Math.round(buf.length / 1024)} KB，上限 ${subTemplate.MAX_BYTES / 1024} KB）` };
+    }
+    text = buf.toString('utf8');
+  } catch (err) {
+    const msg = err && err.name === 'AbortError' ? '请求超时（15 秒）' : (err && err.message) || '未知错误';
+    return { ok: false, error: `拉取模板失败：${msg}` };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const out = subTemplate.convert(text);
+  if (!out.ok) return { ok: false, error: out.error };
+
+  // 生成的模板再走一遍正式校验：存进去之后每条订阅都会用它，不能带病上线
+  const template = JSON.stringify(out.template, null, 2);
+  const check = sub.parseTemplate(template);
+  if (!check.ok) {
+    return { ok: false, error: `转换结果未通过校验：${check.error}` };
+  }
+  return { ok: true, template, stats: out.stats, warnings: out.warnings };
 }
 
 /**
@@ -4615,51 +4709,123 @@ async function syncClashTemplate(req, res, params, body) {
   const raw = String((body && body.url) || s.subTemplateUrl || '').trim();
   if (!raw) return sendJson(res, 400, { error: '请先填写「自定义模板地址」' });
 
-  let target;
-  try {
-    target = normalizeHttpUrl(raw, '自定义模板地址');
-  } catch (err) {
-    return sendJson(res, 400, { error: err.message });
-  }
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
-  let text;
-  try {
-    const resp = await fetch(target, {
-      signal: ctrl.signal,
-      redirect: 'follow',
-      headers: { 'User-Agent': 'node-panel/template-sync' },
-    });
-    if (!resp.ok) {
-      return sendJson(res, 400, { error: `模板地址返回 HTTP ${resp.status}` });
-    }
-    const buf = Buffer.from(await resp.arrayBuffer());
-    if (buf.length > subTemplate.MAX_BYTES) {
-      return sendJson(res, 400, { error: `模板文件太大（${Math.round(buf.length / 1024)} KB，上限 ${subTemplate.MAX_BYTES / 1024} KB）` });
-    }
-    text = buf.toString('utf8');
-  } catch (err) {
-    const msg = err && err.name === 'AbortError' ? '请求超时（15 秒）' : (err && err.message) || '未知错误';
-    log.warn('拉取订阅模板失败', { err: msg });
-    return sendJson(res, 400, { error: `拉取模板失败：${msg}` });
-  } finally {
-    clearTimeout(timer);
-  }
-
-  const out = subTemplate.convert(text);
-  if (!out.ok) return sendJson(res, 400, { error: out.error });
-
-  // 生成的模板再走一遍正式校验：存进去之后每条订阅都会用它，不能带病上线
-  const template = JSON.stringify(out.template, null, 2);
-  const check = sub.parseTemplate(template);
-  if (!check.ok) {
-    return sendJson(res, 400, { error: `转换结果未通过校验：${check.error}` });
+  const out = await fetchTemplateConfig(raw);
+  if (!out.ok) {
+    log.warn('拉取订阅模板失败', { err: out.error });
+    return sendJson(res, 400, { error: out.error });
   }
 
   log.info('订阅模板已转换', { ...out.stats, warnings: out.warnings.length });
-  sendJson(res, 200, { ok: true, template, stats: out.stats, warnings: out.warnings });
+  sendJson(res, 200, { ok: true, template: out.template, stats: out.stats, warnings: out.warnings });
 }
+
+/* ----------------------------- 订阅模板定时同步 ---------------------------- */
+
+// 时刻按「周几 + 几点」定，而不是「每 N 小时」：模板来自人手维护的仓库，
+// 固定钟点（例如每周一 03:00）比漂移的间隔好理解，也方便对着 cron / 计划任务核对。
+// day 取值 'daily' 或 '0'–'6'（0 是周日，与 Date#getDay 一致）。
+const TPL_SYNC_DAY_LABEL = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+/** 非法值返回空串，交给调用方决定是报错还是回退默认 */
+function normTplSyncDay(v) {
+  const s = String(v === undefined || v === null ? '' : v).trim().toLowerCase();
+  if (s === 'daily') return 'daily';
+  return /^[0-6]$/.test(s) ? s : '';
+}
+
+/** 非法值返回 -1（0 点是合法值，不能用 falsy 判断） */
+function normTplSyncHour(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 && n <= 23 ? n : -1;
+}
+
+function tplSyncLabel(day, hour) {
+  const hh = String(hour).padStart(2, '0');
+  return day === 'daily' ? `每天 ${hh}:00` : `每${TPL_SYNC_DAY_LABEL[Number(day)]} ${hh}:00`;
+}
+
+function tplSyncConfig() {
+  const s = store.db().settings;
+  const hour = normTplSyncHour(s.subTemplateSyncHour);
+  return {
+    enabled: s.subTemplateAutoSync === '1',
+    day: normTplSyncDay(s.subTemplateSyncDay) || '1',
+    hour: hour < 0 ? 3 : hour,
+    url: String(s.subTemplateUrl || '').trim(),
+    last: Date.parse(s.subTemplateSyncAt || '') || 0,
+  };
+}
+
+/**
+ * 最近一次「本该同步」的时刻（<= now）。
+ *
+ * 判定用「上次同步早于它」而不是「距上次超过 N 小时」：面板停机错过一次后，
+ * 重启当天仍会补上；改周几/钟点也不用重算基准，更没有「间隔漂移」这一说。
+ */
+function tplSyncDueAt(now, day, hour) {
+  const d = new Date(now);
+  d.setMinutes(0, 0, 0);
+  d.setHours(hour);
+  if (day === 'daily') {
+    if (d.getTime() > now) d.setDate(d.getDate() - 1);
+    return d.getTime();
+  }
+  d.setDate(d.getDate() - (((d.getDay() - Number(day)) % 7) + 7) % 7);
+  if (d.getTime() > now) d.setDate(d.getDate() - 7);
+  return d.getTime();
+}
+
+/** 下一次同步的时刻（> now），只给界面显示「下次同步」 */
+function tplSyncNextAt(now, day, hour) {
+  const d = new Date(now);
+  d.setMinutes(0, 0, 0);
+  d.setHours(hour);
+  if (day === 'daily') {
+    if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+    return d.getTime();
+  }
+  d.setDate(d.getDate() + (((Number(day) - d.getDay()) % 7) + 7) % 7);
+  if (d.getTime() <= now) d.setDate(d.getDate() + 7);
+  return d.getTime();
+}
+
+let tplSyncRunning = false;
+
+/**
+ * 到点就把远程模板拉下来，直接覆盖 settings.clashTemplate（定时同步的意义就在于
+ * 不用人守着，所以这一步必须真落盘，不能像手动同步那样只填进编辑器）。
+ *
+ * 失败时保留上一份模板 —— 宁可旧也不能给所有用户一份坏的；但 `subTemplateSyncAt`
+ * 照样更新，否则地址填错之后会出现「每 5 分钟重试一次」的隐形压力
+ * （跟通知的 lastNotifyAt 是同一个道理）。
+ */
+async function sweepTemplateSync(force) {
+  const c = tplSyncConfig();
+  if (!c.enabled || !c.url) return;
+  if (tplSyncRunning) return;
+  // 到点才拉：把「上次同步」跟「最近一次该同步的时刻」比，错过就当场补
+  if (!force && c.last >= tplSyncDueAt(Date.now(), c.day, c.hour)) return;
+  tplSyncRunning = true;
+  try {
+    const out = await fetchTemplateConfig(c.url);
+    const s = store.db().settings;
+    s.subTemplateSyncAt = new Date().toISOString();
+    if (out.ok) {
+      s.clashTemplate = out.template;
+      s.subTemplateSyncResult = `成功 · ${out.stats.groups} 组 / ${out.stats.rules} 条规则`;
+      log.info('订阅模板已定时同步', { ...out.stats, schedule: tplSyncLabel(c.day, c.hour) });
+    } else {
+      s.subTemplateSyncResult = '失败：' + out.error;
+      log.warn('订阅模板定时同步失败，保留上一份模板', { err: out.error });
+    }
+    store.save();
+  } catch (err) {
+    log.error('订阅模板定时同步异常', { err });
+  } finally {
+    tplSyncRunning = false;
+  }
+}
+
 
 /* -------------------------------- 消息通知 -------------------------------- */
 /** settings 里的通知开关都是字符串（key/value 表），这里统一解析成类型正确的对象 */
@@ -5932,6 +6098,18 @@ function main() {
   setTimeout(() => {
     alerts.sweep().catch((err) => log.error('告警巡检异常', { err }));
   }, 15000).unref();
+  // 订阅模板定时同步：5 分钟一轮只是「闹钟」，真正发不发请求取决于设置里的
+  // 「周几 + 几点」（最近一次尝试时间写在 settings.subTemplateSyncAt）。
+  // 5 分钟粒度对上「整点」足够 —— 到点后的第一轮就会补上，界面显示的下次时间也是整点。
+  // 启动后先等 30 秒，避开启动瞬间的初始化与 agent 首轮拉取；重启后欠下的那次
+  // 会在这里被补上 —— 这也是它必须落盘「上次同步时间」的原因
+  const tplSyncTimer = setInterval(() => {
+    sweepTemplateSync(false).catch((err) => log.error('订阅模板定时同步异常', { err }));
+  }, 5 * 60 * 1000);
+  tplSyncTimer.unref();
+  setTimeout(() => {
+    sweepTemplateSync(false).catch((err) => log.error('订阅模板定时同步异常', { err }));
+  }, 30 * 1000).unref();
   // 过期会话原本只在「再次被访问」时删除，长期运行会缓慢堆积（正常一两个管理员
   // 在线，堆不了几条，但零成本顺手清掉）；每 30 分钟扫一遍，超出硬上限时淘汰最早过期的一批。
   const SESSION_HARD_LIMIT = 500;

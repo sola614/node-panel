@@ -1189,6 +1189,19 @@ input[readonly]:focus { border-color: var(--line); box-shadow: none; }
 }
 .ve-label input { accent-color: var(--accent); }
 
+/* Clash 模板定时同步：「开关 + 周几 + 整点 + 保存」一行放完，窄屏自动折行 */
+.tpl-auto {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-soft);
+}
+.tpl-auto select { min-width: 96px; }
+.tpl-auto .hint { flex: 1 0 100%; margin: 0; }
+
 .section-title {
   font-size: 11.5px;
   letter-spacing: 0.8px;

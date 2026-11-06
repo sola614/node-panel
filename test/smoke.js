@@ -641,6 +641,42 @@ function totpCodeOf(secret) {
     clashSynced.includes('support-x25519mlkem768: true'));
   await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: '' }) });
 
+  /* ---------- 5.4 模板定时同步：周几 + 整点 ---------- */
+  const dayBad = await call('/api/settings', { method: 'PUT', body: json({ subTemplateSyncDay: '8' }) });
+  ok('同步周期拒收非法周几', dayBad.status === 400, `(${dayBad.status})`);
+  const hourBad = await call('/api/settings', { method: 'PUT', body: json({ subTemplateSyncHour: '24' }) });
+  ok('同步时刻拒收 24 点', hourBad.status === 400, `(${hourBad.status})`);
+  ok('非法值不落盘',
+    (await call('/api/settings')).data.settings.subTemplateSyncDay !== '8' &&
+    String((await call('/api/settings')).data.settings.subTemplateSyncHour) !== '24');
+
+  const autoOn = await call('/api/settings', {
+    method: 'PUT',
+    body: json({ subTemplateAutoSync: true, subTemplateSyncDay: '5', subTemplateSyncHour: '4' }),
+  });
+  ok('定时同步按周几 + 整点落盘',
+    autoOn.data.settings.subTemplateSyncDay === '5' &&
+    String(autoOn.data.settings.subTemplateSyncHour) === '4');
+  ok('保存后返回「下次同步」时刻', /^\d{4}-\d{2}-\d{2}T/.test(autoOn.data.tplSyncNext || ''),
+    `(${autoOn.data.tplSyncNext})`);
+  const nextAt = new Date(autoOn.data.tplSyncNext);
+  ok('下次同步正好落在设定的周几与整点（00 分）',
+    nextAt.getDay() === 5 && nextAt.getHours() === 4 && nextAt.getMinutes() === 0,
+    `(${autoOn.data.tplSyncNext})`);
+  ok('下次同步在未来', nextAt.getTime() > Date.now());
+
+  const autoDaily = await call('/api/settings', {
+    method: 'PUT', body: json({ subTemplateSyncDay: 'daily', subTemplateSyncHour: '0' }),
+  });
+  ok('「每天 0 点」也接受（0 点不能当 falsy 丢掉）',
+    autoDaily.data.settings.subTemplateSyncDay === 'daily' &&
+    String(autoDaily.data.settings.subTemplateSyncHour) === '0' &&
+    new Date(autoDaily.data.tplSyncNext).getHours() === 0);
+
+  const autoOff = await call('/api/settings', { method: 'PUT', body: json({ subTemplateAutoSync: false }) });
+  ok('关闭定时同步后不给「下次同步」', autoOff.data.tplSyncNext === '');
+  await call('/api/settings', { method: 'PUT', body: json({ subTemplateSyncDay: '1', subTemplateSyncHour: '3' }) });
+
   /* ---------- 5.5 格式清单 / 按 UA 自动选格式 / 在线订阅转换 ---------- */
   const subJson = await call(`/api/sub/${u2.token}`);
   const fmts = (subJson.data && subJson.data.formats) || [];

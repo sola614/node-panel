@@ -25,6 +25,70 @@ const CLASH_TPL_EXAMPLE = `{
   ]
 }`;
 
+/* --------------------------- 模板定时同步（设置页） --------------------------- */
+
+/**
+ * 同步周期。value 与后端 normTplSyncDay 一致：'daily' 或 '0'–'6'（0=周日）。
+ * 不列「每 N 小时」——模板是人维护的仓库，按固定钟点拉才说得清「什么时候更新了」。
+ */
+const TPL_SYNC_DAYS = [
+  { value: 'daily', label: '每天' },
+  { value: '1', label: '每周一' },
+  { value: '2', label: '每周二' },
+  { value: '3', label: '每周三' },
+  { value: '4', label: '每周四' },
+  { value: '5', label: '每周五' },
+  { value: '6', label: '每周六' },
+  { value: '0', label: '每周日' },
+];
+
+/** 0–23 点。整点就够：模板仓库不会在半小时里变两次 */
+const TPL_SYNC_HOURS = Array.from({ length: 24 }, (_, i) => i);
+
+/** 「每周一 03:00」，文案只在这个文件里拼，和任务日志里的写法保持一致 */
+function tplSyncLabel(day, hour) {
+  const hh = String(Number(hour) >= 0 ? Number(hour) : 3).padStart(2, '0');
+  if (String(day) === 'daily') return `每天 ${hh}:00`;
+  const hit = TPL_SYNC_DAYS.find((x) => x.value === String(day));
+  return `${hit ? hit.label : '每周一'} ${hh}:00`;
+}
+
+function fmtClock(iso) {
+  const d = new Date(iso);
+  if (!iso || isNaN(d)) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/**
+ * 「上次同步」那行字。渲染时用一次，保存后再调一次原地刷新 ——
+ * 定时同步是异步的，用户点完按钮只能从这里看出到底成没成。
+ * nextIso 由后端算（浏览器与面板时区可能不同），没开定时同步时是空串。
+ */
+function tplSyncStatusHtml(s, nextIso) {
+  const st = s || {};
+  if (st.subTemplateAutoSync !== '1') {
+    return '未开启：模板只在点「手动同步」时变化。';
+  }
+  const at = fmtClock(st.subTemplateSyncAt);
+  const lines = [];
+  lines.push(
+    at
+      ? `上次同步 ${esc(at)}${st.subTemplateSyncResult ? ` · <span class="mono">${esc(st.subTemplateSyncResult)}</span>` : ''}`
+      : '还没同步过：保存后几秒内会拉第一次。',
+  );
+  if (!String(st.subTemplateUrl || '').trim()) {
+    lines.push('但「自定义模板地址」是空的，拉不到东西 —— 填好地址再保存一次。');
+  } else {
+    const next = fmtClock(nextIso);
+    lines.push(
+      `${esc(tplSyncLabel(st.subTemplateSyncDay, st.subTemplateSyncHour))} 自动覆盖上面的模板（失败保留上一份）` +
+      `${next ? `，下次 ${esc(next)}` : ''}。`,
+    );
+  }
+  return lines.join('<br>');
+}
+
 RENDERERS.settings = async () => {
   const [d, n, b, cd] = await Promise.all([
     api('/api/settings'),
@@ -119,14 +183,33 @@ RENDERERS.settings = async () => {
             <br><code>rules</code> 的目标必须是下面声明过的分组名或 <code>DIRECT</code>；
             没写 <code>MATCH</code> 兜底规则时会自动补到第一个分组。
             <br>手里已有 subconverter 的 <code>[custom]</code> 配置（<code>sub.toml</code> 那类
-            <code>ruleset=</code> / <code>custom_proxy_group=</code> 写法）时，点「从模板地址同步」
+            <code>ruleset=</code> / <code>custom_proxy_group=</code> 写法）时，点「手动同步」
             会把它翻译成上面这份 JSON：远程规则集变成 <code>rule-providers</code>，
             分组正则 <code>.*</code> 变成 <code>{all}</code>。译文先进编辑器，确认后再保存。
           </div>
           <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
             <button class="btn btn-primary" data-act="save-clash-tpl">保存模板</button>
-            <button class="btn" data-act="sync-clash-tpl">从模板地址同步</button>
+            <button class="btn" data-act="sync-clash-tpl">手动同步</button>
             <button class="btn" data-act="fill-clash-tpl">填入示例</button>
+          </div>
+          <div class="tpl-auto">
+            <label class="ve-label" style="margin:0">
+              <input type="checkbox" id="set-tpl-auto" ${s.subTemplateAutoSync === '1' ? 'checked' : ''}>
+              定时同步
+            </label>
+            <select id="set-tpl-auto-day">
+              ${TPL_SYNC_DAYS.map((x) => `<option value="${x.value}" ${String(s.subTemplateSyncDay || '1') === x.value ? 'selected' : ''}>${x.label}</option>`).join('')}
+            </select>
+            <select id="set-tpl-auto-hour">
+              ${TPL_SYNC_HOURS.map((h) => `<option value="${h}" ${Number(s.subTemplateSyncHour || 3) === h ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`).join('')}
+            </select>
+            <button class="btn" data-act="save-tpl-auto">保存定时同步</button>
+            <div class="hint" id="set-tpl-auto-status">${tplSyncStatusHtml(s, d.tplSyncNext)}</div>
+            <div class="hint" style="flex:1 0 100%;margin:0">
+              手动同步只把译文填进编辑器，要再点「保存模板」才生效；
+              定时同步是无人值守的那份：到点直接拉取并<b>覆盖已保存的模板</b>（失败保留上一份）。
+              时间按面板所在服务器的时区算。
+            </div>
           </div>
         </div>
       </div>
@@ -1181,6 +1264,43 @@ async function runAction(act, btn, id) {
         } else {
           throw err;
         }
+      }
+      break;
+    }
+    case 'save-tpl-auto': {
+      const onEl = $('#set-tpl-auto');
+      if (!onEl) break;
+      const dayEl = $('#set-tpl-auto-day');
+      const hourEl = $('#set-tpl-auto-hour');
+      const day = dayEl ? dayEl.value : '1';
+      const hour = hourEl ? hourEl.value : '3';
+      const paint = (st, next) => {
+        const box = $('#set-tpl-auto-status');
+        if (box) box.innerHTML = tplSyncStatusHtml(st, next);
+      };
+      const r = await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          subTemplateAutoSync: onEl.checked,
+          subTemplateSyncDay: day,
+          subTemplateSyncHour: hour,
+        }),
+      });
+      paint(r.settings || {}, r.tplSyncNext);
+      toast(
+        onEl.checked
+          ? `定时同步已开启：${tplSyncLabel(day, hour)}（保存后已立刻拉一次）`
+          : '定时同步已关闭，模板只在点「手动同步」时变化',
+        'ok',
+      );
+      // 后端保存后会异步拉一次远程模板，隔几秒再刷状态，让用户当场看到「上次同步」的结果
+      if (onEl.checked) {
+        setTimeout(() => {
+          if (!$('#set-tpl-auto-status')) return;
+          api('/api/settings')
+            .then((g) => paint(g.settings || {}, g.tplSyncNext))
+            .catch(() => {});
+        }, 2500);
       }
       break;
     }

@@ -221,7 +221,7 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   const d5 = w5.document;
   const seen5 = [];
   w5.fetch = (p, o = {}) => {
-    seen5.push({ url: String(p), method: (o.method || 'GET').toUpperCase() });
+    seen5.push({ url: String(p), method: (o.method || 'GET').toUpperCase(), body: o.body ? String(o.body) : '' });
     return fetch(String(p).startsWith('http') ? p : BASE + p, o);
   };
   d5.querySelector('.nav-item[data-view="settings"]').dispatchEvent(new w5.MouseEvent('click', { bubbles: true }));
@@ -278,6 +278,29 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   seen5.length = 0;
   click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
   await sleep(300);
+
+  // 定时同步：周几 + 整点。后端早就实现了，但按钮一度没接上（点了毫无反应），
+  // 所以这里除了看控件存在，还要确认真的把三项提交出去
+  const daySel = d5.querySelector('#set-tpl-auto-day');
+  const hourSel = d5.querySelector('#set-tpl-auto-hour');
+  ok('设置页有「定时同步」的周几与整点选择',
+    !!daySel && !!hourSel && daySel.options.length === 8 && hourSel.options.length === 24,
+    `(${daySel ? daySel.options.length : '-'}/${hourSel ? hourSel.options.length : '-'})`);
+  const autoChk = d5.querySelector('#set-tpl-auto');
+  if (autoChk) autoChk.checked = false;
+  if (daySel) daySel.value = '2';
+  if (hourSel) hourSel.value = '5';
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="save-tpl-auto"]'), w5);
+  await sleep(500);
+  const autoPut = seen5.find(
+    (r) => r.method === 'PUT' && r.url.endsWith('/api/settings') && /subTemplateSyncDay/.test(r.body),
+  );
+  ok('「保存定时同步」提交周几 + 整点',
+    !!autoPut && /"subTemplateSyncHour":"5"/.test(autoPut.body) && /false/.test(autoPut.body),
+    autoPut ? autoPut.body.slice(0, 72) : '没发出请求');
+  ok('保存后状态行跟着刷新',
+    /未开启/.test((d5.querySelector('#set-tpl-auto-status') || {}).textContent || ''));
 
   const baseInput = d5.querySelector('#set-base');
   const errBox = d5.querySelector('#set-base-err');
