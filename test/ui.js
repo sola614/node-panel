@@ -252,15 +252,15 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
   await sleep(300);
 
-  // 「从模板地址同步」：起个本地服务返回 subconverter 配置，验证转换结果落进编辑器
-  ok('设置页有「从模板地址同步」按钮', !!d5.querySelector('[data-act="sync-clash-tpl"]'));
+  // 「手动同步」：起个本地服务返回 subconverter 配置，验证转换结果落进编辑器
+  ok('设置页有「手动同步」按钮', !!d5.querySelector('[data-act="sync-clash-tpl"]'));
   const iniSrv = http.createServer((q, s) => {
     s.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     s.end([ '[custom]', 'ruleset=通用代理,[]MATCH', 'custom_proxy_group=通用代理`select`.*' ].join('\n'));
   });
   await new Promise((r) => iniSrv.listen(0, '127.0.0.1', r));
-  const convTpl = d5.querySelector('#set-conv-tpl');
-  if (convTpl) convTpl.value = `http://127.0.0.1:${iniSrv.address().port}/sub.toml`;
+  const tplSrc = d5.querySelector('#set-tpl-src');
+  if (tplSrc) tplSrc.value = `http://127.0.0.1:${iniSrv.address().port}/sub.toml`;
   seen5.length = 0;
   click(d5.querySelector('[data-act="sync-clash-tpl"]'), w5);
   await sleep(700);
@@ -277,6 +277,24 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   tplBox.value = '';
   seen5.length = 0;
   click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
+  await sleep(300);
+
+  // 在线订阅转换已隐藏（subconverter 会吞 REALITY 的 support-x25519mlkem768），
+  // 「自定义模板地址」改名「模板来源地址」并入模板卡片，并带自己的保存按钮
+  ok('设置页不再展示「在线订阅转换」卡片',
+    !d5.querySelector('#set-conv-url') && !/在线订阅转换/.test(d5.body.textContent || ''));
+  ok('模板来源地址并入模板卡片', !!tplSrc && !!d5.querySelector('[data-act="save-tpl-src"]'));
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="save-tpl-src"]'), w5);
+  await sleep(300);
+  ok('保存模板来源地址只提交 subTemplateUrl',
+    seen5.some((r) => r.method === 'PUT' && /"subTemplateUrl"/.test(r.body) &&
+      !/"subConverterUrl"/.test(r.body)),
+    seen5.map((r) => r.body).filter(Boolean).join(' | ').slice(0, 60));
+  // 还原成空地址，后面还有用例共用同一个面板实例
+  if (tplSrc) tplSrc.value = '';
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="save-tpl-src"]'), w5);
   await sleep(300);
 
   // 定时同步：周几 + 整点。后端早就实现了，但按钮一度没接上（点了毫无反应），

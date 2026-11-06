@@ -677,7 +677,7 @@ function totpCodeOf(secret) {
   ok('关闭定时同步后不给「下次同步」', autoOff.data.tplSyncNext === '');
   await call('/api/settings', { method: 'PUT', body: json({ subTemplateSyncDay: '1', subTemplateSyncHour: '3' }) });
 
-  /* ---------- 5.5 格式清单 / 按 UA 自动选格式 / 在线订阅转换 ---------- */
+  /* ---------- 5.5 格式清单 / 按 UA 自动选格式 / 订阅转换已隐藏 ---------- */
   const subJson = await call(`/api/sub/${u2.token}`);
   const fmts = (subJson.data && subJson.data.formats) || [];
   ok('订阅数据带「可用格式」清单', fmts.length >= 3 && fmts.every((f) => f.name && f.url));
@@ -704,23 +704,24 @@ function totpCodeOf(secret) {
   ok('显式 ?format= 优先于 UA 猜测', !(await asClient('ClashforWindows/0.20.39', '?format=base64')).includes('proxies:'));
 
   const convBad = await call('/api/settings', { method: 'PUT', body: json({ subConverterUrl: 'ftp://x/sub' }) });
-  ok('非 http(s) 的转换地址被拒绝', convBad.status === 400, `(${convBad.status})`);
+  ok('非 http(s) 的转换地址仍被拒绝（接口保留）', convBad.status === 400, `(${convBad.status})`);
 
+  // subconverter 会吞掉 REALITY 的 support-x25519mlkem768，转换后 VLESS 全 timeout，
+  // 所以 0.1.27 起面板不再展示这条链接：设置项与拼接逻辑留着，开关是 SUB_CONVERT_ENABLED
   const convBase = 'https://sub.example.com/sub?target=clash';
-  const convTpl = 'https://example.com/tpl.ini';
-  await call('/api/settings', { method: 'PUT', body: json({ subConverterUrl: convBase, subTemplateUrl: convTpl }) });
-  const withConv = await call('/api/users');
-  const convUser = (withConv.data.items || []).find((x) => x.id === u2.id) || {};
-  const convFmt = (convUser.subFormats || []).find((f) => f.key === 'convert') || {};
-  ok('转换链接按「转换地址&url=&config=」拼接',
-    String(convFmt.url || '').startsWith(convBase + '&url=') &&
-    String(convFmt.url || '').endsWith('&config=' + encodeURIComponent(convTpl)),
-    `(${String(convFmt.url || '').slice(0, 56)}…)`);
-  ok('转换链接里的订阅地址完整编码', String(convFmt.url || '').includes(encodeURIComponent(`/s/${u2.token}`)));
+  await call('/api/settings', {
+    method: 'PUT',
+    body: json({ subConverterUrl: convBase, subTemplateUrl: 'https://example.com/tpl.ini' }),
+  });
+  const hiddenUsers = (await call('/api/users')).data.items || [];
+  ok('订阅转换不再出现在用户页格式清单',
+    !hiddenUsers.some((x) => (x.subFormats || []).some((f) => f.key === 'convert')));
+  ok('用户数据也不再带转换链接', hiddenUsers.every((x) => !x.convertedUrl));
+  const hiddenSub = await call(`/api/sub/${u2.token}`);
+  ok('订阅页只发三种格式',
+    ((hiddenSub.data && hiddenSub.data.formats) || []).map((f) => f.key).join(',') === 'base64,clash,singbox',
+    `(${((hiddenSub.data && hiddenSub.data.formats) || []).map((f) => f.key).join(',')})`);
   await call('/api/settings', { method: 'PUT', body: json({ subConverterUrl: '', subTemplateUrl: '' }) });
-  const afterClear = await call(`/api/sub/${u2.token}`);
-  ok('清空转换配置后不再展示转换格式',
-    !((afterClear.data && afterClear.data.formats) || []).some((f) => f.key === 'convert'));
 
   /* ---------- 6.1 订阅下发的边界格式（纯函数，不改动实例数据） ---------- */
   const mkLink = (node, host) => sub.buildLink(node, [], { uuid: 'u-test' }, { host, port: 443 });

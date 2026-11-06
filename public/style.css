@@ -962,7 +962,6 @@ tr.tree-child .cell-name { font-weight: 450; }
 .link-item .code { font-size: 11.5px; padding: 9px 84px 9px 11px; }
 .link-foot { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 .link-item .hint { margin: 6px 0 0; }
-.conv-sample { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; color: var(--key-fg); }
 
 /* ------------------------------- 服务器卡 ------------------------------ */
 

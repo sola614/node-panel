@@ -803,12 +803,15 @@ function batchDeletePlans(req, res, params, body) {
 /**
  * 在线订阅转换链接：`转换地址&url=订阅地址&config=模板地址`。
  *
- * 为什么保留这条后路：面板直出（0.1.23/0.1.24）已经覆盖了绝大多数场景，
- * 但有人就是想让外部转换服务统一套模板、或者给第三方客户端做分发。
- * 转换地址里通常已经带了 `?target=clash` 之类的查询串，所以拼 `&` 还是 `?`
- * 要看它自己有没有 `?`，不能想当然。
+ * 0.1.27 起**暂时关闭**（`SUB_CONVERT_ENABLED = false`）：subconverter 不认识 REALITY 的
+ * `support-x25519mlkem768`，转换后 VLESS 节点全部 timeout，而「能直连就别用它」这句劝告
+ * 用户基本不看 —— 与其给一条会坏的链接，不如先不给。设置里的地址、拼接逻辑、
+ * 用户页/订阅页的「订阅转换」格式都还留着，上游支持这个参数后把开关改回 true 就恢复。
  */
+const SUB_CONVERT_ENABLED = false;
+
 function convertedSubUrl(base, token, settings) {
+  if (!SUB_CONVERT_ENABLED) return '';
   const conv = String((settings && settings.subConverterUrl) || '').trim();
   if (!conv) return '';
   const subUrl = `${base}/s/${token}`;

@@ -168,6 +168,17 @@ RENDERERS.settings = async () => {
         </div>
         <div class="card-body">
           <div class="field">
+            <label>模板来源地址（手动同步 / 定时同步都从这里拉）</label>
+            <input type="text" id="set-tpl-src" value="${esc(s.subTemplateUrl || '')}"
+              placeholder="https://raw.githubusercontent.com/你/仓库/main/Clash_Rule/sub.toml"
+              spellcheck="false" autocomplete="off">
+            <div class="hint">
+              subconverter 的 <code>[custom]</code> 配置文件地址（<code>sub.toml</code> / <code>.ini</code>）。
+              它只用于把配置<b>翻译成下面这份面板模板</b> —— 用户的订阅不会交给任何外部转换服务。
+            </div>
+            <button class="btn" data-act="save-tpl-src" style="margin-top:10px">保存模板地址</button>
+          </div>
+          <div class="field">
             <label>自定义 proxy-groups 与 rules（JSON，留空用内置两组）</label>
             <textarea id="set-clash-tpl" class="code-area" spellcheck="false" autocomplete="off"
               placeholder='${esc(CLASH_TPL_EXAMPLE)}'>${esc(s.clashTemplate || '')}</textarea>
@@ -211,35 +222,6 @@ RENDERERS.settings = async () => {
               时间按面板所在服务器的时区算。
             </div>
           </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-head">
-          <h3>在线订阅转换</h3>
-          <span class="hint" style="margin:0">可选，留空即不展示</span>
-        </div>
-        <div class="card-body">
-          <div class="field">
-            <label>订阅转换服务地址</label>
-            <input type="text" id="set-conv-url" value="${esc(s.subConverterUrl || '')}"
-              placeholder="https://sub.example.com/sub?target=clash" spellcheck="false" autocomplete="off">
-            <div class="hint">填到「已经带了客户端参数的接口」这一层，比如 <code>.../sub?target=clash</code>。</div>
-          </div>
-          <div class="field">
-            <label>自定义模板地址</label>
-            <input type="text" id="set-conv-tpl" value="${esc(s.subTemplateUrl || '')}"
-              placeholder="https://example.com/my-template.ini" spellcheck="false" autocomplete="off">
-            <div class="hint">转换服务支持的模板文件地址；留空则只拼 <code>url=</code>。</div>
-          </div>
-          <div class="hint" id="set-conv-preview"></div>
-          <button class="btn btn-primary" data-act="save-sub-conv" style="margin-top:12px">保存转换设置</button>
-          <p class="hint">
-            面板会用 <code>转换地址&url=用户的普通订阅&config=模板地址</code> 拼出一条额外链接，
-            在用户页和订阅页里作为「订阅转换」格式展示。
-            <b>这条链接是重新解析过的</b>：转换器可能改写节点参数（指纹、udp、REALITY 兼容字段），
-            能直连就别用它 —— 面板自带的 Clash 订阅（0.1.24 起支持自定义模板）才是参数不失真的那条。
-          </p>
         </div>
       </div>
 
@@ -367,30 +349,7 @@ GET  /api/health                        健康检查（容器探针）</pre>
 
   bindSubBaseField();
   checkSubBaseField(false);
-  paintConvPreview();
 };
-
-/**
- * 转换链接拼接示例。只是给管理员看清楚最终长什么样，
- * 真正的拼接（含 encodeURIComponent）在后端 convertedSubUrl() 里做一次，
- * 前端绝不重复实现 —— 两处实现迟早会走样。
- */
-function paintConvPreview() {
-  const el = $('#set-conv-preview');
-  if (!el) return;
-  const conv = (($('#set-conv-url') || {}).value || '').trim();
-  const tpl = (($('#set-conv-tpl') || {}).value || '').trim();
-  if (!conv) {
-    el.innerHTML = '未配置：订阅页与用户页只显示面板自带的三种格式。';
-    return;
-  }
-  const base = ((($('#set-base') || {}).value || '').trim() || 'https://面板地址').replace(/\/+$/, '');
-  const sep = conv.includes('?') ? '&' : '?';
-  const sample =
-    `${conv}${sep}url=${encodeURIComponent(base + '/s/<用户 token>')}` +
-    (tpl ? `&config=${encodeURIComponent(tpl)}` : '');
-  el.innerHTML = `拼接示例：<code class="conv-sample">${esc(sample)}</code>`;
-}
 
 /* ------------------------------ 通知设置卡片 ------------------------------ */
 
@@ -885,11 +844,6 @@ const ACT_LOADING = {
   'save-https': '应用中',
 };
 
-document.addEventListener('input', (e) => {
-  const id = e.target && e.target.id;
-  if (id === 'set-conv-url' || id === 'set-conv-tpl') paintConvPreview();
-});
-
 document.addEventListener('click', async (e) => {
   const copyBtn = e.target.closest('[data-copy]');
   if (copyBtn) {
@@ -1307,7 +1261,7 @@ async function runAction(act, btn, id) {
     case 'sync-clash-tpl': {
       const box = $('#set-clash-tpl');
       const errBox = $('#set-clash-tpl-err');
-      const urlEl = $('#set-conv-tpl');
+      const urlEl = $('#set-tpl-src');
       const url = String(urlEl && urlEl.value ? urlEl.value : '').trim();
       if (errBox) {
         errBox.hidden = true;
@@ -1315,7 +1269,7 @@ async function runAction(act, btn, id) {
         errBox.style.color = '';
       }
       if (!url) {
-        toast('请先在下方「在线订阅转换」里填写自定义模板地址', 'err');
+        toast('请先在上方「模板来源地址」里填写自定义模板地址', 'err');
         break;
       }
       if (!box) break;
@@ -1373,20 +1327,17 @@ async function runAction(act, btn, id) {
       }
       break;
     }
-    case 'save-sub-conv': {
-      await api('/api/settings', {
+    case 'save-tpl-src': {
+      // 只存「模板来源地址」：它同时喂给手动同步与定时同步。
+      // 保存后立刻把状态行刷一遍 —— 地址为空时它会提示「拉不到东西」
+      const r = await api('/api/settings', {
         method: 'PUT',
-        body: JSON.stringify({
-          subConverterUrl: $('#set-conv-url').value.trim(),
-          subTemplateUrl: $('#set-conv-tpl').value.trim(),
-        }),
+        body: JSON.stringify({ subTemplateUrl: $('#set-tpl-src').value.trim() }),
       });
-      const saved = await api('/api/settings');
-      const st = saved.settings || {};
-      if ($('#set-conv-url')) $('#set-conv-url').value = st.subConverterUrl || '';
-      if ($('#set-conv-tpl')) $('#set-conv-tpl').value = st.subTemplateUrl || '';
-      paintConvPreview();
-      toast('订阅转换设置已保存', 'ok');
+      if ($('#set-tpl-src')) $('#set-tpl-src').value = (r.settings && r.settings.subTemplateUrl) || '';
+      const box = $('#set-tpl-auto-status');
+      if (box && r.settings) box.innerHTML = tplSyncStatusHtml(r.settings, r.tplSyncNext);
+      toast('模板来源地址已保存', 'ok');
       break;
     }
     case 'save-billing': {
