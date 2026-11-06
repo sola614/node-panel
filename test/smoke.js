@@ -835,9 +835,57 @@ function totpCodeOf(secret) {
     String(certObj.certificateFile || '').endsWith('/fullchain.pem') && String(certObj.keyFile || '').endsWith('/privkey.pem'),
     JSON.stringify(certObj));
 
+  /* ---------- 9.5 出站强制 IPv4 ---------- */
+
+  const v4Xray = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-V4-XRAY', mode: 'standalone', ipMode: 'manual', address: '10.0.0.11',
+      protocol: 'vless', port: 20846, network: 'tcp', security: 'tls', certMode: 'self',
+      sni: 'v4x.example.com', forceV4: true, enabled: true,
+    }),
+  });
+  const cfgV4 = await call(`/api/agent/config?token=${v4Xray.data.item.token}&v=test`);
+  const v4Doc = cfgV4.data.xray || {};
+  const v4Ob = (v4Doc.outbounds || []).find((o) => o.tag === 'direct-v4') || {};
+  ok('出站强制 IPv4：Xray 新增 direct-v4 出站并取 UseIPv4',
+    v4Ob.protocol === 'freedom' && !!v4Ob.settings && v4Ob.settings.domainStrategy === 'UseIPv4',
+    JSON.stringify(v4Ob));
+  // inboundTag 必须真的对应一个存在的入站，写错 tag 时规则会静默不生效
+  const v4Tag = 'node-' + v4Xray.data.item.id;
+  ok('出站强制 IPv4：只有该节点的入站被接到 direct-v4',
+    (v4Doc.inbounds || []).some((i) => i.tag === v4Tag) &&
+    (v4Doc.routing.rules || []).some((r) => r.outboundTag === 'direct-v4' &&
+      (r.inboundTag || []).includes(v4Tag)));
+  ok('出站强制 IPv4：默认 direct 出站保持双栈（不写 domainStrategy）',
+    (v4Doc.outbounds || []).some((o) => o.tag === 'direct' && !o.settings));
+  // 路由「第一条命中即止」：BT 拦截若排在 direct-v4 之后，开了 v4 的节点上
+  // BT 会被 direct-v4 抢先放行，等于把拦截悄悄关掉
+  const v4Rules = v4Doc.routing.rules || [];
+  ok('出站强制 IPv4：BT 拦截仍先于 direct-v4 命中',
+    v4Rules.findIndex((r) => r.outboundTag === 'blocked') <
+      v4Rules.findIndex((r) => r.outboundTag === 'direct-v4'));
+
+  const v4Hy = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-V4-HY', mode: 'standalone', ipMode: 'manual', address: '10.0.0.12',
+      protocol: 'hysteria2', port: 20847, certMode: 'self', sni: 'v4h.example.com',
+      forceV4: true, enabled: true,
+    }),
+  });
+  const cfgV4Hy = await call(`/api/agent/config?token=${v4Hy.data.item.token}&v=test`);
+  const hyV4 = (cfgV4Hy.data.hysteria || [])[0] || {};
+  ok('出站强制 IPv4：HY2 生成 direct mode 4',
+    /direct:\s*\n\s*mode:\s*"?4"?/.test(hyV4.yaml || ''),
+    hyV4.yaml ? hyV4.yaml.split('\n').filter((l) => /mode|outbounds/.test(l)).map((s) => s.trim()).join(' | ') : '');
+  ok('未开开关的 HY2 配置里没有 outbounds 块', !/^outbounds:/m.test(hySelf.yaml || ''));
+
   // 这两个节点只为验证证书生成，立刻删掉：留着会混进后面章节「不限套餐用户看到全部节点」的断言
   await call('/api/nodes/' + selfHy.data.item.id, { method: 'DELETE' });
   await call('/api/nodes/' + selfTls.data.item.id, { method: 'DELETE' });
+  await call('/api/nodes/' + v4Xray.data.item.id, { method: 'DELETE' });
+  await call('/api/nodes/' + v4Hy.data.item.id, { method: 'DELETE' });
 
   /* ---------- 10. 超额自动剔除 ---------- */
   const report = await call(`/api/agent/report?token=${serverToken}`, {

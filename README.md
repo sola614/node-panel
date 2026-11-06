@@ -266,6 +266,29 @@ Alpine 这类没有 systemd 的系统也能跑。流量通过每实例的 `traff
 部署脚本检测到 Hysteria2 节点时会按 CPU 架构下载官方静态二进制。
 混淆密码在节点表单里点「生成」即可随机产生，也可手填。
 
+### 出站强制 IPv4
+
+节点表单里有一个「强制 IPv4 出站」开关，**两种协议都支持，入站一律保持双栈** ——
+客户端该用 IPv6 连还是照样连，改的只是「服务端主动连目标网站」时用哪个协议栈。
+
+典型场景：机器 v6 入站正常、v6 出口却是黑洞。此时默认的 happy eyeballs 会先撞 v6，
+每条连接都要干等一次超时，Hysteria 的日志里是一串
+`dial tcp6 … i/o timeout` + `accepting stream failed: timeout: no recent network activity`，
+最终表现成「能连上、但访问什么都超时，几十秒后整条连接断掉」。
+
+| 协议 | 实现 |
+| --- | --- |
+| Xray（VLESS / VMess / Trojan / SS） | 单独加一个 `direct-v4` 的 freedom 出站（`settings.domainStrategy = UseIPv4`），再用 `inboundTag` 规则把该节点的入站接上去。**同机其它节点不受影响**，仍走默认的 `direct` 双栈出站 |
+| Hysteria2 | 实例 YAML 里写 `outbounds: [{ type: direct, direct: { mode: 4 } }]`，`4` 是官方取值 = 始终 IPv4 |
+
+两点实现细节值得记着：Xray 的路由是「第一条命中即止」，所以 BT 拦截规则必须排在
+`direct-v4` 之前，否则开了开关的节点上 BT 会被 `direct-v4` 抢先放行；Hysteria2 配了
+`outbounds` 又不配 ACL 时只用列表第一个出站，所以只写一个就够。
+
+反过来也要注意：**纯 IPv6 的机器不要开**。`mode: 4` / `UseIPv4` 在拿不到 v4 地址时
+是直接失败的，不是回退（想要「优先 v4、v6 兜底」得用 hysteria 的 `46`，
+面板暂时只做严格 v4）。
+
 ### TLS 证书的几种来源
 
 | 模式 | 说明 |

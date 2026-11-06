@@ -25,6 +25,17 @@
   覆盖已保存的模板，失败保留上一份，结果写在「上次同步」那行。判定条件是「上次同步早于
   最近一次本该同步的时刻」而不是「间隔到了没有」，所以面板停机错过一次，重启后会补上；
   改开关 / 周几 / 钟点 / 地址后保存的当下也会立刻拉一次，不用等下个周期
+- **出站强制 IPv4**（节点表单开关，两种协议都支持）：只改「服务端主动连目标网站」时用哪个
+  协议栈，**入站保持双栈** —— 客户端该用 IPv6 连照样连。用于「v6 入站正常、v6 出口是黑洞」
+  的机器：默认的 happy eyeballs 会先撞 v6，每条连接都要干等一次超时，Hysteria 日志里是
+  `dial tcp6 … i/o timeout` + `accepting stream failed: timeout: no recent network activity`，
+  最终表现成「能连上、访问什么都超时、几十秒后整条连接断掉」
+  - Xray：给该节点单独挂一个 `direct-v4` 的 freedom 出站（`domainStrategy: UseIPv4`），
+    用 `inboundTag` 规则接上，**同机其它节点不受影响**。BT 拦截规则必须排在它之前，
+    否则路由「第一条命中即止」会让开关一开就绕过 BT 拦截
+  - Hysteria2：实例 YAML 写 `outbounds: [{ type: direct, direct: { mode: 4 } }]`，
+    `4` = 始终 IPv4。没配 ACL 时只用列表第一个出站，写一个就够
+  - 纯 IPv6 机器别开：`UseIPv4` / `mode: 4` 拿不到 v4 地址时是直接失败，不是回退
 
 ### 修正
 

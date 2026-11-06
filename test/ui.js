@@ -1008,6 +1008,12 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   protoSel.value = 'hysteria2';
   change(protoSel);
   ok('切到 hysteria2 时加密方式跟到 TLS', secSel.value === 'tls', secSel.value);
+  // 出站强制 IPv4：所有协议通用（Xray 走独立 freedom 出站，HY2 走 direct mode 4）
+  const v4Box = d9.querySelector('#n-force-v4');
+  ok('节点表单有「强制 IPv4 出站」开关且默认关闭', !!v4Box && v4Box.checked === false);
+  const nodesSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'nodes.js'), 'utf8');
+  ok('开关状态会随节点一起提交',
+    /forceV4:\s*\$\('#n-force-v4',\s*mask\)\.checked/.test(nodesSrc));
   // 带宽默认值会原样进服务端配置与订阅，客户端拿它当 Brutal 的上限
   const upBox = d9.querySelector('#h-up');
   const downBox = d9.querySelector('#h-down');

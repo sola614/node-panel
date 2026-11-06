@@ -1692,6 +1692,9 @@ function normalizeNode(body, prev = {}) {
     method: String(body.method ?? prev.method ?? 'aes-256-gcm'),
     password: String(body.password ?? prev.password ?? ''),
     enabled: body.enabled !== undefined ? !!body.enabled : prev.enabled !== false,
+    // 出站强制 IPv4：入站照旧双栈，只把「主动连目标」钉到 v4。
+    // 典型场景是机器 v6 入站正常、v6 出口不通 —— 客户端能连上但访问什么都超时
+    forceV4: body.forceV4 !== undefined ? !!body.forceV4 : !!prev.forceV4,
   };
 
   // Reality 参数

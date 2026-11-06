@@ -756,6 +756,19 @@ function nodeForm(node, servers) {
       </div>
     </div>
 
+    <div class="section-title">出站</div>
+    <label class="ve-label">
+      <input type="checkbox" id="n-force-v4" ${n.forceV4 ? 'checked' : ''} style="width:auto">
+      强制 IPv4 出站
+    </label>
+    <div class="hint">
+      只影响<b>服务端主动连目标网站</b>时用哪个协议栈，入站照旧双栈 —— 客户端仍然可以用 IPv6 连进来。
+      适用于「v6 能连、但机器 v6 出口不通」的情况：那种机器上访问任何网站都超时，
+      日志里是一串 <code>dial tcp6 … i/o timeout</code>。<br>
+      另一种可选项是「优先 v4、v6 兜底」，本面板暂时只做严格 v4：先保证能用，
+      真需要双栈回退再说。
+    </div>
+
     <div class="section-title">归属套餐</div>
     <div class="field">
       <label>套餐（可多选）</label>
@@ -1192,6 +1205,8 @@ function readNodeForm(mask) {
     port: Number(v('#n-port')),
     enabled: $('#n-enabled', mask).checked,
     hidden: $('#n-hidden', mask).checked,
+    // 出站强制 IPv4：对所有协议通用（Xray 走独立 freedom 出站，HY2 走 direct mode 4）
+    forceV4: $('#n-force-v4', mask).checked,
     fp: v('#n-fp'),
     vlessEncryption: protocol === 'vless' ? $('#n-ve', mask).checked : false,
     entries: draft.filter((e) => e.host),
