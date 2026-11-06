@@ -59,7 +59,11 @@ function userRowHtml(u) {
         </td>
         <td><span class="badge ${STATUS_BADGE[u.status]}">${u.statusLabel}</span></td>
         <td>
-          <button class="btn btn-sm btn-ghost" data-act="user-subs" data-id="${u.id}" title="查看全部订阅格式">订阅链接</button>
+          <div class="row-actions" style="justify-content:flex-start">
+            <a class="btn btn-sm btn-ghost" href="${esc(u.subUrl)}" target="_blank" rel="noreferrer"
+              title="打开用户订阅页（就是「通用订阅」那条链接）">打开</a>
+            <button class="btn btn-sm btn-ghost" data-act="user-subs" data-id="${u.id}" title="查看全部订阅格式">订阅链接</button>
+          </div>
         </td>
         <td>
           <div class="row-actions">
@@ -525,6 +529,8 @@ async function createUserFlow(template) {
  * 数据来自后端 subFormatList：客户端标签只在那一个地方写，
  * 否则「哪个客户端能用哪条链接」迟早会两处说法不一致，最后误导用户。
  * 弹窗不设确定/取消按钮 —— 这里没有需要提交的东西，只有复制。
+ * 每条也不给「打开」：这些地址交给浏览器只会渲染成一屏 base64/YAML，
+ * 想看用户视角就点列表行上的「打开」，那才是用户侧那一页。
  */
 function subLinksHtml(formats) {
   const items = formats && formats.length
@@ -541,9 +547,6 @@ function subLinksHtml(formats) {
         ${f.url ? `<div class="code-wrap">
           <pre class="code">${esc(f.url)}</pre>
           <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(f.url)}">复制</button>
-        </div>
-        <div class="link-foot">
-          <a class="btn btn-sm btn-ghost" href="${esc(f.url)}" target="_blank" rel="noreferrer">打开</a>
         </div>` : ''}
         ${f.tip ? `<p class="hint">${esc(f.tip)}</p>` : ''}
       </div>`,
@@ -559,6 +562,8 @@ function userSubsFlow(id) {
     body: subLinksHtml(u.subFormats) + `<p class="hint" style="margin-top:12px">
       这些链接就是该用户的凭证，转发出去等于把账号给出去。
       改了节点或套餐后，客户端「更新订阅」即可生效，不用重新添加。
+      <br>想看用户侧是什么样，点列表行上的「打开」—— 打开的就是第一条「通用订阅」链接，
+      浏览器里访问它是订阅页，客户端里访问它才是订阅内容。
     </p>`,
     footer: false,
   });

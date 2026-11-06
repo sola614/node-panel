@@ -137,6 +137,10 @@ function recommendClient(d) {
 /**
  * 订阅链接清单。与后端 subFormatList 一一对应（来源是 /api/sub/:token 的 formats），
  * 老版本缓存里没有 formats 时用三条固定链接兜底，不让页面开天窗。
+ *
+ * 每条只给「复制」不给「打开」：用户已经在这一页上了，再点开是把同一份内容
+ * 用浏览器渲染一遍（base64 / YAML 糊一屏），没有意义还容易让人以为要这么用。
+ * 要下载配置的话上面「一键导入」区有专门的下载按钮。
  */
 function linkListHtml(d, preferred) {
   const items = d.formats && d.formats.length
@@ -157,9 +161,6 @@ function linkListHtml(d, preferred) {
         <div class="code-wrap">
           <pre class="code">${esc(f.url)}</pre>
           <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(f.url)}">复制</button>
-        </div>
-        <div class="link-foot">
-          <a class="btn btn-sm btn-ghost" href="${esc(f.url)}" target="_blank" rel="noreferrer">打开</a>
         </div>
         ${f.tip ? `<p class="hint">${esc(f.tip)}</p>` : ''}
       </div>`,

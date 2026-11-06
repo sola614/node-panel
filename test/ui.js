@@ -676,9 +676,13 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('顶部显示当前条数', /共\s*\d+\s*位|\d+\s*\/\s*\d+\s*位/.test(d9.querySelector('#u-count').textContent),
     d9.querySelector('#u-count').textContent);
 
-  // 订阅链接改成弹窗：一行按钮进来，每种格式各自可复制、可打开
+  // 订阅链接改成弹窗：一行按钮进来，每种格式各自可复制
   const subsBtn = d9.querySelector('#u-tbody [data-act="user-subs"]');
   ok('每行都有「订阅链接」按钮', !!subsBtn);
+  const rowOpen = d9.querySelector('#u-tbody a[href]');
+  ok('每行「打开」指向用户订阅页（通用订阅链接）',
+    !!rowOpen && /\/s\/[0-9a-f]+\/?$/.test(rowOpen.getAttribute('href') || ''),
+    rowOpen ? rowOpen.getAttribute('href') : '(无)');
   click(subsBtn, w9);
   await sleep(220);
   const subsModal = d9.querySelector('.modal-mask');
@@ -686,7 +690,8 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('点开订阅链接弹出弹窗', !!subsModal);
   ok('弹窗列出全部订阅格式', linkItems.length >= 3, `(${linkItems.length})`);
   ok('每种格式都能复制', !!subsModal && subsModal.querySelectorAll('.link-item .copy-btn').length === linkItems.length);
-  ok('每种格式都能打开', !!subsModal && subsModal.querySelectorAll('.link-item .link-foot a[href]').length === linkItems.length);
+  ok('弹窗不再逐条给「打开」（打开统一走列表按钮）',
+    !!subsModal && subsModal.querySelectorAll('.link-item a[href]').length === 0);
   ok('弹窗标注适用客户端', !!subsModal && subsModal.textContent.includes('适用：'));
   click(subsModal.querySelector('[data-close]'), w9);
   await sleep(160);
@@ -1461,9 +1466,11 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     `card=${!!d12b.querySelector('.sub-card')} form=${!!d12b.querySelector('#sub-login-form')}`);
   const subLinks = d12b.querySelectorAll('.link-item');
   ok('订阅页列出全部订阅格式', subLinks.length >= 3, `(${subLinks.length})`);
-  ok('订阅页每条格式都能复制与打开',
-    d12b.querySelectorAll('.link-item .copy-btn').length === subLinks.length &&
-    d12b.querySelectorAll('.link-item .link-foot a[href]').length === subLinks.length);
+  ok('订阅页每条格式都能复制',
+    d12b.querySelectorAll('.link-item .copy-btn').length === subLinks.length);
+  ok('订阅页不再给「打开」（用户自己就在这一页上）',
+    d12b.querySelectorAll('.link-item a[href]').length === 0,
+    `(${d12b.querySelectorAll('.link-item a[href]').length})`);
   ok('订阅页标注适用客户端', d12b.body.textContent.includes('适用：'));
   dom12b.window.close();
   await fetch(`${BASE}/api/users/${uiUser2.item.id}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + T } });
