@@ -93,6 +93,21 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   }
   const T = login.token;
 
+  /* ========================= 0. 样式文件的静态体检 ========================= */
+  // jsdom 不解析自定义属性（var() 一律算成无效），所以这几条只能读文件验证。
+  // 起因是个真 bug：夜间主题里 --tint-1..4 曾被写成 var(--tint-1) 指自己，
+  // 变量在计算值阶段直接失效，行悬浮、进度条底槽、chip 底色全变成 transparent。
+  console.log('\n── 样式变量 ──');
+  const cssText = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+  const selfRef = cssText.match(/--([\w-]+)\s*:\s*var\(--\1\)/g) || [];
+  ok('没有自引用的自定义属性（夜间叠加层不再是空色）', selfRef.length === 0, selfRef.join(' '));
+  const tintDefs = (name) => (cssText.match(new RegExp('--' + name + '\\s*:', 'g')) || []).length;
+  ok('--tint-1..4 在夜间与日间各定义一次',
+    [1, 2, 3, 4].every((n) => tintDefs('tint-' + n) === 2));
+  ok('行悬浮高亮只在有 hover 的设备上生效',
+    /@media \(hover: hover\)\s*\{[^}]*tbody tr:hover/.test(cssText));
+  ok('触屏的点击高亮有对应样式（tbody tr.is-active）', cssText.includes('tbody tr.is-active'));
+
   /* ============================ 1. 皮肤切换 ============================ */
   console.log('\n── 日间 / 夜间皮肤 ──');
 
@@ -675,6 +690,25 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('列表每行带勾选框', d9.querySelectorAll('#u-tbody .u-pick').length === totalRows);
   ok('顶部显示当前条数', /共\s*\d+\s*位|\d+\s*\/\s*\d+\s*位/.test(d9.querySelector('#u-count').textContent),
     d9.querySelector('#u-count').textContent);
+
+  // 触屏没有 hover：点击行挂 .is-active 当「我在看这一行」的反馈。
+  // jsdom 不带 matchMedia，测试里手动塞一个，模拟粗指针设备
+  w9.matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
+  click(rowsOf(d9)[1], w9);
+  await sleep(60);
+  ok('触屏点行加高亮（同一张表只亮一行）',
+    d9.querySelectorAll('#u-tbody tr.is-active').length === 1 &&
+    rowsOf(d9)[1].classList.contains('is-active'));
+  click(rowsOf(d9)[2], w9);
+  await sleep(60);
+  ok('点另一行，高亮跟过去',
+    d9.querySelectorAll('#u-tbody tr.is-active').length === 1 &&
+    rowsOf(d9)[2].classList.contains('is-active'));
+  // 鼠标设备交给 CSS :hover，点击不该留状态
+  w9.matchMedia = () => ({ matches: false });
+  click(rowsOf(d9)[0], w9);
+  await sleep(60);
+  ok('鼠标设备点击不留高亮（交给 :hover）', !rowsOf(d9)[0].classList.contains('is-active'));
 
   // 订阅链接改成弹窗：一行按钮进来，每种格式各自可复制
   const subsBtn = d9.querySelector('#u-tbody [data-act="user-subs"]');

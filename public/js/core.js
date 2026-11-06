@@ -702,6 +702,35 @@ $('#collapse').addEventListener('click', () => {
 // 每次渲染领一个序号：慢的旧请求回来时不再覆盖新页面
 let renderSeq = 0;
 
+/* --------------------- 触屏表格的「点一下」高亮 --------------------- */
+// 宽表格靠行高亮追行：指针设备有 :hover（@media (hover: hover)），触屏没有，
+// 点一下什么都不留，八列的信息很容易看串行。所以粗指针设备改由点击挂 .is-active，
+// 同一张表只留一行，点表格外/点空白处清掉。
+//
+// 只做视觉反馈，不参与任何选中逻辑 —— 真正要「选中」是用复选框（如 .u-pick），
+// 别把这两套混成一个状态。行被重绘（搜索、筛选、操作后重新拉数据）时高亮消失是
+// 预期的：它标记的是「刚点的这一行」，不是被记住的选项。
+//
+// 每次点击现查一次媒体查询而不是加载时算一次：外接键盘/鼠标的平板会在两种
+// 指针间来回切，缓存下来就会在插上鼠标后仍按触屏处理
+function noHoverPointer() {
+  return !!(window.matchMedia && window.matchMedia('(hover: none)').matches);
+}
+
+document.addEventListener('click', (e) => {
+  if (!noHoverPointer()) return;
+  const target = e.target;
+  if (!target || typeof target.closest !== 'function') return;
+  const tr = target.closest('tbody tr');
+  const table = tr ? tr.closest('table') : null;
+  // 点空白处清全部；否则先清同一张表的其他行，再点亮这一行
+  const scope = table || document;
+  scope.querySelectorAll('tbody tr.is-active').forEach((row) => {
+    if (row !== tr) row.classList.remove('is-active');
+  });
+  if (tr) tr.classList.add('is-active');
+});
+
 /* --------------------- 待同步自动刷新（节点列表） --------------------- */
 // agent 最长 60s 才回执一次：列表里挂着「待同步」时不该让人守着 F5。
 // 存在 stale/pending 节点 → 按钮变「自动刷新 Ns」倒数，归零自动 render()；

@@ -42,11 +42,14 @@
   --code-fg: #b8c8dc;
   --key-fg: #8fb4e0;
 
-  /* 叠加层（夜间用白，日间换成黑） */
-  --tint-1: var(--tint-1);
-  --tint-2: var(--tint-2);
-  --tint-3: var(--tint-3);
-  --tint-4: var(--tint-4);
+  /* 叠加层（夜间用白，日间换成黑）
+   * 别写成 var(--tint-1) 指自己：自引用会让变量在「计算值」阶段变成无效，
+   * 用到它的 background 一律退化成 transparent —— 夜间主题里的进度条底槽、
+   * 行悬浮、chip 底色、图表底柱会一起消失且不报错（0.1.27 修） */
+  --tint-1: rgba(255, 255, 255, 0.025);
+  --tint-2: rgba(255, 255, 255, 0.05);
+  --tint-3: rgba(255, 255, 255, 0.08);
+  --tint-4: rgba(255, 255, 255, 0.12);
 
   /* 毛玻璃与遮罩 */
   --glass-sidebar: rgba(9, 13, 19, 0.72);
@@ -652,7 +655,19 @@ tbody td {
 }
 
 tbody tr:last-child td { border-bottom: none; }
-tbody tr:hover { background: var(--tint-1); }
+
+/* 行悬浮高亮（宽表格里靠它追行）。
+ * - 指针设备：:hover，放在 (hover: hover) 里，触屏就不会出现「点完还粘着」的假悬浮
+ * - 触屏：没有 hover，由 core.js 在点击时给行挂 .is-active（同一张表只留一行，
+ *   点空白清掉）。两套给出同一个底色，观感一致
+ * - 树形子行自己带了 td 底色，必须一并覆盖，否则高亮被 td 盖掉、看着像没生效
+ */
+@media (hover: hover) {
+  tbody tr:hover,
+  tbody tr:hover > td { background: var(--tint-2); }
+}
+tbody tr.is-active,
+tbody tr.is-active > td { background: var(--tint-2); }
 
 .cell-name { font-weight: 500; }
 .cell-sub { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
