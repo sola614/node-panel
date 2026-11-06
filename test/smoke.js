@@ -585,6 +585,62 @@ function totpCodeOf(secret) {
   ok('清空模板后回到内置默认分组',
     clashDefault.includes('🚀 节点选择') && !clashDefault.includes('🎬 流媒体'));
 
+  /* ---------- 5.4b subconverter 模板同步 ---------- */
+  // 用户手里已有的 sub.toml 描述的是「分组 + 规则」，翻译成面板模板就不必再过
+  // subconverter —— 那一步会把 REALITY 的 support-x25519mlkem768 吞掉
+  const SYNC_INI = [
+    '[custom]',
+    'ruleset=通用代理,clash-classic:https://example.com/proxy.list',
+    'ruleset=DIRECT,[]GEOIP,CN',
+    'ruleset=通用代理,[]MATCH',
+    'custom_proxy_group=通用代理`select`[]延迟最低`.*',
+    'custom_proxy_group=延迟最低`url-test`.*`https://www.gstatic.com/generate_204`300,,50',
+    'custom_proxy_group=广告拦截`select`[]DIRECT`香港|日本',
+  ].join('\n');
+  const iniSrv = http.createServer((q, s) => {
+    s.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    s.end(SYNC_INI);
+  });
+  await new Promise((r) => iniSrv.listen(0, '127.0.0.1', r));
+  const iniPort = iniSrv.address().port;
+  const syncBad = await call('/api/settings/sync-template', {
+    method: 'POST', body: json({ url: 'ftp://example.com/sub.toml' }),
+  });
+  ok('模板同步拒绝非 http(s) 地址', syncBad.status === 400, `(${syncBad.status})`);
+  const sync = await call('/api/settings/sync-template', {
+    method: 'POST', body: json({ url: `http://127.0.0.1:${iniPort}/sub.toml` }),
+  });
+  iniSrv.close();
+  ok('模板同步返回 ok', sync.status === 200 && sync.data.ok, `(${sync.status})`);
+  let synced = {};
+  try {
+    synced = JSON.parse(sync.data.template || '{}');
+  } catch { synced = {}; }
+  const syncedGroups = synced['proxy-groups'] || [];
+  ok('按 custom_proxy_group 生成分组', syncedGroups.length === 3, `(${syncedGroups.length})`);
+  ok('.* 转成 {all}，关键词正则转成 {filter:}',
+    JSON.stringify(syncedGroups).includes('{all}') &&
+    JSON.stringify(syncedGroups).includes('{filter:香港|日本}'));
+  ok('url-test 的 url 与 interval 取自模板',
+    (syncedGroups.find((g) => g.name === '延迟最低') || {}).interval === 300 &&
+    (syncedGroups.find((g) => g.name === '延迟最低') || {}).type === 'url-test');
+  ok('远程规则集进 rule-providers，behavior=classical',
+    !!(synced['rule-providers'] || {}).rs0 &&
+    synced['rule-providers'].rs0.behavior === 'classical' &&
+    synced['rule-providers'].rs0.url === 'https://example.com/proxy.list');
+  ok('ruleset 转成 RULE-SET / 内联规则 / 结尾 MATCH',
+    (synced.rules || []).includes('RULE-SET,rs0,通用代理') &&
+    (synced.rules || []).includes('GEOIP,CN,DIRECT') &&
+    (synced.rules || []).slice(-1)[0] === 'MATCH,通用代理');
+
+  await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: sync.data.template }) });
+  const clashSynced = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  ok('同步来的模板能直接出订阅（带 rule-providers）',
+    clashSynced.includes('rule-providers:') && clashSynced.includes('RULE-SET,rs0,通用代理'));
+  ok('套用同步模板后节点参数不变',
+    clashSynced.includes('support-x25519mlkem768: true'));
+  await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: '' }) });
+
   /* ---------- 5.5 格式清单 / 按 UA 自动选格式 / 在线订阅转换 ---------- */
   const subJson = await call(`/api/sub/${u2.token}`);
   const fmts = (subJson.data && subJson.data.formats) || [];

@@ -252,6 +252,33 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
   await sleep(300);
 
+  // 「从模板地址同步」：起个本地服务返回 subconverter 配置，验证转换结果落进编辑器
+  ok('设置页有「从模板地址同步」按钮', !!d5.querySelector('[data-act="sync-clash-tpl"]'));
+  const iniSrv = http.createServer((q, s) => {
+    s.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    s.end([ '[custom]', 'ruleset=通用代理,[]MATCH', 'custom_proxy_group=通用代理`select`.*' ].join('\n'));
+  });
+  await new Promise((r) => iniSrv.listen(0, '127.0.0.1', r));
+  const convTpl = d5.querySelector('#set-conv-tpl');
+  if (convTpl) convTpl.value = `http://127.0.0.1:${iniSrv.address().port}/sub.toml`;
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="sync-clash-tpl"]'), w5);
+  await sleep(700);
+  iniSrv.close();
+  ok('同步按钮请求模板转换接口',
+    seen5.some((r) => r.method === 'POST' && r.url.endsWith('/api/settings/sync-template')));
+  let tplSynced = null;
+  try { tplSynced = JSON.parse(tplBox.value); } catch { tplSynced = null; }
+  ok('转换结果写进模板编辑器',
+    !!tplSynced && (tplSynced['proxy-groups'] || []).length === 1 &&
+    (tplSynced.rules || []).includes('MATCH,通用代理'),
+    `(${String(tplBox.value).slice(0, 20)})`);
+  // 清掉，避免影响同一实例上的后续用例
+  tplBox.value = '';
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
+  await sleep(300);
+
   const baseInput = d5.querySelector('#set-base');
   const errBox = d5.querySelector('#set-base-err');
   const saveBtn = d5.querySelector('[data-act="save-settings"]');

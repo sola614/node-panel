@@ -985,6 +985,22 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 分组 `type`、分组重名，以及 `rules` 的目标必须是已声明的分组或 `DIRECT`。
 留空即内置的「🚀 节点选择 + ♻️ 自动选择 + `GEOIP,CN` 直连」。
 
+**已有 subconverter 模板怎么办**（0.1.27）：设置 → Clash 订阅模板 → **从模板地址同步**，
+读「自定义模板地址」里那份 `[custom]` 配置（`ruleset=` / `custom_proxy_group=`），
+翻译成上面这段 JSON 填进编辑器，确认后保存即可：
+
+| 模板里写的 | 面板生成的 |
+|---|---|
+| `ruleset=组,clash-classic:URL` | `rule-providers` 里一条 + `RULE-SET,rsN,组` |
+| `ruleset=DIRECT,[]GEOIP,CN` | 内联规则 `GEOIP,CN,DIRECT` |
+| `custom_proxy_group=组`select`[]A`.*` | `{ name: 组, type: select, proxies: [A, '{all}'] }` |
+| `custom_proxy_group=组`url-test`.*`URL`300,,50` | 同上，带 `url` 与 `interval: 300` |
+
+节点正则只有「纯字面量 + `|` 分支」能安全转成 `{filter:...}`；带 `\d`、`[]`、`()`
+的退化成 `{all}` 并在编辑器下方提示。译文**先填进编辑器、不自动保存** ——
+模板是全局的，一次误存会让所有用户的订阅一起失效。
+模板里声明了 `rule-providers` 时面板会原样输出到订阅，由客户端自己去拉规则集。
+
 **sing-box 格式**（0.1.16）：输出是纯 JSON（客户端拉远程订阅走严格解析，注释头都会被拒），
 覆盖 vless（Reality 的 `tls.reality` + `tls.utls`）、vmess、trojan、ss、hysteria2，
 外加 selector / urltest / direct 出站。可见性与 Clash 同一套规则（入口套餐独立、直连继承节点）。

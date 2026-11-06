@@ -118,9 +118,14 @@ RENDERERS.settings = async () => {
             <code>{filter:香港|日本}</code> 名字含任一关键词的节点。
             <br><code>rules</code> 的目标必须是下面声明过的分组名或 <code>DIRECT</code>；
             没写 <code>MATCH</code> 兜底规则时会自动补到第一个分组。
+            <br>手里已有 subconverter 的 <code>[custom]</code> 配置（<code>sub.toml</code> 那类
+            <code>ruleset=</code> / <code>custom_proxy_group=</code> 写法）时，点「从模板地址同步」
+            会把它翻译成上面这份 JSON：远程规则集变成 <code>rule-providers</code>，
+            分组正则 <code>.*</code> 变成 <code>{all}</code>。译文先进编辑器，确认后再保存。
           </div>
-          <div style="display:flex;gap:10px;margin-top:12px">
+          <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
             <button class="btn btn-primary" data-act="save-clash-tpl">保存模板</button>
+            <button class="btn" data-act="sync-clash-tpl">从模板地址同步</button>
             <button class="btn" data-act="fill-clash-tpl">填入示例</button>
           </div>
         </div>
@@ -1176,6 +1181,61 @@ async function runAction(act, btn, id) {
         } else {
           throw err;
         }
+      }
+      break;
+    }
+    case 'sync-clash-tpl': {
+      const box = $('#set-clash-tpl');
+      const errBox = $('#set-clash-tpl-err');
+      const urlEl = $('#set-conv-tpl');
+      const url = String(urlEl && urlEl.value ? urlEl.value : '').trim();
+      if (errBox) {
+        errBox.hidden = true;
+        errBox.textContent = '';
+        errBox.style.color = '';
+      }
+      if (!url) {
+        toast('请先在下方「在线订阅转换」里填写自定义模板地址', 'err');
+        break;
+      }
+      if (!box) break;
+
+      const run = async () => {
+        try {
+          const r = await api('/api/settings/sync-template', {
+            method: 'POST',
+            body: JSON.stringify({ url }),
+          });
+          box.value = r.template || '';
+          box.focus();
+          const st = r.stats || {};
+          const warnings = r.warnings || [];
+          toast(
+            `已转换 ${st.groups || 0} 个分组、${st.rules || 0} 条规则` +
+            `${st.providers ? `、${st.providers} 个规则集` : ''}，确认后点「保存模板」`,
+            'ok',
+          );
+          if (errBox && warnings.length) {
+            // 用弱化颜色：这些是「按全部节点处理」之类的提示，不是错误
+            errBox.style.color = 'var(--muted)';
+            errBox.textContent = warnings.join('；');
+            errBox.hidden = false;
+          }
+        } catch (err) {
+          if (errBox) {
+            errBox.style.color = '';
+            errBox.textContent = err.message;
+            errBox.hidden = false;
+          } else {
+            toast(err.message, 'err');
+          }
+        }
+      };
+
+      if (box.value.trim()) {
+        confirmDialog('同步自定义模板', '编辑器里的模板会被转换结果替换（尚未保存，刷新页面可找回原值），继续？', run);
+      } else {
+        await run();
       }
       break;
     }

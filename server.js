@@ -21,6 +21,7 @@ const store = require('./lib/store');
 const xray = require('./lib/xray');
 const hysteria = require('./lib/hysteria');
 const sub = require('./lib/sub');
+const subTemplate = require('./lib/subTemplate');
 const keys = require('./lib/keys');
 const cert = require('./lib/cert');
 const acme = require('./lib/acme');
@@ -4603,8 +4604,64 @@ function updateSettings(req, res, params, body) {
   });
 }
 
-/* -------------------------------- 消息通知 -------------------------------- */
+/**
+ * 从「自定义模板地址」拉一份 subconverter 配置，转成面板的 Clash 订阅模板。
+ *
+ * 只返回转换结果、**不落盘** —— 让用户在设置页先看一眼分组和规则，确认后
+ * 再点「保存模板」。理由：模板是全局的，一次误存会让所有用户的订阅一起失效。
+ */
+async function syncClashTemplate(req, res, params, body) {
+  const s = store.db().settings;
+  const raw = String((body && body.url) || s.subTemplateUrl || '').trim();
+  if (!raw) return sendJson(res, 400, { error: '请先填写「自定义模板地址」' });
 
+  let target;
+  try {
+    target = normalizeHttpUrl(raw, '自定义模板地址');
+  } catch (err) {
+    return sendJson(res, 400, { error: err.message });
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  let text;
+  try {
+    const resp = await fetch(target, {
+      signal: ctrl.signal,
+      redirect: 'follow',
+      headers: { 'User-Agent': 'node-panel/template-sync' },
+    });
+    if (!resp.ok) {
+      return sendJson(res, 400, { error: `模板地址返回 HTTP ${resp.status}` });
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length > subTemplate.MAX_BYTES) {
+      return sendJson(res, 400, { error: `模板文件太大（${Math.round(buf.length / 1024)} KB，上限 ${subTemplate.MAX_BYTES / 1024} KB）` });
+    }
+    text = buf.toString('utf8');
+  } catch (err) {
+    const msg = err && err.name === 'AbortError' ? '请求超时（15 秒）' : (err && err.message) || '未知错误';
+    log.warn('拉取订阅模板失败', { err: msg });
+    return sendJson(res, 400, { error: `拉取模板失败：${msg}` });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const out = subTemplate.convert(text);
+  if (!out.ok) return sendJson(res, 400, { error: out.error });
+
+  // 生成的模板再走一遍正式校验：存进去之后每条订阅都会用它，不能带病上线
+  const template = JSON.stringify(out.template, null, 2);
+  const check = sub.parseTemplate(template);
+  if (!check.ok) {
+    return sendJson(res, 400, { error: `转换结果未通过校验：${check.error}` });
+  }
+
+  log.info('订阅模板已转换', { ...out.stats, warnings: out.warnings.length });
+  sendJson(res, 200, { ok: true, template, stats: out.stats, warnings: out.warnings });
+}
+
+/* -------------------------------- 消息通知 -------------------------------- */
 /** settings 里的通知开关都是字符串（key/value 表），这里统一解析成类型正确的对象 */
 function notifySettings() {
   const s = store.db().settings;
@@ -5542,6 +5599,7 @@ const ROUTES = [
 
   ['GET', '/api/settings', getSettings, true],
   ['PUT', '/api/settings', updateSettings, true],
+  ['POST', '/api/settings/sync-template', syncClashTemplate, true],
 
   ['GET', '/api/notify/channels', listNotifyChannels, true],
   ['POST', '/api/notify/channels', createNotifyChannel, true],

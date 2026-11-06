@@ -3,6 +3,34 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.27] - 2026-11-06
+
+把用户手里现成的 subconverter 模板直接搬进面板，顺带确认了「订阅转换后只有 VLESS 不通」
+的根因。
+
+### 新增
+
+- **设置 → Clash 订阅模板 → 从模板地址同步**：读取「自定义模板地址」里的 subconverter
+  配置（`[custom]` 段 + `ruleset=` / `custom_proxy_group=`），翻译成面板的模板 JSON 填进
+  编辑器，确认后再保存。译文不落盘，避免一次误存让所有用户的订阅一起失效
+  - `ruleset=组,clash-classic:URL` → `rule-providers` + `RULE-SET,rsN,组`
+  - `ruleset=DIRECT,[]GEOIP,CN` → 内联规则 `GEOIP,CN,DIRECT`
+  - `custom_proxy_group=组`select`[]A`.*` → `{ name, type: select, proxies: [A, '{all}'] }`
+  - `url-test` / `fallback` 的 `url` 与 `interval` 一并搬过来（`300,,50` 只取 300）
+  - 节点正则只有「纯字面量 + `|` 分支」能安全转成 `{filter:...}`，带 `\d`、`[]`、`()`
+    的退化成 `{all}` 并在编辑器下面提示，避免生成一个永远匹配不到节点的空分组
+- **模板支持 `rule-providers`**：模板里可以声明规则集，面板原样输出到订阅，让客户端自己
+  去拉。保存时校验 `RULE-SET` 引用的规则集必须已声明（缺了客户端会整份拒绝加载）
+
+### 排查
+
+- **订阅转换后 VLESS 全部 timeout，HY2 正常**：subconverter 不认识 REALITY 的
+  `support-x25519mlkem768`，转换时整条丢掉。拿用户实际的转换产物做了对照：字段计数为 0，
+  补上这一个字段后同一份配置立刻能连（972ms / 322ms，出口正常）。它保留
+  `client-fingerprint: chrome`、`udp`、`reality-opts`，唯独漏掉这个新参数 ——
+  所以不是「转换后全都不能用」，而是「只有 REALITY 节点不能用」
+- 结论：REALITY 节点别走 subconverter。要么用面板直出，要么按上面的方式把模板搬进来
+
 ## [0.1.26] - 2026-11-06
 
 REALITY 的默认值反转：**默认就能连**，把「严格模式」变成需要主动选择的那一个。
