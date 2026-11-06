@@ -1605,12 +1605,15 @@ function normalizeNode(body, prev = {}) {
   if (security === 'reality') {
     const r = body.reality || prev.reality || {};
     node.reality = {
-      dest: String(r.dest || 'www.microsoft.com:443'),
-      serverNames: String(r.serverNames || 'www.microsoft.com'),
+      dest: String(r.dest || xray.DEFAULT_REALITY_DEST),
+      serverNames: String(r.serverNames || xray.DEFAULT_REALITY_SNI),
       privateKey: String(r.privateKey || ''),
       publicKey: String(r.publicKey || ''),
       shortId: String(r.shortId || ''),
       flow: r.flow === '' ? '' : String(r.flow || 'xtls-rprx-vision'),
+      // 只接受固定值，避免 API 直调塞任意版本串把 Xray 配置搞坏；空 = 用官方默认值
+      minClientVer: r.minClientVer === xray.REALITY_COMPAT_MIN_CLIENT_VER
+        ? xray.REALITY_COMPAT_MIN_CLIENT_VER : '',
     };
   } else if (prev.reality) {
     node.reality = prev.reality; // 保留，切回 reality 时不用重填

@@ -788,6 +788,46 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('同步完成后自动刷新停止', d9.querySelector('#page-actions [data-act="refresh"]').textContent.trim() === '刷新',
     d9.querySelector('#page-actions [data-act="refresh"]').textContent.trim());
 
+  /* ---- 自动刷新可取消 ---- */
+  console.log('\n── 自动刷新可取消 ──');
+  // 重新制造待同步节点，手动刷新进入倒数态
+  await json(`/api/agent/receipt?token=${st}`, {
+    method: 'POST',
+    body: JSON.stringify({ hash: 'deadbeefdeadbeef', ok: true, xray: 'ok' }),
+  });
+  click(d9.querySelector('#page-actions [data-act="refresh"]'), w9);
+  await waitFor(
+    () => /自动刷新 \d+s/.test(d9.querySelector('#page-actions [data-act="refresh"]').textContent),
+    '重新进入自动刷新',
+  );
+  const cancelBtn = d9.querySelector('#page-actions [data-act="refresh"]');
+  ok('倒数中的按钮提示可取消', /取消/.test(cancelBtn.title), cancelBtn.title);
+  click(cancelBtn, w9);
+  ok('点击后取消自动刷新', cancelBtn.textContent.trim() === '刷新', cancelBtn.textContent.trim());
+  ok('取消后计时器已停', w9.autoRefreshActive() === false);
+  await sleep(2700);
+  ok('取消后不会自行重启倒数', cancelBtn.textContent.trim() === '刷新', cancelBtn.textContent.trim());
+  // 再点一次「刷新」= 新会话，按待同步状态恢复自动轮询
+  click(d9.querySelector('#page-actions [data-act="refresh"]'), w9);
+  await waitFor(
+    () => /自动刷新 \d+s/.test(d9.querySelector('#page-actions [data-act="refresh"]').textContent),
+    '手动刷新恢复自动轮询',
+  );
+  ok('手动刷新后恢复自动轮询', true);
+
+  // 恢复现场：回执对上 desired，等一轮让自动刷新自然停止，不干扰后续用例
+  const desired2 = (await json(`/api/agent/receipt?token=${st}`, {
+    method: 'POST',
+    body: JSON.stringify({ hash: 'deadbeefdeadbeef', ok: true, xray: 'ok' }),
+  })).desired;
+  await json(`/api/agent/receipt?token=${st}`, {
+    method: 'POST',
+    body: JSON.stringify({ hash: desired2, ok: true, xray: 'ok' }),
+  });
+  await sleep(2700);
+  ok('恢复现场：自动刷新已停止',
+    d9.querySelector('#page-actions [data-act="refresh"]').textContent.trim() === '刷新');
+
   /* ---- 新增节点默认值 ---- */
   console.log('\n── 新增节点默认值 ──');
   const nodesBefore = await json('/api/nodes', {}, T);

@@ -3,6 +3,49 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.22] - 2026-11-06
+
+REALITY 侧一批兼容性收口：默认伪装站换成不会触发 Xray GFW 警告的站点，
+新增「兼容旧客户端」开关解决 sing-box / NekoBox 报 `reality verification failed`，
+顺带修掉订阅下发的几处格式不一致。
+
+### 新增
+
+- **节点页自动刷新可取消**：顶栏按钮进入「自动刷新 Ns」倒数后，点它即可停表并恢复
+  普通「刷新」（按钮带「点击取消自动刷新」提示）；再点一次才按待同步状态重新开始轮询。
+  取消标记会压过节点页的自动重启，切到别的页面后视为新会话重新判断
+- **REALITY 兼容旧客户端开关**：节点表单新增「兼容旧客户端 / 非 Xray 内核」。
+  Xray 从 v26.3.27 起给 REALITY 加了最低客户端版本校验，不填 `minClientVer` 时默认
+  `v26.3.27`，会把 sing-box / NekoBox 等内核的 ClientHello 判为过期并拒绝，客户端表现为
+  `reality verification failed`。勾选后服务端下发 `minClientVer=0.0.0` 关掉这道检查。
+  **默认关闭**，保持官方安全默认值；开启会降低 REALITY 主动探测防护、增加服务器 IP
+  被 GFW 识别封锁的风险，表单里已红字提示
+
+### 变更
+
+- **REALITY 默认伪装站**：`www.microsoft.com:443` / `www.microsoft.com` →
+  `www.samsung.com:443` / `www.samsung.com`。前者会触发 Xray 启动警告
+  「增加被 GFW 识别封锁风险」；新值选大厂、流量足够大、TLS 1.3、证书与 SNI 匹配，
+  且不像 cloudflare / microsoft 那样被大量用作 REALITY dest。默认值集中成
+  `lib/xray.js` 的 `DEFAULT_REALITY_DEST` / `DEFAULT_REALITY_SNI`，后端、节点表单、
+  演示种子共用一处。只影响新建节点，已有节点配置不变；表单提示按节点所在网络换成
+  当地可达的大流量站（过冷门的站会让主动探测的转发流量显得异常）
+- **VLESS 分享链接不再无条件下发 `encryption=none`**：未开启 VLESS Encryption 时
+  不下发该参数，避免严格 JSON 解析的客户端把它映射成出站根级 `encryption` 字段而启动失败
+
+### 修复
+
+- **sing-box 订阅启用 VLESS Encryption 时漏发参数**：`toSingBox()` 的 vless 出站补
+  `encryption: mlkem768x25519plus`，与 base64 / Clash 两种格式口径一致
+- **IPv6 节点地址生成的分享链接缺方括号**：新增 `uriHost()`，vless / trojan / ss /
+  hysteria2 四种 URI 统一输出 `@[2001:db8::1]:443` 形式；Clash / sing-box JSON 格式不受影响
+
+### 文档
+
+- README 新增「伪装目标与『兼容旧客户端』开关」小节，说明默认值选择依据与 GFW 风险
+
+测试：renew 48/48、smoke 468/468（新增 10 条边界断言）、ui 221/221，全通过。
+
 ## [0.1.21] - 2026-11-05
 
 结算日与批量到期操作：管理员可以把所有用户的账期统一到每月同一天，

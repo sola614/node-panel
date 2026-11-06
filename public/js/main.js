@@ -725,7 +725,15 @@ document.addEventListener('click', async (e) => {
 async function runAction(act, btn, id) {
   switch (act) {
     case 'refresh':
-      await render();
+      // 倒数中的按钮是「取消自动刷新」；停表后不重渲染，避免节点页立刻重启一轮。
+      // 普通「刷新」才清掉取消标记并真正重拉。
+      if (autoRefreshActive()) {
+        cancelAutoRefresh();
+        toast('已取消自动刷新，点「刷新」可重新开始', 'ok');
+      } else {
+        resumeAutoRefresh();
+        await render();
+      }
       break;
     case 'stats-range':
       state.data.statsDays = Number(btn.dataset.days) || 14;

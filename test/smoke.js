@@ -15,6 +15,8 @@ const http = require('http');
 const tls = require('tls');
 const { spawnSync, spawn } = require('node:child_process');
 const totp = require('../lib/totp');
+const sub = require('../lib/sub');
+const xray = require('../lib/xray');
 
 const BASE = (process.argv[2] || 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const ADMIN_USER = process.env.PANEL_ADMIN_USER || 'admin';
@@ -227,7 +229,7 @@ function totpCodeOf(secret) {
       name: 'SMOKE-REALITY', mode: 'standalone', address: 'sg.example.com',
       protocol: 'vless', port: 443, network: 'tcp', security: 'reality',
       reality: {
-        dest: 'www.microsoft.com:443', serverNames: 'www.microsoft.com',
+        // 故意不传 dest / serverNames：验证服务端默认值（不再用 microsoft）
         privateKey: keyPair.data.privateKey, publicKey: keyPair.data.publicKey,
         shortId: keyPair.data.shortId, flow: 'xtls-rprx-vision',
       },
@@ -535,6 +537,31 @@ function totpCodeOf(secret) {
     clash.includes('reality-opts') && clash.includes('public-key') &&
     clash.includes('type: hysteria2') && clash.includes('obfs-password'));
 
+  /* ---------- 6.1 订阅下发的边界格式（纯函数，不改动实例数据） ---------- */
+  const mkLink = (node, host) => sub.buildLink(node, [], { uuid: 'u-test' }, { host, port: 443 });
+  const fmtNode = { name: 'FMT', protocol: 'vless', port: 443, network: 'tcp', security: 'none' };
+  const v6Uri = mkLink(fmtNode, '2001:db8::1');
+  ok('IPv6 主机在分享链接里带方括号',
+    !!v6Uri && v6Uri.includes('@[2001:db8::1]:443?'), `(${v6Uri})`);
+  const v4Uri = mkLink(fmtNode, '203.0.113.7');
+  ok('IPv4 / 域名不加方括号',
+    !!v4Uri && v4Uri.includes('@203.0.113.7:443?') && !v4Uri.includes('['));
+  ok('未开启 VLESS Encryption 时不下发 encryption 参数', !v4Uri.includes('encryption='));
+  const veUri = mkLink({ ...fmtNode, vlessEncryption: true }, '203.0.113.7');
+  ok('开启 VLESS Encryption 时链接带 mlkem768x25519plus',
+    veUri.includes('encryption=mlkem768x25519plus'));
+
+  const mkRs = (minClientVer) => xray.streamSettings({
+    security: 'reality', reality: { privateKey: 'k', shortId: 'abcd1234', minClientVer },
+  }).realitySettings;
+  const strictRs = mkRs(undefined);
+  ok('未开启兼容时不写 minClientVer（保留官方默认）', strictRs.minClientVer === undefined);
+  ok('REALITY 默认伪装站不含 microsoft / cloudflare',
+    strictRs.dest === 'www.samsung.com:443' && strictRs.serverNames[0] === 'www.samsung.com',
+    `(${strictRs.dest})`);
+  ok('兼容开关下发 minClientVer=0.0.0', mkRs('0.0.0').minClientVer === '0.0.0');
+  ok('非法 minClientVer 不会下发', mkRs('9.9.9').minClientVer === undefined);
+
   /* ---------- 7. 配置层套餐隔离（服务器 agent） ---------- */
   const cfgServer = await call(`/api/agent/config?token=${serverToken}&v=test`);
   const inbound = cfgServer.data.xray.inbounds.find((i) => i.tag === 'node-' + node1Id);
@@ -558,6 +585,11 @@ function totpCodeOf(secret) {
     realityInbound.streamSettings.realitySettings.privateKey === keyPair.data.privateKey);
   ok('Reality 客户端启用 vision 流控',
     realityInbound.settings.clients.every((c) => c.flow === 'xtls-rprx-vision'));
+  ok('新建节点不传 dest 时落到默认伪装站 samsung',
+    realityInbound.streamSettings.realitySettings.dest === 'www.samsung.com:443' &&
+    realityInbound.streamSettings.realitySettings.serverNames[0] === 'www.samsung.com');
+  ok('默认不开启兼容，配置里没有 minClientVer',
+    realityInbound.streamSettings.realitySettings.minClientVer === undefined);
 
   /* ---------- 9. Hysteria2 配置 ---------- */
   const cfgNode3 = await call(`/api/agent/config?token=${node3Token}&v=test`);

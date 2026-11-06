@@ -708,13 +708,40 @@ let renderSeq = 0;
 // 刷新后仍有待同步就续下一轮，没有了就恢复普通「刷新」。
 // 切页面 / 手动刷新都会走 render() 开头的 stopAutoRefresh()，旧计时器不跨页面泄漏
 let autoRefreshTimer = null;
+// 用户主动取消过自动刷新：这个标记要压过 renderNodes 的自动重启，
+// 否则任何一次 render 都会把倒数又拉起来，取消形同虚设。
+let autoRefreshCancelled = false;
 
 function stopAutoRefresh() {
   if (autoRefreshTimer) clearInterval(autoRefreshTimer);
   autoRefreshTimer = null;
 }
 
+function autoRefreshActive() {
+  return !!autoRefreshTimer;
+}
+
+/** 点倒数中的按钮 = 取消；不触发 render，否则节点页会立刻重启新一轮 */
+function cancelAutoRefresh() {
+  autoRefreshCancelled = true;
+  stopAutoRefresh();
+  const btn = $('#page-actions [data-act="refresh"]');
+  if (btn) {
+    btn.textContent = '刷新';
+    btn.title = '';
+    // 点击走 withLoading：lockBtn 把点击瞬间的 innerHTML 存进 dataset.rawHtml，
+    // unlockBtn 会在 finally 里原样恢复。不同步覆盖它，取消后按钮仍显示「自动刷新 Ns」。
+    if (btn.dataset.rawHtml != null) btn.dataset.rawHtml = '刷新';
+  }
+}
+
+/** 手动点「刷新」= 新会话，允许按待同步状态重新自动轮询 */
+function resumeAutoRefresh() {
+  autoRefreshCancelled = false;
+}
+
 function startAutoRefresh() {
+  if (autoRefreshCancelled) return;
   stopAutoRefresh();
   const secs = Number(window.NP_AUTOREFRESH_SECS) || 10;
   let left = secs;
@@ -723,6 +750,7 @@ function startAutoRefresh() {
     // 按钮被别的流程重画没了就别硬撑，直接停表
     if (!btn) return stopAutoRefresh();
     btn.textContent = left > 0 ? `自动刷新 ${left}s` : '刷新';
+    btn.title = left > 0 ? '点击取消自动刷新' : '';
   };
   paint();
   autoRefreshTimer = setInterval(() => {
@@ -740,6 +768,8 @@ async function render() {
   const seq = ++renderSeq;
   const view = state.view;
   const cfg = VIEWS[view];
+  // 离开节点页视为新会话：取消标记不跨页面，回来时按状态重新判断
+  if (view !== 'nodes') autoRefreshCancelled = false;
   stopAutoRefresh();
   $$('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
   $('#page-title').textContent = cfg.title;

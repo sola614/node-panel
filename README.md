@@ -232,6 +232,25 @@ Reality 下建议 chrome。VLESS Encryption（`mlkem768x25519plus`）则是服�
 - 它解决的正是 vision 流控当年解决的 TLS-in-TLS 问题，所以**与 Reality 二选一即可**
 - 同时开启在部分传输组合下有已知问题，默认关闭
 
+#### 伪装目标与「兼容旧客户端」开关
+
+REALITY 服务端要连一个真实站点（`dest`）借它的 TLS 证书完成握手，客户端的 SNI 必须在
+`serverNames` 里。面板默认用 `www.samsung.com:443` / `www.samsung.com`：大厂、流量
+足够大、TLS 1.3、证书与 SNI 匹配，且避开 Xray 会警告「增加被识别风险」的 microsoft /
+apple / icloud 与 `.cn` / `.ru` / `.ir` 域名；同时不像 cloudflare / microsoft 那样
+被大量用作 REALITY dest，降低被针对性识别的概率。**请按节点所在网络换成当地可达的
+大流量站点**，dest 与 SNI 列表要一起改 —— 太冷门的站反而会让主动探测时的转发流量
+显得异常。
+
+Xray 从 v26.3.27 起给 REALITY 加了最低客户端版本校验：不填 `minClientVer` 时默认就是
+`v26.3.27`，会把 sing-box / NekoBox 等非 Xray 内核的 ClientHello 判为过期并拒绝，客户端
+表现为 `reality verification failed`。节点表单里的**「兼容旧客户端 / 非 Xray 内核」**
+开关勾选后，面板下发 `minClientVer=0.0.0` 关掉这道检查：
+
+- 默认**关闭**，保持官方安全默认值
+- 开启后**会降低 REALITY 的主动探测防护，增加服务器 IP 被 GFW 识别封锁的风险**
+- 只在确实需要兼容这些客户端时开；否则更推荐让这些用户换用 Xray 内核客户端
+
 ### Hysteria2
 
 由独立的 `hysteria` 二进制承载（不是 Xray 协议）。agent 会为每个节点写一份

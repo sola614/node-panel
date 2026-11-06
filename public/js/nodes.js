@@ -565,12 +565,17 @@ function nodeForm(node, servers) {
         <div class="form-row">
           <div class="field">
             <label>伪装目标 dest</label>
-            <input type="text" id="r-dest" value="${esc(r.dest || 'www.microsoft.com:443')}" placeholder="www.microsoft.com:443">
+            <input type="text" id="r-dest" value="${esc(r.dest || 'www.samsung.com:443')}" placeholder="www.samsung.com:443">
           </div>
           <div class="field">
             <label>SNI 列表 serverNames</label>
-            <input type="text" id="r-names" value="${esc(r.serverNames || 'www.microsoft.com')}" placeholder="www.microsoft.com">
+            <input type="text" id="r-names" value="${esc(r.serverNames || 'www.samsung.com')}" placeholder="www.samsung.com">
           </div>
+        </div>
+        <div class="hint">
+          默认值与服务端 lib/xray.js 的 DEFAULT_REALITY_DEST / SNI 一致。请按节点所在网络换成
+          <b>当地可达、流量大、TLS 1.3 且证书与 SNI 匹配</b>的站；避开 microsoft / apple / icloud
+          与 .cn / .ru / .ir 结尾的域名 —— Xray 会警告这些目标增加被识别风险。
         </div>
         <div class="field">
           <label>密钥对（服务端私钥 / 客户端公钥）</label>
@@ -595,6 +600,16 @@ function nodeForm(node, servers) {
               <option value="" ${r.flow === '' ? 'selected' : ''}>关闭流控</option>
             </select>
           </div>
+        </div>
+        <label class="ve-label" style="margin-top:10px">
+          <input type="checkbox" id="r-compat" ${r.minClientVer ? 'checked' : ''} style="width:auto">
+          兼容旧客户端 / 非 Xray 内核（sing-box、NekoBox 等）
+        </label>
+        <div class="hint" style="color:var(--danger, #e24b4a)">
+          默认关闭：Xray 会用官方最低客户端版本 v26.3.27，非 Xray 内核的 ClientHello 会被拒绝，
+          表现为 <code>reality verification failed</code>。勾选后服务端下发
+          <code>minClientVer=0.0.0</code> 关掉这道检查。<b>会降低 REALITY 的主动探测防护，
+          增加服务器 IP 被 GFW 识别封锁的风险</b>，仅在确实需要兼容这些客户端时开启。
         </div>
       </div>
     </div>
@@ -1218,6 +1233,7 @@ function readNodeForm(mask) {
           publicKey: $('#r-pub', mask).textContent.trim(),
           shortId: v('#r-sid'),
           flow: v('#r-flow'),
+          minClientVer: $('#r-compat', mask).checked ? '0.0.0' : '',
         },
       });
     }
