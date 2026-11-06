@@ -295,7 +295,7 @@
         "obfs": "salamander",
         "obfsPassword": "bcba909e1e25d247",
         "upMbps": 100,
-        "downMbps": 1000,
+        "downMbps": 200,
         "maskUrl": "https://news.ycombinator.com/"
       },
       "serverName": "独立部署",

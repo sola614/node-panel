@@ -741,8 +741,13 @@ function nodeForm(node, servers) {
         </div>
         <div class="field">
           <label>下行带宽（Mbps）</label>
-          <input type="number" id="h-down" value="${h.downMbps || 1000}" min="1">
+          <input type="number" id="h-down" value="${h.downMbps || 200}" min="1">
         </div>
+      </div>
+      <div class="hint" style="margin:-6px 0 12px">
+        填这条线路的<b>实测吞吐</b>（建议 70–80%），下行要大于上行。
+        服务端与订阅都会下发这两个值，Clash / mihomo 拿到就按它走 Brutal ——
+        填得比真实链路高，丢包会被「补偿性多发」放大，表现为忽快忽慢甚至断流。
       </div>
       <div class="field">
         <label>伪装站点（可选）</label>
@@ -1209,7 +1214,7 @@ function readNodeForm(mask) {
         obfs: v('#h-obfs'),
         obfsPassword: v('#h-obfs-pass'),
         upMbps: Number(v('#h-up')) || 100,
-        downMbps: Number(v('#h-down')) || 1000,
+        downMbps: Number(v('#h-down')) || 200,
         maskUrl: v('#h-mask'),
       },
     });

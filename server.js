@@ -1719,7 +1719,7 @@ function normalizeNode(body, prev = {}) {
       obfs: h.obfs === 'salamander' ? 'salamander' : '',
       obfsPassword: String(h.obfsPassword || ''),
       upMbps: Number(h.upMbps) || 100,
-      downMbps: Number(h.downMbps) || 1000,
+      downMbps: Number(h.downMbps) || 200,
       // 裸域名补 https:// 前缀：hysteria 的 masquerade.proxy.url 要求完整地址，
       // 空 scheme 会让实例 FATAL（见 lib/hysteria.js normalizeMaskUrl）
       maskUrl: hysteria.normalizeMaskUrl(h.maskUrl),

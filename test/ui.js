@@ -1008,6 +1008,12 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   protoSel.value = 'hysteria2';
   change(protoSel);
   ok('切到 hysteria2 时加密方式跟到 TLS', secSel.value === 'tls', secSel.value);
+  // 带宽默认值会原样进服务端配置与订阅，客户端拿它当 Brutal 的上限
+  const upBox = d9.querySelector('#h-up');
+  const downBox = d9.querySelector('#h-down');
+  ok('HY2 带宽默认上行 100 / 下行 200',
+    !!upBox && !!downBox && upBox.value === '100' && downBox.value === '200',
+    `${upBox ? upBox.value : '?'} / ${downBox ? downBox.value : '?'}`);
   protoSel.value = 'vless';
   change(protoSel);
   ok('切回 vless 时回到 Reality', secSel.value === 'reality', secSel.value);

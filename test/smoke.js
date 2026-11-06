@@ -812,6 +812,11 @@ function totpCodeOf(secret) {
   ok('自签证书的 hy2 配置带 cert 与 key',
     !!hySelf && hySelf.yaml.includes(`${selfDir}/fullchain.pem`) && hySelf.yaml.includes(`${selfDir}/privkey.pem`),
     hySelf ? hySelf.yaml.split('\n').filter((l) => /cert|key/.test(l)).map((s) => s.trim()).join(' | ') : '');
+  // 默认带宽从 100/1000 收到 100/200：1000 对绝大多数 VPS 是虚高，这两个值会原样
+  // 下发给客户端，mihomo 拿到就走 Brutal 按声明值硬推，越填大越容易卡顿/断流
+  ok('Hysteria2 未填带宽时默认上行 100 / 下行 200',
+    !!hySelf && /up:\s*"?100 mbps"?/.test(hySelf.yaml) && /down:\s*"?200 mbps"?/.test(hySelf.yaml),
+    hySelf ? hySelf.yaml.split('\n').filter((l) => /mbps/.test(l)).map((s) => s.trim()).join(' | ') : '');
   ok('自签证书随配置包下发给 agent 生成',
     (cfgSelfHy.data.certs || []).some((c) => c.nodeId === selfHy.data.item.id && c.mode === 'self'));
 
