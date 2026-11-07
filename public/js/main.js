@@ -103,7 +103,13 @@ RENDERERS.settings = async () => {
   state.data.backups = b;
   state.data.certList = (cd.items || []).filter((c) => c.hasKey);
 
+  const tab = settingsTabOf();
+  const panelClass = (id) => (tab === id ? '' : 'hidden');
+
   $('#view').innerHTML = `
+    ${settingsTabsHtml((n.openAlerts || []).length)}
+
+    <div class="tab-panel ${panelClass('basic')}" data-panel="basic">
     <div class="grid-2">
       <div class="card">
         <div class="card-head"><h3>站点信息</h3></div>
@@ -162,6 +168,29 @@ RENDERERS.settings = async () => {
       </div>
 
       <div class="card">
+        <div class="card-head"><h3>统一结算日</h3></div>
+        <div class="card-body">
+          <div class="field">
+            <label>每月结算日</label>
+            <select id="set-billing-day">
+              <option value="0" ${String(s.billingDay || '0') === '0' ? 'selected' : ''}>关闭（按建号日起租）</option>
+              ${Array.from({ length: 28 }, (_, i) => `<option value="${i + 1}" ${String(s.billingDay || '0') === String(i + 1) ? 'selected' : ''}>每月 ${i + 1} 号</option>`).join('')}
+            </select>
+          </div>
+          <div class="hint">
+            开启后，新建用户与换套餐都从最近的结算日起租：例如今天 5 号设为 1 号，
+            5 号新建的用户首期到下月 1 号（自然月制，首期不足整月），以后每月 1 号到期并自动清零流量。
+            存量用户请在用户列表勾选后点「对齐结算日」。
+            只能选 1–28：29/30/31 在短月会落到月末，反而不对齐；按天套餐不参与。
+          </div>
+          <button class="btn btn-primary" data-act="save-billing" style="margin-top:12px">保存结算日</button>
+        </div>
+      </div>
+    </div>
+    </div>
+
+    <div class="tab-panel ${panelClass('sub')}" data-panel="sub">
+      <div class="card">
         <div class="card-head">
           <h3>Clash 订阅模板</h3>
           <span class="hint" style="margin:0">分组与规则</span>
@@ -179,7 +208,10 @@ RENDERERS.settings = async () => {
             <button class="btn" data-act="save-tpl-src" style="margin-top:10px">保存模板地址</button>
           </div>
           <div class="field">
-            <label>自定义 proxy-groups 与 rules（JSON，留空用内置两组）</label>
+            <div class="label-row">
+              <label>自定义 proxy-groups 与 rules（JSON，留空用内置两组）</label>
+              <button class="btn btn-sm btn-ghost" type="button" data-act="clash-tpl-full" title="在接近全屏的弹窗里改，长模板不用来回滚">放大编辑</button>
+            </div>
             <textarea id="set-clash-tpl" class="code-area" spellcheck="false" autocomplete="off"
               placeholder='${esc(CLASH_TPL_EXAMPLE)}'>${esc(s.clashTemplate || '')}</textarea>
             <div class="field-err" id="set-clash-tpl-err" hidden></div>
@@ -225,26 +257,10 @@ RENDERERS.settings = async () => {
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-head"><h3>统一结算日</h3></div>
-        <div class="card-body">
-          <div class="field">
-            <label>每月结算日</label>
-            <select id="set-billing-day">
-              <option value="0" ${String(s.billingDay || '0') === '0' ? 'selected' : ''}>关闭（按建号日起租）</option>
-              ${Array.from({ length: 28 }, (_, i) => `<option value="${i + 1}" ${String(s.billingDay || '0') === String(i + 1) ? 'selected' : ''}>每月 ${i + 1} 号</option>`).join('')}
-            </select>
-          </div>
-          <div class="hint">
-            开启后，新建用户与换套餐都从最近的结算日起租：例如今天 5 号设为 1 号，
-            5 号新建的用户首期到下月 1 号（自然月制，首期不足整月），以后每月 1 号到期并自动清零流量。
-            存量用户请在用户列表勾选后点「对齐结算日」。
-            只能选 1–28：29/30/31 在短月会落到月末，反而不对齐；按天套餐不参与。
-          </div>
-          <button class="btn btn-primary" data-act="save-billing" style="margin-top:12px">保存结算日</button>
-        </div>
-      </div>
+    </div>
 
+    <div class="tab-panel ${panelClass('security')}" data-panel="security">
+    <div class="grid-2">
       <div class="card">
         <div class="card-head"><h3>管理员安全</h3></div>
         <div class="card-body">
@@ -318,12 +334,18 @@ RENDERERS.settings = async () => {
         </div>
       </div>
     </div>
+    </div>
 
-    ${notifyCardHtml(n)}
+    <div class="tab-panel ${panelClass('notify')}" data-panel="notify">
+      ${notifyCardHtml(n)}
+    </div>
 
-    ${backupCardHtml(b)}
+    <div class="tab-panel ${panelClass('backup')}" data-panel="backup">
+      ${backupCardHtml(b)}
+    </div>
 
-    <div class="card" style="margin-top:16px">
+    <div class="tab-panel ${panelClass('api')}" data-panel="api">
+    <div class="card">
       <div class="card-head"><h3>接口速查</h3></div>
       <div class="card-body">
         <pre class="code" style="white-space:pre-wrap">GET  /api/agent/config?token=TOKEN      服务器/独立节点拉取配置（含 Xray 与 Hysteria2）
@@ -345,11 +367,115 @@ GET  /api/invite/:code                  邀请码公开信息（名额、套餐�
 POST /api/invite/:code/claim            用邀请码自助建号
 GET  /api/health                        健康检查（容器探针）</pre>
       </div>
+    </div>
     </div>`;
 
+  bindSettingsTabs();
   bindSubBaseField();
   checkSubBaseField(false);
 };
+
+/* ------------------------------ 设置页页签 ------------------------------ */
+
+/* 原来一屏堆八张卡片，找「改密码」要滚三屏。按用途拆成页签，一次只看一类。 */
+const SETTINGS_TABS = [
+  { id: 'basic', label: '基础' },
+  { id: 'sub', label: '订阅模板' },
+  { id: 'notify', label: '通知' },
+  { id: 'backup', label: '备份' },
+  { id: 'security', label: '安全' },
+  { id: 'api', label: '接口' },
+];
+
+/* 当前页签挂在 state 上：渲染完再切回来，不用用户重新找位置 */
+function settingsTabOf() {
+  return SETTINGS_TABS.some((t) => t.id === state.settingsTab) ? state.settingsTab : 'basic';
+}
+
+function settingsTabsHtml(openAlerts) {
+  const cur = settingsTabOf();
+  return `<div class="page-tabs" id="set-tabs">${SETTINGS_TABS.map(
+    (t) =>
+      `<button type="button" data-tab="${t.id}" class="${t.id === cur ? 'on' : ''}">${t.label}${
+        // 有待处理告警时在「通知」上点一下，否则没人会主动翻进去看
+        t.id === 'notify' && openAlerts ? '<span class="tab-dot"></span>' : ''
+      }</button>`,
+  ).join('')}</div>`;
+}
+
+function switchSettingsTab(id) {
+  if (!SETTINGS_TABS.some((t) => t.id === id)) return;
+  state.settingsTab = id;
+  $$('#set-tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === id));
+  $$('.tab-panel').forEach((p) => p.classList.toggle('hidden', p.dataset.panel !== id));
+}
+
+function bindSettingsTabs() {
+  const bar = $('#set-tabs');
+  if (!bar) return;
+  bar.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-tab]');
+    if (btn) switchSettingsTab(btn.dataset.tab);
+  });
+}
+
+/**
+ * Clash 模板「放大编辑」：接近全屏的弹窗，长模板不用在 200px 高的框里来回滚。
+ *
+ * 两个出口，语义分开：
+ *   - 应用到编辑器：只写回行内 textarea，不落库（和「手动同步」一致：草稿先过一遍眼睛）
+ *   - 保存模板：直接打同一个 PUT 接口，校验错误贴回弹窗里 —— 关窗会丢掉刚改的内容
+ */
+function clashTplFullEdit() {
+  const box = $('#set-clash-tpl');
+  if (!box) return;
+  const inlineErr = $('#set-clash-tpl-err');
+
+  const mask = openModal({
+    title: 'Clash 订阅模板',
+    full: true,
+    bodyClass: 'fill',
+    okText: '保存模板',
+    footActions: '<button class="btn btn-ghost" data-clash-apply>应用到编辑器</button>',
+    body: `<textarea id="clash-tpl-full" class="code-area" spellcheck="false" autocomplete="off"
+      placeholder='${esc(CLASH_TPL_EXAMPLE)}'>${esc(box.value)}</textarea>
+      <div class="field-err" id="clash-tpl-full-err" hidden></div>`,
+    onOk: async (m) => {
+      const err = $('#clash-tpl-full-err', m);
+      err.hidden = true;
+      try {
+        const r = await api('/api/settings', {
+          method: 'PUT',
+          body: JSON.stringify({ clashTemplate: $('#clash-tpl-full', m).value }),
+        });
+        box.value = (r.settings && r.settings.clashTemplate) || '';
+        if (inlineErr) {
+          inlineErr.hidden = true;
+          inlineErr.textContent = '';
+        }
+        toast('订阅模板已保存，客户端重新拉取订阅后生效', 'ok');
+      } catch (e) {
+        err.textContent = e.message;
+        err.hidden = false;
+        return false; // 留着窗口，改完可以直接再存
+      }
+      return true;
+    },
+  });
+
+  $('[data-clash-apply]', mask).addEventListener('click', () => {
+    box.value = $('#clash-tpl-full', mask).value;
+    if (inlineErr) {
+      inlineErr.hidden = true;
+      inlineErr.textContent = '';
+    }
+    closeModal();
+    toast('已应用到编辑器，记得点「保存模板」', 'ok');
+  });
+
+  const ta = $('#clash-tpl-full', mask);
+  if (ta) ta.focus();
+}
 
 /* ------------------------------ 通知设置卡片 ------------------------------ */
 
@@ -415,7 +541,7 @@ function notifyCardHtml(n) {
   const openCount = (n.openAlerts || []).length;
 
   return `
-    <div class="card" style="margin-top:16px">
+    <div class="card">
       <div class="card-head">
         <h3>消息通知</h3>
         <div style="display:flex;gap:6px">
@@ -522,7 +648,7 @@ function backupRowsHtml(b) {
 
 function backupCardHtml(b) {
   return `
-    <div class="card" style="margin-top:16px">
+    <div class="card">
       <div class="card-head">
         <h3>备份与恢复</h3>
         <div style="display:flex;gap:6px">
@@ -1197,6 +1323,9 @@ async function runAction(act, btn, id) {
       toast('订阅显示已保存，客户端重新拉取订阅后生效', 'ok');
       break;
     }
+    case 'clash-tpl-full':
+      clashTplFullEdit();
+      break;
     case 'save-clash-tpl': {
       const errBox = $('#set-clash-tpl-err');
       if (errBox) {

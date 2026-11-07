@@ -754,6 +754,27 @@ function nodeForm(node, servers) {
         <input type="text" id="h-mask" value="${esc(h.maskUrl || '')}" placeholder="https://news.ycombinator.com/">
         <div class="hint">未通过认证的访问会跳转到这个网站。必须带 http(s):// 前缀，留空则伪装为 404</div>
       </div>
+
+      <div class="section-title" style="margin-top:18px">端口跳跃（可选）</div>
+      <div class="form-row">
+        <div class="field">
+          <label>跳跃端口范围</label>
+          <input type="text" id="h-hop" value="${esc(h.hop || '')}" placeholder="40000-40499">
+        </div>
+        <div class="field">
+          <label>跳变间隔（秒）</label>
+          <input type="number" id="h-hop-int" value="${h.hopInterval || 30}" min="5" max="600">
+        </div>
+      </div>
+      <div class="hint" style="margin:-6px 0 12px">
+        客户端在范围内每 N 秒换一个目标端口，绕开「单端口 UDP 被限速」。服务端仍然只监听上面那个端口，
+        范围内的其余端口由 agent 装 NAT 转发规则送进来（<code>ss</code> 里只会看到一个端口，这是正常的）。
+        <br>· 留空 = 关闭；建议 100–1000 个连续端口（上限 1000），别写 20000-50000 那种三万端口。
+        <br>· <b>云安全组必须放行整段 UDP</b>：少放一个，客户端跳到那儿就断一个 hop 周期。
+        <br>· 范围不能包含本节点或同机其它节点的端口，也不能落在 29000-29899（流量统计端口）。
+        <br>· <b>与「中转入口」互斥</b>：客户端连的是入口机，落地机的转发表看不到这批流量 ——
+        保留任一入口时不能填范围（填了就保存不了）。
+      </div>
     </div>
 
     <div class="section-title">出站</div>
@@ -781,12 +802,16 @@ function nodeForm(node, servers) {
     </div>
 
     <div class="section-title">中转入口</div>
-    <div id="entries-list"></div>
-    <button class="btn btn-sm" id="entry-add" type="button" style="margin-top:9px">+ 添加入口</button>
-    <p class="hint" style="margin-top:9px">
-      客户端连接入口地址，流量经 L4 转发落到本节点所在机器，<b>一个入口发布为订阅里的一条节点</b>，
-      方便客户端自动选路与故障转移。不填任何入口 = 直连。入口机器上执行「节点 → 部署 → 中转脚本」即可。
-    </p>
+    <div id="entries-box">
+      <div class="alert alert-warn hidden" id="entries-hop-warn" style="margin:0 0 10px;font-size:12px;line-height:1.6"></div>
+      <div id="entries-list"></div>
+      <button class="btn btn-sm" id="entry-add" type="button" style="margin-top:9px">+ 添加入口</button>
+      <p class="hint" style="margin-top:9px" id="entries-hint">
+        客户端连接入口地址，流量经 L4 转发落到本节点所在机器，<b>一个入口发布为订阅里的一条节点</b>，
+        方便客户端自动选路与故障转移。不填任何入口 = 直连。入口机器上执行「节点 → 部署 → 中转脚本」即可。
+        <br>· 与「端口跳跃」<b>互斥</b>：填了跳跃范围就不能再用中转入口（客户端连的是入口机，落地机的转发表看不到这批流量）。
+      </p>
+    </div>
 
     <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:6px">
       <label class="ve-label" style="margin:0">
@@ -812,6 +837,35 @@ function bindNodeForm(mask) {
         ? '跟随服务器：使用服务器 token，随服务器 agent 一起下发'
         : '独立部署：生成独立 token 与部署命令，适合单机单节点';
   };
+
+  /**
+   * 端口跳跃与中转入口互斥（服务端 hopError 也会拦，这里提前给出可视反馈）：
+   *   - 填了范围：不允许再加新入口（加了也保存不了）
+   *   - 已经有入口：红字说清怎么解，入口行仍可编辑，方便就地删掉
+   * 单向就够了 —— 跳跃范围的输入框只在 Hysteria2 表单里，非 hy2 节点不受影响。
+   */
+  function syncHopGate() {
+    const box = $('#entries-box', mask);
+    const addBtn = $('#entry-add', mask);
+    if (!box || !addBtn) return;
+    const isHy2 = $('#n-protocol', mask).value === 'hysteria2';
+    const hop = $('#h-hop', mask);
+    const locked = isHy2 && !!hop && hop.value.trim() !== '';
+    const rows = $$('.entry-row', box).length;
+
+    addBtn.disabled = locked;
+    addBtn.title = locked ? '已填写端口跳跃范围，不能再添加中转入口' : '';
+
+    const warn = $('#entries-hop-warn', mask);
+    if (!warn) return;
+    const conflict = locked && rows > 0;
+    warn.classList.toggle('hidden', !conflict);
+    if (conflict) {
+      warn.innerHTML =
+        `已填写端口跳跃范围，与中转入口互斥：下面这 ${rows} 个入口不会生效（订阅里也不会带跳跃范围）。` +
+        '请删除这些入口，或把上方的范围清空。';
+    }
+  }
 
   const sync = () => {
     const mode = $('#n-mode button.on', mask).dataset.mode;
@@ -867,6 +921,7 @@ function bindNodeForm(mask) {
         ? 'agent 自动安装 acme.sh 并向 Let\'s Encrypt 申请证书，之后由 acme.sh 定时任务自动续期（失败重试有 30 分钟冷静期，防触发 CA 限速）。'
         : 'agent 用 openssl 生成 10 年自签证书，并把证书 SHA-256 指纹随回执报回面板：订阅链接自动带证书锁定参数（Xray 系为 pcs，Hysteria2 为 pinSHA256，均映射 pinnedPeerCertSha256），新版 Xray-core（v26.2.6 起，已移除 allowInsecure）与新版 v2rayN 可直接导入使用；指纹上报前的过渡期回退 allowInsecure=1（兼容 24.x 及更早核心），Clash 订阅始终用 skip-cert-verify。生产环境建议改用 ACME 证书。';
 
+    syncHopGate();
     modeHint();
   };
 
@@ -894,6 +949,10 @@ function bindNodeForm(mask) {
     certModeTouched = true;
     sync();
   });
+
+  // 跳跃范围与中转入口互斥：边输边提示，不用等点保存才报错
+  const hopInput = $('#h-hop', mask);
+  if (hopInput) hopInput.addEventListener('input', syncHopGate);
 
   $('#n-ipmode', mask).addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-ipmode]');
@@ -1039,6 +1098,8 @@ function bindNodeForm(mask) {
     const box = $('#entries-list', mask);
     if (!entries.length) {
       box.innerHTML = '<div class="hint" style="margin:0 0 4px">尚未添加入口，订阅将使用节点自身地址。</div>';
+      // 删掉最后一个入口也要重算互斥提示 —— 这条 early return 以前直接把提示留在屏幕上
+      syncHopGate();
       return;
     }
     box.innerHTML = entries
@@ -1079,6 +1140,8 @@ function bindNodeForm(mask) {
       </div>`;
       })
       .join('');
+    // 行数变了要重算「填了范围还留着几个入口」，否则删光入口后红字还挂着
+    syncHopGate();
   };
 
   /* 入口套餐多选下拉：面板按需插入，事件委托到 #entries-list */
@@ -1221,6 +1284,16 @@ function readNodeForm(mask) {
   };
 
   if (protocol === 'hysteria2') {
+    // 与中转入口互斥：客户端连的是入口机，落地机的转发表看不到这批流量，
+    // 范围填了也不生效，还白占上千个端口。表单里已经禁用「添加入口」，
+    // 这里兜住「先有入口、后填范围」的顺序。
+    const hopRange = v('#h-hop');
+    const hopEntries = draft.filter((e) => e.host);
+    if (hopRange && hopEntries.length) {
+      throw new Error(
+        `端口跳跃与中转入口互斥：该节点还有 ${hopEntries.length} 个中转入口，请删掉入口或清空跳跃范围`,
+      );
+    }
     Object.assign(payload, {
       network: 'tcp',
       security: 'tls',
@@ -1231,6 +1304,10 @@ function readNodeForm(mask) {
         upMbps: Number(v('#h-up')) || 100,
         downMbps: Number(v('#h-down')) || 200,
         maskUrl: v('#h-mask'),
+        // 端口跳跃：空字符串 = 关闭。合法性由服务端统一校验（hopError），
+        // 这里不拦，让用户看到具体报错而不是「保存没反应」
+        hop: v('#h-hop'),
+        hopInterval: Number(v('#h-hop-int')) || 30,
       },
     });
   } else {

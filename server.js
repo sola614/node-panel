@@ -1727,6 +1727,12 @@ function normalizeNode(body, prev = {}) {
       // 裸域名补 https:// 前缀：hysteria 的 masquerade.proxy.url 要求完整地址，
       // 空 scheme 会让实例 FATAL（见 lib/hysteria.js normalizeMaskUrl）
       maskUrl: hysteria.normalizeMaskUrl(h.maskUrl),
+      // 端口跳跃：范围为空 = 关闭。这里只 trim，不做合法性判断 ——
+      // 校验有独立通道（hopError），填错时要让用户看到报错而不是被静默清空
+      hop: String(h.hop !== undefined ? h.hop : (prev.hy2 && prev.hy2.hop) || '').trim(),
+      hopInterval: hysteria.normalizeHopInterval(
+        h.hopInterval !== undefined ? h.hopInterval : prev.hy2 && prev.hy2.hopInterval,
+      ),
     };
   } else if (prev.hy2) {
     node.hy2 = prev.hy2;
@@ -1779,6 +1785,75 @@ function normalizeNode(body, prev = {}) {
   node.hidden = body.hidden !== undefined ? !!body.hidden : !!prev.hidden;
 
   return node;
+}
+
+/**
+ * 端口跳跃的范围校验（保存节点时调用，返回空串表示通过）。
+ *
+ * 一段范围会一次性占掉上百甚至上千个端口，事后才发现撞车的代价很高（客户端跳到
+ * 被占用的端口就断一个 hop 周期，表现为「每隔一会儿卡一下」），所以全部前移到这里：
+ *
+ *   - 不能包含本节点端口：跳进来会被改回原端口，等于白占一个号
+ *   - 不能包含同机其它节点端口：那个节点的客户端会连到错误的实例上
+ *   - 不能与同机其它节点的范围重叠：两个 redirect 抢同一批 dport，谁先匹配谁赢
+ *   - 不能包含 22 / 面板端口 / 统计端口段：这些都是本机正在用的
+ *
+ * 「同机」的判定：server 模式按 serverId 归并，独立节点各自独占一台机器。
+ */
+function hopError(node, selfId) {
+  if (!node || node.protocol !== 'hysteria2') return '';
+  const parsed = hysteria.parsePortRange(node.hy2 && node.hy2.hop);
+  if (!parsed.ok) return parsed.error;
+  if (!parsed.ranges.length) return '';
+
+  // 中转入口与端口跳跃互斥：订阅里的入口链接指向入口机，客户端连的是入口的地址和端口，
+  // 落地机上的转发表根本看不到这批流量 —— 范围填了也不生效，白占上千个端口。
+  // 反过来说，同一个节点也不可能既「客户端直连落地机跳端口」又「客户端只连入口机」。
+  const entryHosts = (node.entries || []).map((e) => String((e && e.host) || '').trim()).filter(Boolean);
+  if (entryHosts.length) {
+    return `端口跳跃与中转入口不能同时使用：该节点还有 ${entryHosts.length} 个中转入口，` +
+      '客户端连的是入口机，落地机的转发表看不到这批流量。请删掉中转入口，或清空跳跃范围';
+  }
+
+  const hit = (port) => parsed.ranges.some(([a, b]) => port >= a && port <= b);
+  const overlap = (ranges) => parsed.ranges.some(([a1, b1]) => ranges.some(([a2, b2]) => a1 <= b2 && a2 <= b1));
+
+  const port = Number(node.port);
+  if (port && hit(port)) {
+    return `跳跃范围包含了本节点的监听端口 ${port}：客户端跳到这里会被改回原端口，请换一段范围`;
+  }
+
+  const db = store.db();
+  const sameBox = (n) =>
+    node.mode === 'server'
+      ? n.mode === 'server' && n.serverId === node.serverId
+      : n.mode === 'standalone' && n.id === node.id;
+
+  for (const n of db.nodes) {
+    if (!sameBox(n) || (n.id && n.id === selfId)) continue;
+    if (n.port && hit(Number(n.port))) {
+      return `跳跃范围包含了同机节点「${n.name}」的端口 ${n.port}，它的客户端会被转发到错误的实例`;
+    }
+    const other = hysteria.hopOf(n);
+    if (other && overlap(other.ranges)) {
+      return `跳跃范围与同机节点「${n.name}」的 ${other.text} 重叠，两段规则会互相抢端口`;
+    }
+  }
+
+  for (const [p, label] of [
+    [22, 'SSH 的 22 端口'],
+    [PORT, `面板的 ${PORT} 端口`],
+    [TLS_PORT, `面板 HTTPS 的 ${TLS_PORT} 端口`],
+  ]) {
+    if (hit(p)) return `跳跃范围包含了${label}`;
+  }
+
+  const statsEnd = hysteria.STATS_PORT_BASE + hysteria.STATS_PORT_SPAN - 1;
+  if (overlap([[hysteria.STATS_PORT_BASE, statsEnd]])) {
+    return `跳跃范围包含了流量统计端口段 ${hysteria.STATS_PORT_BASE}-${statsEnd}，撞上会让实例启动失败`;
+  }
+
+  return '';
 }
 
 /**
@@ -1868,6 +1943,9 @@ function createNode(req, res, params, body) {
     return sendJson(res, 400, { error: '该服务器上已有相同端口与协议的节点' });
   }
 
+  const badHop = hopError(data);
+  if (badHop) return sendJson(res, 400, { error: badHop });
+
   const node = {
     id: store.uid(),
     createdAt: store.iso(),
@@ -1893,6 +1971,8 @@ function updateNode(req, res, params, body) {
   }
   const badCert = certRefError(next);
   if (badCert) return sendJson(res, 400, { error: badCert });
+  const badHop = hopError(next, node.id);
+  if (badHop) return sendJson(res, 400, { error: badHop });
   Object.assign(node, next);
   store.save();
   auditAction('node.update', node.name, `${node.protocol} · 端口 ${node.port}${node.enabled ? '' : ' · 已停用'}`);
@@ -3991,10 +4071,14 @@ function buildAgentPayload(scope) {
 
   const hysteriaList = hyNodes.map((n) => {
     const users = usersResolver(n);
+    const hop = hysteria.hopOf(n);
     return {
       nodeId: n.id,
       name: n.name,
       port: Number(n.port),
+      // 端口跳跃范围（空 = 关闭）：agent 据此建 `范围 → 本实例端口` 的转发规则。
+      // 注意它不进 yaml —— 服务端配置里 listen 仍是单端口，跳跃是 NAT 层的事
+      hop: hop ? hop.text : '',
       statsPort: statsPorts.get(n.id),
       secret: hysteria.secretFor(n),
       yaml: hysteria.toYamlFile(n, users, db.settings.siteName, statsPorts.get(n.id)),
@@ -4052,10 +4136,13 @@ function buildAgentPayload(scope) {
   }
 
   // agentVersion 也算进 hash：面板升级后配置包必须重下一遍，
-  // 否则 agent 永远拿不到「目标版本」这个信号，自更新就形同虚设
+  // 否则 agent 永远拿不到「目标版本」这个信号，自更新就形同虚设。
+  // hop 同理 —— 它不在 yaml 里（跳跃是 NAT 层的事），漏掉就会出现
+  // 「面板上改了范围、agent 那边规则一直没变」这种查不出来的不同步
   const payloadForHash = JSON.stringify({
     xray: xrayConfig,
     hysteria: hysteriaList.map((h) => h.yaml),
+    hop: hysteriaList.map((h) => `${h.nodeId}:${h.port}:${h.hop}`),
     certs,
     agent: APP_VERSION,
   });
@@ -4394,6 +4481,7 @@ function syncView(item, scope) {
     error: sync ? sync.error || '' : '',
     xray: sync ? sync.xray || '' : '',
     hy: sync ? sync.hy || '' : '',
+    hop: sync ? sync.hop || '' : '',
     unbound: sync ? sync.unbound || '' : '',
     nodes: sync ? Number(sync.nodes) || 0 : 0,
     users: sync ? Number(sync.users) || 0 : 0,
@@ -4424,6 +4512,9 @@ function agentReceipt(req, res, params, body, session, ctx) {
     error: trim(body.error, 500),
     xray: trim(body.xray, 24),
     hy: trim(body.hy, 24),
+    // 跳跃规则装载情况（`4/4`）。客户端拿到的是端口范围，规则没装上就等于整段不可达 ——
+    // 它比「端口未监听」更隐蔽，因为实例本身跑得好好的
+    hop: trim(body.hop, 24),
     // 本机没在监听的端口（tcp:42000,udp:8443）：配置对了但进程没起来时唯一能暴露问题的信号
     unbound: trim(body.unbound, 200),
     nodes: Number(body.nodes) || 0,
@@ -4456,6 +4547,7 @@ function agentReceipt(req, res, params, body, session, ctx) {
     || prev.ok !== item.sync.ok
     || prev.xray !== item.sync.xray
     || prev.hy !== item.sync.hy
+    || (prev.hop || '') !== item.sync.hop
     || (prev.unbound || '') !== item.sync.unbound;
   const ctxFields = {
     rid: ctx.rid,

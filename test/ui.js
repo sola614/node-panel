@@ -359,6 +359,54 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('保存后状态行跟着刷新',
     /未开启/.test((d5.querySelector('#set-tpl-auto-status') || {}).textContent || ''));
 
+  /* ---------- 设置页页签 + 模板放大编辑 ---------- */
+  // 原来八张卡片一屏堆着，改密码要滚三屏；现在按用途分页签，默认停在「基础」
+  const tabBtns = [...d5.querySelectorAll('#set-tabs button')];
+  const tplPanel = d5.querySelector('.tab-panel[data-panel="sub"]');
+  const tabOf = (id) => tabBtns.find((b) => b.dataset.tab === id);
+  ok('设置页拆成页签', tabBtns.length >= 6, `(${tabBtns.length})`);
+  ok('非当前页签的内容默认隐藏', !!tplPanel && tplPanel.classList.contains('hidden'));
+
+  click(tabOf('sub'), w5);
+  await sleep(90);
+  ok('点页签切到「订阅模板」',
+    !tplPanel.classList.contains('hidden') &&
+    d5.querySelector('.tab-panel[data-panel="basic"]').classList.contains('hidden') &&
+    tabOf('sub').classList.contains('on'));
+
+  // 放大编辑：弹窗承载同一份内容；「应用到编辑器」只回写、不落库
+  click(d5.querySelector('[data-act="clash-tpl-full"]'), w5);
+  await sleep(150);
+  const fullTa = d5.querySelector('#clash-tpl-full');
+  ok('「放大编辑」打开接近全屏的弹窗', !!fullTa && !!d5.querySelector('.modal.full'));
+  if (fullTa) fullTa.value = '{"proxy-groups":[{"name":"P","type":"select","proxies":["{all}"]}],"rules":["MATCH,P"]}';
+  click(d5.querySelector('[data-clash-apply]'), w5);
+  await sleep(150);
+  ok('「应用到编辑器」把内容回写到行内框',
+    /"MATCH,P"/.test(tplBox.value) && !d5.querySelector('.modal.full'),
+    String(tplBox.value).slice(0, 24));
+
+  // 弹窗里直接保存：走同一个 PUT，成功后关窗
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="clash-tpl-full"]'), w5);
+  await sleep(150);
+  ok('弹窗打开时回填行内当前内容',
+    (d5.querySelector('#clash-tpl-full') || {}).value === tplBox.value);
+  click(d5.querySelector('.modal.full [data-ok]'), w5);
+  await sleep(450);
+  ok('弹窗里的「保存模板」提交设置接口',
+    seen5.some((r) => r.method === 'PUT' && r.url.endsWith('/api/settings') && /clashTemplate/.test(r.body)));
+  ok('保存成功后弹窗自动关闭', !d5.querySelector('.modal.full'));
+
+  // 还原成空模板：后面还有用例共用同一个面板实例
+  tplBox.value = '';
+  seen5.length = 0;
+  click(d5.querySelector('[data-act="save-clash-tpl"]'), w5);
+  await sleep(300);
+  // 切回「基础」：后面的用例都在这个面板实例上跑，别让它们停在隐藏页签里
+  click(tabOf('basic'), w5);
+  await sleep(80);
+
   const baseInput = d5.querySelector('#set-base');
   const errBox = d5.querySelector('#set-base-err');
   const saveBtn = d5.querySelector('[data-act="save-settings"]');
@@ -1085,6 +1133,58 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   protoSel.value = 'vless';
   change(protoSel);
   ok('切回 vless（无加密）后证书区重新隐藏', d9.querySelector('#cert-box').classList.contains('hidden'));
+
+  /* ---- 端口跳跃 × 中转入口互斥 ---- */
+  // 两个模型不相容：跳跃要「客户端直连落地机任意端口」，中转要「客户端只认识入口机那个端口」。
+  // 允许并存的结果是「界面上范围填着、订阅里连 mport 都不带」，所以保存时直接拦。
+  console.log('\n── 端口跳跃 × 中转入口互斥 ──');
+  protoSel.value = 'hysteria2';
+  change(protoSel);
+  const hopInput = () => d9.querySelector('#h-hop');
+  const addEntryBtn = () => d9.querySelector('#entry-add');
+  ok('未填范围时「添加入口」可用', !addEntryBtn().disabled);
+
+  click(addEntryBtn(), w9);
+  await sleep(60);
+  const entryHost = d9.querySelector('#entries-list .e-host');
+  ok('入口行已渲染', !!entryHost);
+  entryHost.value = 'relay.example.com';
+  entryHost.dispatchEvent(new w9.Event('input', { bubbles: true }));
+
+  hopInput().value = '40000-40499';
+  hopInput().dispatchEvent(new w9.Event('input', { bubbles: true }));
+  await sleep(60);
+  ok('填了范围后「添加入口」被禁用', addEntryBtn().disabled === true);
+  ok('已有入口时给出互斥警示',
+    !d9.querySelector('#entries-hop-warn').classList.contains('hidden') &&
+      /互斥/.test(d9.querySelector('#entries-hop-warn').textContent));
+
+  const gatePosts = [];
+  const realFetch10 = w9.fetch;
+  w9.fetch = (p, o = {}) => {
+    if (String(p).includes('/api/nodes') && (o.method || 'GET').toUpperCase() === 'POST') {
+      gatePosts.push(String(p));
+    }
+    return realFetch10(p, o);
+  };
+  d9.querySelector('#n-name').value = TAG + '-HOPGATE';
+  click(d9.querySelector('.modal [data-ok]'), w9);
+  await sleep(250);
+  ok('范围 + 入口同时存在时保存被拦下',
+    /互斥/.test((d9.querySelector('#toast-root') || {}).textContent || '') && gatePosts.length === 0,
+    `${gatePosts.length} 个请求`);
+  w9.fetch = realFetch10;
+
+  click(d9.querySelector('#entries-list .e-del'), w9);
+  await sleep(60);
+  // 入口删光后只是「不再冲突」；「添加入口」仍禁用 —— 范围还填着呢
+  ok('删掉入口后互斥警示消失',
+    d9.querySelector('#entries-hop-warn').classList.contains('hidden') &&
+      addEntryBtn().disabled === true);
+  hopInput().value = '';
+  hopInput().dispatchEvent(new w9.Event('input', { bubbles: true }));
+  await sleep(60);
+  ok('清空范围后恢复可添加', addEntryBtn().disabled === false);
 
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(150);

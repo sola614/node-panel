@@ -44,7 +44,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.28'
+VERSION='0.1.29'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -62,11 +62,13 @@ ENV_FILE=${AGENT_ENV:-$SELF_DIR/agent.env}
 #   RC_OK    1=一切正常，0=有失败（面板上标红）
 #   RC_XRAY  ok / fail / skip
 #   RC_HY    「跑起来的实例数/期望实例数」，没有 Hysteria2 节点时为空
+#   RC_HOP   「装上的跳跃规则数/期望数」，没开端口跳跃时为空
 #   BAD_PORTS 本轮没在监听的端口（tcp:42000,udp:8443），面板据此报「端口未监听」
 RC_OK=1
 RC_XRAY=''
 RC_HY=''
 RC_HY_FAIL=''
+RC_HOP=''
 RC_ERR=''
 BAD_PORTS=''
 # reload / start 之后端口 bind 需要一点时间，自检前先等一下
@@ -791,6 +793,169 @@ probe_ports() {
   return 1
 }
 
+# --------------------------- 端口跳跃（NAT 转发） ----------------------------
+# Hysteria2 的端口跳跃不是「监听一段端口」：进程只 bind 一个端口，客户端在范围里
+# 轮换目标端口，中间靠 NAT 规则把范围内所有端口改写成那个监听端口。
+#
+# 为什么由 agent 建规则，而不是在 yaml 里写 listen: :40000-40499（hysteria 2.8.0+
+# 的内置能力）：
+#   1. 内置方案要求二进制够新，而本 agent 只在「文件不存在」时安装 hysteria，
+#      老机器上可能是 2.12.3 之前的版本 —— 那几版会把转发规则同时挂到 OUTPUT 链，
+#      误伤同机出站 UDP（官方 2.12.3 才修）。
+#   2. 内置规则的清理跟着进程退出走，kill -9 / OOM 之后表还在，下次启动
+#      `nft add table` 撞名直接失败，表现为「配置没错但实例起不来」。
+#   3. 一张表、每条规则带 counter，面板能看出客户端到底在不在跳。
+#
+# 规则只挂 prerouting：本机自己连本机节点走 output 通路，不在覆盖范围内（也不需要）。
+
+HOP_TABLE=nodepanel_hyhop
+HOP_CHAIN=NODEPANEL_HYHOP
+# 留环境变量入口：测试里 export HOP_BACKEND=none 就能走降级分支，
+# 而不必在跑测试的机器上真去改防火墙（SOCK_CMD 也是同一个套路）
+HOP_BACKEND=${HOP_BACKEND:-}
+
+hop_backend() {
+  [ -n "$HOP_BACKEND" ] && { printf '%s\n' "$HOP_BACKEND"; return 0; }
+  if command -v nft >/dev/null 2>&1; then
+    HOP_BACKEND=nft
+  elif command -v iptables >/dev/null 2>&1; then
+    HOP_BACKEND=iptables
+  else
+    HOP_BACKEND=none
+  fi
+  printf '%s\n' "$HOP_BACKEND"
+}
+
+hop_present() {
+  case "$(hop_backend)" in
+    nft) nft list table inet "$HOP_TABLE" >/dev/null 2>&1 ;;
+    iptables) iptables -t nat -S "$HOP_CHAIN" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+hop_teardown() {
+  case "$(hop_backend)" in
+    nft) nft delete table inet "$HOP_TABLE" 2>/dev/null ;;
+    iptables)
+      iptables -t nat -D PREROUTING -j "$HOP_CHAIN" 2>/dev/null
+      iptables -t nat -F "$HOP_CHAIN" 2>/dev/null
+      iptables -t nat -X "$HOP_CHAIN" 2>/dev/null
+      ;;
+  esac
+  rm -f "$STATE_DIR/hyhop.spec" 2>/dev/null
+}
+
+# 范围里只允许数字、连字符、逗号。面板侧已经校验过，这里是挡「手改 state.env」
+# 和旧面板下发脏数据的兜底 —— 拼进 nft/iptables 命令行的东西不能有别的字符
+hop_spec_ok() {
+  case "$1" in '' | *[!0-9,-]*) return 1 ;; esac
+  return 0
+}
+
+# NP_HY_HOP = "node-x:443:40000-40499 node-y:8443:41000-41099,42000"
+#             实例   监听端口  客户端轮换范围
+hop_apply() {
+  _spec="${NP_HY_HOP:-}"
+
+  # 没有节点开跳跃：把上一版留下的规则清掉（关掉功能要真的把端口还回去）
+  if [ -z "$_spec" ]; then
+    if hop_present; then
+      hop_teardown
+      log "已移除端口跳跃规则（面板上已无节点开启）"
+    fi
+    RC_HOP=''
+    return 0
+  fi
+
+  if [ "$(hop_backend)" = 'none' ]; then
+    log "! 端口跳跃需要 nft 或 iptables，本机都没有；节点仍可用单端口连接"
+    RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃未生效：本机没有 nft/iptables"
+    RC_OK=0
+    return 1
+  fi
+
+  _total=$(printf '%s' "$_spec" | tr ' ' '\n' | grep -c '[0-9]' 2>/dev/null)
+  case "$_total" in '' | *[!0-9]*) _total=0 ;; esac
+
+  # 没变化且规则还在就跳过：每轮重下防火墙规则费 CPU，替换瞬间还会丢几个包。
+  # 只比 spec 不够 —— 机器重启后规则没了而 state 文件还在，所以还要探一次真实存在性
+  if [ "$(cat "$STATE_DIR/hyhop.spec" 2>/dev/null)" = "$_spec" ] && hop_present; then
+    RC_HOP="${_total}/${_total}"
+    return 0
+  fi
+
+  _ok=0
+  if [ "$(hop_backend)" = 'nft' ]; then
+    _rules=''
+    for _item in $_spec; do
+      case "$_item" in *:*:*) : ;; *) continue ;; esac
+      _port=${_item#*:}
+      _port=${_port%%:*}
+      _range=${_item##*:}
+      hop_spec_ok "$_range" || { log "! 跳跃范围不合法，已跳过：$_item"; continue; }
+      # nft 的集合语法：{ 40000-40499, 41000-41099 }
+      _rules="${_rules}    udp dport { $(printf '%s' "$_range" | tr ',' ' ') } counter redirect to :${_port}
+"
+    done
+
+    _f="$STATE_DIR/hyhop.nft"
+    {
+      printf 'table inet %s {\n' "$HOP_TABLE"
+      printf '  chain prerouting {\n'
+      printf '    type nat hook prerouting priority dstnat; policy accept;\n'
+      printf '%s' "$_rules"
+      printf '  }\n}\n'
+    } > "$_f" 2>/dev/null
+
+    # 整表替换：先删（不存在就忽略）再一次性 -f。失败时表是空的，客户端会退化成
+    # 「只有单端口可用」，比留一半旧规则更容易判断
+    nft delete table inet "$HOP_TABLE" 2>/dev/null
+    if _out=$(nft -f "$_f" 2>&1); then
+      _ok=$_total
+    else
+      _why=$(printf '%s' "$_out" | sed -n '1p' | cut -c1-160)
+      log "! 端口跳跃规则下发失败：$_why"
+      RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃规则下发失败：${_why:-见 agent 日志}"
+      RC_OK=0
+    fi
+  else
+    iptables -t nat -N "$HOP_CHAIN" 2>/dev/null
+    iptables -t nat -F "$HOP_CHAIN" 2>/dev/null
+    # 插到最前面：docker、云厂商镜像有时会在 PREROUTING 里塞 ACCEPT，
+    # 追加到末尾会被它们提前放行掉
+    iptables -t nat -C PREROUTING -j "$HOP_CHAIN" 2>/dev/null \
+      || iptables -t nat -I PREROUTING 1 -j "$HOP_CHAIN" 2>/dev/null
+    for _item in $_spec; do
+      case "$_item" in *:*:*) : ;; *) continue ;; esac
+      _port=${_item#*:}
+      _port=${_port%%:*}
+      _range=${_item##*:}
+      hop_spec_ok "$_range" || continue
+      # iptables 的 --dport 只认单段，逗号组合要拆成多条
+      _seg_ok=1
+      for _seg in $(printf '%s' "$_range" | tr ',' ' '); do
+        _dport=$(printf '%s' "$_seg" | tr '-' ':')
+        iptables -t nat -A "$HOP_CHAIN" -p udp --dport "$_dport" -j REDIRECT --to-ports "$_port" 2>/dev/null \
+          || _seg_ok=0
+      done
+      [ "$_seg_ok" = '1' ] && _ok=$((_ok + 1))
+    done
+    if [ "$_ok" != "$_total" ]; then
+      RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃规则只装上 ${_ok}/${_total} 段（检查 root 权限与内核 netfilter）"
+      RC_OK=0
+    fi
+  fi
+
+  printf '%s\n' "$_spec" > "$STATE_DIR/hyhop.spec" 2>/dev/null
+  RC_HOP="${_ok}/${_total}"
+  if [ "$_ok" = "$_total" ]; then
+    log "✓ 端口跳跃规则已生效：${_total} 段（$(hop_backend)）"
+  else
+    log "! 端口跳跃规则只装上 ${_ok}/${_total} 段"
+  fi
+}
+
 hy_pidfile() { printf '%s/%s.pid' "$RUN_DIR" "$1"; }
 
 
@@ -1148,6 +1313,10 @@ apply_services() {
   # 配置没变也要收敛：Xray 崩了 / 开机没自启时把它拉起来（否则端口永久空着）
   xray_ensure
 
+  # 端口跳跃的转发表同样每轮核一次：机器重启后规则会没（nft 表不持久），
+  # 但 state 文件还在 —— 只比 state 会让「重启后跳跃静默失效」
+  hop_apply
+
   # 等服务把端口 bind 上再自检；每轮都跑一次 ss，开销可以忽略
   [ "$NP_JUST_RESTARTED" = '1' ] && sleep 1 2>/dev/null
   verify_started_hy
@@ -1416,7 +1585,7 @@ receipt_escape() {
 send_receipt() {
   # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发。
   # 指纹清单也进签名：证书重签 → 指纹变化 → 回执立即重发，面板订阅里的 pcs 才不会拿着旧指纹
-  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")"
+  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${RC_HOP:-}|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")"
   _last=''
   _ts=0
   if [ -f "$STATE_DIR/.receipt" ]; then
@@ -1439,8 +1608,8 @@ send_receipt() {
   fi
   mkdir -p "$RUN_DIR" "$STATE_DIR" 2>/dev/null
   _f="$RUN_DIR/receipt.$$.json"
-  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
-    "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${BAD_PORTS:-}" \
+  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","hop":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
+    "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${RC_HOP:-}" "${BAD_PORTS:-}" \
     "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
 
   if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
@@ -1549,6 +1718,7 @@ tick() {
   RC_XRAY=''
   RC_HY=''
   RC_HY_FAIL=''
+  RC_HOP=''
   RC_ERR=''
   BAD_PORTS=''
   NP_JUST_RESTARTED=0

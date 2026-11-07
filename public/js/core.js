@@ -182,6 +182,14 @@ function syncDetailFlow(sync, name) {
     <span style="width:88px;color:var(--muted);flex-shrink:0">${esc(k)}</span>
     <span style="flex:1;min-width:0;word-break:break-all">${v}</span>
   </div>`;
+  const hopText = (hop) => {
+    const [ok, total] = String(hop).split('/');
+    // 规则没装上时实例本身活得好好的、端口也在监听，面板看不出任何异常 ——
+    // 但客户端拿着范围连过来会打在没人接的端口上，所以这一行必须能报警
+    return ok && total && ok === total
+      ? `${esc(hop)} 段已装`
+      : `<span style="color:var(--bad)">${esc(hop)} 段（未全部装上，客户端跳到这些端口会断流）</span>`;
+  };
   const same = sync.hash && sync.desired && sync.hash === sync.desired;
   openModal({
     title: '同步状态 · ' + name,
@@ -200,6 +208,7 @@ function syncDetailFlow(sync, name) {
       ${row('面板当前', sync.desired ? `<code>${esc(sync.desired)}</code>` : '—')}
       ${row('Xray 重载', { ok: '成功（或本来就无需重载）', fail: '失败', skip: '跳过（配置已落盘，需手动重启）' }[sync.xray] || esc(sync.xray || '—'))}
       ${row('Hysteria2', sync.hy && sync.hy !== '0/0' ? esc(sync.hy) + ' 个实例在跑' : '无')}
+      ${sync.hop ? row('端口跳跃规则', hopText(sync.hop)) : ''}
       ${sync.unbound ? row('未监听端口', `<span style="color:var(--bad)">${esc(sync.unbound)}</span>`) : ''}
       ${row('agent 版本', esc(sync.agentVersion || '—'))}
       ${sync.error ? row('错误详情', `<span style="color:var(--bad)">${esc(sync.error)}</span>`) : ''}
@@ -510,18 +519,31 @@ function closeModal() {
   }
 }
 
-function openModal({ title, body, wide, okText = '保存', cancelText = '取消', onOk, footer = true }) {
+function openModal({
+  title,
+  body,
+  wide,
+  full,
+  bodyClass = '',
+  okText = '保存',
+  cancelText = '取消',
+  onOk,
+  footer = true,
+  // 额外按钮插在「取消」左边：给「放大编辑」那类次要动作留位置
+  footActions = '',
+}) {
   closeModal();
   const mask = document.createElement('div');
   mask.className = 'modal-mask';
   mask.innerHTML = `
-    <div class="modal ${wide ? 'wide' : ''}">
+    <div class="modal ${wide ? 'wide' : ''} ${full ? 'full' : ''}">
       <div class="modal-head">
         <h3>${esc(title)}</h3>
         <button class="x-close" data-close>×</button>
       </div>
-      <div class="modal-body">${body}</div>
+      <div class="modal-body ${bodyClass}">${body}</div>
       ${footer ? `<div class="modal-foot">
+        ${footActions}
         <button class="btn btn-ghost" data-close>${esc(cancelText)}</button>
         <button class="btn btn-primary" data-ok>${esc(okText)}</button>
       </div>` : ''}

@@ -637,6 +637,26 @@ const runAgent = (box) =>
     ok('旧面板下成功上报后清空增量文件', read(path.join(boxV1.runDir, 'stats.agg')).trim() === '');
   }
 
+  /* ------------------- 11. 端口跳跃：规则装不上必须说话 ------------------- */
+  // 客户端拿到的是端口范围，规则没装 = 整段不可达；而此时实例本身还活得好好的、
+  // 端口也在监听，面板只会显示「已同步」。用 HOP_BACKEND=none（agent.sh 留的测试把手）
+  // 覆盖降级分支，顺带避免测试去动跑测试那台机器的真实防火墙。
+  console.log('\n— 端口跳跃规则 —');
+  {
+    const boxHop = makeSandbox(panel.port, PKG_VERSION, { env: { HOP_BACKEND: 'none' } });
+    fs.appendFileSync(path.join(boxHop.stateDir, 'state.env'), "NP_HY_HOP='node-abc123:443:40000-40499'\n");
+    const nHop = panel.state.receipts.length;
+    const rHop = await runAgent(boxHop);
+    const outHop = rHop.stdout + rHop.stderr;
+    const rcHop = panel.state.receipts[nHop] || {};
+    ok('没有 nft/iptables 时回执 ok=false', rHop.status === 0 && rcHop.ok === false,
+      JSON.stringify({ ok: rcHop.ok, hop: rcHop.hop }));
+    ok('错误里点明端口跳跃未生效', /端口跳跃未生效/.test(rcHop.error || ''),
+      String(rcHop.error || '').slice(0, 80));
+    ok('日志给出可直接处理的原因', /端口跳跃需要 nft 或 iptables/.test(outHop));
+    ok('没装上时不谎报计数', !rcHop.hop, String(rcHop.hop || ''));
+  }
+
   /* ------------------- 面板上这台机器已被删除（HTTP 401） ------------------- */
   console.log('\n— 面板不认这台机器（401） —');
   {

@@ -551,6 +551,68 @@ function totpCodeOf(secret) {
   ok('Clash 订阅的 REALITY 节点开启 support-x25519mlkem768',
     clash.includes('support-x25519mlkem768: true'));
 
+  /* ---------- 5.3 端口跳跃：范围校验 + 三种订阅格式 ---------- */
+  // 面板只管两件事：范围合法（不撞端口）与写进订阅；真正把端口转发出去的是 agent
+  // （规则部分见 test/agent.js）。这里逐条盯住「填错会被拦」和「订阅方言对不对」。
+  const hy2Body = (hop, extra = {}) => ({
+    hy2: {
+      obfs: 'salamander', obfsPassword: 'obfspass', upMbps: 50, downMbps: 500,
+      maskUrl: 'https://example.com/', hop, ...extra,
+    },
+  });
+  const hopStatus = async (hop) =>
+    (await call('/api/nodes/' + node3Id, { method: 'PUT', body: json(hy2Body(hop)) })).status;
+
+  ok('跳跃范围格式非法被拒绝', (await hopStatus('abc')) === 400);
+  ok('跳跃范围包含本节点端口被拒绝', (await hopStatus('20800-20900')) === 400);
+  ok('跳跃范围落在统计端口段被拒绝', (await hopStatus('29000-29100')) === 400);
+  ok('跳跃范围超过 1000 个端口被拒绝', (await hopStatus('20000-50000')) === 400);
+
+  const hopOk = await call('/api/nodes/' + node3Id, {
+    method: 'PUT',
+    body: json(hy2Body('40000-40499', { hopInterval: 20 })),
+  });
+  ok('合法的跳跃范围可保存',
+    hopOk.status === 200 && hopOk.data.item.hy2.hop === '40000-40499' && hopOk.data.item.hy2.hopInterval === 20,
+    JSON.stringify({ hop: hopOk.data.item && hopOk.data.item.hy2.hop }));
+
+  // 中转入口与端口跳跃互斥：入口发布的是「入口机地址」，客户端连过去，落地机的转发表看不到这批流量。
+  // 允许同时保存的话，用户会以为开了跳跃，实际上订阅里连范围都不会带。
+  const hopEntry = await call('/api/nodes/' + node3Id, {
+    method: 'PUT',
+    body: json({ ...hy2Body('40000-40499'), entries: [{ name: '中转', host: 'relay.example.com', port: 8443 }] }),
+  });
+  ok('跳跃范围与中转入口互斥被拒绝', hopEntry.status === 400, `(${hopEntry.status})`);
+
+  const subHop = await call(`/api/sub/${u2.token}`);
+  const hopLink = (subHop.data.links || []).find((l) => l.name.includes('SMOKE-HY2'));
+  ok('订阅链接带 mport 且 port 位仍是单端口',
+    !!hopLink && /[?&]mport=40000-40499(&|#)/.test(hopLink.uri) && hopLink.uri.includes('@hy.example.com:20843'),
+    hopLink ? hopLink.uri.split('?')[1] : '');
+
+  const clashHop = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
+  ok('Clash 订阅带 ports 与 hop-interval',
+    /ports: ['"]?40000-40499['"]?/.test(clashHop) && /hop-interval: 20/.test(clashHop));
+
+  const sbHopDoc = await fetch(`${BASE}/s/${u2.token}?format=singbox`).then((r) => r.json()).catch(() => null);
+  const sbHopOb = ((sbHopDoc && sbHopDoc.outbounds) || []).find((o) => o.type === 'hysteria2');
+  // sing-box 用冒号分段，和 mihomo 的连字符不是一套写法
+  ok('sing-box 订阅用 server_ports 冒号分段',
+    !!sbHopOb && JSON.stringify(sbHopOb.server_ports) === '["40000:40499"]' && sbHopOb.hop_interval === '20s',
+    sbHopOb ? JSON.stringify({ ports: sbHopOb.server_ports, hop: sbHopOb.hop_interval }) : '');
+
+  // 配置包必须带上范围，且范围要进 hash（否则面板改了、agent 那边永远不更新）
+  const bundleHop = await call(`/api/agent/bundle?token=${node3Token}`);
+  ok('配置包下发 NP_HY_HOP',
+    bundleHop.status === 200 && /NP_HY_HOP='node-[a-f0-9]+:20843:40000-40499'/.test(String(bundleHop.data || '')),
+    String(bundleHop.data || '').match(/NP_HY_HOP=[^\n]*/)?.[0] || '');
+
+  // 关掉之后三处都不该再出现跳跃字段（客户端拿着旧范围会连不上）
+  await call('/api/nodes/' + node3Id, { method: 'PUT', body: json(hy2Body('')) });
+  const subNoHop = await call(`/api/sub/${u2.token}`);
+  const noHopLink = (subNoHop.data.links || []).find((l) => l.name.includes('SMOKE-HY2'));
+  ok('关闭后订阅不再带 mport', !!noHopLink && !/mport=/.test(noHopLink.uri));
+
   /* ---------- 5.4 Clash 订阅模板：面板直出分组/规则，取代 subconverter ---------- */
   // 为什么要有这个功能：subconverter 会二次解析节点，改写 client-fingerprint、
   // 丢掉 udp/network/support-x25519mlkem768。模板只接管分组与规则，节点原样透传。
