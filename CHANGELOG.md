@@ -3,6 +3,56 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.31] - 2026-11-07
+
+`server.js` 从一个 6,484 行的文件拆成 21 个模块：外壳只剩 570 行（路由表 / 启动 / 监听），
+其余按业务域放进 `server/`。**纯搬移，行为不变** —— 唯一有意的差异是两条日志的 scope。
+
+顺带修好了那张坏了很久的回归网：`test/browser.js` 自 0.1.17 起就跑不起来，而 CI 从没跑过它。
+
+### 拆分
+
+拆之前先把「谁依赖谁」量出来再动手，最终是一张无环的依赖图：
+
+```
+servers → agent → users → util / context
+subscription → auth / users / nodes
+settings → subscription / panel-https
+底座：config / tokens / util / http-util / context / deploy-scripts（谁都能用，谁也不反向依赖）
+```
+
+- **没有任何模块 `require` 回 `server.js`**。`panel-https` 建 https 服务要外壳的 `requestHandler`、
+  掉线兜底要 `restoreHttpIfNeeded` / `closeHttpIfNeeded`，改成启动时 `wire()` 注入 ——
+  直接 require 回去等于只换了个文件名
+- **跨域可变状态集中到 `server/context.js`**：`desiredHashCache` 从裸 `let` 改成
+  `get / set / reset` 的 accessor。导出裸 `let` 的话，别处重新赋值后调用方永远读到初始值
+- 三处归属纠正（不纠正就成环）：`usersForNode` 移入用户域（判据是用户套餐，节点只是入参）、
+  `sweepRenewals` 移入用户域（概览因此变成零依赖叶子）、`getSession` / `tokenEq` /
+  `agentTokenOf` / `sha256` 收进 `tokens`（它们原本躺在「订阅对外域名校验」段里）
+- 纯搬移是可验证的：HEAD 的 182 个顶层函数**一个都没丢**，逐函数比对后有 12 个正文变化，
+  全部是上述预期改动（accessor、`httpsState.*` 重命名、限流计数改走函数）
+
+### 修正
+
+- **`test/browser.js` 自 0.1.17 起就是坏的**：订阅页改成先登录后，建号 / 批量建号 /
+  邀请领取三处都要填密码；设置页也拆成了分栏，备份按钮不在默认页签里。补齐后 72 项全过。
+  CI 之前只跑 smoke + ui，所以坏了两周没人发现 —— 现在接进流水线，失败时传截图
+- **`/api/logout` 补断言**（此前唯一零覆盖的接口）：登出后该 token 立即 401，
+  且只失效自己那一枚。会话表是按 token 删一条，整表清空是改密的行为
+- **smoke 不幂等**：一轮要领 7 次邀请，而邀请领取按 IP 限流 10 次/小时，同一实例跑第二轮
+  必被自己的计数拦住（报「领取过于频繁」，把「名额用尽」那条断言带偏）。改为每轮随机
+  一个来源 IP 单独占桶
+- **演示数据里有一处本机路径**：`demo/api/backups.json` 记的是录制机器的
+  `C:\Users\...\AppData\Local\Temp\...`，能看出用户名。换成典型部署路径
+
+### 其它
+
+- 日志多了两个 scope：`cert`（证书续期在后台异步发生，记成 http 会误导）与
+  `settings`（模板定时同步同理）
+- `test/browser.js` 补 `--no-sandbox` / `--disable-dev-shm-usage`（容器与 root 环境必需）
+- TOTP 待绑定密钥的清理改由 `auth.js` 自己的 `sweepExpiredTotp()` 负责，
+  订阅域的定时器不再跨域遍历那张表
+
 ## [0.1.30] - 2026-11-07
 
 多段跳跃范围（`40670-40675,50670-50675`）现在可用了。0.1.29 上填多段会**静默失效**：
