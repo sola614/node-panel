@@ -647,7 +647,7 @@ const runAgent = (box) =>
     // 这一条是整个改造的动因：401 和「连不上」必须是两种结论，
     // 否则面板删了记录之后 agent 只会永远喊「无法连接面板」，没有任何出路
     ok('401 被识别成「面板不认这台机器」', /面板不认这台机器（HTTP 401）/.test(log401),
-      (log401.split('\n').find((l) => /401/.test(l)) || '').slice(0, 80));
+      (log401.split('\n').find((l) => /不认这台机器/.test(l)) || '').slice(0, 80));
     ok('401 不再被误报成「无法连接面板」', !/无法连接面板/.test(log401));
     ok('记下 401 的起点，供宽限期判断', read(path.join(box401.stateDir, '.orphan')).trim() !== '');
     ok('宽限期内进程照常退出（不自杀、不碰服务）', r401.status === 0, `exit=${r401.status}`);
@@ -655,7 +655,12 @@ const runAgent = (box) =>
     // 同一台机器再来一轮：宽限期没到，日志要收敛（10 分钟内只记一条），
     // 否则孤儿 agent 一天能在 journal 里刷 1440 行
     const r401b = await runAgent(box401);
-    ok('宽限期内重复 401 不重复刷日志', !/401/.test(r401b.stdout + r401b.stderr));
+    const out401b = r401b.stdout + r401b.stderr;
+    // 断言只能盯「日志正文」，不能裸匹配 /401/：沙箱目录名是 np-agent-<时间戳>，
+    // 时间戳里凑巧出现 401 时（1794019xxxxxx）启动那行「Xray：…」就会被当成 401 日志，
+    // 于是这条用例随时钟随机变红 —— 实际什么都没刷
+    ok('宽限期内重复 401 不重复刷日志', !/面板(持续)?不认这台机器|面板仍不认这台机器/.test(out401b),
+      (out401b.split('\n').find((l) => /不认这台机器/.test(l)) || '').slice(0, 80));
 
     // 宽限期设为 0：立刻判定为「面板上已经没有我了」
     const boxGone = makeSandbox(panel.port, PKG_VERSION, { env: { ORPHAN_GRACE: '0' } });
