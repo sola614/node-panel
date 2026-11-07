@@ -338,6 +338,10 @@ async function main() {
     [
       '--headless=new',
       '--disable-gpu',
+      // GH Actions / 容器里以 root 跑时，Chrome 不加这个会直接拒绝启动。
+      // 这是无头测试浏览器，不承载任何真实浏览行为，关掉沙箱没有安全顾虑。
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-extensions',

@@ -49,6 +49,17 @@ jobs:
           done
           node test/smoke.js http://127.0.0.1:8080
           node test/ui.js http://127.0.0.1:8080
+          # 真浏览器回归：点不到的元素、原生文件选择、真实导航只有它能测出来。
+          # 找不到 Chrome 时脚本会自己跳过（ubuntu-latest 自带，正常不会被跳过）
+          node test/browser.js http://127.0.0.1:8080
+
+      - name: 浏览器测试截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-shots
+          path: /tmp/node-panel-shots
+          if-no-files-found: ignore
 
   docker:
     needs: test
