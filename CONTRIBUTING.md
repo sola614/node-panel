@@ -44,7 +44,7 @@ PANEL_ADMIN_PASSWORD=test-pass-123 node test/ui.js    http://127.0.0.1:8080
 | 想做的事 | 改哪里 |
 | --- | --- |
 | 加一个页面 | `public/index.html` 加 `.nav-item` → `public/js/core.js` 的 `VIEWS` → 新建 `public/js/views-*.js` 并在 `index.html` 里按序引入 → 写 `RENDERERS.<名字>` |
-| 加一个接口 | `server.js` 的 `ROUTES` 表加一行（`[方法, 路径, 处理函数, 是否需要登录]`）；权限默认要登录 |
+| 加一个接口 | `server.js` 的 `ROUTES` 表加一行（`[方法, 路径, 处理函数, 是否需要登录]`）；处理函数写在对应的 `server/<域>.js` 里并从那里导出，`server.js` 只负责挂表 |
 | 加一个字段 | `lib/store.js` 的 `TABLE_SPECS` 加列 → `ensureColumn()` → `migrate()` 补默认值 → `SCHEMA_VERSION` +1 |
 | 改节点协议 | `lib/xray.js` / `lib/hysteria.js`（配置）+ `lib/sub.js`（分享链接与 Clash） |
 | 改下发逻辑 | `lib/agentBundle.js`（编译成 shell 包）+ `agent/agent.sh`（落盘执行） |

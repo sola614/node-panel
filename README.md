@@ -1000,7 +1000,7 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 `support-x25519mlkem768`，经它转换后 VLESS 节点全部 timeout，而「能用直出就别走转换」这句
 提示用户基本不看 —— 与其给一条会坏的链接，不如先不给。所以设置页去掉了「订阅转换服务地址」，
 用户页 / 订阅页也只列三种格式（Base64 / Clash / sing-box），全部由面板原样输出、参数不失真。
-拼接逻辑与设置项仍留在代码里（`server.js` 的 `SUB_CONVERT_ENABLED`），
+拼接逻辑与设置项仍留在代码里（`server/users.js` 的 `SUB_CONVERT_ENABLED`），
 上游补上这个参数后改回 `true` 即可恢复。
 
 **订阅页与用户页的链接清单**（0.1.25）：两处共用后端 `subFormatList()` 产出的
@@ -1204,7 +1204,29 @@ POST /api/sub/logout                  订阅页退出登录：作废服务端会
 
 ```
 node-panel/
-├── server.js            HTTP 服务、路由、业务逻辑
+├── server.js            外壳：路由表 + 启动 + 监听（业务逻辑都在 server/）
+├── server/
+│   ├── config.js        运行期配置（端口 / 静态目录 / 版本号，只读一次环境变量）
+│   ├── context.js       跨域共享状态（会话 / 登录限流 / 改密标记 / 请求上下文）
+│   ├── http-util.js     HTTP 基础件（sendJson / sendText / readBody / serveFile）
+│   ├── tokens.js        令牌与会话工具（getSession / agentTokenOf / 恒时比较 / sha256）
+│   ├── util.js          跨域小工具（对外地址 / 名称查重 / 批量 id 过滤）
+│   ├── deploy-scripts.js 部署脚本模板（install / uninstall / relay 的 shell 正文）
+│   ├── auth.js          鉴权域（登录 / 登出 / 改密 / TOTP 二步验证）
+│   ├── users.js         用户域（建号 / 批量 / 到期续期 / 套餐覆盖判定）
+│   ├── plans.js         套餐域
+│   ├── nodes.js         节点域（CRUD / 排序 / 预览 / 连通性探测 / Reality 密钥）
+│   ├── agent.js         agent 域（配置包编译 / 心跳回执 / 状态上报 / 自更新）
+│   ├── servers.js       服务器域（CRUD / 部署脚本下发 / 中转脚本）
+│   ├── invites.js       邀请域（邀请码 / 落地页领取）
+│   ├── certs.js         证书域（申请 / 续期 / 引用检查）
+│   ├── subscription.js  订阅域（用户侧订阅 / 订阅页登录 / 自助重置）
+│   ├── settings.js      设置域（站点 / 模板 / 面板 HTTPS 开关 / 定时同步）
+│   ├── panel-https.js   面板自身 HTTPS（证书来源 / 监听生命周期）
+│   ├── notifications.js 消息通知域（通道 / 事件开关 / 手动巡检）
+│   ├── reports.js       报表域（流量明细 / 审计列表）
+│   ├── backup.js        备份恢复域
+│   └── overview.js      概览页数据
 ├── lib/
 │   ├── store.js         数据层（SQLite，内置 node:sqlite + 内存读缓存）
 │   ├── agentBundle.js   把配置编译成 shell 配置包下发给 agent
