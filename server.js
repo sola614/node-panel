@@ -30,6 +30,7 @@ const notify = require('./lib/notify');
 const alerts = require('./lib/alerts');
 const totp = require('./lib/totp');
 const qrcode = require('./lib/qrcode');
+const probeLib = require('./lib/probe');
 const logger = require('./lib/log');
 
 const log = logger.create('http');
@@ -1995,23 +1996,51 @@ function rotateNodeToken(req, res, params) {
  *   3. TLS 抽检：仅 security=tls 的节点 —— 校验证书是否过期、SAN 是否覆盖 SNI。
  *      Reality 是伪装握手，证书本来就「不属于」本站，做证书校验必然误报，跳过。
  * Hysteria2 是 UDP：没有连接语义，TCP 握手不通是正常现象，只做 DNS 验证。
+ *
+ * IPv6 单独一档（0.1.27）：节点是 v6 地址、而面板所在机器根本没有 v6 出口时，
+ * 结论只能是「测不了」，不能报成「节点不可达」—— 后者会把人引去查安全组。
  */
 const PROBE_TIMEOUT = 5000;
 
-function tcpProbe(host, port) {
+function tcpProbe(host, port, timeout = PROBE_TIMEOUT) {
   return new Promise((resolve, reject) => {
     const s = net.connect({ host, port });
-    s.setTimeout(PROBE_TIMEOUT);
+    s.setTimeout(timeout);
     s.once('connect', () => {
       s.destroy();
       resolve();
     });
     s.once('timeout', () => {
       s.destroy();
-      reject(new Error(`连接超时（${PROBE_TIMEOUT / 1000} 秒）`));
+      reject(new Error(`连接超时（${timeout / 1000} 秒）`));
     });
     s.once('error', (err) => reject(err));
   });
+}
+
+/**
+ * 面板这台机器到底能不能真的连出去 IPv6。
+ *
+ * 只有「探测目标是 v6 且已经失败」时才问这个问题：接口上有地址、路由却是黑洞的
+ * 机器很常见（LXC / 容器 / 小厂 VPS），这时超时到底是节点被拦、还是面板自己出不去，
+ * 只有实测一下才分得清 —— 分不清就会把面板的短板报成「节点不可达」。
+ *
+ * 目标用 Cloudflare 的 v6 DNS 地址做一次 TCP 握手，纯启发式判断；结果缓存 5 分钟，
+ * 别在每次探测失败时都去连一次公网。
+ */
+const V6_CHECK = { at: 0, ok: false };
+async function panelV6Works() {
+  if (Date.now() - V6_CHECK.at < 5 * 60 * 1000) return V6_CHECK.ok;
+  let ok = false;
+  try {
+    await tcpProbe('2606:4700:4700::1111', 443, 2000);
+    ok = true;
+  } catch {
+    ok = false;
+  }
+  V6_CHECK.at = Date.now();
+  V6_CHECK.ok = ok;
+  return ok;
 }
 
 /** TLS 握手抽检：不做 CA 信任判定（自签证书是本项目支持的常态），只看过期与 SNI 匹配 */
@@ -2070,17 +2099,39 @@ function tlsProbe(host, port, sni) {
 }
 
 async function runNodeProbe(node) {
-  const host = store.nodeHost(node);
+  const host = String(store.nodeHost(node) || '').replace(/^\[|\]$/g, '');
   const port = Number(node.port);
-  const out = { host, port, ip: '', ms: null, ok: false, error: '', note: '', tls: null };
+  const hasV6 = probeLib.panelHasIPv6();
+  const out = {
+    host, port, ip: '', ms: null, ok: false, error: '', note: '', tls: null,
+    // skipped = 这次探测没有结论。前端必须把它和「节点不可达」分开显示：
+    // v6 节点跑在没有 v6 的面板上，以前永远是红叉，看的人只会去查安全组
+    skipped: false, reason: '',
+  };
 
+  let addrs;
   try {
-    const r = await dns.promises.lookup(host);
-    out.ip = r.address;
+    addrs = await dns.promises.lookup(host, { all: true });
   } catch (err) {
     out.error = `域名解析失败：${err.code || err.message}（${host}）`;
     return out;
   }
+  if (!addrs || !addrs.length) {
+    out.error = `域名解析失败：没有解析到任何地址（${host}）`;
+    return out;
+  }
+
+  // 面板没有 v6 时优先挑 A 记录（见 lib/probe.js）：双栈域名节点一旦落到 AAAA，
+  // 面板这边必然连不上，报成「节点不可达」等于把面板的短板算在节点头上
+  const chosen = probeLib.pickAddress(addrs, hasV6);
+  if (!chosen) {
+    out.ip = addrs[0].address;
+    out.skipped = true;
+    out.reason = 'panel-ipv6';
+    out.note = '该节点只有 IPv6 地址，而面板所在机器没有 IPv6，无法从这里验证连通性（不代表节点不通）';
+    return out;
+  }
+  out.ip = chosen.address;
 
   if (node.protocol === 'hysteria2') {
     out.ok = true;
@@ -2089,11 +2140,22 @@ async function runNodeProbe(node) {
   }
 
   const t0 = Date.now();
+  // 连选中的那个 IP，而不是再让系统解析一次域名 —— 否则前面挑 A 记录、后面
+  // 又可能连到 AAAA，白挑
   try {
-    await tcpProbe(host, port);
+    await tcpProbe(out.ip, port);
     out.ms = Date.now() - t0;
     out.ok = true;
   } catch (err) {
+    // 目标是 v6 时先分清「节点不通」和「面板根本出不去 v6」：
+    // errno 能立刻判定的就不再多花一次握手，判不了（超时 / 被丢）再实测一次本机 v6
+    if (probeLib.isV6Addr(out.ip)
+      && (probeLib.isNoV6Error(err.code) || !(await panelV6Works()))) {
+      out.skipped = true;
+      out.reason = 'panel-ipv6';
+      out.note = `面板所在机器连不出去 IPv6${err.code ? `（${err.code}）` : ''}，这条结果不能用来判断节点好坏`;
+      return out;
+    }
     // 到这里 DNS 是通的，TCP 不通 = 安全组 / 防火墙 / 服务没起，正是 agent 自检发现不了的那类
     out.error = `TCP 握手失败：${err.message}（agent 在线时多为安全组/防火墙拦截或端口未放行）`;
     return out;
@@ -2104,7 +2166,7 @@ async function runNodeProbe(node) {
   // 证书过期会被误报成「面板不可达」，把人引向安全组/端口排查的错方向
   if ((node.security || '') === 'tls') {
     const sni = node.sni || node.host || host;
-    out.tls = await tlsProbe(host, port, sni);
+    out.tls = await tlsProbe(out.ip, port, sni);
   }
   return out;
 }
@@ -2125,14 +2187,21 @@ function probeNode(req, res, params) {
         rid: req.__rid,
         node: node.name,
         ok: p.ok,
+        skipped: p.skipped || undefined,
+        reason: p.reason || undefined,
         ip: p.ip,
         ms: p.ms,
         tlsOk: p.tls ? p.tls.ok : undefined,
         error: p.error || p.tls?.error || undefined,
       });
       const tlsErr = p.tls && !p.tls.ok ? `；证书异常：${p.tls.error}` : '';
-      auditAction('node.probe', node.name,
-        p.ok ? `可达 ${p.ms ?? ''}ms${tlsErr}` : `不可达：${p.error || (p.tls && p.tls.error)}`);
+      // 没有结论时不能写「不可达」：审计里那句话会被当成故障记录留档
+      const verdict = p.skipped
+        ? `跳过：${p.note}`
+        : p.ok
+          ? `可达 ${p.ms ?? ''}ms${tlsErr}`
+          : `不可达：${p.error || (p.tls && p.tls.error)}`;
+      auditAction('node.probe', node.name, verdict);
       sendJson(res, 200, { ok: true, probe: p });
     })
     .catch((err) => {
@@ -3758,11 +3827,17 @@ function buildRelayScript({ to, port, proto = 'both', label = '' }) {
 # ${store.db().settings.siteName} · 中转部署脚本
 # ${label ? label + '\n# ' : ''}把本机 \${LISTEN_PORT} 的流量转发到 \${TARGET_HOST}:\${TARGET_PORT}
 # 生成时间：${new Date().toISOString()}
+# 用法：sh relay.sh      （需要 root：直接以 root 执行，或先 su -；脚本不依赖 sudo）
 set -euo pipefail
 
 TARGET_HOST="${target}"
 TARGET_PORT=${listenPort}
 LISTEN_PORT=${listenPort}
+
+if [ "$(id -u)" != '0' ]; then
+  echo "✗ 需要 root 权限（要改 sysctl 与 iptables）：用 root 执行，或先 su - 再跑"
+  exit 1
+fi
 
 if [ -z "$TARGET_HOST" ]; then
   echo "✗ 未指定落地节点地址"

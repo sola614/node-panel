@@ -1350,14 +1350,14 @@ async function nodePreviewFlow(id) {
 async function nodeDeployFlow(id) {
   const n = state.data.nodes.find((x) => x.id === id);
   if (!n) return;
-  const cmd = `curl -fsSL "${location.origin}/api/nodes/${n.id}/install?token=${n.token}" | sudo sh`;
+  const cmd = rootShCmd(`${location.origin}/api/nodes/${n.id}/install?token=${n.token}`, '', 'np-node-setup.sh');
 
   openModal({
     title: '独立部署 · ' + n.name,
     wide: true,
     footer: false,
     body: `
-      <p class="hint" style="margin:0 0 10px">在 <b>${esc(n.host || '待上报地址')}</b> 的终端（root）执行：</p>
+      <p class="hint" style="margin:0 0 10px">在 <b>${esc(n.host || '待上报地址')}</b> 的终端执行（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）：</p>
       <div class="code-wrap">
         <pre class="code">${esc(cmd)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(cmd)}">复制</button>
@@ -1384,7 +1384,7 @@ ${n.protocol === 'hysteria2' ? 'ls /run/nodepanel/                  # Hysteria2 
     box.innerHTML = `
       <div class="section-title">中转部署</div>
       <p class="hint" style="margin:0 0 12px">
-        在入口机器上执行对应脚本，把该端口的流量 DNAT 到 <b>${esc(n.host || '本节点')}:${n.port}</b>。
+        在入口机器上<b>以 root 执行</b>对应脚本（没有 sudo 的系统先 <code>su -</code>），把该端口的流量 DNAT 到 <b>${esc(n.host || '本节点')}:${n.port}</b>。
         入口不解析协议，TLS / Reality / Hysteria2 均适用，流量仍记在本节点上。
       </p>
       <div id="relay-list" style="display:flex;flex-direction:column;gap:8px">

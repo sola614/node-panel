@@ -243,7 +243,7 @@ async function serverEditFlow(id) {
 async function serverDeployFlow(id) {
   const s = state.data.servers.find((x) => x.id === id);
   if (!s) return;
-  const cmd = `curl -fsSL "${location.origin}/api/servers/${s.id}/install?token=${s.token}" | sudo sh`;
+  const cmd = rootShCmd(`${location.origin}/api/servers/${s.id}/install?token=${s.token}`, '', 'np-server-setup.sh');
   const nodes = (state.data.nodes || []).filter((n) => n.serverId === s.id && n.mode === 'server');
 
   openModal({
@@ -251,7 +251,7 @@ async function serverDeployFlow(id) {
     wide: true,
     footer: false,
     body: `
-      <p class="hint" style="margin:0 0 10px">在服务器终端（root）执行以下命令。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
+      <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
       <div class="code-wrap">
         <pre class="code">${esc(cmd)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(cmd)}">复制</button>
@@ -296,8 +296,8 @@ function uninstallFlow(kind, id) {
   if (!item) return;
 
   const url = `${location.origin}/api/${isServer ? 'servers' : 'nodes'}/${id}/uninstall?token=${item.token}`;
-  const plain = `curl -fsSL "${url}" | sudo sh`;
-  const purge = `curl -fsSL "${url}" | sudo sh -s -- --purge`;
+  const plain = rootShCmd(url, '', 'np-uninstall.sh');
+  const purge = rootShCmd(url, '--purge', 'np-uninstall.sh');
   const where = isServer ? item.address || item.host || '该机器' : item.host || '该机器';
 
   openModal({
@@ -305,7 +305,7 @@ function uninstallFlow(kind, id) {
     wide: true,
     footer: false,
     body: `
-      <p class="hint" style="margin:0 0 10px">在 <b>${esc(where)}</b> 的终端（root）执行。脚本可重复执行，不会报错：</p>
+      <p class="hint" style="margin:0 0 10px">在 <b>${esc(where)}</b> 的终端执行（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。脚本可重复执行，不会报错：</p>
       <div class="code-wrap">
         <pre class="code">${esc(plain)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(plain)}">复制</button>

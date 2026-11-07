@@ -135,6 +135,30 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   click(topBtn, dom.window);
   await sleep(150);
   ok('再点切回夜间', attr(d, 'data-theme') === 'dark' && ls(dom.window, 'np_theme') === 'dark');
+
+  /* ================== 1.5 部署命令（无 sudo 系统）与探测徽标 ================== */
+  console.log('\n── 部署命令 / 探测徽标 ──');
+  const w1 = dom.window;
+  const shCmd = w1.rootShCmd('http://h/api/servers/x/install?token=t', '', 'np-server-setup.sh');
+  const purgeCmd = w1.rootShCmd('http://h/api/servers/x/uninstall?token=t', '--purge', 'np-uninstall.sh');
+  // 起因：`curl … | sudo sh` 在 Alpine / 只给 root 的 LXC 上第一行就报
+  // -bash: sudo: command not found
+  ok('部署命令不再硬依赖 sudo', !/\|\s*sudo sh/.test(shCmd));
+  ok('部署命令先判断是不是 root', /"\$\(id -u\)"\s*=\s*0/.test(shCmd));
+  ok('有 sudo 才用 sudo', /command -v sudo/.test(shCmd));
+  ok('两者都没有时提示 su -', /su -/.test(shCmd), shCmd.slice(-70));
+  ok('命令先落盘再执行（不是管道给 sh）', /-o \/tmp\/np-server-setup\.sh/.test(shCmd));
+  ok('卸载命令把 --purge 透传给脚本', /sh \/tmp\/np-uninstall\.sh --purge/.test(purgeCmd));
+
+  // 探测徽标：v6 节点 + 无 v6 面板必须自成一档，不能红成「面板不可达」
+  const skipBadge = w1.probeBadge({ skipped: true, reason: 'panel-ipv6', ok: false, note: '面板所在机器没有 IPv6' });
+  ok('无 v6 面板的探测结果是灰色「面板无 IPv6」',
+    /badge-dim/.test(skipBadge) && skipBadge.includes('面板无 IPv6') && !skipBadge.includes('面板不可达'),
+    skipBadge.slice(0, 80));
+  ok('真的不可达仍然是红色「面板不可达」',
+    /badge-bad/.test(w1.probeBadge({ ok: false, error: 'TCP 握手失败' })));
+  ok('可达的徽标不受影响', /badge-ok/.test(w1.probeBadge({ ok: true, ms: 32 })));
+
   dom.window.close();
 
   // 刷新后应保持上次选择：靠 <head> 内联脚本提前定主题

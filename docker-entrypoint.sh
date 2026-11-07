@@ -53,9 +53,10 @@ if [ ! -w "$DATA_DIR" ]; then
 [entrypoint] ✗ 数据目录 $DATA_DIR 不可写（当前 uid=$(id -u)）。
 
 绑定宿主机目录时 Docker 不会沿用镜像里的属主，目录会是 root 所有。
-在宿主机上执行一次即可：
+在宿主机上执行一次即可（非 root 用户在这条命令前加 sudo；已是 root 的系统
+不一定装了 sudo，直接跑就行）：
 
-    mkdir -p ./data && sudo chown -R 1000:1000 ./data
+    mkdir -p ./data && chown -R 1000:1000 ./data
 
 或者干脆用命名卷，属主由 Docker 自动处理：
 

@@ -17,6 +17,7 @@ const { spawnSync, spawn } = require('node:child_process');
 const totp = require('../lib/totp');
 const sub = require('../lib/sub');
 const xray = require('../lib/xray');
+const probeLib = require('../lib/probe');
 
 const BASE = (process.argv[2] || 'http://127.0.0.1:8080').replace(/\/+$/, '');
 const ADMIN_USER = process.env.PANEL_ADMIN_USER || 'admin';
@@ -2485,6 +2486,31 @@ function totpCodeOf(secret) {
     const nodesList = await call('/api/nodes');
     const probed = nodesList.data.items.find((n) => n.id === okNode.data.item.id);
     ok('探测结果随节点列表下发', probed && probed.probe && probed.probe.ok === true);
+
+    /* 选地址的纯逻辑（lib/probe.js）：跑测试的机器有没有 v6 不可控，
+       这里直接喂地址列表断言，不依赖本机网络 */
+    const dual = [{ address: '2001:db8::5' }, { address: '203.0.113.9' }];
+    ok('选地址：面板没有 v6 时优先取 A 记录',
+      (probeLib.pickAddress(dual, false) || {}).address === '203.0.113.9');
+    ok('选地址：面板有 v6 时按解析顺序取第一个',
+      (probeLib.pickAddress(dual, true) || {}).address === '2001:db8::5');
+    ok('选地址：只有 AAAA 且面板无 v6 → 返回 null（测不了，不是不通）',
+      probeLib.pickAddress([{ address: '2001:db8::5' }], false) === null);
+    ok('选地址：只有 AAAA 且面板有 v6 → 正常选中',
+      (probeLib.pickAddress([{ address: '2001:db8::5' }], true) || {}).address === '2001:db8::5');
+    ok('errno 归类：ENETUNREACH 算「本机出不去 v6」', probeLib.isNoV6Error('ENETUNREACH') === true);
+    ok('errno 归类：ECONNREFUSED 不算（那是对端拒绝）', probeLib.isNoV6Error('ECONNREFUSED') === false);
+
+    // IPv6 字面量节点：文档网段，永远不会通。面板没有 v6 时必须给出「未得出结论」，
+    // 而不是红着的「面板不可达」把人引去查安全组
+    const v6Node = await mkNode('SMOKE-探测IPv6', { address: '2001:db8::1', port: 443, security: 'none' });
+    const v6Probe = await call(`/api/nodes/${v6Node.data.item.id}/probe`, { method: 'POST', body: '{}' });
+    const p6 = (v6Probe.data && v6Probe.data.probe) || {};
+    ok('探测：v6 节点在无 v6 的面板上标为「未得出结论」而不是不可达',
+      v6Probe.status === 200 && (p6.skipped === true
+        ? p6.ok === false && !p6.error && /IPv6/.test(p6.note || '')
+        : /握手失败|超时/.test(p6.error || '')),
+      `skipped=${p6.skipped} ip=${p6.ip || '-'} ${(p6.note || p6.error || '').slice(0, 46)}`);
   }
 
   /* ---------- 15.9 订阅页登录 + 自助重置订阅链接（0.1.16，密码必填方案） ---------- */

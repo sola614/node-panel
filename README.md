@@ -460,6 +460,10 @@ curl -fsSL "http://面板/api/servers/<id>/install?token=<服务器token>" | sh
 curl -fsSL "http://面板/api/nodes/<id>/install?token=<节点token>" | sh
 ```
 
+面板给出的完整命令会自动分档：**已经是 root 就直接跑，有 sudo 就套 sudo，
+两者都没有就提示先 `su -`**。所以没有 sudo 的精简系统（Alpine、只留 root 的 LXC / 容器、
+`-bash: sudo: command not found` 的那类机器）照抄即可，不需要自己去装 sudo。
+
 脚本会做这些事（输出按 `[n/m]` 分步，每步都把版本、体积、路径、服务状态打出来）：
 
 1. 把 agent 装到 `/opt/nodepanel/agent.sh`，`sh -n` 校验后打印版本与体积
@@ -907,12 +911,20 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 | TCP | 公网握手一次，量出 RTT（Hysteria2 是 UDP，跳过此层并说明原因） | 安全组 / 外部防火墙拦截、端口未放行 |
 | TLS 抽检 | 仅 security=tls 的节点：看证书是否过期、SAN 是否覆盖 SNI（`DNS:` 与 `IP Address:` 条目分别匹配） | 挂错证书、证书过期（Reality 是伪装握手，校验必误报，跳过） |
 
-结果三态落在节点列表里：**面板可达 Xms / 证书异常 / 面板不可达**（徽标点开看解析 IP、
-延迟、证书详情）。可达性（`ok`）与证书（`tls.ok`）是两个独立结论 —— 证书过期
-不会被降级显示成「不可达」把人引向安全组排查的错方向。
+结果四态落在节点列表里：**面板可达 Xms / 证书异常 / 面板不可达 / 面板无 IPv6**
+（徽标点开看解析 IP、延迟、证书详情）。可达性（`ok`）与证书（`tls.ok`）是两个独立结论 ——
+证书过期不会被降级显示成「不可达」把人引向安全组排查的错方向。
 **`同步=已同步` 且 `探测=不可达` ≈ agent 活着但公网进不来** ——
 大概率是云厂商安全组，去控制台放行端口就行，不用再登机器。
 探测本身不做 CA 信任判定（自签证书是本项目支持的常态），只看过期与 SNI 匹配。
+
+**IPv6 节点与没有 v6 的面板机**：节点只解析到 IPv6、而面板所在机器没有 v6 出口时，
+探测**不可能得出「节点坏了」的结论**，所以它自成一档（灰色的「面板无 IPv6」，
+点开写明「这不代表节点不通」），不再落进红色的「面板不可达」——后者会把人引去查安全组，
+白忙一场。判定看两处：机器上有没有非链路本地的 v6 地址，以及连接报错里的
+`ENETUNREACH` / `EAFNOSUPPORT` / `EADDRNOTAVAIL` / `EHOSTUNREACH`（有地址但没路由也能认出来）。
+双栈域名节点在无 v6 的面板上会**优先挑 A 记录**去连，不会因为解析到 AAAA 就误判。
+排查时可以 `PANEL_ASSUME_NO_IPV6=1` 启动面板，强制按「没有 v6」处理来验证这条分支。
 
 ### 备份与恢复
 
@@ -1440,7 +1452,8 @@ docker run -d -v "$PWD/data:/app/data" ...
 docker compose pull && docker compose up -d
 
 # 2. 手动把宿主机目录交给容器里的 node 用户（uid 1000）
-mkdir -p ./data && sudo chown -R 1000:1000 ./data
+#    非 root 用户在这条前面加 sudo；已经以 root 登录的系统可能根本没装 sudo
+mkdir -p ./data && chown -R 1000:1000 ./data
 
 # 3. 改用命名卷，属主由 Docker 自动处理
 ```

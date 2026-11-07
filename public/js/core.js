@@ -52,6 +52,30 @@ function fmtAgo(iso) {
 
 const STATUS_BADGE = { active: 'badge-ok', over: 'badge-bad', expired: 'badge-warn', disabled: 'badge-dim' };
 
+/* ---------------------------- 远程执行命令拼装 ---------------------------- */
+
+/**
+ * 「以 root 执行面板下发的远程脚本」的命令行，部署 / 卸载共用。
+ *
+ * 不能直接写 `curl … | sudo sh`：Alpine、精简 Debian、只给 root 登录的 LXC 与
+ * 容器里根本没有 sudo，用户复制过去第一行就是
+ *     -bash: sudo: command not found
+ * 所以按三档展开：已经是 root → 有 sudo → 都没有（给一句能照做的提示）。
+ *
+ * 先落盘再执行，而不是 `| sh`：管道两端的成败会互相牵连 —— 没有 sudo 时 curl
+ * 还在往一个已经关掉的管道写，最后报出来的是一句和真实原因无关的错误。
+ * 语法全是 POSIX sh，bash / dash / ash 都能跑。
+ */
+function rootShCmd(url, args = '', tmpName = 'np-setup.sh') {
+  const file = '/tmp/' + tmpName;
+  const tail = args ? ' ' + args : '';
+  return `curl -fsSL "${url}" -o ${file} && `
+    + `if [ "$(id -u)" = 0 ]; then sh ${file}${tail}; `
+    + `elif command -v sudo >/dev/null 2>&1; then sudo sh ${file}${tail}; `
+    + `else echo "✗ 当前不是 root，系统里也没有 sudo：先执行 su - 切到 root，再重跑这条命令" >&2; `
+    + `rm -f ${file}; exit 1; fi`;
+}
+
 /* ---------------------------- 同步回执（节点/服务器共用） ---------------------------- */
 
 const SYNC_BADGE = {
@@ -89,12 +113,18 @@ function syncBadge(sync, name = '') {
 /**
  * 面板视角的探测结果徽标：与 agent 回执（sync）互补 ——
  * sync=ok 且 probe 失败 ≈ 「agent 正常但面板/用户不可达」（安全组、防火墙）。
+ *
+ * skipped 单独一档：节点是 v6 地址、面板机没有 v6 出口时，探测本身没有结论。
+ * 这种情况以前落进「面板不可达」的红叉里，看的人只会去查安全组 —— 白忙一场。
  */
 function probeBadge(probe) {
   if (!probe) return '';
   let cls = 'badge-dim';
   let label = '未探测';
-  if (probe.ok) {
+  if (probe.skipped) {
+    cls = 'badge-dim';
+    label = probe.reason === 'panel-ipv6' ? '面板无 IPv6' : '未得出结论';
+  } else if (probe.ok) {
     cls = 'badge-ok';
     label = probe.ms != null ? `面板可达 ${probe.ms}ms` : '解析正常';
     if (probe.tls && !probe.tls.ok) {
@@ -116,13 +146,20 @@ function probeDetailFlow(probe) {
     <span style="flex:1;min-width:0;word-break:break-all">${v}</span>
   </div>`;
   const tls = probe.tls;
+  const skipped = !!probe.skipped;
+  const tone = skipped ? 'alert-warn' : probe.ok ? 'alert-ok' : 'alert-bad';
+  const title = skipped ? '这次探测没有结论' : probe.ok ? '面板可以连上这个节点' : '面板连不上这个节点';
+  const body = skipped
+    ? `　${esc(probe.note || '探测被跳过，不能据此判断节点好坏。')}`
+    : probe.ok
+      ? '　TCP 握手成功，客户端视角的网络路径是通的。'
+      : `　${esc(probe.error || '原因见下方详情。')}`;
   openModal({
     title: '面板侧探测',
     body: `
-      <div class="alert ${probe.ok ? 'alert-ok' : 'alert-bad'}" style="margin:0 0 14px">
-        <b>${probe.ok ? '面板可以连上这个节点' : '面板连不上这个节点'}</b>
-        ${probe.ok ? '　TCP 握手成功，客户端视角的网络路径是通的。' : `　${esc(probe.error || '原因见下方详情。')}`}
-        ${probe.ok && tls && !tls.ok ? `　但 TLS 抽检发现问题：${esc(tls.error)}` : ''}
+      <div class="alert ${tone}" style="margin:0 0 14px">
+        <b>${title}</b>${body}
+        ${!skipped && probe.ok && tls && !tls.ok ? `　但 TLS 抽检发现问题：${esc(tls.error)}` : ''}
       </div>
       ${row('探测目标', `<code>${esc(probe.host || '')}:${probe.port || ''}</code>`)}
       ${row('解析 IP', probe.ip ? `<code>${esc(probe.ip)}</code>` : '—')}
@@ -133,6 +170,7 @@ function probeDetailFlow(probe) {
       <p class="hint" style="margin-top:14px">
         这是从<b>面板所在机器</b>发起的公网探测：agent 在线但这里不可达，多半是云厂商安全组 /
         外部防火墙拦了端口；两者都正常用户还连不上，再看证书与客户端配置。
+        ${skipped ? '<br>面板自己没有 IPv6 出口时，v6 节点只能从客户端那边验证 —— 或者给面板机加一条 v6 线路后重新探测。' : ''}
       </p>`,
     footer: false,
   });
