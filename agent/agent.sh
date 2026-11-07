@@ -894,8 +894,11 @@ hop_apply() {
       _port=${_port%%:*}
       _range=${_item##*:}
       hop_spec_ok "$_range" || { log "! 跳跃范围不合法，已跳过：$_item"; continue; }
-      # nft 的集合语法：{ 40000-40499, 41000-41099 }
-      _rules="${_rules}    udp dport { $(printf '%s' "$_range" | tr ',' ' ') } counter redirect to :${_port}
+      # nft 的匿名集合**必须**用逗号分隔元素：{ 40000-40499, 41000-41099 }。
+      # 只写空格（{ 40000-40499 41000-41099 }）是 syntax error —— 而 nft -f 是
+      # 整文件原子的，一条写错整张表都不落地，多段范围会全部失效。所以只把
+      # 逗号补成「逗号+空格」用于可读，不能丢掉逗号本身。
+      _rules="${_rules}    udp dport { $(printf '%s' "$_range" | sed 's/,/, /g') } counter redirect to :${_port}
 "
     done
 
@@ -908,15 +911,24 @@ hop_apply() {
       printf '  }\n}\n'
     } > "$_f" 2>/dev/null
 
-    # 整表替换：先删（不存在就忽略）再一次性 -f。失败时表是空的，客户端会退化成
-    # 「只有单端口可用」，比留一半旧规则更容易判断
-    nft delete table inet "$HOP_TABLE" 2>/dev/null
-    if _out=$(nft -f "$_f" 2>&1); then
-      _ok=$_total
+    # 整表替换。**先 -c 预检，过了才动旧表**：nft -f 是整文件原子的，一条写错
+    # 整张表都不落地，而表此时已经被删掉了 —— 等于「新配置写错」连带把同机其它
+    # 正常节点的跳跃规则一起打掉，全机退化成单端口。语法检查失败时保留上一版，
+    # 只把原因写进回执（0.1.29 的多段分隔符 bug 就是这么全灭的）
+    if _chk=$(nft -c -f "$_f" 2>&1); then
+      nft delete table inet "$HOP_TABLE" 2>/dev/null
+      if _out=$(nft -f "$_f" 2>&1); then
+        _ok=$_total
+      else
+        _why=$(printf '%s' "$_out" | sed -n '1p' | cut -c1-160)
+        log "! 端口跳跃规则下发失败：$_why"
+        RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃规则下发失败：${_why:-见 agent 日志}"
+        RC_OK=0
+      fi
     else
-      _why=$(printf '%s' "$_out" | sed -n '1p' | cut -c1-160)
-      log "! 端口跳跃规则下发失败：$_why"
-      RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃规则下发失败：${_why:-见 agent 日志}"
+      _why=$(printf '%s' "$_chk" | sed -n '1p' | cut -c1-160)
+      log "! 端口跳跃规则语法检查未通过，已保留上一版规则：$_why"
+      RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃规则语法错误：${_why:-见 agent 日志}"
       RC_OK=0
     fi
   else
@@ -947,7 +959,11 @@ hop_apply() {
     fi
   fi
 
-  printf '%s\n' "$_spec" > "$STATE_DIR/hyhop.spec" 2>/dev/null
+  # spec 只在**全部装上**时才落盘。失败也写的话，下一轮「spec 相同 且 表还在」
+  # 会命中幂等跳过，直接回报 ${_total}/${_total} —— 把上一版残留规则谎报成新配置已生效
+  if [ "$_ok" = "$_total" ]; then
+    printf '%s\n' "$_spec" > "$STATE_DIR/hyhop.spec" 2>/dev/null
+  fi
   RC_HOP="${_ok}/${_total}"
   if [ "$_ok" = "$_total" ]; then
     log "✓ 端口跳跃规则已生效：${_total} 段（$(hop_backend)）"

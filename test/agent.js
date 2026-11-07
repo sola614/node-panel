@@ -657,6 +657,88 @@ const runAgent = (box) =>
     ok('没装上时不谎报计数', !rcHop.hop, String(rcHop.hop || ''));
   }
 
+  // 多段范围：nft 匿名集合的元素**必须**用逗号分隔。曾经这里把逗号 tr 成空格，
+  // 生成 `{ 40670-40675 50670-50675 }` —— nft -f 直接 syntax error，而它是整文件
+  // 原子的，一条写错整张表都不落地，多段范围 100% 失效且只在 agent 日志里留一行。
+  {
+    const boxNft = makeSandbox(panel.port, PKG_VERSION);
+    const nftBin = path.join(boxNft.dir, 'bin');
+    fs.mkdirSync(nftBin, { recursive: true });
+    const nftStub = path.join(nftBin, 'nft');
+    // 只模拟「-c 预检 + -f 下发都成功」；list 一律非 0，表示表不存在，逼 agent 真的写一遍
+    fs.writeFileSync(nftStub, '#!/bin/sh\ncase "$*" in *-f*) exit 0 ;; *) exit 1 ;; esac\n');
+    try {
+      fs.chmodSync(nftStub, 0o755);
+    } catch {
+      /* Windows 上 chmod 是空操作，Git Bash 照样能跑 */
+    }
+    boxNft.env.PATH = nftBin + path.delimiter + (boxNft.env.PATH || '');
+    fs.appendFileSync(
+      path.join(boxNft.stateDir, 'state.env'),
+      "NP_HY_HOP='node-abc:443:40670-40675,50670-50675'\n",
+    );
+    const nNft = panel.state.receipts.length;
+    await runAgent(boxNft);
+    const rcNft = panel.state.receipts[nNft] || {};
+    const nftBody = read(path.join(boxNft.stateDir, 'hyhop.nft'));
+    ok('多段范围保留逗号分隔（nft 集合语法硬要求）',
+      /udp dport \{ 40670-40675, 50670-50675 \}/.test(nftBody), nftBody.trim());
+    ok('多段范围未退化成空格分隔',
+      !/udp dport \{ 40670-40675 50670-50675 \}/.test(nftBody));
+    ok('多段范围回执按节点计 1/1', rcNft.hop === '1/1' && rcNft.ok === true,
+      JSON.stringify({ hop: rcNft.hop, ok: rcNft.ok }));
+  }
+
+  // 预检失败时必须保留旧表：nft -f 是整文件原子的，先删后加载等于「新配置写错」
+  // 会把同机其它正常节点的规则一起打掉。桩记录调用序列来验「没删、没加载」。
+  {
+    const boxChk = makeSandbox(panel.port, PKG_VERSION);
+    const chkBin = path.join(boxChk.dir, 'bin');
+    fs.mkdirSync(chkBin, { recursive: true });
+    const chkStub = path.join(chkBin, 'nft');
+    fs.writeFileSync(
+      chkStub,
+      [
+        '#!/bin/sh',
+        // spawn 的 cwd 是沙箱根，opt/ 即 STATE_DIR
+        'echo "$*" >> opt/nft.calls',
+        'case "$*" in',
+        '  *-c*-f*) [ -f opt/nft-bad ] && { echo "syntax error"; exit 1; } ; exit 0 ;;',
+        '  *-f*) exit 0 ;;',
+        '  list*) exit 0 ;;',
+        'esac',
+        'exit 1',
+        '',
+      ].join('\n'),
+    );
+    try {
+      fs.chmodSync(chkStub, 0o755);
+    } catch {
+      /* Windows 上 chmod 是空操作 */
+    }
+    boxChk.env.PATH = chkBin + path.delimiter + (boxChk.env.PATH || '');
+    const chkEnv = path.join(boxChk.stateDir, 'state.env');
+    fs.appendFileSync(chkEnv, "NP_HY_HOP='node-abc:443:40670-40675,50670-50675'\n");
+
+    await runAgent(boxChk); // 第一轮：语法正常，表建起来
+    fs.writeFileSync(path.join(boxChk.stateDir, 'nft-bad'), '1');
+    // 换一段范围，绕开「spec 相同 且 表存在」的幂等跳过
+    fs.appendFileSync(chkEnv, "NP_HY_HOP='node-abc:443:40670-40675,50670-50680'\n");
+    const nChk = panel.state.receipts.length;
+    await runAgent(boxChk);
+    const rcChk = panel.state.receipts[nChk] || {};
+
+    const calls = read(path.join(boxChk.stateDir, 'nft.calls')).trim().split('\n');
+    const delCnt = calls.filter((l) => /^delete /.test(l)).length;
+    const loadCnt = calls.filter((l) => /^-f /.test(l)).length;
+    ok('语法检查失败时回执说明原因',
+      rcChk.ok === false && /端口跳跃规则语法错误/.test(rcChk.error || ''),
+      JSON.stringify({ ok: rcChk.ok, err: String(rcChk.error || '').slice(0, 60) }));
+    ok('语法检查失败时没删旧表、也没加载坏规则',
+      delCnt === 1 && loadCnt === 1, `delete=${delCnt} load=${loadCnt}`);
+    ok('语法失败时不谎报装载数', rcChk.hop === '0/1', String(rcChk.hop || ''));
+  }
+
   /* ------------------- 面板上这台机器已被删除（HTTP 401） ------------------- */
   console.log('\n— 面板不认这台机器（401） —');
   {
