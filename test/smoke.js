@@ -568,6 +568,13 @@ function totpCodeOf(secret) {
   ok('跳跃范围落在统计端口段被拒绝', (await hopStatus('29000-29100')) === 400);
   ok('跳跃范围超过 1000 个端口被拒绝', (await hopStatus('20000-50000')) === 400);
 
+  // 单端口不构成跳跃（客户端永远连它），且会让 Clash 订阅输出未加引号的 `ports: 40670`
+  const hopSingle = await call('/api/nodes/' + node3Id, { method: 'PUT', body: json(hy2Body('30001')) });
+  ok('跳跃范围只有单个端口被拒绝', hopSingle.status === 400, `(${hopSingle.status})`);
+  ok('单端口被拒时说明原因', /至少要 2 个端口/.test((hopSingle.data && hopSingle.data.error) || ''),
+    JSON.stringify(hopSingle.data));
+  ok('单端口写成 a-a 同样被拒绝', (await hopStatus('30001-30001')) === 400);
+
   const hopOk = await call('/api/nodes/' + node3Id, {
     method: 'PUT',
     body: json(hy2Body('40000-40499', { hopInterval: 20 })),
