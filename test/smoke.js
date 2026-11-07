@@ -82,6 +82,23 @@ async function call(path, opts = {}) {
 
 const json = (obj) => JSON.stringify(obj);
 
+/**
+ * 邀请领取走的是「按 IP 限流」（10 次 / 小时，失败的尝试也算）。一轮测试会领 7 次，
+ * 同一个实例连跑第二轮就会被自己上一轮留下的计数拦住 —— 实测第二轮报
+ * 「领取过于频繁，请一小时后再试」，把「名额用尽」那条断言带偏。
+ *
+ * 所以每轮换一个假 IP：本机回环时面板信任 X-Forwarded-For（见 context.clientIp），
+ * 这样既让重复运行真的幂等，也顺手覆盖了「反代场景按 XFF 识别来源」这条路径。
+ * 一轮之内所有领取仍是同一个 IP，限流本身照样生效。
+ */
+const CLAIM_IP = '203.0.113.' + (10 + Math.floor(Math.random() * 50));
+const claim = (path, opts = {}) => {
+  const headers = { ...(opts.headers || {}) };
+  // 调用方显式指定来源 IP 时尊重它（那几条断言要的就是「换个 IP 是另一个桶」）
+  if (!headers['X-Forwarded-For']) headers['X-Forwarded-For'] = CLAIM_IP;
+  return call(path, { ...opts, headers });
+};
+
 /** 用 lib/totp 的同源密钥算当前窗口的合法 6 位码（±1 窗口容差由服务端承担） */
 function totpCodeOf(secret) {
   const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -165,6 +182,37 @@ function totpCodeOf(secret) {
       const asAdmin = await fetch(`${BASE}/api/me`, { headers: { Authorization: 'Bearer ' + (alData.session || '') } });
       ok('订阅会话进不了管理台（非管理员）', asAdmin.status === 401);
     }
+  }
+
+  /* ---------- 1.2 登出：token 立即失效，且只失效自己那枚 ---------- */
+  {
+    // 单独登录一次拿独立 token：别把自己刚拿到的主 token 弄失效了（后面全篇都要用）
+    const second = await call('/api/login', {
+      method: 'POST',
+      body: json({ username: ADMIN_USER, password: ADMIN_PASS }),
+    });
+    const tmp = second.data && second.data.token;
+    ok('二次登录拿到另一枚 token', !!tmp && tmp !== token);
+
+    const before = await fetch(`${BASE}/api/me`, { headers: { Authorization: 'Bearer ' + tmp } });
+    ok('登出前这枚 token 可用', before.status === 200, `(${before.status})`);
+
+    const out = await fetch(`${BASE}/api/logout`, { method: 'POST', headers: { Authorization: 'Bearer ' + tmp } });
+    ok('登出返回 200', out.status === 200, `(${out.status})`);
+
+    const after = await fetch(`${BASE}/api/me`, { headers: { Authorization: 'Bearer ' + tmp } });
+    ok('登出后这枚 token 立即失效', after.status === 401, `(${after.status})`);
+
+    // 会话是「按 token 删一条」，不是清空整张表 —— 否则管理员一台设备登出，
+    // 其它设备全被踢下线（改密才应该清空）
+    const still = await fetch(`${BASE}/api/me`, { headers: { Authorization: 'Bearer ' + token } });
+    ok('登出只失效自己那枚，不影响其它会话', still.status === 200, `(${still.status})`);
+
+    // 路由对 logout 不做鉴权（false），所以裸调也不能 500 —— 重复登出是很常见的客户端行为
+    const anon = await fetch(`${BASE}/api/logout`, { method: 'POST' });
+    ok('无 token 登出不报错', anon.status === 200, `(${anon.status})`);
+    const twice = await fetch(`${BASE}/api/logout`, { method: 'POST', headers: { Authorization: 'Bearer ' + tmp } });
+    ok('重复登出不报错', twice.status === 200, `(${twice.status})`);
   }
 
   /* ---------- 0.5 清理上次崩溃的残留，保证测试可重复 ---------- */
@@ -1709,14 +1757,14 @@ function totpCodeOf(secret) {
     invInfo.data.plan.name === 'SMOKE-套餐', JSON.stringify(invInfo.data.plan));
   ok('邀请公开信息不泄露 token', JSON.stringify(invInfo.data).indexOf('token') === -1);
 
-  const claimNoPass = await call('/api/invite/' + invCode + '/claim', {
+  const claimNoPass = await claim('/api/invite/' + invCode + '/claim', {
     method: 'POST',
     body: json({ name: 'SMOKE-受邀无密码' }),
   });
   ok('领取时缺登录密码被拒', claimNoPass.status === 400 && /登录密码/.test(claimNoPass.data.error || ''),
     claimNoPass.data.error || '');
 
-  const claim1 = await call('/api/invite/' + invCode + '/claim', {
+  const claim1 = await claim('/api/invite/' + invCode + '/claim', {
     method: 'POST',
     body: json({ name: 'SMOKE-受邀者', password: 'invite-pass-123' }),
   });
@@ -1725,17 +1773,17 @@ function totpCodeOf(secret) {
   const claimed = (await call('/api/users')).data.items.find((u) => u.name === 'SMOKE-受邀者');
   ok('受邀用户落到配置的套餐里', claimed && claimed.planName === 'SMOKE-套餐');
   ok('受邀用户自带登录密码（hasPassword）', claimed && claimed.hasPassword === true);
-  const claimDup = await call('/api/invite/' + invCode + '/claim', {
+  const claimDup = await claim('/api/invite/' + invCode + '/claim', {
     method: 'POST',
     body: json({ name: 'SMOKE-受邀者', password: 'invite-pass-123' }),
   });
   ok('重名领号返回 409', claimDup.status === 409);
-  const claim2 = await call('/api/invite/' + invCode + '/claim', {
+  const claim2 = await claim('/api/invite/' + invCode + '/claim', {
     method: 'POST',
     body: json({ name: 'SMOKE-受邀者2', password: 'invite-pass-123' }),
   });
   ok('第二个名额仍可领', claim2.status === 200 && claim2.data.remaining === 0);
-  const claim3 = await call('/api/invite/' + invCode + '/claim', {
+  const claim3 = await claim('/api/invite/' + invCode + '/claim', {
     method: 'POST',
     body: json({ name: 'SMOKE-第三人', password: 'invite-pass-123' }),
   });
@@ -1756,10 +1804,10 @@ function totpCodeOf(secret) {
 
   // 限流必须把失败尝试算进去：只数成功的话，脚本拿一个失效邀请码就能把 6 位码枚举一遍。
   // 这里特意换一个来源 IP，免得把本机这个桶打满、影响后面的用例。
-  const FLOOD = { 'X-Forwarded-For': '203.0.113.77' };
+  const FLOOD = { 'X-Forwarded-For': '203.0.113.' + (60 + Math.floor(Math.random() * 70)) };
   let hit429 = 0;
   for (let i = 0; i < 12; i++) {
-    const r = await call('/api/invite/' + invCode + '/claim', {
+    const r = await claim('/api/invite/' + invCode + '/claim', {
       method: 'POST',
       headers: FLOOD,
       body: json({ name: 'SMOKE-刷号' + i, password: 'invite-pass-123' }),
@@ -1767,12 +1815,13 @@ function totpCodeOf(secret) {
     if (r.status === 429) { hit429 = i + 1; break; }
   }
   ok('连续失败尝试也会触发限流 429', hit429 > 0, `第 ${hit429} 次被拦`);
-  ok('限流按 IP 分桶（换个 IP 仍可领）',
-    (await call('/api/invite/' + invCode + '/claim', {
-      method: 'POST',
-      headers: { 'X-Forwarded-For': '203.0.113.88' },
-      body: json({ name: 'SMOKE-受邀者3', password: 'invite-pass-123' }),
-    })).status !== 429);
+  const altIp = await claim('/api/invite/' + invCode + '/claim', {
+    method: 'POST',
+    headers: { 'X-Forwarded-For': '203.0.113.' + (130 + Math.floor(Math.random() * 70)) },
+    body: json({ name: 'SMOKE-受邀者3', password: 'invite-pass-123' }),
+  });
+  // 邀请码此刻已被领完 / 已停用，所以这里只断言「不是被限流拦下的」
+  ok('限流按 IP 分桶（换个 IP 不会被限流）', altIp.status !== 429, `(${altIp.status})`);
 
   /* ---------- 13.2 节点回执 ---------- */
   const syncBefore = (await call('/api/servers')).data.items.find((s) => s.id === serverId).sync;

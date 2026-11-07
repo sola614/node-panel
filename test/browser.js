@@ -304,9 +304,13 @@ async function main() {
   });
   const planId = plan.data.item.id;
 
-  const uPlan = await call('/api/users', { method: 'POST', body: { name: TAG + '-甲', planId, note: '浏览器测试' } });
-  await call('/api/users', { method: 'POST', body: { name: TAG + '-乙' } });
-  await call('/api/users', { method: 'POST', body: { name: TAG + '-丙' } });
+  // 订阅页 0.1.17 起一律先登录，建号必须带密码（这里用测试口令，和其它测试一致）
+  const uPlan = await call('/api/users', {
+    method: 'POST',
+    body: { name: TAG + '-甲', planId, note: '浏览器测试', password: 'test-pass-123' },
+  });
+  await call('/api/users', { method: 'POST', body: { name: TAG + '-乙', password: 'test-pass-123' } });
+  await call('/api/users', { method: 'POST', body: { name: TAG + '-丙', password: 'test-pass-123' } });
 
   const srv = await call('/api/servers', { method: 'POST', body: { name: TAG + '-服务器', host: '10.9.9.9' } });
   const serverId = srv.data.item.id;
@@ -518,6 +522,8 @@ async function main() {
     await click('#b-mode button[data-mode="count"]', cdp);
     ok('切回数量模式后名单区隐藏', await evalJs(`return document.querySelector('#b-names-fields').hidden`, cdp));
 
+    // 批量建号同样必须给一个统一的初始登录密码（0.1.17 起）
+    await type('#b-password', 'test-pass-123', cdp);
     await click('.modal-foot [data-ok]', cdp);
     await waitFor(`return /已创建 2 个用户/.test(document.querySelector('.modal-head h3').textContent)`, '创建结果', cdp);
     const resultText = await textOf('.modal-body', cdp);
@@ -564,6 +570,7 @@ async function main() {
     ok('领取页显示「可领取」', claimText.includes('可领取'));
 
     await type('#c-name', TAG + '-受邀者', cdp);
+    await type('#c-password', 'test-pass-123', cdp);
     await click('#claim-form button[type=submit]', cdp);
     await waitFor(`return /账号已创建/.test(document.querySelector('#root').textContent)`, '领取成功', cdp);
     const doneText = await textOf('#root', cdp);
@@ -635,6 +642,10 @@ async function main() {
     /* ==================== 7. 备份 ==================== */
     console.log('\n7. 设置页备份');
     await click('.nav-item[data-view="settings"]', cdp);
+    // 设置页拆成了分栏（基础/订阅模板/通知/备份/安全/接口），备份在「备份」页签里，
+    // 不切过去的话按钮是 hidden 的，点不到
+    await waitFor(`return !!document.querySelector('#set-tabs')`, '设置页分栏', cdp);
+    await click('#set-tabs button[data-tab="backup"]', cdp);
     await waitFor(`return !!document.querySelector('#bk-body tbody')`, '备份卡片', cdp);
     ok('设置页有备份卡片', (await textOf('.card-head h3', cdp)) !== '' && (await count('[data-act="backup-now"]', cdp)) === 1);
     // 空态也占一行，所以数「下载」按钮而不是数 <tr>
