@@ -592,6 +592,10 @@ function totpCodeOf(secret) {
   const SYNC_INI = [
     '[custom]',
     'ruleset=通用代理,clash-classic:https://example.com/proxy.list',
+    // 裸 URL：ACL4SSR 官方模板就长这样，先前会被当成「不支持的规则集 https:」整条丢掉
+    'ruleset=通用代理,https://example.com/extra.list',
+    // .yaml 结尾的规则集必须按 YAML 解析，.list 必须按纯文本解析（写错客户端会整份丢弃）
+    'ruleset=广告拦截,clash-domain:https://example.com/domain.yaml',
     'ruleset=DIRECT,[]GEOIP,CN',
     'ruleset=通用代理,[]MATCH',
     'custom_proxy_group=通用代理`select`[]延迟最低`.*',
@@ -625,19 +629,31 @@ function totpCodeOf(secret) {
   ok('url-test 的 url 与 interval 取自模板',
     (syncedGroups.find((g) => g.name === '延迟最低') || {}).interval === 300 &&
     (syncedGroups.find((g) => g.name === '延迟最低') || {}).type === 'url-test');
-  ok('远程规则集进 rule-providers，behavior=classical',
-    !!(synced['rule-providers'] || {}).rs0 &&
-    synced['rule-providers'].rs0.behavior === 'classical' &&
-    synced['rule-providers'].rs0.url === 'https://example.com/proxy.list');
+  const syncedProviders = synced['rule-providers'] || {};
+  ok('远程规则集进 rule-providers，键名取自文件名、behavior=classical',
+    !!syncedProviders.proxy &&
+    syncedProviders.proxy.behavior === 'classical' &&
+    syncedProviders.proxy.url === 'https://example.com/proxy.list');
+  ok('裸 URL 规则集不再被丢掉',
+    !!syncedProviders.extra && syncedProviders.extra.behavior === 'classical');
+  ok('`.list` 标 text、`.yaml` 标 yaml（写错客户端会报 no payload field）',
+    syncedProviders.proxy.format === 'text' &&
+    syncedProviders.extra.format === 'text' &&
+    syncedProviders.domain.format === 'yaml' &&
+    syncedProviders.domain.behavior === 'domain');
   ok('ruleset 转成 RULE-SET / 内联规则 / 结尾 MATCH',
-    (synced.rules || []).includes('RULE-SET,rs0,通用代理') &&
+    (synced.rules || []).includes('RULE-SET,proxy,通用代理') &&
+    (synced.rules || []).includes('RULE-SET,extra,通用代理') &&
+    (synced.rules || []).includes('RULE-SET,domain,广告拦截') &&
     (synced.rules || []).includes('GEOIP,CN,DIRECT') &&
     (synced.rules || []).slice(-1)[0] === 'MATCH,通用代理');
 
   await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: sync.data.template }) });
   const clashSynced = await fetch(`${BASE}/s/${u2.token}?format=clash`).then((r) => r.text());
   ok('同步来的模板能直接出订阅（带 rule-providers）',
-    clashSynced.includes('rule-providers:') && clashSynced.includes('RULE-SET,rs0,通用代理'));
+    clashSynced.includes('rule-providers:') &&
+    clashSynced.includes('RULE-SET,proxy,通用代理') &&
+    clashSynced.includes('format: text'));
   ok('套用同步模板后节点参数不变',
     clashSynced.includes('support-x25519mlkem768: true'));
   await call('/api/settings', { method: 'PUT', body: json({ clashTemplate: '' }) });

@@ -3,6 +3,29 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.28] - 2026-11-07
+
+修「从模板来源地址同步来的规则不生效」：译文里的规则集没写 `format`，客户端按 YAML
+去解析纯文本 `.list`，整份规则集被丢掉 —— 界面上 RULE-SET 一条不少，实际全不命中。
+
+### 修正
+
+- **规则集补上 `format`**：mihomo 的 `rule-providers` 默认按 `yaml` 解析，要求文件里有
+  `payload:` 头；ACL4SSR / blackmatrix 这些 `.list` 是「一行一条规则」的纯文本，解析直接
+  失败（日志里是 `file must have a payload field`），规则集为空 → 所有流量落到 `MATCH`。
+  现在按后缀判定：`.yaml` / `.yml` → `format: yaml`，其余 → `format: text`
+  （YAML 规则集几乎都会带后缀，判不准时按纯文本处理更安全），缓存文件名也跟着改成
+  `./rules/<name>.list` 或 `.yaml`
+- **`ruleset=组,https://…/xxx.list` 不再被丢掉**：ACL4SSR 官方模板就是这么写的（不带
+  `clash-classic:` 前缀），此前被当成「不支持的规则集 `https:`」整条跳过，规则几乎掉光。
+  裸 URL 与 `surge:` 一样按 surge 规则集处理 → `behavior: classical` + `format: text`。
+  另外补上 `clash` / `clash-classical` / `clash-domains` 几个别名
+- **规则集键名从 `rs0` / `rs1` 改成文件名**（`ProxyMedia`、`BanAD`…），重名自动加序号，
+  取不到文件名才退回 `rsN` —— 客户端「规则」页里 `rs0 RuleSet BT下载` 这种完全没法对照
+  模板，排在第七个的 rsN 更是没法认
+- 模板长度上限从 20000 提到 60000 字符：一份 ACL4SSR 全量模板翻译后约 15 KB，
+  再多几个分组就会撞上「模板太长」而存不进去
+
 ## [0.1.27] - 2026-11-06
 
 把用户手里现成的 subconverter 模板直接搬进面板，顺带确认了「订阅转换后只有 VLESS 不通」

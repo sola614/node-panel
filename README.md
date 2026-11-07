@@ -1033,10 +1033,17 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 
 | 模板里写的 | 面板生成的 |
 |---|---|
-| `ruleset=组,clash-classic:URL` | `rule-providers` 里一条 + `RULE-SET,rsN,组` |
+| `ruleset=组,clash-classic:URL` | `rule-providers` 里一条（`behavior` 按前缀、`format` 按后缀）+ `RULE-SET,文件名,组` |
+| `ruleset=组,URL` | 同上（subconverter 把裸 URL 当 surge 规则集，内容同样是纯文本） |
 | `ruleset=DIRECT,[]GEOIP,CN` | 内联规则 `GEOIP,CN,DIRECT` |
 | `custom_proxy_group=组`select`[]A`.*` | `{ name: 组, type: select, proxies: [A, '{all}'] }` |
 | `custom_proxy_group=组`url-test`.*`URL`300,,50` | 同上，带 `url` 与 `interval: 300` |
+
+规则集的 `format` 必须和文件实际格式一致：mihomo 默认按 `yaml` 解析（要求文件里有
+`payload:` 头），而 ACL4SSR / blackmatrix 这些 `.list` 是「一行一条规则」的纯文本，
+写成 yaml 会被整份丢掉 —— 客户端「规则」页里 RULE-SET 一条不少，实际一条都不生效，
+所有流量直接落到 `MATCH`。所以面板按 URL 后缀判定：`.yaml` / `.yml` 走 `yaml`，
+其余一律 `text`（判不准时按纯文本更安全），规则集键名取文件名（`ProxyMedia`、`BanAD`…）。
 
 节点正则只有「纯字面量 + `|` 分支」能安全转成 `{filter:...}`；带 `\d`、`[]`、`()`
 的退化成 `{all}` 并在编辑器下方提示。译文**先填进编辑器、不自动保存** ——
