@@ -25,6 +25,9 @@ jobs:
       # 单元 / 端到端（自带临时库，不需要先起服务）
       - name: 续期与安全测试
         run: |
+          # 先查版本号：package.json 升了、agent.sh 的 VERSION= 忘了跟，会让下面
+          # agent 测试一进门就退出。这条只要一秒钟，放在最前面挡住
+          node test/version.js
           node test/renew.js
           node test/security.js
 

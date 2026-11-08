@@ -15,7 +15,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test/smoke.js",
+    "test": "node test/version.js && node test/smoke.js",
+    "test:version": "node test/version.js",
     "test:renew": "node test/renew.js",
     "test:security": "node test/security.js",
     "test:notify": "node test/notify.js",

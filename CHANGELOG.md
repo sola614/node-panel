@@ -3,6 +3,28 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [未发布]
+
+**端口跳跃在只装了 `iptables` 的机器上对 IPv6 客户端完全失效**：规则只写进 v4 的 `nat` 表，
+而 v6 走的是另一张表（内核两套协议栈各一张），客户端跳到的每个端口都不会被重定向。
+最迷惑的是所有表象都正常：面板报「x/x 段已装」、实例在跑、`tcpdump` 能看到范围内的入站包，
+只有 `iptables -t nat -L NODEPANEL_HYHOP -vn` 的 counter 恒为 0。
+
+线上形态：`tcpdump -ni any 'udp and portrange 64552-64562'` 有包、`iptables` 侧 `pkts=0`、
+`ip6tables -t nat -L PREROUTING` 空白。走 `nft` 后端的机器（`table inet` 天然双栈）不受影响。
+
+### 修正
+
+- `hop_apply` 的 iptables 分支把同一份规则镜像进 `ip6tables`：链和每条 `REDIRECT` 都要补，
+  只建链不补规则等于没修
+- `hop_present` / `hop_teardown` 同步处理 v6 链：半装状态（v4 在、v6 不在）不再命中幂等跳过，
+  关掉功能时也不会留下继续劫持端口的 v6 残链
+- 回执口径：该装 v6 却装不上时 `hop` 记 `0/N` 且 `RC_OK=0`，错误里点名 `IPv6` 与
+  `nf_nat_ipv6`，不再补一句「检查 root 权限」把方向带偏
+- 是否要求 v6 按「本机有没有全局 v6 地址」判断（`ip -6 addr show scope global`），
+  纯 v4 的机器不会被标红；`HOP_V6=1/0` 可强制，测试用它覆盖两条分支
+- `test/agent.js` 补两个用例：双栈都写（回执 `1/1`）、v6 的 nat 表不可用（回执 `0/1` 且点名 IPv6）
+
 ## [0.1.31] - 2026-11-07
 
 `server.js` 从一个 6,484 行的文件拆成 21 个模块：外壳只剩 570 行（路由表 / 启动 / 监听），
@@ -47,6 +69,9 @@ settings → subscription / panel-https
 
 ### 其它
 
+- 新增 `test/version.js`：检查 `package.json` 与 `agent/agent.sh` 的 `VERSION=` 是否一致，
+  `npm test` 与 CI 最先跑它。0.1.31 发版时就漏改了 agent.sh，导致整条流水线在
+  agent 测试门口就红掉 —— 那条检查本来藏在三分钟的套件里，现在一秒钟就能挡住
 - 日志多了两个 scope：`cert`（证书续期在后台异步发生，记成 http 会误导）与
   `settings`（模板定时同步同理）
 - `test/browser.js` 补 `--no-sandbox` / `--disable-dev-shm-usage`（容器与 root 环境必需）
