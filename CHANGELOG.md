@@ -3,14 +3,14 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
-## [未发布]
+## [0.1.32] - 2026-11-08
 
 **端口跳跃在只装了 `iptables` 的机器上对 IPv6 客户端完全失效**：规则只写进 v4 的 `nat` 表，
 而 v6 走的是另一张表（内核两套协议栈各一张），客户端跳到的每个端口都不会被重定向。
 最迷惑的是所有表象都正常：面板报「x/x 段已装」、实例在跑、`tcpdump` 能看到范围内的入站包，
 只有 `iptables -t nat -L NODEPANEL_HYHOP -vn` 的 counter 恒为 0。
 
-线上形态：`tcpdump -ni any 'udp and portrange 64552-64562'` 有包、`iptables` 侧 `pkts=0`、
+线上形态：`tcpdump -ni any 'udp and portrange 40000-40499'` 有包、`iptables` 侧 `pkts=0`、
 `ip6tables -t nat -L PREROUTING` 空白。走 `nft` 后端的机器（`table inet` 天然双栈）不受影响。
 
 ### 修正

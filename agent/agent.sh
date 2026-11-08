@@ -44,7 +44,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.31'
+VERSION='0.1.32'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -813,6 +813,8 @@ HOP_CHAIN=NODEPANEL_HYHOP
 # 留环境变量入口：测试里 export HOP_BACKEND=none 就能走降级分支，
 # 而不必在跑测试的机器上真去改防火墙（SOCK_CMD 也是同一个套路）
 HOP_BACKEND=${HOP_BACKEND:-}
+# v6 判定结果缓存：hop_apply / hop_present / hop_teardown 每轮都会问一次
+HOP_V6_NEED=''
 
 hop_backend() {
   [ -n "$HOP_BACKEND" ] && { printf '%s\n' "$HOP_BACKEND"; return 0; }
@@ -826,10 +828,43 @@ hop_backend() {
   printf '%s\n' "$HOP_BACKEND"
 }
 
+# 要不要同时装 v6 规则。
+#
+# iptables 的 nat 表对 IPv6 流量是**完全不可见**的 —— 内核是两套独立的协议栈，
+# 各有一张 nat 表。只往 iptables 写规则时，v6 客户端跳到范围内任何端口都不会命中：
+# counter 恒 0，而面板显示「x/x 段已装」、实例也活得好好的，是最难自己发现的一类故障。
+# 实际踩过的形态：tcpdump 能看到范围内（如 40037/40055）的入站包，ip6tables 的 PREROUTING 一片空白。
+#
+# 判据只看「这台机器有没有全局 v6 地址」：没有 v6 就不会有 v6 客户端过来，不必强求，
+# 免得把纯 v4 的机器全标红。HOP_V6=1/0 是测试把手，强制走某一侧。
+hop_need_v6() {
+  if [ -z "$HOP_V6_NEED" ]; then
+    case "${HOP_V6:-}" in
+      1) HOP_V6_NEED=1 ;;
+      0) HOP_V6_NEED=0 ;;
+      *)
+        if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+          HOP_V6_NEED=1
+        else
+          HOP_V6_NEED=0
+        fi
+        ;;
+    esac
+  fi
+  [ "$HOP_V6_NEED" = '1' ]
+}
+
 hop_present() {
   case "$(hop_backend)" in
     nft) nft list table inet "$HOP_TABLE" >/dev/null 2>&1 ;;
-    iptables) iptables -t nat -S "$HOP_CHAIN" >/dev/null 2>&1 ;;
+    iptables)
+      iptables -t nat -S "$HOP_CHAIN" >/dev/null 2>&1 || return 1
+      # 半装（v4 在、v6 不在）不算就绪：否则「spec 相同 且 表还在」会命中幂等跳过，
+      # 把漏掉的 v6 规则一直当成装好的，重启后也不会自愈
+      if hop_need_v6 && ! ip6tables -t nat -S "$HOP_CHAIN" >/dev/null 2>&1; then
+        return 1
+      fi
+      ;;
     *) return 1 ;;
   esac
 }
@@ -838,9 +873,13 @@ hop_teardown() {
   case "$(hop_backend)" in
     nft) nft delete table inet "$HOP_TABLE" 2>/dev/null ;;
     iptables)
-      iptables -t nat -D PREROUTING -j "$HOP_CHAIN" 2>/dev/null
-      iptables -t nat -F "$HOP_CHAIN" 2>/dev/null
-      iptables -t nat -X "$HOP_CHAIN" 2>/dev/null
+      # v4/v6 是两张独立的表，关功能时两套都得拆 —— 只拆 v4 会让 v6 那半截
+      # 继续把端口劫持到已经不存在的实例上。ip6tables 不存在时命令失败即跳过
+      for _hop_t in iptables ip6tables; do
+        $_hop_t -t nat -D PREROUTING -j "$HOP_CHAIN" 2>/dev/null
+        $_hop_t -t nat -F "$HOP_CHAIN" 2>/dev/null
+        $_hop_t -t nat -X "$HOP_CHAIN" 2>/dev/null
+      done
       ;;
   esac
   rm -f "$STATE_DIR/hyhop.spec" 2>/dev/null
@@ -932,12 +971,33 @@ hop_apply() {
       RC_OK=0
     fi
   else
+    _needs_v6=0
+    if hop_need_v6; then _needs_v6=1; fi
     iptables -t nat -N "$HOP_CHAIN" 2>/dev/null
     iptables -t nat -F "$HOP_CHAIN" 2>/dev/null
     # 插到最前面：docker、云厂商镜像有时会在 PREROUTING 里塞 ACCEPT，
     # 追加到末尾会被它们提前放行掉
     iptables -t nat -C PREROUTING -j "$HOP_CHAIN" 2>/dev/null \
       || iptables -t nat -I PREROUTING 1 -j "$HOP_CHAIN" 2>/dev/null
+
+    # 同一份规则镜像进 ip6tables。v4 的 nat 表看不到 v6 包，只写一半时
+    # v6 客户端一条都命中不了，而回执照样是 x/y —— 必须两套一起装才叫装上
+    _v6_ready=0
+    if [ "$_needs_v6" = '1' ]; then
+      ip6tables -t nat -N "$HOP_CHAIN" 2>/dev/null
+      if ip6tables -t nat -F "$HOP_CHAIN" 2>/dev/null; then
+        _v6_ready=1
+        ip6tables -t nat -C PREROUTING -j "$HOP_CHAIN" 2>/dev/null \
+          || ip6tables -t nat -I PREROUTING 1 -j "$HOP_CHAIN" 2>/dev/null
+      else
+        log "! 端口跳跃的 IPv6 规则装不上：ip6tables 的 nat 表不可用"
+        RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃的 IPv6 规则未生效：ip6tables 的 nat 表不可用（modprobe nf_nat_ipv6，或改装带 nft 的系统）"
+        RC_OK=0
+      fi
+    fi
+
+    _v4_bad=0
+    _v6_bad=0
     for _item in $_spec; do
       case "$_item" in *:*:*) : ;; *) continue ;; esac
       _port=${_item#*:}
@@ -945,16 +1005,35 @@ hop_apply() {
       _range=${_item##*:}
       hop_spec_ok "$_range" || continue
       # iptables 的 --dport 只认单段，逗号组合要拆成多条
-      _seg_ok=1
+      _seg_v4=1
+      _seg_v6=1
       for _seg in $(printf '%s' "$_range" | tr ',' ' '); do
         _dport=$(printf '%s' "$_seg" | tr '-' ':')
         iptables -t nat -A "$HOP_CHAIN" -p udp --dport "$_dport" -j REDIRECT --to-ports "$_port" 2>/dev/null \
-          || _seg_ok=0
+          || _seg_v4=0
+        if [ "$_v6_ready" = '1' ]; then
+          ip6tables -t nat -A "$HOP_CHAIN" -p udp --dport "$_dport" -j REDIRECT --to-ports "$_port" 2>/dev/null \
+            || _seg_v6=0
+        fi
       done
+      [ "$_seg_v4" = '1' ] || _v4_bad=1
+      [ "$_seg_v6" = '1' ] || _v6_bad=1
+      # 需要 v6 却没装上 v6 的段不能算「已装」：宁可回执 0/4，
+      # 也不能让面板显示 4/4 而 v6 客户端全断
+      _seg_ok=1
+      [ "$_seg_v4" = '1' ] || _seg_ok=0
+      if [ "$_needs_v6" = '1' ] && { [ "$_v6_ready" != '1' ] || [ "$_seg_v6" != '1' ]; }; then
+        _seg_ok=0
+      fi
       [ "$_seg_ok" = '1' ] && _ok=$((_ok + 1))
     done
     if [ "$_ok" != "$_total" ]; then
-      RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃规则只装上 ${_ok}/${_total} 段（检查 root 权限与内核 netfilter）"
+      # v6 那条已经写清原因时别再补这条，否则方向会被指到权限上
+      if [ "$_v4_bad" = '1' ] || [ "$_needs_v6" != '1' ]; then
+        RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃规则只装上 ${_ok}/${_total} 段（检查 root 权限与内核 netfilter）"
+      elif [ "$_v6_bad" = '1' ]; then
+        RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃的 IPv6 规则只装上 ${_ok}/${_total} 段"
+      fi
       RC_OK=0
     fi
   fi

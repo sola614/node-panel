@@ -657,6 +657,87 @@ const runAgent = (box) =>
     ok('没装上时不谎报计数', !rcHop.hop, String(rcHop.hop || ''));
   }
 
+  // iptables 后端的 nat 表分 v4/v6 两张，只写 v4 时 v6 客户端一条都命中不了，
+  // 而回执照样是 x/y —— 线上表现成「面板显示已装、tcpdump 能看到范围内 dport、
+  // counter 恒 0」。两个桩：双栈都成功 / v6 的 nat 表不可用。
+  {
+    const boxIp = makeSandbox(panel.port, PKG_VERSION, { env: { HOP_BACKEND: 'iptables', HOP_V6: '1' } });
+    const ipBin = path.join(boxIp.dir, 'bin');
+    fs.mkdirSync(ipBin, { recursive: true });
+    const hopStub = '#!/bin/sh\necho "$(basename "$0") $*" >> opt/hop.calls\nexit 0\n';
+    for (const name of ['iptables', 'ip6tables']) {
+      const p = path.join(ipBin, name);
+      fs.writeFileSync(p, hopStub);
+      try {
+        fs.chmodSync(p, 0o755);
+      } catch {
+        /* Windows 上 chmod 是空操作 */
+      }
+    }
+    boxIp.env.PATH = ipBin + path.delimiter + (boxIp.env.PATH || '');
+    fs.appendFileSync(path.join(boxIp.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
+    const nIp = panel.state.receipts.length;
+    await runAgent(boxIp);
+    const rcIp = panel.state.receipts[nIp] || {};
+    const ipCalls = read(path.join(boxIp.stateDir, 'hop.calls'));
+    ok('iptables 后端同时写 v4 与 v6 规则',
+      /^iptables .*--dport 40000:40499/m.test(ipCalls) &&
+        /^ip6tables .*--dport 40000:40499/m.test(ipCalls),
+      ipCalls.trim().replace(/\n/g, ' | ').slice(0, 200));
+    ok('双栈都装上时回执 1/1', rcIp.hop === '1/1' && rcIp.ok === true,
+      JSON.stringify({ hop: rcIp.hop, ok: rcIp.ok }));
+  }
+
+  {
+    const boxNo6 = makeSandbox(panel.port, PKG_VERSION, { env: { HOP_BACKEND: 'iptables', HOP_V6: '1' } });
+    const no6Bin = path.join(boxNo6.dir, 'bin');
+    fs.mkdirSync(no6Bin, { recursive: true });
+    // v4 正常、v6 的 nat 表初始化失败（nf_nat_ipv6 缺失时的形态）
+    fs.writeFileSync(path.join(no6Bin, 'iptables'), '#!/bin/sh\nexit 0\n');
+    fs.writeFileSync(path.join(no6Bin, 'ip6tables'), '#!/bin/sh\nexit 1\n');
+    for (const name of ['iptables', 'ip6tables']) {
+      try {
+        fs.chmodSync(path.join(no6Bin, name), 0o755);
+      } catch {
+        /* Windows 上 chmod 是空操作 */
+      }
+    }
+    boxNo6.env.PATH = no6Bin + path.delimiter + (boxNo6.env.PATH || '');
+    fs.appendFileSync(path.join(boxNo6.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
+    const nNo6 = panel.state.receipts.length;
+    await runAgent(boxNo6);
+    const rcNo6 = panel.state.receipts[nNo6] || {};
+    ok('v6 规则装不上时不谎报段数', rcNo6.ok === false && rcNo6.hop === '0/1',
+      JSON.stringify({ hop: rcNo6.hop, ok: rcNo6.ok }));
+    ok('错误里点名 IPv6 而不是甩给权限', /IPv6/.test(rcNo6.error || ''),
+      String(rcNo6.error || '').slice(0, 100));
+  }
+
+  {
+    // 链建得起来、但单条 REDIRECT 写不进去（内核拒绝 / 规则被并发清空）
+    const boxAdd = makeSandbox(panel.port, PKG_VERSION, { env: { HOP_BACKEND: 'iptables', HOP_V6: '1' } });
+    const addBin = path.join(boxAdd.dir, 'bin');
+    fs.mkdirSync(addBin, { recursive: true });
+    fs.writeFileSync(path.join(addBin, 'iptables'), '#!/bin/sh\nexit 0\n');
+    fs.writeFileSync(path.join(addBin, 'ip6tables'), '#!/bin/sh\ncase "$*" in *-A*) exit 1 ;; esac\nexit 0\n');
+    for (const name of ['iptables', 'ip6tables']) {
+      try {
+        fs.chmodSync(path.join(addBin, name), 0o755);
+      } catch {
+        /* Windows 上 chmod 是空操作 */
+      }
+    }
+    boxAdd.env.PATH = addBin + path.delimiter + (boxAdd.env.PATH || '');
+    fs.appendFileSync(path.join(boxAdd.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
+    const nAdd = panel.state.receipts.length;
+    await runAgent(boxAdd);
+    const rcAdd = panel.state.receipts[nAdd] || {};
+    ok('v6 单条规则写失败也算该段未生效', rcAdd.ok === false && rcAdd.hop === '0/1',
+      JSON.stringify({ hop: rcAdd.hop, ok: rcAdd.ok }));
+    ok('v6 单条失败时给出独立原因', /IPv6 规则只装上/.test(rcAdd.error || ''),
+      String(rcAdd.error || '').slice(0, 100));
+  }
+
   // 多段范围：nft 匿名集合的元素**必须**用逗号分隔。曾经这里把逗号 tr 成空格，
   // 生成 `{ 40670-40675 50670-50675 }` —— nft -f 直接 syntax error，而它是整文件
   // 原子的，一条写错整张表都不落地，多段范围 100% 失效且只在 agent 日志里留一行。

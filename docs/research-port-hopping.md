@@ -252,7 +252,14 @@ URI 里**不要**把范围写进 port 位：官方客户端认（`host:40000-404
 9. **iptables 回退没有 counter**。nft 路径每条规则带命中计数，`nft list table` 就能看出
    客户端在不在跳；iptables 只能 `iptables -t nat -L NODEPANEL_HYHOP -vn`。排障时优先找
    有 `nft` 的机器。
-10. **nft 匿名集合的元素必须用逗号分隔**：`{ 40000-40499, 41000-41099 }`。
+10. **iptables 回退只覆盖 IPv4**。`iptables` 的 `nat` 表对 IPv6 流量完全不可见 —— 内核是
+   两套协议栈、各有一张 nat 表。只写 v4 时，v6 客户端跳到范围内任何端口都不会被重定向，
+   而所有表象都正常：面板显示 `x/x 已装`、`tcpdump` 能看到范围内的入站包、实例也活得好好的，
+   只有 v4 那张表的 counter 恒为 0（实际踩过：`ip6tables -t nat -L PREROUTING` 一片空白）。
+   0.1.31 及之前 agent 的 iptables 分支就是只写 v4；现在会镜像一份 v6 规则，并用
+   `ip -6 addr show scope global` 判断「本机到底有没有 v6」，纯 v4 机器不必强求。
+   自查时 `iptables` 和 `ip6tables` 两边都要看 —— 只看一边会得出完全相反的结论。
+11. **nft 匿名集合的元素必须用逗号分隔**：`{ 40000-40499, 41000-41099 }`。
     `{ 40000-40499 41000-41099 }`（只有空格）是 syntax error —— 实测报
     `unexpected number, expecting comma or '}'`，而 `nft -f` 是整文件原子的
     —— 一条写错整张表都不落地。多段范围因此会**全部**失效，客户端看到订阅里有范围、
@@ -260,7 +267,7 @@ URI 里**不要**把范围写进 port 位：官方客户端认（`host:40000-404
     生成规则时 `tr ',' ' '`，单段范围看不出来，一填多段就全灭。
     连带两条防护：下发前跑 `nft -c -f` 预检（不过就保留上一版规则，别先删表），
     且 `hyhop.spec` 只在全部装上时落盘，否则下一轮会命中幂等跳过、把残留规则报成成功。
-11. **端口段选择**。官方示例 20000-50000 只是示意，30001 个端口收益并不比 500 个大，
+12. **端口段选择**。官方示例 20000-50000 只是示意，30001 个端口收益并不比 500 个大，
    反而让安全组难配、被扫描面变大。**100–1000 个连续端口足够**，避开 443 附近的
    高关注段更容易绕开单端口 QoS。
 
@@ -275,6 +282,11 @@ nft list tables | grep hysteria_
 # 2. 规则有没有命中（counter 增长 = 客户端确实在跳）
 nft list table inet nodepanel_hyhop | grep -A1 counter
 
+# 2b. iptables 后端 + 本机有 v6 地址：v4/v6 是两张独立的表，两边都要有这条链。
+#     只查 iptables 会看到「规则在、counter 0」，容易误判成规则没命中
+iptables -t nat -L NODEPANEL_HYHOP -vn
+ip6tables -t nat -L NODEPANEL_HYHOP -vn
+
 # 3. 外部是否真的打到范围内端口（在服务器上抓）
 tcpdump -ni eth0 'udp and portrange 40000-40499' -c 20
 
@@ -285,8 +297,9 @@ ss -lunp | grep hysteria
 hysteria client -c client.yaml   # server: host:40037
 ```
 
-判定口径：**`nft` 有规则 + `tcpdump` 能看到范围内的 dport + `ss` 只有一个监听端口**，
-三者同时成立才算通。只看 `ss` 会误判成「没生效」。
+判定口径：**规则真的在（nft 看表；iptables 后端要 v4/v6 两张表都有）+ `tcpdump` 能看到
+范围内的 dport + `ss` 只有一个监听端口**，三者同时成立才算通。只看 `ss` 会误判成「没生效」，
+只看 `iptables` 会把「v6 规则缺失」误判成「规则没命中」。
 
 ## 七、不建议做的事
 
