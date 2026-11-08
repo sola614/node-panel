@@ -28,6 +28,8 @@ jobs:
           # 先查版本号：package.json 升了、agent.sh 的 VERSION= 忘了跟，会让下面
           # agent 测试一进门就退出。这条只要一秒钟，放在最前面挡住
           node test/version.js
+          # 再查镜像：Dockerfile 拷进去的东西够不够让面板跑起来（0.1.32 漏了 server/ 目录）
+          node test/dockerfile.js
           node test/renew.js
           node test/security.js
 
@@ -114,6 +116,38 @@ jobs:
             type=raw,value=${{ steps.pkg.outputs.version }},enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=${{ steps.pkg.outputs.minor }},enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable={{is_default_branch}}
+
+      # 先把镜像在本地构建出来跑一次，确认它真的能起来：
+      # 0.1.32 的教训是 server.js 拆目录后 Dockerfile 少 COPY 了一个目录，
+      # 静态检查能挡住 require，但「镜像里到底缺什么」只有真跑一遍才知道。
+      # 这一步在推送之前，坏镜像不会拿到 tag。
+      - name: 构建本地镜像用于自检（单架构，不推送）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: node-panel:ci-check
+          build-args: |
+            APP_VERSION=${{ steps.pkg.outputs.version }}
+          cache-from: type=gha
+
+      - name: 容器启动自检
+        run: |
+          docker run -d --name np-check -p 18080:8080 node-panel:ci-check
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18080/api/health >/dev/null 2>&1; then
+              echo "▸ 容器已就绪：$(curl -fsS http://127.0.0.1:18080/api/health)"
+              docker rm -f np-check >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "✗ 容器 40 秒内没起来，日志如下：" >&2
+          docker logs np-check >&2 || true
+          docker rm -f np-check >/dev/null || true
+          exit 1
 
       - name: 构建并推送
         uses: docker/build-push-action@v6

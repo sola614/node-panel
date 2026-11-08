@@ -3,7 +3,25 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.33] - 2026-11-08
+
+> 修复 0.1.32 的镜像问题，其余与 0.1.32 相同。
+
+### 修正
+
+- **Docker 镜像缺 `server/` 目录**：0.1.31 把 `server.js` 拆成 21 个模块放进 `server/`，
+  Dockerfile 还是只 `COPY server.js ./`，容器启动即 `Cannot find module './server/config'`。
+  顺序问题很隐蔽：本地跑 `node server.js` 永远有整个目录，只有真镜像会缺
+- **新增 `test/dockerfile.js`**：静态核对「代码 require 的模块 / 运行时读的文件」是否都在
+  Dockerfile 的 COPY 清单里，并检查 `.dockerignore` 有没有把必需路径挡在构建上下文之外。
+  零依赖、不用 docker，已接进 `npm test` 与 CI 单元步骤
+- **CI 增加容器启动自检**：先在本地构建单架构镜像、`docker run` 起来打 `/api/health`，
+  通过才进入推送步骤 —— 坏镜像从此拿不到 tag（0.1.32 那次是先推上去、部署时才发现）
+
 ## [0.1.32] - 2026-11-08
+
+> **该版本的 Docker 镜像起不来**：`server.js` 拆目录后 Dockerfile 少 `COPY server ./server`，
+> 容器一启动就 `MODULE_NOT_FOUND`。源码方式部署不受影响。请直接用 0.1.33。
 
 **端口跳跃在只装了 `iptables` 的机器上对 IPv6 客户端完全失效**：规则只写进 v4 的 `nat` 表，
 而 v6 走的是另一张表（内核两套协议栈各一张），客户端跳到的每个端口都不会被重定向。

@@ -22,6 +22,7 @@ ENV NODE_ENV=production \
 # 零 npm 依赖项目（SQLite 用 Node 内置的 node:sqlite），不需要 npm install
 COPY package.json ./
 COPY server.js ./
+COPY server ./server
 COPY lib ./lib
 COPY public ./public
 COPY agent ./agent
