@@ -20,6 +20,7 @@ const probeLib = require('../lib/probe');
 const logger = require('../lib/log');
 const { sendJson } = require('./http-util');
 const { PORT, TLS_PORT } = require('./config');
+const { isHostName } = require('../public/js/hosts');
 const { auditAction, desiredHashCache } = require('./context');
 const { nameTaken, pickExistingIds } = require('./util');
 const { usersForNode } = require('./users');
@@ -371,11 +372,34 @@ function portWarnings(node) {
   return out;
 }
 
+/**
+ * 证书主机名字段校验（返回空串表示通过）。
+ *
+ * selfCN / sni 会一路走进 agent 的 shell：面板把它们拼成 `CN|证书|私钥` 交给 agent，
+ * agent 拆开后再交给 openssl 写文件。CN 里带空格会把一条记录拆成两个 token，
+ * 带 `|` 会串位，带 `../` 则是 root 权限下的任意路径写入 —— 都不是「填错」的量级。
+ *
+ * 合法的 CN / SNI 本来就是主机名，所以直接按主机名卡死，不做字符白名单。
+ * 保留 IP：自签证书用 IP 当 CN 是常见做法（`net.isIP` 认裸 IPv6，主机名规则只认带括号的）。
+ */
+function hostFieldError(node) {
+  const bad = (v) => !isHostName(v) && net.isIP(v) === 0;
+  if (node.selfCN && bad(node.selfCN)) {
+    return `自签证书 CN「${node.selfCN}」不是合法主机名（只填域名或 IP，不要带空格、斜杠）`;
+  }
+  if (node.sni && bad(node.sni)) {
+    return `SNI「${node.sni}」不是合法主机名（只填域名或 IP，不要带空格、斜杠）`;
+  }
+  return '';
+}
+
 function createNode(req, res, params, body) {
   const data = normalizeNode(body);
   if (!data.name) return sendJson(res, 400, { error: '请填写节点名称' });
   const badPort = portError(data);
   if (badPort) return sendJson(res, 400, { error: badPort });
+  const badHost = hostFieldError(data);
+  if (badHost) return sendJson(res, 400, { error: badHost });
   const badCert = certRefError(data);
   if (badCert) return sendJson(res, 400, { error: badCert });
   const db = store.db();
@@ -421,6 +445,8 @@ function updateNode(req, res, params, body) {
   }
   const badPort = portError(next);
   if (badPort) return sendJson(res, 400, { error: badPort });
+  const badHost = hostFieldError(next);
+  if (badHost) return sendJson(res, 400, { error: badHost });
   const badCert = certRefError(next);
   if (badCert) return sendJson(res, 400, { error: badCert });
   const badHop = hopError(next, node.id);

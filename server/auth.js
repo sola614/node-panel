@@ -29,6 +29,18 @@ const {
 
 const logAuth = logger.create('auth');
 
+/**
+ * 用户名不匹配时用来「陪跑」的哈希。
+ *
+ * `username !== admin.username || !checkPassword(...)` 的短路会让「用户名错」跳过
+ * scrypt —— 几十毫秒的差异在线就能测出来，等于把「用户名对不对」告诉对方。
+ * 这里对一个固定的假哈希跑一次真实校验，把两条路径的耗时抹平。
+ *
+ * 启动时算一次（约几十毫秒），不要放到请求路径里懒加载：那会让第一次猜错用户名
+ * 的请求反而更慢，侧信道换了个方向又回来了。
+ */
+const DUMMY_PASSWORD_HASH = store.hashPassword(crypto.randomBytes(16).toString('hex'));
+
 /* --------------------------------- 鉴权接口 -------------------------------- */
 
 async function login(req, res, params, body) {
@@ -48,7 +60,10 @@ async function login(req, res, params, body) {
   const { username, password } = body || {};
   const admin = store.db().admin;
   if (!username || !password) return sendJson(res, 400, { error: '请输入账号和密码' });
-  if (username !== admin.username || !store.checkPassword(password, admin.password)) {
+  // 两个条件都要算出来再判断：短路会让「用户名错」比「密码错」快几十毫秒
+  const userOk = username === admin.username;
+  const passOk = store.checkPassword(password, userOk ? admin.password : DUMMY_PASSWORD_HASH);
+  if (!userOk || !passOk) {
     noteLoginFail(ip);
     const left = loginFailsLeft(ip);
     // 只记用户名与剩余次数，绝不记密码 / 密码长度

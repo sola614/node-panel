@@ -680,6 +680,19 @@ function totpCodeOf(secret) {
   ok('模板 JSON 写坏时被拒绝', tplBadJson.status === 400, `(${tplBadJson.status})`);
   ok('非法模板不落盘', (await call('/api/settings')).data.settings.clashTemplate === '');
 
+  // 两段式保存：一次请求里既有合法字段又有非法字段时，合法的那部分不能留在内存里。
+  // store.save() 是全表 diff，只要内存被改脏，下一次任何保存都会把半套配置写进库
+  const beforeHalf = (await call('/api/settings')).data.settings;
+  const halfSaved = await call('/api/settings', {
+    method: 'PUT',
+    body: json({ siteName: 'SMOKE-半套配置', notice: 'SMOKE-半套公告', clashTemplate: '{"rules":' }),
+  });
+  ok('一次请求里夹带非法字段时整次拒绝', halfSaved.status === 400, `(${halfSaved.status})`);
+  const afterHalf = (await call('/api/settings')).data.settings;
+  ok('被拒绝的保存不留下半套配置',
+    afterHalf.siteName === beforeHalf.siteName && afterHalf.notice === beforeHalf.notice,
+    `${afterHalf.siteName} / ${afterHalf.notice}`);
+
   const tplDoc = {
     'proxy-groups': [
       { name: '🚀 节点选择', type: 'select', proxies: ['♻️ 自动选择', '{all}', 'DIRECT'] },
@@ -968,6 +981,33 @@ function totpCodeOf(secret) {
   ok('自签证书的 xray 入站带 certificateFile 与 keyFile',
     String(certObj.certificateFile || '').endsWith('/fullchain.pem') && String(certObj.keyFile || '').endsWith('/privkey.pem'),
     JSON.stringify(certObj));
+
+  // CN / SNI 会拼进 agent 的 shell 当 openssl 的 CN，带空格 / 斜杠的一律在保存时拦掉
+  const badCN = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-BAD-CN', mode: 'standalone', ipMode: 'manual', address: '10.0.0.12',
+      protocol: 'vless', port: 20848, security: 'tls', certMode: 'self', selfCN: '../../etc/passwd',
+    }),
+  });
+  ok('自签 CN 不是主机名时拒绝保存', badCN.status === 400 && /CN/.test(badCN.data.error || ''), badCN.data.error);
+  const badSNI = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-BAD-SNI', mode: 'standalone', ipMode: 'manual', address: '10.0.0.12',
+      protocol: 'vless', port: 20848, security: 'tls', certMode: 'self', sni: 'a b.example.com',
+    }),
+  });
+  ok('SNI 不是主机名时拒绝保存', badSNI.status === 400 && /SNI/.test(badSNI.data.error || ''), badSNI.data.error);
+  const ipCN = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-IP-CN', mode: 'standalone', ipMode: 'manual', address: '10.0.0.12',
+      protocol: 'vless', port: 20848, security: 'tls', certMode: 'self', selfCN: '10.0.0.12', enabled: false,
+    }),
+  });
+  ok('自签 CN 允许 IP 字面量', ipCN.status === 200, JSON.stringify(ipCN.data.error || ''));
+  if (ipCN.data && ipCN.data.item) cleanup.push(['/api/nodes/' + ipCN.data.item.id]);
 
   /* ---------- 9.5 出站强制 IPv4 ---------- */
 

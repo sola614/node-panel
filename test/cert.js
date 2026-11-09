@@ -157,6 +157,58 @@ const selfBundle = agentBundle.buildBundle(
 ok('自签仍走 agent 侧生成', selfBundle.includes('NP_SELF_CERTS='));
 ok('自签不写空文件', !selfBundle.includes('np_cert_put'));
 
+// 证书清单必须是「一条一行」：以前是空格分隔，CN 里带空格会把一条记录拆成两条，
+// agent 拿半个 CN 当路径去 openssl 建文件（root 权限）。这里从两头卡住 ——
+// 生成端用 \n，消费端用 agent.sh 里同样的 `while IFS='|' read` 数一遍条数。
+const multiSelf = agentBundle.buildBundle(
+  {
+    ...basePayload,
+    certs: [
+      { nodeId: 'n1', mode: 'self', cn: 'a.local', certPath: '/a/c.pem', keyPath: '/a/k.pem', certPem: '', keyPem: '' },
+      { nodeId: 'n2', mode: 'self', cn: 'b.local', certPath: '/b/c.pem', keyPath: '/b/k.pem', certPem: '', keyPem: '' },
+    ],
+  },
+  { siteName: 'T' },
+);
+const selfRaw = (multiSelf.match(/NP_SELF_CERTS='([^']*)'/) || [])[1] || '';
+ok('多条自签证书按行分隔', selfRaw.split('\n').length === 2, JSON.stringify(selfRaw));
+
+const envBody = (multiSelf.split("<<'NP_STATE_EOF'\n")[1] || '').split('\nNP_STATE_EOF')[0];
+const envFile = path.join(os.tmpdir(), `np-cert-env-${process.pid}.sh`);
+const probeFile = path.join(os.tmpdir(), `np-cert-probe-${process.pid}.sh`);
+fs.writeFileSync(envFile, envBody, 'utf8');
+fs.writeFileSync(
+  probeFile,
+  [
+    `. "${envFile.split(path.sep).join('/')}"`,
+    'n=0',
+    `while IFS='|' read -r _cn _crt _key; do`,
+    '  [ -n "$_cn" ] || continue',
+    '  n=$((n+1))',
+    'done <<EOF',
+    '${NP_SELF_CERTS:-}',
+    'EOF',
+    'printf "%s" "$n"',
+    '',
+  ].join('\n'),
+  'utf8',
+);
+const probe = spawnSync('sh', [probeFile], { encoding: 'utf8' });
+if (probe.error) {
+  console.log('  · 跳过证书清单解析检查（本机没有 sh）');
+} else {
+  ok(
+    '证书清单能被 agent 逐行拆开（多行单引号在 shell 里合法）',
+    probe.status === 0 && probe.stdout === '2',
+    `stdout=${JSON.stringify(probe.stdout)} status=${probe.status}`,
+  );
+}
+for (const f of [envFile, probeFile]) {
+  try {
+    fs.unlinkSync(f);
+  } catch { /* 临时文件，删不掉不影响结论 */ }
+}
+
 // 生成的脚本必须能被 sh 解析：语法错的话 agent 整轮都白跑
 const tmp = path.join(os.tmpdir(), `np-cert-bundle-${process.pid}.sh`);
 fs.writeFileSync(tmp, hyBundle, 'utf8');

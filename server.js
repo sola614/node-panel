@@ -51,7 +51,7 @@ const {
   reorderNodes, nodePreview, rotateNodeToken, probeNode, generateRealityKeys,
 } = require('./server/nodes');
 const {
-  agentConfig, agentReport, agentReceipt, agentBundleHandler, demoTick, agentScript,
+  agentConfig, agentReport, agentReceipt, agentBundleHandler, demoTick, agentScript, flushSaves,
 } = require('./server/agent');
 const {
   listServers, createServer, updateServer, deleteServer, batchDeleteServers,
@@ -575,6 +575,13 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     log.info('收到退出信号，正在关闭', { signal: sig, uptimeS: Math.round((Date.now() - STARTED_AT) / 1000) });
     if (httpsState.server) httpsState.server.close();
+    // 心跳落盘是合并的（见 server/agent.js 的 saveSoon），关库前必须冲一次，
+    // 否则最后 1 秒的 lastSeen / 回执就跟着进程一起没了
+    try {
+      flushSaves();
+    } catch (err) {
+      log.error('退出前落盘失败', { err });
+    }
     store.close();
     process.exit(0);
   });

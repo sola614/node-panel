@@ -324,12 +324,29 @@ public_ip() {
 
 # -------------------------------- 证书 --------------------------------------
 
+# CN 只允许主机名字符（含 IP 字面量）。
+#
+# 面板保存节点时已经按主机名卡过一遍，这里再挡一次是因为 agent 的输入不完全受
+# 面板控制：手改过的 state.env、旧面板下发的清单、被替换的配置文件都算输入。
+# 而 CN 会被写进 openssl 的配置文件（`CN=$_cn` 那一行），带换行就能插进别的配置段，
+# 带 ../ 则是 root 权限下往任意路径写文件。
+cn_ok() {
+  case "$1" in
+    '' | *[!][A-Za-z0-9._:-]*) return 1 ;;
+  esac
+  return 0
+}
+
 # 自签证书：文件已存在就跳过，所以每轮调用都是安全的
 ensure_self_cert() {
   _cn=$1
   _crt=$2
   _key=$3
   [ -n "$_crt" ] && [ -n "$_key" ] || return 0
+  if ! cn_ok "$_cn"; then
+    log "! 自签证书 CN 非法，已跳过：$_cn（只允许域名或 IP）"
+    return 1
+  fi
   [ -f "$_crt" ] && [ -f "$_key" ] && return 0
   if ! command -v openssl >/dev/null 2>&1; then
     log "! 缺少 openssl，无法为 $_cn 生成自签证书（apk add openssl / apt install openssl）"
@@ -485,6 +502,10 @@ ensure_acme_cert() {
   _crt=$2
   _key=$3
   [ -n "$_crt" ] || return 0
+  if ! cn_ok "$_cn"; then
+    log "! ACME 证书 CN 非法，已跳过：$_cn（只允许域名或 IP）"
+    return 1
+  fi
   [ -f "$_crt" ] && return 0
 
   # CA 账号邮箱：agent.env 可指定 ACME_EMAIL，缺省 admin@<证书域名>。
@@ -1382,16 +1403,26 @@ apply_bundle() {
 
 apply_services() {
   # 证书先就位，否则 Xray 起来会因为找不到证书而失败
-  for _item in ${NP_SELF_CERTS:-}; do
-    _cn=${_item%%|*}
-    _rest=${_item#*|}
-    ensure_self_cert "$_cn" "${_rest%%|*}" "${_rest#*|}"
-  done
-  for _item in ${NP_ACME_CERTS:-}; do
-    _cn=${_item%%|*}
-    _rest=${_item#*|}
-    ensure_acme_cert "$_cn" "${_rest%%|*}" "${_rest#*|}"
-  done
+  #
+  # 逐行读：面板下发的清单是「一条一行」，字段用 | 分隔。
+  # 以前是空格分隔 + `for item in $NP_SELF_CERTS` 拆词，CN 里带一个空格就会把
+  # 一条记录拆成两条，后半个 CN 会被当成证书路径交给 openssl（root 权限建文件）。
+  #
+  # 用 heredoc 重定向而不是 `printf | while`：管道里的 while 跑在子 shell，
+  # ensure_acme_cert 设置的 RC_OK / RC_ERR 会随子 shell 一起丢掉，
+  # 回执就变成「一切正常」，面板上看不出证书没签下来。
+  while IFS='|' read -r _cn _crt _key; do
+    [ -n "$_cn" ] || continue
+    ensure_self_cert "$_cn" "$_crt" "$_key"
+  done <<NP_SELF_CERTS_EOF
+${NP_SELF_CERTS:-}
+NP_SELF_CERTS_EOF
+  while IFS='|' read -r _cn _crt _key; do
+    [ -n "$_cn" ] || continue
+    ensure_acme_cert "$_cn" "$_crt" "$_key"
+  done <<NP_ACME_CERTS_EOF
+${NP_ACME_CERTS:-}
+NP_ACME_CERTS_EOF
   # 自签证书就位后立刻算指纹：首轮生成的证书当轮回执就能把指纹带给面板，
   # 面板订阅从 allowInsecure 切到 pcs 不用等第二轮
   collect_selfcert_fps

@@ -26,11 +26,74 @@ const { APP_VERSION } = require('./config');
 const { baseUrl } = require('./util');
 const { usersForNode, sweepRenewals } = require('./users');
 const { readAgentSource } = require('./deploy-scripts');
+const { isHostName } = require('../public/js/hosts');
 
 const logAgent = logger.create('agent');
 
+/**
+ * 证书 CN 的兜底清洗。
+ *
+ * 优先用用户填的 selfCN / SNI（保存时已按主机名卡过），都没有才退回 Host 头 ——
+ * 而 host 是不校验的自由文本（有人填 CDN 的假域名、有人填中文），所以这里再判一次。
+ * 这个值会被拼进 agent 的 shell 当 openssl 的 CN，不合格就换占位符：
+ * 自签证书的 CN 本来就只影响「客户端看到的证书名」，不影响连通性。
+ */
+function certCN(n) {
+  for (const v of [n.selfCN, n.sni, n.host]) {
+    const s = String(v || '').trim();
+    if (s && (isHostName(s) || net.isIP(s) !== 0)) return s;
+  }
+  return 'nodepanel.local';
+}
+
 /** 已告警过的非法地址：同一条值只报一次，避免每轮心跳刷一行 */
 const badIpHint = new Map();
+
+/**
+ * 心跳类写入的合并落盘。
+ *
+ * 每台机器 60 秒一轮，而一轮里 agent 会连着打 config / bundle / report / receipt 四个接口，
+ * 每个都改一点内存（lastSeen、上报 IP、agentVersion、回执状态）。store.save() 是
+ * 「整份内存快照 vs 数据库」的全表 diff + 一次 SQLite 事务，10 台机器同时在线时
+ * 这些写会放大到每秒好几次 —— 而它们落的都是「晚一秒完全没关系」的字段。
+ *
+ * 所以这里只标脏，1 秒后统一写一次。真要立刻落盘的地方（用户、节点、计费）仍然直接
+ * 调 store.save()，它们大多在 store.tx() 里，那条路径必须同步 —— 它决定事务提交什么。
+ *
+ * 进程退出前必须 flushSaves()（server.js 的退出钩子里调），否则最后 1 秒的心跳会丢。
+ */
+let saveTimer = null;
+
+function saveSoon() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      store.save();
+    } catch (err) {
+      // 定时器里抛异常会直接打死进程；这里只记日志，下一轮心跳会再试
+      logAgent.error('延迟落盘失败', { err });
+    }
+  }, 1000);
+  // 不让这个定时器把进程吊住：测试里 require 了本模块也会起定时器
+  if (saveTimer.unref) saveTimer.unref();
+}
+
+/** 立刻把挂起的写入落盘 */
+function flushSaves() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  store.save();
+}
+
+// 兜底：不是所有退出路径都走 SIGINT/SIGTERM（未捕获异常、测试里直接 process.exit）。
+// store.close() 之后再调 save() 是空操作，所以这里重复冲一次没有副作用。
+process.on('exit', () => {
+  try {
+    flushSaves();
+  } catch { /* 退出路径上不再抛 */ }
+});
 
 /**
  * 记录 agent 上报的公网 IP（仅自动模式下生效，手填域名不会被覆盖）。
@@ -173,7 +236,7 @@ function buildAgentPayload(scope) {
       mode,
       certPem: n.certPem || '',
       keyPem: n.keyPem || '',
-      cn: n.selfCN || n.sni || n.host || 'nodepanel.local',
+      cn: certCN(n),
       certPath: paths.certPath,
       keyPath: paths.keyPath,
     });
@@ -226,7 +289,7 @@ function agentConfig(req, res, params, body, session, ctx) {
   }
 
   const payload = buildAgentPayload(scope);
-  store.save();
+  saveSoon(); // 只是 agentVersion，没必要为此同步写一次库
   sendJson(res, 200, payload);
 }
 
@@ -280,6 +343,8 @@ function agentReport(req, res, params, body, session, ctx) {
   }
 
   if (bytes > 0) store.addDaily(bytes);
+  // 这里不合并：v1 报的是「增量」，丢一次就永久丢量（v2 有水位可以在下一轮补）。
+  // 走的都是老 agent，量很小，不值得为它冒计费误差
   store.save();
 
   // 有数据却一条都没匹配上：说明 agent 报的 email 在库里找不到（用户被删 / 配置没下发到这台机器），
@@ -637,7 +702,7 @@ function agentReceipt(req, res, params, body, session, ctx) {
     logAgent.debug('回执无变化', ctxFields);
   }
 
-  store.save();
+  saveSoon();
   sendJson(res, 200, { ok: true, desired: desiredHashOf(scope) });
 }
 
@@ -663,7 +728,7 @@ function agentBundleHandler(req, res, params, body, session, ctx) {
   }
 
   const payload = buildAgentPayload(scope);
-  store.save(); // 落盘 lastSeen / 上报的 IP
+  saveSoon(); // 落盘 lastSeen / 上报的 IP
 
   // 带上本地 hash 来问：没变就直接回一行，省掉整包传输
   const known = ctx.query.get('hash');
@@ -728,7 +793,7 @@ function agentScript(req, res, params, body, session, ctx) {
   } catch {
     return sendText(res, 500, '#ERROR agent source missing');
   }
-  store.save(); // 把这次心跳的 lastSeen 落盘
+  saveSoon(); // 把这次心跳的 lastSeen 落盘
   sendText(res, 200, src, 'text/x-shellscript; charset=utf-8', { 'Cache-Control': 'no-store' });
 }
 
@@ -749,4 +814,5 @@ module.exports = {
   agentBundleHandler,
   demoTick,
   agentScript,
+  flushSaves,
 };

@@ -111,6 +111,14 @@ function getSettings(req, res) {
 function updateSettings(req, res, params, body) {
   const s = store.db().settings;
 
+  // 两段式：先把整份改动算进影子对象 next，全部校验通过才一次性写回 s。
+  //
+  // 以前是「边校验边改 s」：只要后面某个字段报 400，前面已经改过的字段就留在内存里了。
+  // store.save() 是全表 diff，下一次任何地方保存都会把这半套配置写进库；
+  // 更糟的是 applySubNameTemplates() 早就把命名模板推进 lib/sub 的运行时状态了 ——
+  // 表现成「设置提示保存失败，但订阅里的节点名已经变了」。
+  const next = { ...s };
+
   // 先校验再落盘：结算日放在最前面，避免校验失败时前面的字段已改了内存对象
   if (body.billingDay !== undefined) {
     const n = Math.floor(Number(body.billingDay) || 0);
@@ -118,14 +126,13 @@ function updateSettings(req, res, params, body) {
     if (!Number.isFinite(n) || n < 0 || n > 28) {
       return sendJson(res, 400, { error: '结算日只能是 1–28，或填 0 关闭' });
     }
-    s.billingDay = String(n);
+    next.billingDay = String(n);
   }
 
   // 先校验再落盘：域名填错时整次保存回滚，不留半套配置
-  let nextSubBase = s.subBase;
   if (body.subBase !== undefined) {
     try {
-      nextSubBase = normalizeSubBase(body.subBase);
+      next.subBase = normalizeSubBase(body.subBase);
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
@@ -134,12 +141,14 @@ function updateSettings(req, res, params, body) {
   // 在线订阅转换：转换地址与模板地址都只是拼进链接里给用户复制，
   // 面板自己不会去请求它们 —— 所以「填错也能存」是危险的（用户点了打不开），
   // 这里只做到「必须是合法的 http(s) 地址」，可达性留给用户自己点一下验证
-  let nextConverter = s.subConverterUrl || '';
-  let nextTemplate = s.subTemplateUrl || '';
   if (body.subConverterUrl !== undefined || body.subTemplateUrl !== undefined) {
     try {
-      if (body.subConverterUrl !== undefined) nextConverter = normalizeHttpUrl(body.subConverterUrl, '订阅转换地址');
-      if (body.subTemplateUrl !== undefined) nextTemplate = normalizeHttpUrl(body.subTemplateUrl, '模板地址');
+      if (body.subConverterUrl !== undefined) {
+        next.subConverterUrl = normalizeHttpUrl(body.subConverterUrl, '订阅转换地址');
+      }
+      if (body.subTemplateUrl !== undefined) {
+        next.subTemplateUrl = normalizeHttpUrl(body.subTemplateUrl, '模板地址');
+      }
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
@@ -147,12 +156,12 @@ function updateSettings(req, res, params, body) {
 
   // 模板定时同步：改了开关/同步日/钟点/地址就当场拉一次，否则用户要傻等一周
   // 才看得出有没有生效（模板是异步替换的，界面上的「上次同步」就是唯一反馈）
-  let tplSyncTouched = nextTemplate !== (s.subTemplateUrl || '');
+  let tplSyncTouched = (next.subTemplateUrl || '') !== (s.subTemplateUrl || '');
   if (body.subTemplateSyncDay !== undefined) {
     const day = normTplSyncDay(body.subTemplateSyncDay);
     if (!day) return sendJson(res, 400, { error: '同步周期只能是「每天」或周一–周日' });
     if (day !== (normTplSyncDay(s.subTemplateSyncDay) || '1')) {
-      s.subTemplateSyncDay = day;
+      next.subTemplateSyncDay = day;
       tplSyncTouched = true;
     }
   }
@@ -160,15 +169,15 @@ function updateSettings(req, res, params, body) {
     const hour = normTplSyncHour(body.subTemplateSyncHour);
     if (hour < 0) return sendJson(res, 400, { error: '同步时刻只能是 0–23 点' });
     if (hour !== normTplSyncHour(s.subTemplateSyncHour)) {
-      s.subTemplateSyncHour = String(hour);
+      next.subTemplateSyncHour = String(hour);
       tplSyncTouched = true;
     }
   }
   if (body.subTemplateAutoSync !== undefined) {
     const on = body.subTemplateAutoSync === true || body.subTemplateAutoSync === '1' || body.subTemplateAutoSync === 'true';
-    const next = on ? '1' : '0';
-    if (next !== (s.subTemplateAutoSync || '0')) {
-      s.subTemplateAutoSync = next;
+    const onOff = on ? '1' : '0';
+    if (onOff !== (s.subTemplateAutoSync || '0')) {
+      next.subTemplateAutoSync = onOff;
       tplSyncTouched = true;
     }
   }
@@ -188,39 +197,39 @@ function updateSettings(req, res, params, body) {
     httpsChanged = nextCertId !== (s.httpsCertId || '');
   }
 
-  if (body.siteName !== undefined) s.siteName = String(body.siteName).trim() || s.siteName;
-  if (body.notice !== undefined) s.notice = String(body.notice);
-  s.subBase = nextSubBase;
-  s.subConverterUrl = nextConverter;
-  s.subTemplateUrl = nextTemplate;
-  if (httpsChanged) s.httpsCertId = nextCertId;
+  if (body.siteName !== undefined) next.siteName = String(body.siteName).trim() || s.siteName;
+  if (body.notice !== undefined) next.notice = String(body.notice);
+  if (httpsChanged) next.httpsCertId = nextCertId;
 
   // 订阅显示：命名模板 + 首行信息节点。模板长度设上限 —— 它会被拼进
   // 每个节点的名字里，几百字的长模板能把客户端列表撑爆。
   let subDisplayChanged = false;
   if (body.nameTplDirect !== undefined) {
-    s.nameTplDirect = String(body.nameTplDirect).trim().slice(0, 80);
+    next.nameTplDirect = String(body.nameTplDirect).trim().slice(0, 80);
     subDisplayChanged = true;
   }
   if (body.nameTplRelay !== undefined) {
-    s.nameTplRelay = String(body.nameTplRelay).trim().slice(0, 80);
+    next.nameTplRelay = String(body.nameTplRelay).trim().slice(0, 80);
     subDisplayChanged = true;
   }
   if (body.subInfoNode !== undefined) {
-    s.subInfoNode = body.subInfoNode ? '1' : '0';
+    next.subInfoNode = body.subInfoNode ? '1' : '0';
     subDisplayChanged = true;
   }
-  if (subDisplayChanged) applySubNameTemplates();
 
   // Clash 订阅模板：校验通过才落盘。坏模板不会当场坏事，只会让客户端
   // 「配置加载失败」，用户完全无从下手，所以宁可在这里 400 拦掉
-  let nextClashTpl = s.clashTemplate || '';
   if (body.clashTemplate !== undefined) {
     const r = sub.parseTemplate(body.clashTemplate);
     if (!r.ok) return sendJson(res, 400, { error: '订阅模板有误：' + r.error });
-    nextClashTpl = String(body.clashTemplate || '').trim();
+    next.clashTemplate = String(body.clashTemplate || '').trim();
   }
-  s.clashTemplate = nextClashTpl;
+
+  // —— 到这里所有校验都过了，开始落地 ——
+  Object.assign(s, next);
+  // 命名模板要等 s 落定之后再推：applySubNameTemplates 读的是 settings 对象，
+  // 早一步调用就会把「没保存成功的那份」推给 lib/sub
+  if (subDisplayChanged) applySubNameTemplates();
 
   store.save();
   // 保存后立刻拉一次：模板是异步替换的，界面上的「上次同步」是唯一反馈，
