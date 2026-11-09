@@ -699,7 +699,7 @@ async function main() {
     void bkPath;
     // 备份实际落在面板数据目录下的 backups/，用接口反查绝对路径
     const bkList = await call('/api/backups');
-    const bkAbs = path.join(bkList.data.dir, bkFile);
+    const bkAbs = path.resolve(path.join(bkList.data.dir, bkFile));
     ok('备份文件在磁盘上', fs.existsSync(bkAbs), bkAbs);
 
     await click('.nav-item[data-view="settings"]', cdp);
