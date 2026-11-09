@@ -56,8 +56,24 @@ for (const name of fs.readdirSync(DIST)) {
 fs.copyFileSync(path.join(DEMO, 'demo.js'), path.join(DIST, 'demo.js'));
 copyDir(path.join(DEMO, 'api'), path.join(DIST, 'api'));
 
+// 快照是录出来的字面量，重录不勤就会比 package.json 落后（0.1.33 就漏了两处）。
+// 构建时按唯一来源兜底注入：仓库里忘了同步，Pages 上显示的版本号也仍然正确。
+const appVersion = require('../scripts/version').readVersion(ROOT);
+let synced = 0;
+for (const name of fs.readdirSync(path.join(DIST, 'api'))) {
+  if (!name.endsWith('.json')) continue;
+  const file = path.join(DIST, 'api', name);
+  const text = fs.readFileSync(file, 'utf8');
+  if (!/"appVersion"\s*:/.test(text)) continue;
+  const next = text.replace(/("appVersion"\s*:\s*")[^"]+(")/g, `$1${appVersion}$2`);
+  if (next !== text) {
+    fs.writeFileSync(file, next);
+    synced++;
+  }
+}
+
 // 关掉 Jekyll：否则以下划线开头的文件会被吞掉，也省掉一次无谓的构建
 fs.writeFileSync(path.join(DIST, '.nojekyll'), '', 'utf8');
 
 const count = fs.readdirSync(path.join(DIST, 'api')).length;
-console.log(`演示站构建完成：${pages} 个页面 · ${count} 份数据 → dist/`);
+console.log(`演示站构建完成：${pages} 个页面 · ${count} 份数据 · ${synced} 份快照版本号对齐 v${appVersion} → dist/`);

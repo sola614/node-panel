@@ -1529,6 +1529,31 @@ PR 只跑测试和构建，不推送。
       APP_VERSION=${{ steps.pkg.outputs.version }}
 ```
 
+### 版本号维护
+
+写版本号的地方不止一处，但**只有 `package.json` 的 `version` 需要人决定**：
+
+| 位置 | 谁读它 | 怎么维护 |
+| --- | --- | --- |
+| `package.json` | 运行时 `APP_VERSION`、`/api/health`、侧栏、镜像 tag / label | **唯一来源**，发版只定这一个 |
+| `agent/agent.sh` 的 `VERSION` | 节点机判断「面板升级了、要不要重新下发自己」 | 脚本同步 |
+| `demo/api/me.json`、`demo/api/notify-channels.json` 的 `appVersion` | 静态演示站 | 脚本同步 + 构建时兜底注入 |
+| `CHANGELOG.md` 的 `## [x.y.z]` | 人 | 手工写，检查器会提醒 |
+
+agent 跑在没有 `package.json` 的节点机上、演示站是纯静态站，这两类位置必须自带字面量，
+没法运行时读取。所以做法不是「消除副本」，而是**一份清单 + 一条命令 + 一道校验**：
+
+```bash
+npm run version:check                     # 查所有副本是否一致（CI 第一道也跑它）
+node scripts/version.js 0.1.34 --dry-run  # 预览将改动的文件，不落盘
+npm run version:set -- 0.1.34             # 一次写全；之后补 CHANGELOG 段落
+```
+
+清单收在 `scripts/version.js`：`test/version.js` 用它校验、`demo/build.js` 用它兜底，
+以后新增要带版本号的文件只改这一处。脚本**不会自动递增**——版本号按约定必须先确认，
+且一次发版只升末位一位。检查失败时会直接打印修复命令，不必先读文档。
+完整的发版顺序（版本确认、CHANGELOG、单提交、推送授权）见 `CONTRIBUTING.md`「发版流程」。
+
 ### 升级到新版本
 
 版本线是 `0.1.x`，每次发布递增末位。升级只换镜像，**数据不用动**。
