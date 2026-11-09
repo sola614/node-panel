@@ -564,6 +564,39 @@ const runAgent = (box) =>
     console.log('  · 本机没有 openssl，跳过指纹用例');
   }
 
+  /* --------------- 11b. 证书清单的两种格式（回滚兼容） --------------- */
+  // 新面板下发「一条一行」，老面板下发「空格分隔的一整行」。
+  // agent 必须两种都能正确拆：拆错时第 3 段会吞掉下一条记录的路径，openssl 把私钥
+  // 写到怪文件名（还会顺手 mkdir 出一串目录），而两个文件此后都存在、
+  // ensure_self_cert 直接跳过 —— 证书永久不配对，只能人工删文件。
+  // 这个场景就是「升级后又回滚面板」：新 agent 先跑一轮老格式，再自更新回老脚本。
+  console.log('\n— 证书清单格式兼容 —');
+  if (opensslOk) {
+    const box12 = makeSandbox(panel.port, PKG_VERSION);
+    const d1 = path.join(box12.dir, 'c1');
+    const d2 = path.join(box12.dir, 'c2');
+    const c1 = pos(path.join(d1, 'fullchain.pem'));
+    const k1 = pos(path.join(d1, 'privkey.pem'));
+    const c2 = pos(path.join(d2, 'fullchain.pem'));
+    const k2 = pos(path.join(d2, 'privkey.pem'));
+    const st12 = path.join(box12.stateDir, 'state.env');
+    fs.writeFileSync(
+      st12,
+      read(st12).replace(/NP_SELF_CERTS=.*/, `NP_SELF_CERTS='a.local|${c1}|${k1} b.local|${c2}|${k2}'`),
+    );
+    const r12 = await runAgent(box12);
+    ok('老面板的空格分隔格式：两条记录各自落到自己的路径',
+      r12.status === 0 && fs.existsSync(c1) && fs.existsSync(k1) && fs.existsSync(c2) && fs.existsSync(k2),
+      `c1=${fs.existsSync(c1)} k1=${fs.existsSync(k1)} c2=${fs.existsSync(c2)} k2=${fs.existsSync(k2)}`);
+    const strays = [
+      ...(fs.existsSync(d1) ? fs.readdirSync(d1) : []),
+      ...(fs.existsSync(d2) ? fs.readdirSync(d2) : []),
+    ].filter((n) => n !== 'fullchain.pem' && n !== 'privkey.pem');
+    ok('老格式下不产生错位的怪文件/怪目录', strays.length === 0, strays.join(' | '));
+  } else {
+    console.log('  · 本机没有 openssl，跳过格式兼容用例');
+  }
+
   /* ------------------- 流量上报对账（v2：累计 + 序号） ------------------- */
   console.log('\n— 流量上报对账（v2） —');
   {

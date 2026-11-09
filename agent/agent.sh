@@ -1401,26 +1401,43 @@ apply_bundle() {
   return 1
 }
 
+# 逐条应用一份证书清单（$1 = 处理函数名，清单由 stdin 提供）。
+#
+# 清单格式是「一条一行，字段用 | 分隔」（面板侧 lib/agentBundle.js 生成）。
+# 但 agent 的输入不完全受面板控制：**回滚面板版本**时，老面板下发的还是
+# 「空格分隔的一整行」。那种情况下 IFS='|' 只能拆出 3 段，第 3 段会把后面所有
+# 记录的路径一起吞掉 —— openssl 于是把证书覆盖成新的一对、私钥写到怪路径，
+# 而这两个文件此后都存在，ensure_*_cert 直接跳过，**证书永久不配对**，
+# 得人工删文件才恢复。所以这里认「一条记录只应有 3 段」：第 3 段里还出现 |
+# 就说明这一行挤了多条，退回按空白拆词（与旧 agent 行为一致）。
+#
+# 用 heredoc 而不是 `printf | while`：管道里的 while 跑在子 shell，
+# ensure_acme_cert 设置的 RC_OK / RC_ERR 会随子 shell 一起丢掉，
+# 回执就变成「一切正常」，面板上看不出证书没签下来。
+apply_cert_list() {
+  _handler=$1
+  while IFS='|' read -r _cn _crt _key; do
+    [ -n "$_cn" ] || continue
+    case "$_key" in
+      *'|'*)
+        _line="$_cn|$_crt|$_key"
+        for _rec in $_line; do
+          _rest=${_rec#*|}
+          "$_handler" "${_rec%%|*}" "${_rest%%|*}" "${_rest#*|}"
+        done
+        continue
+        ;;
+    esac
+    "$_handler" "$_cn" "$_crt" "$_key"
+  done
+}
+
 apply_services() {
   # 证书先就位，否则 Xray 起来会因为找不到证书而失败
-  #
-  # 逐行读：面板下发的清单是「一条一行」，字段用 | 分隔。
-  # 以前是空格分隔 + `for item in $NP_SELF_CERTS` 拆词，CN 里带一个空格就会把
-  # 一条记录拆成两条，后半个 CN 会被当成证书路径交给 openssl（root 权限建文件）。
-  #
-  # 用 heredoc 重定向而不是 `printf | while`：管道里的 while 跑在子 shell，
-  # ensure_acme_cert 设置的 RC_OK / RC_ERR 会随子 shell 一起丢掉，
-  # 回执就变成「一切正常」，面板上看不出证书没签下来。
-  while IFS='|' read -r _cn _crt _key; do
-    [ -n "$_cn" ] || continue
-    ensure_self_cert "$_cn" "$_crt" "$_key"
-  done <<NP_SELF_CERTS_EOF
+  apply_cert_list ensure_self_cert <<NP_SELF_CERTS_EOF
 ${NP_SELF_CERTS:-}
 NP_SELF_CERTS_EOF
-  while IFS='|' read -r _cn _crt _key; do
-    [ -n "$_cn" ] || continue
-    ensure_acme_cert "$_cn" "$_crt" "$_key"
-  done <<NP_ACME_CERTS_EOF
+  apply_cert_list ensure_acme_cert <<NP_ACME_CERTS_EOF
 ${NP_ACME_CERTS:-}
 NP_ACME_CERTS_EOF
   # 自签证书就位后立刻算指纹：首轮生成的证书当轮回执就能把指纹带给面板，
