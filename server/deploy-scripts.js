@@ -10,22 +10,60 @@
  * 不 require server.js —— 反向依赖会让这次拆分失去意义。
  */
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const store = require('../lib/store');
+// 主机名校验的唯一实现在 public/js/hosts.js（浏览器与 Node 共用，test/hosts.js 锁两侧一致）
+const { isValidHost } = require('../public/js/hosts');
 
 // 与 server.js 指向同一文件；版本号仍以 package.json 为唯一来源
 const AGENT_FILE = path.join(__dirname, '..', 'agent', 'agent.sh');
 const APP_VERSION = require('../package.json').version;
 
-function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc }) {
-  // 面板地址来自请求头，插进 shell 之前先去掉能掀起风浪的字符
-  const safeUrl = String(panelUrl || '').replace(/["'`\\\s$]/g, '');
-  // 名称会进双引号变量：换行撕开语句，引号/反引号/$ 能跑命令
-  const safeLabel = String(label || '')
+/**
+ * 会进 shell 的文本：换行撕开注释与语句，引号 / 反引号 / $ 能跑命令。
+ *
+ * 三个生成器（install / uninstall / relay）都必须走这里。0.1.33 里
+ * buildInstallScript 做了清洗、buildRelayScript 完全没做 —— 同一个文件两套标准，
+ * 就是注入面的来源。`siteName` 这类"看着无害"的字段也一样：它进的是注释行，
+ * 但一个换行就能跳出注释开始执行。
+ */
+function shellSafe(v) {
+  return String(v == null ? '' : v)
     .replace(/[\r\n]+/g, ' ')
     .replace(/["`\\$]/g, '');
+}
+
+/** 面板地址：比 shellSafe 多去一层单引号与空白（URL 里本就不该出现） */
+function urlSafe(v) {
+  return String(v || '').replace(/["'`\\\s$]/g, '');
+}
+
+/**
+ * 中转落地地址：只接受裸 IPv4 或域名。
+ *
+ * 它会被拼进 `iptables -t nat -j DNAT --to-destination`，这个位置必须是一个纯
+ * 主机名/IP —— 带 scheme、端口、路径、引号都会让规则失效或被注入。
+ *
+ * IPv6 暂时拒绝：脚本用的是 iptables（v4），v6 要 ip6tables 加 `[addr]:port`
+ * 写法，半支持比不支持更糟（生成一份一定跑不通的脚本，用户还以为是网络问题）。
+ */
+function relayTarget(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return '';
+  if (net.isIPv4(v)) return v;
+  if (net.isIPv6(v)) return '';
+  if (!/^[A-Za-z0-9.-]+$/.test(v)) return '';
+  return isValidHost(v, v) ? v : '';
+}
+
+function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc }) {
+  // 面板地址来自请求头，插进 shell 之前先去掉能掀起风浪的字符
+  const safeUrl = urlSafe(panelUrl);
+  // 名称会进双引号变量：换行撕开语句，引号/反引号/$ 能跑命令
+  const safeLabel = shellSafe(label);
   return `#!/bin/sh
-# ${store.db().settings.siteName} · 节点部署脚本
+# ${shellSafe(store.db().settings.siteName)} · 节点部署脚本
 # 目标：${safeLabel}
 # 生成时间：${new Date().toISOString()}
 #
@@ -663,9 +701,9 @@ function readAgentSource() {
  */
 function buildUninstallScript({ label }) {
   // 同上：名称里的换行会把注释行撕开
-  const safeLabel = String(label || '').replace(/[\r\n]+/g, ' ');
+  const safeLabel = shellSafe(label);
   return `#!/bin/sh
-# ${store.db().settings.siteName} · 节点卸载脚本
+# ${shellSafe(store.db().settings.siteName)} · 节点卸载脚本
 # 目标：${safeLabel}
 # 生成时间：${new Date().toISOString()}
 #
@@ -884,7 +922,10 @@ echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即
  * 且流量仍记在落地节点上（计费不受影响）。
  */
 function buildRelayScript({ to, port, proto = 'both', label = '' }) {
-  const target = String(to || '').trim();
+  // 落地地址与标签都来自 query：这里再洗一遍是纵深防御，真正的白名单校验在
+  // server/servers.js 的 relayScript（那里能回一句看得懂的 400）
+  const target = shellSafe(to);
+  const safeLabel = shellSafe(label);
   const listenPort = Number(port) || 443;
   const protocols = proto === 'both' ? ['tcp', 'udp'] : [proto];
 
@@ -893,8 +934,8 @@ function buildRelayScript({ to, port, proto = 'both', label = '' }) {
   );
 
   return `#!/usr/bin/env bash
-# ${store.db().settings.siteName} · 中转部署脚本
-# ${label ? label + '\n# ' : ''}把本机 \${LISTEN_PORT} 的流量转发到 \${TARGET_HOST}:\${TARGET_PORT}
+# ${shellSafe(store.db().settings.siteName)} · 中转部署脚本
+# ${safeLabel ? safeLabel + '\n# ' : ''}把本机 \${LISTEN_PORT} 的流量转发到 \${TARGET_HOST}:\${TARGET_PORT}
 # 生成时间：${new Date().toISOString()}
 # 用法：sh relay.sh      （需要 root：直接以 root 执行，或先 su -；脚本不依赖 sudo）
 set -euo pipefail
@@ -963,4 +1004,6 @@ module.exports = {
   readAgentSource,
   buildUninstallScript,
   buildRelayScript,
+  relayTarget,
+  shellSafe,
 };

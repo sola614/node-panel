@@ -22,7 +22,7 @@ const {
   PORT, HOST, TLS_PORT, HTTP_DISABLE, SLOW_MS, PUBLIC_DIR, STARTED_AT, APP_VERSION,
 } = require('./server/config');
 const { getSession } = require('./server/tokens');
-const { sendJson, sendText, readBody, serveFile } = require('./server/http-util');
+const { sendJson, sendText, readBody, serveFile, RAW_BODY_LIMIT } = require('./server/http-util');
 // 主机名校验的唯一实现在 public/js/hosts.js（浏览器与 Node 共用，test/hosts.js 锁两侧一致）。
 // 这里只用 isValidHost：301 的 Location 要拼 Host 头，非法值必须挡掉（防开放重定向）。
 const { isValidHost } = require('./public/js/hosts');
@@ -184,14 +184,40 @@ const ROUTES = [
   ['POST', '/api/sub/logout', subLogout, false],
 ];
 
+/**
+ * 允许 128 MB 请求体的路由白名单。
+ *
+ * 这个集合必须是显式的：限额绑在路由上，而不是绑在客户端可控的 Content-Type 上。
+ * 目前只有「恢复备份」要上传整库，其余接口（尤其是免登录的那几条）没有理由吃大体积。
+ */
+const RAW_UPLOAD_PATHS = new Set(['/api/backups/restore']);
+
+/**
+ * 解码路径参数。
+ *
+ * 畸形百分号编码（`%E0%A4%A`）会让 decodeURIComponent 抛 URIError。以前这个异常
+ * 一路冒到最外层被当成 500，于是任何扫描器随手一个坏 URL 就能在日志里制造一条
+ * error 级"请求异常"，把真故障盖掉。解码失败等同于"路径不匹配"，回 404 才对。
+ */
+function safeDecode(seg) {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return null;
+  }
+}
+
 function matchPath(pattern, pathname) {
   const p = pattern.split('/');
   const s = pathname.split('/');
   if (p.length !== s.length) return null;
   const params = {};
   for (let i = 0; i < p.length; i++) {
-    if (p[i].startsWith(':')) params[p[i].slice(1)] = decodeURIComponent(s[i]);
-    else if (p[i] !== s[i]) return null;
+    if (p[i].startsWith(':')) {
+      const v = safeDecode(s[i]);
+      if (v === null) return null;
+      params[p[i].slice(1)] = v;
+    } else if (p[i] !== s[i]) return null;
   }
   return params;
 }
@@ -290,7 +316,9 @@ async function requestHandler(req, res) {
 
       let body = {};
       if (method !== 'GET' && method !== 'DELETE') {
-        body = await readBody(req);
+        // 只有恢复备份需要整库上传（128 MB）；其余路由 —— 包括全部免登录 POST ——
+        // 一律 1.5 MB，否则一个 application/octet-stream 头就能把限额放大 85 倍
+        body = await readBody(req, RAW_UPLOAD_PATHS.has(pattern) ? RAW_BODY_LIMIT : 0);
       }
       return await reqContext.run({ session, req, rid }, () =>
         handler(req, res, params, body, session, { req, query: url.searchParams, rid }),

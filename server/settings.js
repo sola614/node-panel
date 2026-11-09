@@ -290,11 +290,39 @@ async function fetchTemplateConfig(raw) {
     if (!resp.ok) {
       return { ok: false, error: `模板地址返回 HTTP ${resp.status}` };
     }
-    const buf = Buffer.from(await resp.arrayBuffer());
-    if (buf.length > subTemplate.MAX_BYTES) {
-      return { ok: false, error: `模板文件太大（${Math.round(buf.length / 1024)} KB，上限 ${subTemplate.MAX_BYTES / 1024} KB）` };
+    const tooBig = () => ({
+      ok: false,
+      error: `模板文件太大（上限 ${subTemplate.MAX_BYTES / 1024} KB）`,
+    });
+    // 先看声明长度，再流式读。以前是 arrayBuffer() 整包进内存之后才判大小 ——
+    // 一个慢慢吐 2 GB 的地址能在 15 秒超时触发之前就把堆吃光，而这个拉取是定时任务，
+    // 意味着每 5 分钟重演一次。
+    const declared = Number(resp.headers.get('content-length') || 0);
+    if (declared > subTemplate.MAX_BYTES) return tooBig();
+    if (!resp.body) {
+      // 理论上 fetch 一定给 body；真没有时退回旧路径（仍然有上限检查）
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length > subTemplate.MAX_BYTES) return tooBig();
+      text = buf.toString('utf8');
+    } else {
+      const chunks = [];
+      let size = 0;
+      const reader = resp.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > subTemplate.MAX_BYTES) {
+          ctrl.abort();
+          try {
+            await reader.cancel();
+          } catch { /* 连接已经断了 */ }
+          return tooBig();
+        }
+        chunks.push(Buffer.from(value));
+      }
+      text = Buffer.concat(chunks).toString('utf8');
     }
-    text = buf.toString('utf8');
   } catch (err) {
     const msg = err && err.name === 'AbortError' ? '请求超时（15 秒）' : (err && err.message) || '未知错误';
     return { ok: false, error: `拉取模板失败：${msg}` };

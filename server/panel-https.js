@@ -93,6 +93,7 @@ function syncHttpsServer(onSettled) {
 
   // 没有可用证书：关掉监听（设置里清空 httpsCertId 走这里）
   if (!creds) {
+    const wasReady = state.ready;
     if (state.server) {
       state.server.close(() => log.warn('HTTPS 证书已被清空，监听已关闭'));
     }
@@ -101,6 +102,10 @@ function syncHttpsServer(onSettled) {
     state.ready = false;
     state.error = '';
     settle(false);
+    // 纯 HTTPS 部署（PANEL_HTTP_DISABLE=1）里，关掉 HTTPS 就等于关掉唯一入口。
+    // 这里必须和 error 分支一样把 HTTP 接回来 —— 否则管理员在设置页清空证书
+    // 这个看起来无害的动作，会让面板当场变成「没有任何监听」的进程，只能进容器救。
+    if (wasReady) hooks.restoreHttpIfNeeded();
     return;
   }
 

@@ -32,6 +32,9 @@ jobs:
           node test/dockerfile.js
           node test/renew.js
           node test/security.js
+          # 生成物回读：部署/卸载/中转脚本过 bash -n，YAML 订阅交给真解析器读回来。
+          # 这两类产物出错时面板不报错，只在用户机器上表现为「脚本跑一半」「少一个节点」
+          node test/generators.js
 
       # 通知通道（假 SMTP + 假 HTTP）与 agent 自更新（假面板 + 真 agent.sh）
       - name: 通知与 agent 测试

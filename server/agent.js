@@ -10,6 +10,7 @@
  * 于是 nodes → agent → users 单向。别在这里 require ../server.js。
  */
 
+const net = require('net');
 const path = require('path');
 const store = require('../lib/store');
 const xray = require('../lib/xray');
@@ -28,10 +29,31 @@ const { readAgentSource } = require('./deploy-scripts');
 
 const logAgent = logger.create('agent');
 
-/** 记录 agent 上报的公网 IP（仅自动模式下生效，手填域名不会被覆盖） */
+/** 已告警过的非法地址：同一条值只报一次，避免每轮心跳刷一行 */
+const badIpHint = new Map();
+
+/**
+ * 记录 agent 上报的公网 IP（仅自动模式下生效，手填域名不会被覆盖）。
+ *
+ * 这个值会直接成为订阅里的节点地址，再经 uriHost() 拼进分享链接 —— 那里不做
+ * 任何编码（只处理 IPv6 方括号），所以一个带 @ / ? / # 的字符串足以把
+ * `vless://uuid@host:443?...` 解析到别的主机。合法 agent 只发 IP
+ * （agent.sh 的 detect_ip 已经过滤过），这里按字面 IP 卡一道不会误伤。
+ */
 function applyReportedIp(scope, ip) {
   ip = String(ip || '').trim();
   if (!ip) return;
+  if (!net.isIP(ip)) {
+    if (badIpHint.get(scope.id) !== ip) {
+      badIpHint.set(scope.id, ip);
+      logAgent.warn('agent 上报的地址不是合法 IP，已忽略', {
+        scope: scope.name,
+        ip: ip.slice(0, 64),
+      });
+    }
+    return;
+  }
+  badIpHint.delete(scope.id);
   const db = store.db();
   const target =
     scope.type === 'server'
@@ -392,6 +414,14 @@ function agentReportV2(req, res, scope, body, ctx) {
     const seen = unmatchedNoise.get(scope.id);
     if (!seen || seen.count !== unmatched || Date.now() - seen.at > 10 * 60 * 1000) {
       unmatchedNoise.set(scope.id, { count: unmatched, at: Date.now() });
+      // 和 loginFails 同款清理：条目数本应有界（按 scope 索引），但删了又建的机器
+      // 会留下不再上报的旧 key，顺手清一遍比等它慢慢涨安全
+      if (unmatchedNoise.size > 500) {
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        for (const [k, v] of unmatchedNoise) {
+          if (!v || v.at < cutoff) unmatchedNoise.delete(k);
+        }
+      }
       logAgent.warn('流量上报（v2）有未匹配用户', {
         rid: ctx.rid,
         scope: scope.name,

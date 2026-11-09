@@ -19,9 +19,33 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 
+const JSON_BODY_LIMIT = 1.5 * 1024 * 1024;
+/** 恢复备份要上传整库，只有那条路由能开到这么大 */
+const RAW_BODY_LIMIT = 128 * 1024 * 1024;
+
+/**
+ * 每个响应都带的安全头。
+ *
+ * 会话 token 存在 localStorage、请求靠 JS 带 Authorization —— 这挡住了 CSRF
+ * （浏览器不会自动附带），但**挡不住点击劫持**：面板被放进 iframe 后，它自己的
+ * JS 照样运行、照样带 token，管理员的一次点击就是一次真实的已认证操作。
+ * 所以框架限制是必需的，不是可选的加固。
+ *
+ * 这里刻意不写 CSP 主体（default-src / script-src）：public/index.html 有一段
+ * 内联 <script>，直接上 'self' 会把面板自己的引导脚本挡掉。等内联脚本挪成外链
+ * 或加 nonce 之后再补。
+ */
+const SECURITY_HEADERS = {
+  'X-Frame-Options': 'DENY',
+  'Content-Security-Policy': "frame-ancestors 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+};
+
 function sendJson(res, code, data, extra = {}) {
   const body = JSON.stringify(data);
   res.writeHead(code, {
+    ...SECURITY_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(body),
@@ -32,15 +56,37 @@ function sendJson(res, code, data, extra = {}) {
 
 function sendText(res, code, text, type = 'text/plain; charset=utf-8', extra = {}) {
   const body = Buffer.from(text, 'utf8');
-  res.writeHead(code, { 'Content-Type': type, 'Content-Length': body.length, ...extra });
+  res.writeHead(code, {
+    ...SECURITY_HEADERS,
+    'Content-Type': type,
+    // 默认不缓存：订阅响应体里是完整的节点凭据，token 又在 URL 路径上，
+    // 反代 / CDN 只要开了缓存就会把同一路径的响应回放给任意请求者。
+    // 个别需要缓存的调用方在 extra 里显式覆盖即可。
+    'Cache-Control': 'no-store',
+    'Content-Length': body.length,
+    ...extra,
+  });
   res.end(body);
 }
 
-function readBody(req) {
-  // 恢复备份是上传整个 SQLite 文件，不能按 JSON 的 1.5 MB 卡；
-  // 判断只看 Content-Type，其它接口的限额不变。
-  const isRaw = /application\/octet-stream/i.test(req.headers['content-type'] || '');
-  const limit = isRaw ? 128 * 1024 * 1024 : 1.5 * 1024 * 1024;
+/**
+ * 请求体读取。
+ *
+ * 大体积（raw）通道必须由调用方**按路由**显式开启：早先这里只看 Content-Type
+ * 就把限额放宽到 128 MB，于是任何免登录的 POST（/api/login、/api/invite/:code/claim、
+ * /api/sub/login、/api/agent/report）都能被一个 `application/octet-stream` 头
+ * 放大 85 倍，几十个并发就能把进程堆打满。
+ */
+function readBody(req, rawLimit = 0) {
+  const isRaw = rawLimit > 0 && /application\/octet-stream/i.test(req.headers['content-type'] || '');
+  const limit = isRaw ? rawLimit : JSON_BODY_LIMIT;
+  // 先看声明的长度：超限直接拒绝，别让对端白传 100 MB 再断
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > limit) {
+    const err = new Error('请求体过大');
+    err.status = 413;
+    return Promise.reject(err);
+  }
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -78,6 +124,7 @@ function serveFile(res, filePath) {
     if (err) return sendText(res, 404, 'Not Found');
     const ext = path.extname(filePath).toLowerCase();
     res.writeHead(200, {
+      ...SECURITY_HEADERS,
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=300',
     });
@@ -85,4 +132,13 @@ function serveFile(res, filePath) {
   });
 }
 
-module.exports = { MIME, sendJson, sendText, readBody, serveFile };
+module.exports = {
+  MIME,
+  SECURITY_HEADERS,
+  JSON_BODY_LIMIT,
+  RAW_BODY_LIMIT,
+  sendJson,
+  sendText,
+  readBody,
+  serveFile,
+};

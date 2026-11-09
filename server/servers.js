@@ -17,6 +17,7 @@ const {
   readAgentSource,
   buildUninstallScript,
   buildRelayScript,
+  relayTarget,
 } = require('./deploy-scripts');
 
 /* --------------------------------- 服务器 --------------------------------- */
@@ -254,10 +255,23 @@ function nodeUninstallScript(req, res, params, body, session, ctx) {
 
 function relayScript(req, res, params, body, session, ctx) {
   const q = ctx.query;
-  const to = q.get('to') || '';
-  const port = Number(q.get('port')) || 443;
+  const rawTo = String(q.get('to') || '');
   const proto = ['tcp', 'udp', 'both'].includes(q.get('proto')) ? q.get('proto') : 'both';
-  if (!to) return sendJson(res, 400, { error: '缺少落地节点地址（to）' });
+  if (!rawTo.trim()) return sendJson(res, 400, { error: '缺少落地节点地址（to）' });
+
+  // 这个地址会被拼进 iptables 规则和 shell 变量：只认裸 IPv4 / 域名。
+  // 早先这里只判空，一个带引号和换行的 to 就能在生成的 root 脚本里插进任意命令
+  const to = relayTarget(rawTo);
+  if (!to) {
+    return sendJson(res, 400, {
+      error: '落地地址只能是 IPv4 或域名（不带 http://、端口、路径；IPv6 暂不支持）',
+    });
+  }
+
+  const port = Number(q.get('port')) || 443;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return sendJson(res, 400, { error: '端口只能是 1–65535' });
+  }
 
   const script = buildRelayScript({ to, port, proto, label: q.get('label') || '' });
   sendText(res, 200, script, 'text/x-shellscript; charset=utf-8', {

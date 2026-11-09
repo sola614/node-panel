@@ -15,11 +15,12 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test/version.js && node test/dockerfile.js && node test/smoke.js",
+    "test": "node test/version.js && node test/dockerfile.js && node test/generators.js && node test/smoke.js",
     "test:version": "node test/version.js",
     "version:check": "node scripts/version.js",
     "version:set": "node scripts/version.js",
     "test:dockerfile": "node test/dockerfile.js",
+    "test:generators": "node test/generators.js",
     "test:renew": "node test/renew.js",
     "test:security": "node test/security.js",
     "test:notify": "node test/notify.js",
