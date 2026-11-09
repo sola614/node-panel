@@ -50,7 +50,9 @@ function normalizeNode(body, prev = {}) {
     address: String(body.address ?? prev.address ?? '').trim(),
     token: prev.token || '',
     protocol,
-    port: Number(body.port ?? prev.port) || 443,
+    // 用 ?? 而不是 !== undefined：部分更新时 body.port 可能是 null，
+    // 那也应该沿用原值（旧代码的 `body.port ?? prev.port` 就是这个语义）
+    port: normPort(body.port ?? prev.port),
     network,
     path: String(body.path ?? prev.path ?? ''),
     host: String(body.host ?? prev.host ?? ''),
@@ -108,6 +110,14 @@ function normalizeNode(body, prev = {}) {
 
   if (mode === 'standalone' && !node.token) node.token = store.rnd(20);
 
+  // ss 节点的密码就是接入凭证。以前留空会静默落到 lib/xray.js 的 'change-me'：
+  // 服务正常起来、面板显示一切正常，等于把端口开放给任何公网扫描者。
+  //
+  // 这里自动签发而不是报 400 —— normalizeNode 是 create/update 共用路径，
+  // 报错会让存量空密码节点连改名都保存不了。已有密码时沿用 prev，
+  // 避免前端某次提交漏带 password 就把全网客户端的密码换掉。
+  if (node.protocol === 'ss' && !node.password) node.password = prev.password || store.rnd(16);
+
   // 节点归属套餐（多选）：空数组表示不归任何套餐，只有不限套餐的用户能用
   node.planIds = Array.isArray(body.planIds)
     ? body.planIds.filter((id) => store.db().plans.some((p) => p.id === id))
@@ -143,7 +153,7 @@ function normalizeNode(body, prev = {}) {
           id: e.id || store.uid(),
           name: String(e.name || '').trim(),
           host: String(e.host || '').trim(),
-          port: e.port ? Number(e.port) : null,
+          port: e.port === '' || e.port === null || e.port === undefined ? null : Number(e.port),
           planIds: Array.isArray(e.planIds) ? e.planIds.filter((p) => store.db().plans.some((x) => x.id === p)) : [],
           hidden: !!e.hidden,
         }))
@@ -298,9 +308,74 @@ function certRefError(data) {
   return '';
 }
 
+/**
+ * 端口取值：空 → 默认值（前端留空就是「用默认」），其余一律转数字。
+ *
+ * 不用 `Number(x) || 443`：那个写法会把 `99999`、`1.5` 原样放过去，也会把
+ * `abc` / `-1` / `0` 悄悄变成 443（用户以为存了自己填的值，其实没有）。
+ * 非法值保留成 NaN，交给 portError() 报 400。
+ */
+function normPort(v, fallback = 443) {
+  if (v === undefined || v === null || String(v).trim() === '') return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : Number.NaN;
+}
+
+/**
+ * 端口范围校验（返回空串表示通过）。
+ *
+ * 为什么必须挡：所有 Xray 节点共用**同一份配置文件**（lib/agentBundle.js 的
+ * NP_XRAY_NODES 是单文件单进程），一个 `99999` 会让 Xray 启动失败退出 ——
+ * 这台机器上所有 vless/vmess/trojan/ss 节点一起掉线，而面板只显示「同步失败」，
+ * 配置看起来完全合法。
+ *
+ * `<1024` 不拦：agent 以 root 运行，低端口本来就能用，硬拦会把 443/80 这种
+ * 最常见的配置挡在门外。只在响应里带一句 warnings 让前端提示。
+ */
+function portError(node) {
+  const p = node.port;
+  if (!Number.isInteger(p) || p < 1 || p > 65535) {
+    return '端口必须是 1–65535 之间的整数';
+  }
+  for (const e of node.entries || []) {
+    if (e.port === null || e.port === undefined) continue;
+    if (!Number.isInteger(e.port) || e.port < 1 || e.port > 65535) {
+      return `中转入口「${e.name || e.host}」的端口必须是 1–65535 之间的整数`;
+    }
+  }
+  return '';
+}
+
+/**
+ * 端口没到拦的门槛、但值得提一句的情况。
+ *
+ * 刻意不警告「<1024 是特权端口」：agent 本来就要以 root 运行（agent.sh 自检
+ * `id -u`），443/80 是最常见的配置，每次保存都弹一句废话只会让人忽略提示。
+ * 真正会出事的是**撞上本机已在监听的端口** —— 那是 Xray 起不来、
+ * 同机所有节点一起掉线的 M3 故障模式。
+ */
+function portWarnings(node) {
+  const out = [];
+  const conflict = (p) => {
+    if (p === 22) return '22 是 SSH 的默认端口，撞上会让 Xray 无法监听（同机所有节点一起掉线）';
+    if (p === PORT) return `与面板自身的 ${PORT} 端口相同，会抢占监听`;
+    if (p === TLS_PORT) return `与面板 HTTPS 的 ${TLS_PORT} 端口相同，会抢占监听`;
+    return '';
+  };
+  const own = conflict(Number(node.port));
+  if (own) out.push(`端口 ${node.port}：${own}`);
+  for (const e of node.entries || []) {
+    const w = conflict(Number(e.port));
+    if (w) out.push(`中转入口「${e.name || e.host}」端口 ${e.port}：${w}`);
+  }
+  return out;
+}
+
 function createNode(req, res, params, body) {
   const data = normalizeNode(body);
   if (!data.name) return sendJson(res, 400, { error: '请填写节点名称' });
+  const badPort = portError(data);
+  if (badPort) return sendJson(res, 400, { error: badPort });
   const badCert = certRefError(data);
   if (badCert) return sendJson(res, 400, { error: badCert });
   const db = store.db();
@@ -334,7 +409,7 @@ function createNode(req, res, params, body) {
   db.nodes.push(node);
   store.save();
   auditAction('node.create', node.name, `${node.protocol} · 端口 ${node.port}`);
-  sendJson(res, 200, { ok: true, item: node });
+  sendJson(res, 200, { ok: true, item: node, warnings: portWarnings(node) });
 }
 
 function updateNode(req, res, params, body) {
@@ -344,6 +419,8 @@ function updateNode(req, res, params, body) {
   if (nameTaken(store.db().nodes, next.name, node.id)) {
     return sendJson(res, 409, { error: '已存在同名节点，换个名字' });
   }
+  const badPort = portError(next);
+  if (badPort) return sendJson(res, 400, { error: badPort });
   const badCert = certRefError(next);
   if (badCert) return sendJson(res, 400, { error: badCert });
   const badHop = hopError(next, node.id);
@@ -351,7 +428,7 @@ function updateNode(req, res, params, body) {
   Object.assign(node, next);
   store.save();
   auditAction('node.update', node.name, `${node.protocol} · 端口 ${node.port}${node.enabled ? '' : ' · 已停用'}`);
-  sendJson(res, 200, { ok: true, item: node });
+  sendJson(res, 200, { ok: true, item: node, warnings: portWarnings(node) });
 }
 
 function deleteNode(req, res, params) {
@@ -675,6 +752,8 @@ function generateRealityKeys(req, res) {
 module.exports = {
   normalizeNode,
   hopError,
+  portError,
+  portWarnings,
   orderedNodes,
   listNodes,
   certRefError,

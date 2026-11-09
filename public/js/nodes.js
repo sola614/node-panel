@@ -1375,8 +1375,10 @@ async function nodeNewFlow(template) {
       const payload = readNodeForm(m);
       if (!payload.name) throw new Error('请填写节点名称');
       await ensureRealityKeys(payload);
-      await api('/api/nodes', { method: 'POST', body: JSON.stringify(payload) });
+      const r = await api('/api/nodes', { method: 'POST', body: JSON.stringify(payload) });
       toast(copy ? '节点已复制' : '节点已创建', 'ok');
+      // 特权端口之类的提醒：保存是成功的，只是有件事该让用户知道
+      if (r.warnings && r.warnings.length) toast(r.warnings.join('；'), 'warn');
       render();
     },
   });
@@ -1396,8 +1398,9 @@ async function nodeEditFlow(id) {
       const payload = readNodeForm(m);
       if (!payload.name) throw new Error('请填写节点名称');
       await ensureRealityKeys(payload);
-      await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify(payload) });
+      const r = await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify(payload) });
       toast('已保存', 'ok');
+      if (r.warnings && r.warnings.length) toast(r.warnings.join('；'), 'warn');
       render();
     },
   });

@@ -316,12 +316,14 @@ function updateCert(req, res, params, body) {
   if (domainsChanged && c.certPem) {
     // 还有节点在用时改域名，等于让那些节点的配置指向一张不再匹配的证书 ——
     // 服务下次重载就会因为证书不对而起不来，而报错只有一句「Xray 启动失败」
-    const used = store
-      .db()
-      .nodes.filter((n) => n.certMode === 'ref' && n.certId === c.id);
-    if (used.length) {
+    const usage = certUsage(c);
+    const extra = (c.extraTargets || []).length;
+    if (usage.nodeCount) {
       return sendJson(res, 409, {
-        error: `还有 ${used.length} 个节点在用这张证书，改域名会让它们立刻失效。先把这些节点换成别的证书，或直接新建一张`,
+        error:
+          `还有 ${usage.nodeCount} 个节点在用这张证书` +
+          `${extra ? `（另有 ${extra} 台机器在额外下发）` : ''}，改域名会让它们立刻失效。` +
+          '先把这些节点换成别的证书，或直接新建一张',
       });
     }
   }
@@ -345,15 +347,27 @@ function deleteCert(req, res, params) {
   if (i < 0) return sendJson(res, 404, { error: '证书不存在' });
   const c = db.certs[i];
   // 还有节点在用就拦住：删掉之后那些节点的配置会指向一个不存在的文件，
-  // 服务下次重载就起不来，而用户只会看到一句「Xray 启动失败」
-  const used = db.nodes.filter((n) => n.certMode === 'ref' && n.certId === c.id);
-  if (used.length) {
+  // 服务下次重载就起不来，而用户只会看到一句「Xray 启动失败」。
+  // 统计走 certUsage：它把 extraTargets（额外下发证书的机器）也算进来了，
+  // 以前这里只查 certMode==='ref' 的节点，于是「只挂了 extraTargets」的情况
+  // 在提示里完全看不见（N4）。
+  const usage = certUsage(c);
+  const extra = (c.extraTargets || []).length;
+  if (usage.nodeCount) {
+    const names = usage.nodes
+      .slice(0, 3)
+      .map((n) => n.name)
+      .join('、');
     return sendJson(res, 409, {
-      error: `还有 ${used.length} 个节点在用这张证书（${used
-        .slice(0, 3)
-        .map((n) => n.name)
-        .join('、')}${used.length > 3 ? ' 等' : ''}），先把它们换成别的证书`,
+      error:
+        `还有 ${usage.nodeCount} 个节点在用这张证书（${names}${usage.nodeCount > 3 ? ' 等' : ''}）` +
+        `${extra ? `，另有 ${extra} 台机器在额外下发` : ''}，先把它们换成别的证书`,
     });
+  }
+  // 只挂在 extraTargets 上时不硬拦：那只是「额外下发」，机器上未必真在用它。
+  // 但留一条日志 —— 删完那几台机器会拿到空证书，排查时得有个线索
+  if (extra) {
+    log.warn('删除证书时仍有机器在额外下发', { cert: c.name || c.id, machines: extra });
   }
   // 面板自身 HTTPS 正引用着它也不能删：删掉后下一轮热加载会把监听关掉，
   // 正在用 https:// 的管理员当场失联

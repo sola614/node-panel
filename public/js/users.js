@@ -301,7 +301,7 @@ function userForm(user) {
     <div class="field">
       <label>登录密码（订阅页用）</label>
       <div class="pw-row">
-        <input type="password" id="f-password" placeholder="${u.id ? (u.isAdmin ? '留空 = 跟随面板管理密码' : u.hasPassword ? '已设置，留空表示不修改' : '请设置（该账号还没有密码）') : '至少 6 位，用户打开订阅页时输入'}" autocomplete="new-password">
+        <input type="password" id="f-password" placeholder="${u.id ? (u.isAdmin ? '留空 = 跟随面板管理密码' : u.hasPassword ? '已设置，留空表示不修改' : '请设置（该账号还没有密码）') : '留空 = 自动生成 12 位随机密码；也可自己填（至少 6 位）'}" autocomplete="new-password">
         <button class="btn" type="button" data-gen-pass="#f-password" title="生成 16 位随机密码并复制">生成</button>
       </div>
       ${u.id
@@ -513,10 +513,28 @@ async function createUserFlow(template) {
     onOk: async (m) => {
       const payload = readUserForm(m);
       if (!payload.name) throw new Error('请填写用户名称');
-      if (!payload.password || payload.password.length < 6) throw new Error('请设置登录密码（至少 6 位，订阅页登录用）');
+      // 密码留空 = 服务端生成随机密码（比逼管理员自己想一个更安全）
+      if (payload.password && payload.password.length < 6) throw new Error('登录密码至少 6 位，或留空让系统生成');
       if (payload.expireMode === 'custom' && !payload.expireAt) throw new Error('请选择自定义到期日');
-      await api('/api/users', { method: 'POST', body: JSON.stringify(payload) });
-      toast(copy ? '用户已复制（订阅地址是新的）' : '用户已创建', 'ok');
+      const r = await api('/api/users', { method: 'POST', body: JSON.stringify(payload) });
+      if (r.password) {
+        // 自动生成的密码只显示这一次，关掉就查不到了 —— 用弹窗而不是 toast
+        openModal({
+          title: copy ? '用户已复制' : '用户已创建',
+          footer: false,
+          body: `
+            <div class="hint" style="margin:0 0 10px">
+              系统生成了一个随机登录密码。<b>它只显示这一次</b>，关掉后只能到用户编辑里重置。
+            </div>
+            <div class="code-wrap"><pre class="code">${esc(payload.name)}\t${esc(r.password)}</pre></div>
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <button class="btn btn-primary btn-sm" data-copy="${esc(payload.name + '\t' + r.password)}">复制名字与密码</button>
+              <button class="btn btn-sm btn-ghost" data-close>关闭</button>
+            </div>`,
+        });
+      } else {
+        toast(copy ? '用户已复制（订阅地址是新的）' : '用户已创建', 'ok');
+      }
       render();
     },
   });
@@ -729,14 +747,13 @@ function bulkFormHtml() {
       </div>
     </div>
     <div class="field">
-      <label>统一初始密码（订阅页登录用）</label>
-      <div class="pw-row">
-        <input type="password" id="b-password" placeholder="至少 6 位，本批所有账号共用" autocomplete="new-password">
-        <button class="btn" type="button" data-gen-pass="#b-password" title="生成 16 位随机密码并复制">生成</button>
+      <label>初始登录密码</label>
+      <div class="hint" style="margin:0">
+        每个账号各自生成一个 12 位随机密码，创建后在结果页一次性显示 ——
+        一批共用一个密码的话，任一人泄露就等于整批可登录订阅页。
       </div>
-      <div class="hint">本批所有账号的初始登录密码，发放订阅链接时一并告知用户；之后可在「编辑」里逐个改</div>
     </div>
-    <p class="hint" style="margin:0">创建后每个用户都会拿到独立的 UUID 与订阅链接，建完可以一键复制全部链接。</p>`;
+    <p class="hint" style="margin:0">创建后每个用户都会拿到独立的 UUID、订阅链接与登录密码，建完可以一键复制全部（名字 + 密码 + 链接）。</p>`;
 }
 
 function bulkCreateFlow() {
@@ -750,11 +767,7 @@ function bulkCreateFlow() {
       const payload = {
         planId: $('#b-plan', m).value || null,
         note: $('#b-note', m).value.trim(),
-        password: $('#b-password', m).value,
       };
-      if (!payload.password || payload.password.length < 6) {
-        throw new Error('请填写统一的初始登录密码（至少 6 位）');
-      }
       if (mode === 'names') {
         payload.names = $('#b-names', m).value;
         if (!String(payload.names).trim()) throw new Error('请粘贴名单，一行一个名字');
@@ -814,7 +827,8 @@ function bulkResultFlow(r) {
     return;
   }
 
-  const plain = items.map((x) => `${x.name}\t${x.subUrl}`).join('\n');
+  // 每行「名字 + 密码 + 订阅链接」：密码是随机生成的，只在这一次结果里出现
+  const plain = items.map((x) => `${x.name}\t${x.password || ''}\t${x.subUrl}`).join('\n');
   const urls = items.map((x) => x.subUrl).join('\n');
   const skipped = (r.skipped || []).length
     ? `<div class="alert alert-warn" style="margin-top:14px">跳过 ${r.skipped.length} 个：${esc(
@@ -826,12 +840,12 @@ function bulkResultFlow(r) {
     wide: true,
     footer: false,
     body: `
-      <div class="hint" style="margin:0 0 10px">套餐：<b>${esc(r.planName || '不限套餐')}</b>　每行是「名字 + 订阅链接」，直接复制给对方即可。</div>
+      <div class="hint" style="margin:0 0 10px">套餐：<b>${esc(r.planName || '不限套餐')}</b>　每行是「名字 + 登录密码 + 订阅链接」，直接复制给对方即可。<b>密码只显示这一次</b>，关掉后只能到用户编辑里重置。</div>
       <div class="code-wrap">
         <pre class="code" style="max-height:320px;overflow:auto">${esc(plain)}</pre>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
-        <button class="btn btn-primary btn-sm" data-copy="${esc(plain)}">复制全部（名字 + 链接）</button>
+        <button class="btn btn-primary btn-sm" data-copy="${esc(plain)}">复制全部（名字 + 密码 + 链接）</button>
         <button class="btn btn-sm" data-copy="${esc(urls)}">只复制链接</button>
         <button class="btn btn-sm btn-ghost" data-close>关闭</button>
       </div>

@@ -372,41 +372,58 @@ function agentReportV2(req, res, scope, body, ctx) {
   let nodeBytes = 0;
   let unmatched = 0;
 
-  for (const row of rows) {
-    const prev = store.reportStateOf(scope.id, row.k) || { up: 0, down: 0 };
-    // 累计值变小 = 计数器清零（Xray 重启 / 实例重建）：视为从零重新累计，全额入账
-    const dUp = row.up >= prev.up ? row.up - prev.up : row.up;
-    const dDown = row.down >= prev.down ? row.down - prev.down : row.down;
-    const delta = dUp + dDown;
+  // 回滚只回滚数据库，内存里的累加不会自动撤销。这里记下要还原的两处
+  // （user.usedBytes 与 stats.daily），失败时反向恢复 —— 否则下一轮重发同一批
+  // 会重复计入，从「少计」变成「多计」，对计费面板是更糟的错误方向。
+  const usedBefore = new Map();
+  const dailyBefore = { ...(db.stats.daily || {}) };
 
-    // 水位先推进（哪怕下面找不到用户）：序号已接受，这条数据不该再被处理第二遍
-    store.setReportState(scope.id, row.k, row.up, row.down, seq);
-    if (!delta) continue;
+  try {
+    // 水位推进与用量累加必须在同一个事务里：中途失败（磁盘满 / 被 kill / save 报错）
+    // 时整体回滚，水位不前进，agent 下一轮会重发同一批数据，账才对得上。
+    store.tx(() => {
+      for (const row of rows) {
+        const prev = store.reportStateOf(scope.id, row.k) || { up: 0, down: 0 };
+        // 累计值变小 = 计数器清零（Xray 重启 / 实例重建）：视为从零重新累计，全额入账
+        const dUp = row.up >= prev.up ? row.up - prev.up : row.up;
+        const dDown = row.down >= prev.down ? row.down - prev.down : row.down;
+        const delta = dUp + dDown;
 
-    if (row.k.startsWith('node:')) {
-      store.bumpNodeDaily(row.k.slice(5), delta, date);
-      nodeBytes += delta;
-      applied++;
-      continue;
-    }
+        // 水位先推进（哪怕下面找不到用户）：序号已接受，这条数据不该再被处理第二遍
+        store.setReportState(scope.id, row.k, row.up, row.down, seq);
+        if (!delta) continue;
 
-    const user = byEmail.get(row.k);
-    if (!user) {
-      unmatched++;
-      continue;
-    }
-    user.usedBytes = (user.usedBytes || 0) + delta;
-    store.bumpUserDaily(user.id, delta, date);
-    bytes += delta;
-    applied++;
+        if (row.k.startsWith('node:')) {
+          store.bumpNodeDaily(row.k.slice(5), delta, date);
+          nodeBytes += delta;
+          applied++;
+          continue;
+        }
+
+        const user = byEmail.get(row.k);
+        if (!user) {
+          unmatched++;
+          continue;
+        }
+        if (!usedBefore.has(user)) usedBefore.set(user, user.usedBytes || 0);
+        user.usedBytes = (user.usedBytes || 0) + delta;
+        store.bumpUserDaily(user.id, delta, date);
+        bytes += delta;
+        applied++;
+      }
+
+      // 哨兵行记录「已接受的序号」：这批就算一行都没匹配上，序号也推进，
+      // 否则同一批数据每 60 秒都被重新差值一遍
+      store.setReportState(scope.id, seqKey, 0, 0, seq);
+
+      if (bytes > 0) store.addDaily(bytes);
+      store.save();
+    });
+  } catch (err) {
+    for (const [u, v] of usedBefore) u.usedBytes = v;
+    db.stats.daily = dailyBefore;
+    throw err;
   }
-
-  // 哨兵行记录「已接受的序号」：这批就算一行都没匹配上，序号也推进，
-  // 否则同一批数据每 60 秒都被重新差值一遍
-  store.setReportState(scope.id, seqKey, 0, 0, seq);
-
-  if (bytes > 0) store.addDaily(bytes);
-  store.save();
 
   // 用户被删后 agent 侧 totals 还留着他的行：未匹配数量不变时降为 debug，
   // 否则每 60 秒一条「有未匹配用户」会把日志刷成噪音

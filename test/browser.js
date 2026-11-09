@@ -526,12 +526,14 @@ async function main() {
     await click('#b-mode button[data-mode="count"]', cdp);
     ok('切回数量模式后名单区隐藏', await evalJs(`return document.querySelector('#b-names-fields').hidden`, cdp));
 
-    // 批量建号同样必须给一个统一的初始登录密码（0.1.17 起）
-    await type('#b-password', 'test-pass-123', cdp);
+    // 批量建号不再要求填统一密码：每个账号各自生成随机密码，结果页一次性显示
+    ok('批量建号表单不再有统一密码输入框',
+      await evalJs(`return !document.querySelector('#b-password')`, cdp));
     await click('.modal-foot [data-ok]', cdp);
     await waitFor(`return /已创建 2 个用户/.test(document.querySelector('.modal-head h3').textContent)`, '创建结果', cdp);
     const resultText = await textOf('.modal-body', cdp);
     ok('结果弹窗列出名字与链接', resultText.includes(TAG + '-批01') && resultText.includes('/s/'));
+    ok('结果弹窗带各自生成的密码', /\t[a-zA-Z0-9]{12}\t/.test(resultText) || resultText.includes('登录密码'));
     ok('结果里有两个订阅链接', (resultText.match(/\/s\//g) || []).length >= 2);
     ok('结果弹窗带复制按钮', (await count('[data-copy]', cdp)) >= 2);
     await click('.modal-body [data-close]', cdp);

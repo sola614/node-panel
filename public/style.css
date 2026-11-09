@@ -960,6 +960,7 @@ tr.tree-child .cell-name { font-weight: 450; }
 
 .toast.ok { border-color: rgba(52, 211, 153, 0.4); }
 .toast.err { border-color: rgba(248, 113, 113, 0.45); }
+.toast.warn { border-color: rgba(251, 191, 36, 0.45); }
 
 /* ------------------------------- 代码块 -------------------------------- */
 

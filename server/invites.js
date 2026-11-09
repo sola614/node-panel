@@ -5,7 +5,7 @@
  * 从 server.js 抽出（0.1.31）。领取代号建用户（buildUser / validUserPassword 在用户域），
  * 所以依赖方向是 invites → users，单向。
  *
- * 领取限流（claimHits / claimTicks）是这一域的私有状态，跟着域走。
+ * 领取与信息查询的限流状态是这一域的私有状态，跟着域走。
  */
 
 const path = require('path');
@@ -166,17 +166,51 @@ function publicInviteInfo(code) {
   return { status: state ? 410 : 200, body: info };
 }
 
-function inviteInfoApi(req, res, params) {
-  const r = publicInviteInfo(params.code);
-  sendJson(res, r.status, r.body);
+/**
+ * 按 IP 的固定窗口限流。
+ *
+ * 邀请码只有 6 位 hex（`store.rnd(3)`，约 1677 万种），不限制就能被脚本刷着
+ * 枚举 —— 所以**领取**和**信息查询**两条通道都必须限流，只堵一条等于没堵。
+ *
+ * 计数必须在校验之前记：只数成功的话，脚本拿 410 / 404 把码扫一遍永远不会被拦。
+ *
+ * 抽成一个工厂是因为这里以前有两套写法（领取一套、订阅页登录另一套），
+ * 后者还把窗口重置写错了，导致过期后计数照涨但不再限制。
+ */
+function createIpLimiter(max, windowMs) {
+  const hits = new Map();
+  let ticks = 0;
+  return {
+    /** 记一次尝试。返回 { ok, count }：ok=false 表示本次超限（不再计数） */
+    hit(ip, now = Date.now()) {
+      // 顺手清过期记录：只增不减的话，跑上几个月就是一条内存泄漏
+      if (++ticks % 200 === 0 || hits.size >= 1000) {
+        for (const [k, v] of hits) {
+          if (now - v.first >= windowMs) hits.delete(k);
+        }
+      }
+      let rec = hits.get(ip);
+      // 窗口过期 → 重建记录。不重置 first 的话 count 会一直涨而窗口永远不过期
+      if (rec && now - rec.first >= windowMs) {
+        hits.delete(ip);
+        rec = null;
+      }
+      if (rec && rec.count >= max) return { ok: false, count: rec.count };
+      if (!rec) {
+        rec = { count: 0, first: now };
+        hits.set(ip, rec);
+      }
+      rec.count += 1;
+      return { ok: true, count: rec.count };
+    },
+  };
 }
 
-// 领取按 IP 限流：邀请码只有 6 位，不限制的话可以被脚本刷着批量建号。
-// 计数必须涵盖「失败」的尝试 —— 只数成功的话，脚本拿 410 把邀请码枚举一遍永远不会被拦。
-const CLAIM_MAX = 10;
-const CLAIM_WINDOW = 60 * 60 * 1000;
-const claimHits = new Map();
-let claimTicks = 0;
+// 领取：10 次/小时。正常用户点开链接填个名字就完事，够用
+const claimLimiter = createIpLimiter(10, 60 * 60 * 1000);
+// 信息查询：60 次/小时。放宽是因为落地页会重试、用户会反复刷新；
+// 但对着 1677 万的空间按 60 次/小时扫，扫完要几十年，枚举这条路就断了
+const infoLimiter = createIpLimiter(60, 60 * 60 * 1000);
 
 /** 邀请码 / 订阅 token 这类凭证：日志里只留前 4 位，够定位就行 */
 function maskCode(code) {
@@ -185,36 +219,30 @@ function maskCode(code) {
   return s.length <= 4 ? s : s.slice(0, 4) + '***';
 }
 
-/** 顺手把过期记录清掉：这张表只增不减的话，跑上几个月就是一条内存泄漏 */
-function pruneClaimHits(now) {
-  if (++claimTicks % 200 !== 0 && claimHits.size < 1000) return;
-  for (const [k, v] of claimHits) {
-    if (now - v.first >= CLAIM_WINDOW) claimHits.delete(k);
+function inviteInfoApi(req, res, params, body, session, ctx) {
+  // 枚举通道：响应体一个字不改（前端靠 state 分四种提示、smoke 断言了状态码），
+  // 只加限流 —— 枚举者关心的是「哪个码回 200」，把文案统一挡不住任何一次扫描
+  const ip = clientIp(ctx.req);
+  const lim = infoLimiter.hit(ip);
+  if (!lim.ok) {
+    logData.warn('邀请信息查询被限流', { rid: ctx.rid, code: maskCode(params.code), ip, hits: lim.count });
+    return sendJson(res, 429, { error: '查询过于频繁，请一小时后再试' });
   }
+  const r = publicInviteInfo(params.code);
+  sendJson(res, r.status, r.body);
 }
 
 function claimInvite(req, res, params, body, session, ctx) {
   const ip = clientIp(ctx.req);
-  const now = Date.now();
-  pruneClaimHits(now);
   // 邀请码是领取凭证，日志里只留前 4 位用于定位，不记全码
   const code = maskCode(params.code);
 
-  let rec = claimHits.get(ip);
-  if (rec && now - rec.first >= CLAIM_WINDOW) {
-    claimHits.delete(ip);
-    rec = null;
-  }
-  if (rec && rec.count >= CLAIM_MAX) {
-    logData.warn('邀请领取被限流', { rid: ctx.rid, code, ip, hits: rec.count });
+  // 先记一笔再校验：无论后面是建号成功、重名 409 还是邀请失效 410，都算一次尝试
+  const lim = claimLimiter.hit(ip);
+  if (!lim.ok) {
+    logData.warn('邀请领取被限流', { rid: ctx.rid, code, ip, hits: lim.count });
     return sendJson(res, 429, { error: '领取过于频繁，请一小时后再试' });
   }
-  // 先记一笔再校验：无论后面是建号成功、重名 409 还是邀请失效 410，都算一次尝试
-  if (!rec) {
-    rec = { count: 0, first: now };
-    claimHits.set(ip, rec);
-  }
-  rec.count += 1;
 
   const db = store.db();
   const inv = db.invites.find((x) => x.code === params.code);

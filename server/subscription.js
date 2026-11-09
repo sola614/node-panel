@@ -16,7 +16,7 @@ const store = require('../lib/store');
 const sub = require('../lib/sub');
 const logger = require('../lib/log');
 const { sendJson, sendText, serveFile } = require('./http-util');
-const { auditAction } = require('./context');
+const { auditAction, clientIp, loginBlockedMs, noteLoginFail, loginFailsLeft, clearLoginFails } = require('./context');
 const { PUBLIC_DIR } = require('./config');
 const { baseUrl } = require('./util');
 const { getSession } = require('./tokens');
@@ -175,9 +175,13 @@ function subSessionUser(req, user) {
 }
 
 function noteSubLoginFail(userId) {
-  const f = subLoginFails.get(userId) || { count: 0, firstAt: Date.now() };
+  const now = Date.now();
+  let f = subLoginFails.get(userId);
+  // 窗口过期要重建记录。以前写成「count === 1 时设 firstAt」，但创建时 count 已是 0、
+  // 自增后就是 1，所以 firstAt 永不重置 —— 窗口过期后计数照涨，而锁定条件
+  // `now - firstAt < 窗口` 恒为 false，等于完全不限流（N3 的第二半）
+  if (!f || now - f.firstAt > SUB_LOGIN_LOCK_MS) f = { count: 0, firstAt: now };
   f.count++;
-  if (f.count === 1) f.firstAt = Date.now();
   subLoginFails.set(userId, f);
 }
 
@@ -205,21 +209,56 @@ function subLogin(req, res, params, body) {
     return sendJson(res, 400, { error: '该账号未设置登录密码，请联系管理员设置后再访问' });
   }
 
-  // 登录限流：与面板登录同量级（5 次 / 10 分钟），防对着订阅页爆破密码
-  const fail = subLoginFails.get(user.id);
-  if (fail && fail.count >= SUB_LOGIN_MAX_FAIL && Date.now() - fail.firstAt < SUB_LOGIN_LOCK_MS) {
-    logData.warn('订阅页登录被限流', { rid: req.__rid, user: user.name, tries: fail.count });
-    return sendJson(res, 429, { error: '尝试次数过多，请 10 分钟后再试' });
+  // 管理员影子账号校验的就是**面板管理密码**（subPasswordHash 回落到 admin.password），
+  // 所以它必须和 /api/login 共享同一份按 IP 的失败计数 —— 否则对着订阅页爆破
+  // 等于凭空多拿一套尝试额度，而这条路径根本不经过管理台登录的限流（N3 第一半）。
+  //
+  // 普通用户的订阅密码是另一份凭证，仍按 user.id 计数：合成一个计数器的话，
+  // 任何订阅者在自己 IP 上故意失败几次，就能把同一出口 NAT 后的管理员一起锁掉。
+  const shadowAdmin = !user.password && !!user.isAdmin;
+  const ip = clientIp(req);
+
+  if (shadowAdmin) {
+    const blocked = loginBlockedMs(ip);
+    if (blocked > 0) {
+      const minutes = Math.ceil(blocked / 60000);
+      logData.warn('订阅页登录被限流（管理员影子账号，与面板登录共享计数）', {
+        rid: req.__rid,
+        user: user.name,
+        ip,
+        minutes,
+      });
+      return sendJson(res, 429, { error: `尝试次数过多，请 ${minutes} 分钟后再试` });
+    }
+  } else {
+    // 登录限流：与面板登录同量级（5 次 / 10 分钟），防对着订阅页爆破密码
+    const fail = subLoginFails.get(user.id);
+    if (fail && fail.count >= SUB_LOGIN_MAX_FAIL && Date.now() - fail.firstAt < SUB_LOGIN_LOCK_MS) {
+      logData.warn('订阅页登录被限流', { rid: req.__rid, user: user.name, tries: fail.count });
+      return sendJson(res, 429, { error: '尝试次数过多，请 10 分钟后再试' });
+    }
   }
 
   if (!body.password || !store.checkPassword(String(body.password), hash)) {
-    noteSubLoginFail(user.id);
-    const left = SUB_LOGIN_MAX_FAIL - (subLoginFails.get(user.id) || { count: 0 }).count;
-    logData.warn('订阅页登录失败', { rid: req.__rid, user: user.name, left: left > 0 ? left : 0 });
+    if (shadowAdmin) {
+      noteLoginFail(ip);
+      const left = loginFailsLeft(ip);
+      logData.warn('订阅页登录失败（管理员影子账号）', {
+        rid: req.__rid,
+        user: user.name,
+        ip,
+        left: left > 0 ? left : 0,
+      });
+    } else {
+      noteSubLoginFail(user.id);
+      const left = SUB_LOGIN_MAX_FAIL - (subLoginFails.get(user.id) || { count: 0 }).count;
+      logData.warn('订阅页登录失败', { rid: req.__rid, user: user.name, left: left > 0 ? left : 0 });
+    }
     return sendJson(res, 401, { error: '密码不正确' });
   }
 
-  subLoginFails.delete(user.id);
+  if (shadowAdmin) clearLoginFails(ip);
+  else subLoginFails.delete(user.id);
   const sessionToken = crypto.randomBytes(24).toString('hex');
   subSessions.set(sessionToken, { userId: user.id, expires: Date.now() + SUB_SESSION_TTL });
   auditAction('user.sublogin', user.name, '订阅页登录');

@@ -10,6 +10,7 @@
  * 原来放在「概览」段只是因为概览页最先需要它，结果成了跨域依赖。
  */
 
+const crypto = require('crypto');
 const store = require('../lib/store');
 const logger = require('../lib/log');
 const { sendJson } = require('./http-util');
@@ -192,6 +193,26 @@ function validUserPassword(pw) {
   return typeof pw === 'string' && pw.length >= 6 && pw.length <= 64;
 }
 
+/**
+ * 随机初始密码：12 位，去掉了 i l o 0 1 这类易混字符（这东西要手抄 / 口头转达）。
+ *
+ * 用 crypto 而不是 Math.random —— 这是订阅页的登录凭证，而订阅页能看到
+ * 该用户可见的全部节点凭据。拒绝采样是为了去掉 `byte % 字符集长度` 的模偏差。
+ */
+const PW_ALPHABET = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
+function genUserPassword(len = 12) {
+  const limit = 256 - (256 % PW_ALPHABET.length);
+  let out = '';
+  while (out.length < len) {
+    for (const b of crypto.randomBytes(len)) {
+      if (b >= limit) continue;
+      out += PW_ALPHABET[b % PW_ALPHABET.length];
+      if (out.length === len) break;
+    }
+  }
+  return out;
+}
+
 function createUser(req, res, params, body) {
   const name = String(body.name || '').trim();
   if (!name) return sendJson(res, 400, { error: '请填写用户名称' });
@@ -201,8 +222,15 @@ function createUser(req, res, params, body) {
   if (nameTaken(store.db().users, name)) {
     return sendJson(res, 409, { error: '这个用户名已经存在了' });
   }
-  // 密码必填：订阅页一律先登录再查看，没有密码的用户无法登录（存量无密码账号只能联系管理员补设）
-  if (!validUserPassword(body.password)) {
+  // 密码留空 = 自动生成一个随机密码并随响应返回（前端展示一次）。
+  // 强制必填只会逼管理员自己想一个 —— 弱密码和「一批人共用一个」就是这么来的。
+  // 填了就必须合法：6–64 位，空串走生成分支。
+  let password = body.password;
+  let generatedPassword = '';
+  if (password === undefined || password === null || String(password) === '') {
+    generatedPassword = genUserPassword();
+    password = generatedPassword;
+  } else if (!validUserPassword(password)) {
     return sendJson(res, 400, { error: '请设置登录密码（至少 6 位，订阅页登录用）' });
   }
   // 非法日期格式 → 400（new Date('bad').toISOString() 会抛 RangeError → 500）
@@ -219,7 +247,7 @@ function createUser(req, res, params, body) {
     expireAt: body.expireAt,
     expireMode: body.expireMode,
     note: body.note,
-    password: body.password,
+    password,
     enabled: body.enabled !== false,
   });
   // buildUser 可能返回 { error } （custom 无日期等）
@@ -227,7 +255,12 @@ function createUser(req, res, params, body) {
   store.db().users.push(u);
   store.save();
   auditAction('user.create', name, u.planId ? '绑定套餐' : '不限套餐');
-  sendJson(res, 200, { ok: true, item: store.publicUser(u) });
+  sendJson(res, 200, {
+    ok: true,
+    item: store.publicUser(u),
+    // 只在自动生成时回传：管理员需要把它告诉用户，之后面板不再显示明文
+    ...(generatedPassword ? { password: generatedPassword } : {}),
+  });
 }
 
 function updateUser(req, res, params, body) {
@@ -462,20 +495,21 @@ function bulkCreateUsers(req, res, params, body, session, ctx) {
     if (skipped.length) return sendJson(res, 200, { ok: true, items: [], skipped, planName });
     return sendJson(res, 400, { error: '没有可创建的名字' });
   }
-  // 统一初始密码（必填）：订阅页一律先登录，批量号也要有密码；发链接时把密码一并交给用户
-  if (!validUserPassword(body.password)) {
-    return sendJson(res, 400, { error: '请填写统一的初始登录密码（至少 6 位，订阅页登录用）' });
-  }
+  // 每个账号一个独立随机密码。以前是一批共用一个 body.password：
+  // 任一人泄露即整批可登录订阅页，而订阅页能看到该用户可见的全部节点凭据，
+  // 订阅侧又没有管理台那种「首登强制改密」机制（N6）。
+  // 密码随 created[] 返回，结果页一次性复制「名字 + 密码 + 链接」。
 
   const base = baseUrl(ctx.req);
   const created = [];
   for (const name of names) {
+    const password = genUserPassword();
     const u = buildUser({
       name,
       planId,
       quotaGB: body.quotaGB,
       note: body.note || '',
-      password: body.password,
+      password,
       enabled: body.enabled !== false,
     });
     if (u.error) { skipped.push({ name, reason: u.error }); continue; }
@@ -483,6 +517,8 @@ function bulkCreateUsers(req, res, params, body, session, ctx) {
     created.push({
       id: u.id,
       name: u.name,
+      // 明文只在这一次响应里出现：发给用户之后面板不再回显
+      password,
       token: u.token,
       subUrl: `${base}/s/${u.token}`,
       clashUrl: `${base}/s/${u.token}?format=clash`,

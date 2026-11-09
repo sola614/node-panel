@@ -1685,16 +1685,11 @@ function totpCodeOf(secret) {
   await call('/api/notify/channels/' + tgCh.data.item.id, { method: 'DELETE' });
 
   /* ---------- 13. 批量建号与批量操作 ---------- */
-  const bulkNoPass = await call('/api/users/bulk', {
-    method: 'POST',
-    body: json({ count: 2, prefix: 'SMOKE-无密码' }),
-  });
-  ok('批量建号缺统一初始密码被拒', bulkNoPass.status === 400 && /初始登录密码/.test(bulkNoPass.data.error || ''),
-    bulkNoPass.data.error || '');
-
+  // 批量建号不再要求「统一初始密码」：每个账号各自生成 12 位随机密码，
+  // 随 created[] 返回（一批共用一个密码的话，任一人泄露等于整批失守）
   const bulkCount = await call('/api/users/bulk', {
     method: 'POST',
-    body: json({ count: 3, prefix: 'SMOKE-批量', startAt: 1, planId, password: SUB_PASS }),
+    body: json({ count: 3, prefix: 'SMOKE-批量', startAt: 1, planId }),
   });
   const bulkNames = bulkCount.data.items.map((x) => x.name);
   ok('批量建号（按数量）', bulkCount.status === 200 && bulkCount.data.items.length === 3,
@@ -1702,20 +1697,32 @@ function totpCodeOf(secret) {
   ok('批量建号返回订阅链接', bulkCount.data.items.every((x) => /^https?:\/\/.+\/s\/[a-f0-9]{32}$/.test(x.subUrl)));
   ok('批量建号自动补零', bulkNames[0] === 'SMOKE-批量01', bulkNames[0]);
   ok('批量建号继承套餐', bulkCount.data.planName === 'SMOKE-套餐', bulkCount.data.planName);
-  // 批量号带统一密码：第一批账号能登录订阅页
+  ok('每个账号的密码各不相同',
+    new Set(bulkCount.data.items.map((x) => x.password)).size === 3,
+    bulkCount.data.items.map((x) => x.password).join(' / '));
+  ok('随机密码是 12 位',
+    bulkCount.data.items.every((x) => typeof x.password === 'string' && x.password.length === 12));
+  // 每人用各自的密码登录订阅页
   {
     const b0 = bulkCount.data.items[0];
-    subPasswords.set(b0.token, SUB_PASS);
+    subPasswords.set(b0.token, b0.password);
     const bl = await fetch(`${BASE}/api/sub/login`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: b0.token, password: SUB_PASS }),
+      body: JSON.stringify({ token: b0.token, password: b0.password }),
     });
-    ok('批量建的账号可登录订阅页（统一初始密码）', bl.status === 200);
+    ok('批量建的账号可登录订阅页（各自的随机密码）', bl.status === 200);
+    // 别人的密码不能登进来
+    const b1 = bulkCount.data.items[1];
+    const cross = await fetch(`${BASE}/api/sub/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: b1.token, password: b0.password }),
+    });
+    ok('一个账号的密码不能登录另一个账号', cross.status === 401);
   }
 
   const dupBulk = await call('/api/users/bulk', {
     method: 'POST',
-    body: json({ names: 'SMOKE-甲,SMOKE-乙,SMOKE-甲,SMOKE-批量01', password: SUB_PASS }),
+    body: json({ names: 'SMOKE-甲,SMOKE-乙,SMOKE-甲,SMOKE-批量01' }),
   });
   ok('批量建号（按名单）去重', dupBulk.data.items.length === 2, `建了 ${dupBulk.data.items.length} 个`);
   ok('批量建号跳过重复与同名', dupBulk.data.skipped.length === 2 &&
@@ -1723,7 +1730,7 @@ function totpCodeOf(secret) {
     dupBulk.data.skipped.some((s) => /已存在/.test(s.reason)),
     dupBulk.data.skipped.map((s) => s.reason).join(' / '));
 
-  const tooLong = await call('/api/users/bulk', { method: 'POST', body: json({ names: 'X'.repeat(61), password: SUB_PASS }) });
+  const tooLong = await call('/api/users/bulk', { method: 'POST', body: json({ names: 'X'.repeat(61) }) });
   ok('超长名字被跳过而不是报错', tooLong.data.skipped.length === 1 && tooLong.data.skipped[0].reason.includes('60'));
 
   const batchIds = bulkCount.data.items.map((x) => x.id);
@@ -2649,13 +2656,25 @@ function totpCodeOf(secret) {
 
   /* ---------- 15.9 订阅页登录 + 自助重置订阅链接（0.1.16，密码必填方案） ---------- */
   {
-    // 新增必填：单建缺密码被拒（mkUser 都带 SUB_PASS，这里用裸 POST 验证服务端校验）
+    // 单建留空密码 → 服务端自动生成并随响应返回（以前是 400「请设置登录密码」，
+    // 但那只会逼管理员自己想一个弱密码；随机 12 位严格更好）
     const noPassCreate = await call('/api/users', {
       method: 'POST',
-      body: json({ name: 'SMOKE-无密码新建', quotaGB: 10, expireAt: new Date(Date.now() + 7 * 864e5).toISOString() }),
+      body: json({ name: 'SMOKE-自动密码新建', quotaGB: 10, expireAt: new Date(Date.now() + 7 * 864e5).toISOString() }),
     });
-    ok('新增用户缺登录密码被拒', noPassCreate.status === 400 && /请设置登录密码/.test(noPassCreate.data.error || ''),
-      noPassCreate.data.error || '');
+    const genPw = noPassCreate.data && noPassCreate.data.password;
+    ok('新增用户不填密码时自动生成',
+      noPassCreate.status === 200 && typeof genPw === 'string' && genPw.length === 12,
+      genPw || noPassCreate.data.error || '');
+    if (noPassCreate.status === 200) {
+      // 生成的密码必须真的能登录订阅页，否则等于建了个进不去的号
+      const gl = await fetch(`${BASE}/api/sub/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: noPassCreate.data.item.token, password: genPw }),
+      });
+      ok('自动生成的密码可登录订阅页', gl.status === 200);
+      await call('/api/users/' + noPassCreate.data.item.id, { method: 'DELETE' });
+    }
 
     const ru = await mkUser('SMOKE-自助重置用户', null, 100);
     // mkUser 建的号自带密码（SUB_PASS）：先改成一个独立密码，别和全局会话缓存打架
