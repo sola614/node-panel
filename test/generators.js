@@ -238,7 +238,14 @@ const MUST_QUOTE = [
   'a b', '香港1', 'a:', '#tag', '@at', '`tick', 'x,y', '',
 ];
 // 可以裸写（否则订阅里全是引号，人肉 diff 时噪音很大）
-const MAY_BARE = ['HK-1', 'example.com', 'node_1', 'vless', 'ws', 'a/b', '1.2.3.4', 'a:b', '1.2.3.4:443', 'hysteria2'];
+const MAY_BARE = [
+  'HK-1', 'example.com', 'node_1', 'vless', 'ws', 'a/b', '1.2.3.4', 'a:b', '1.2.3.4:443', 'hysteria2',
+  // 斜杠开头的绝对路径必须裸写：hysteria 的 cert / key 就是这种值，一旦被加引号，
+  // agent 的 hy_ensure 用 sed 抠出来的就是带引号的字面量，`[ -f ]` 永远判假，
+  // 证书明明在也报「证书未就绪」，hysteria 永远不启动（0.1.34 的线上回归）
+  '/etc/nodepanel/certs/c5c12cbdbbde0/fullchain.pem',
+  '/usr/local/etc/xray/config.json',
+];
 
 for (const s of MUST_QUOTE) {
   const out = toYaml(s);
@@ -438,8 +445,60 @@ if (parser) {
   }
 }
 
-/* ------------------------------ 收尾 ------------------------------ */
+/* ------------- 六、hysteria 的证书路径必须能被 agent 正确抠出来 ------------- */
 
+console.log('\nhysteria 证书路径（yaml 抠值与文件判断）');
+
+// 0.1.34 的线上回归：yaml 把绝对路径写成 `cert: "/etc/..."`，agent 的 hy_ensure
+// 用 sed 抠出冒号后的原文直接 `[ -f "$_cert" ]`，于是比的是「带引号字面量」这个
+// 文件名，证书明明在磁盘上也判不存在 → hysteria 永远不启动。这里把两侧都钉住：
+// 面板生成的 yaml 必须裸写，且 agent 那套「抠值 + 剥引号」对两种写法都能还原路径。
+const probeNode = {
+  id: 'e5a3124338ff',
+  name: 'HK',
+  host: '1.2.3.4',
+  port: 24578,
+  protocol: 'hysteria2',
+  certMode: 'ref',
+  certId: 'c5c12cbdbbde0',
+  upMbps: 0,
+  downMbps: 0,
+  obfs: '',
+  sni: '',
+};
+const hyYaml = hysteria.toYamlFile(probeNode, [], '站点', 30001);
+const certLine = hyYaml.split('\n').find((l) => /^\s*cert:/.test(l)) || '';
+const keyLine = hyYaml.split('\n').find((l) => /^\s*key:/.test(l)) || '';
+
+ok('hysteria yaml 的 cert 裸写（不带引号）', certLine === '  cert: /etc/nodepanel/certs/c5c12cbdbbde0/fullchain.pem', certLine);
+ok('hysteria yaml 的 key 裸写（不带引号）', keyLine === '  key: /etc/nodepanel/certs/c5c12cbdbbde0/privkey.pem', keyLine);
+
+// 用 agent 侧同一套 shell 逻辑跑一遍：抠值 → 剥引号。断言还原出的字符串与写入
+// yaml 的路径逐字节一致 —— 只要它带引号，`[ -f ]` 就会判一个不存在的文件名。
+const probeDir = path.join(TMP, 'hyprobe');
+fs.mkdirSync(probeDir, { recursive: true });
+const probeCert = path.join(probeDir, 'fullchain.pem');
+
+const pickScript = `
+_cfg=$1
+_cert=$(sed -n 's/^[[:space:]]*cert:[[:space:]]*//p' "$_cfg" 2>/dev/null | sed -n '1p')
+_cert=\${_cert#\\"}; _cert=\${_cert%\\"}
+_cert=\${_cert#\\'}; _cert=\${_cert%\\'}
+printf '%s' "$_cert"
+`;
+for (const [label, line] of [
+  ['裸写', `  cert: ${probeCert}`],
+  ['双引号（0.1.34 生成的形态）', `  cert: "${probeCert}"`],
+  ['单引号', `  cert: '${probeCert}'`],
+]) {
+  const cfg = path.join(probeDir, 'cfg.yaml');
+  fs.writeFileSync(cfg, `listen: :24578\n${line}\n`);
+  const r = spawnSync('sh', ['-c', pickScript, 'sh', cfg], { encoding: 'utf8' });
+  const out = String(r.stdout || '');
+  ok(`hy_ensure 能从${label}的 yaml 里还原出证书路径`, out === probeCert, JSON.stringify(out));
+}
+
+/* ------------------------------ 收尾 ------------------------------ */
 // 先关库再删目录：Windows 上 SQLite 句柄没释放时 unlink 会 EBUSY
 try {
   require('../lib/store').close();
