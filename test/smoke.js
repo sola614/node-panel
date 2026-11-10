@@ -1759,6 +1759,17 @@ function totpCodeOf(secret) {
   const dropped = await call('/api/notify/settings', { method: 'PUT', body: json({ events: ['nope', 'user.over'] }) });
   ok('未知事件名被过滤掉', dropped.data.settings.events.length === 1 && dropped.data.settings.events[0] === 'user.over');
 
+  // 月末报告两版各是一个事件：群发版进用户群，完整版只给管理员
+  ok('月末报告两个版本都在事件清单里',
+    ['usage.monthly', 'usage.monthly.full'].every((k) => chList.data.events.some((e) => e.kind === k)),
+    chList.data.events.filter((e) => /^usage\./.test(e.kind)).map((e) => e.label).join(' / '));
+  // 关掉总开关再点手动发送：必须明确拒绝，而不是跑去连真 Telegram（会卡 15 秒）
+  await call('/api/notify/settings', { method: 'PUT', body: json({ enabled: false }) });
+  const usageOff = await call('/api/notify/usage-report', { method: 'POST' });
+  ok('总开关关着时手动发月末报告被明确拒绝',
+    usageOff.status === 400 && /总开关/.test(usageOff.data.error), usageOff.data.error || '');
+  await call('/api/notify/settings', { method: 'PUT', body: json({ enabled: true }) });
+
   const sweep = await call('/api/notify/sweep', { method: 'POST' });
   ok('手动巡检可用（发送失败也返回结果）', sweep.status === 200 && typeof sweep.data.fired === 'number',
     JSON.stringify({ fired: sweep.data.fired, sent: sweep.data.sent }));

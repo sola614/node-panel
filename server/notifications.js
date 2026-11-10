@@ -162,17 +162,21 @@ async function runNotifySweep(req, res) {
 /**
  * 手动发一次月末报告：只为让管理员先看看文案对不对。
  * 刻意不写 notifyUsageLastAt —— 月末那一次照常会发（界面上写明了可能收到两条）。
+ * 两版（群发 / 完整）各自发给自己订阅的渠道，一次点完。
  */
 async function sendUsageReport(req, res) {
   const r = await usageReport.sendNow();
   if (r.skipped === 'disabled') return sendJson(res, 400, { error: '通知总开关没开，先把「启用通知」勾上' });
-  if (r.skipped === 'noChannel') return sendJson(res, 400, { error: '没有启用且订阅了「月末流量报告」的渠道' });
+  if (r.skipped === 'noChannel') {
+    return sendJson(res, 400, { error: '没有启用且订阅了「月末报告」的渠道（群发版 / 完整版都算）' });
+  }
   // 全部渠道都失败时别报成功：管理员点这个按钮就是为了确认能收到
   if (!r.sent) {
-    const first = (r.results || []).find((x) => !x.ok) || {};
+    const flat = (r.results || []).flatMap((x) => x.results || []);
+    const first = flat.find((x) => !x.ok) || {};
     return sendJson(res, 400, { error: `发送失败：${first.error || '未知原因'}` });
   }
-  sendJson(res, 200, { ok: true, sent: r.sent, title: r.title, text: r.text });
+  sendJson(res, 200, { ok: true, sent: r.sent, reports: r.reports });
 }
 
 

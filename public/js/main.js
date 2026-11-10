@@ -597,12 +597,14 @@ function notifyCardHtml(n) {
               </div>
             </div>
             <p class="hint" style="margin:-4px 0 10px">
-              月末报告在每月最后一天按上面的时刻发一次；要收它，需勾选「月末流量报告」事件。
+              月末报告在每月最后一天按上面的时刻发一次。<b>群发版</b>只发前 N 名且名字打码，
+              适合用户群；<b>完整版</b>含全部用户与真实用户名，建议只配给管理员自己的渠道。
+              两个事件都勾、且同一个渠道都订阅了，就会收到两条。
               ${st.usageLastAt ? `已发到 <b>${esc(st.usageLastAt)}</b>。` : ''}
             </p>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
               <button class="btn btn-primary" data-act="notify-save">保存通知设置</button>
-              <button class="btn btn-sm btn-ghost" data-act="notify-usage-send" title="用已保存的设置发一条，不影响月末那一次">发送示例报告</button>
+              <button class="btn btn-sm btn-ghost" data-act="notify-usage-send" title="按已保存的设置把两版各发一次，不影响月末那一次">发送示例报告</button>
             </div>
             <p class="hint">
               ${openCount ? `当前有 <b>${openCount}</b> 条告警未恢复，可在「立即检查」后查看发送记录。` : '当前没有未恢复的告警。'}
@@ -1719,7 +1721,12 @@ async function runAction(act, btn, id) {
     case 'notify-usage-send': {
       const r = await api('/api/notify/usage-report', { method: 'POST' });
       // 演示站是静态快照，写接口只回 { ok: true }：别把 undefined 拼进提示里
-      if (r.title) toast(`已发送「${r.title}」，送达 ${r.sent} 次`, 'ok');
+      if (Array.isArray(r.reports) && r.reports.length) {
+        const which = r.reports
+          .map((x) => (x.event === 'usage.monthly.full' ? '完整版' : '群发版'))
+          .join(' + ');
+        toast(`已发送${which}，送达 ${r.sent} 次`, 'ok');
+      }
       render();
       break;
     }

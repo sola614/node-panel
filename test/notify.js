@@ -393,6 +393,8 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
   s.notifyUsageHour = '0';
   s.notifyUsageTop = '2';
   s.notifyUsageLastAt = '';
+  // 前面的告警测试留下的渠道是「全订阅」，先清掉，免得串味
+  store.db().notify_channels.length = 0;
 
   const NOW = new Date(2026, 10, 30, 23, 30); // 2026-11-30 23:30 本地
   const mk = (name, quotaGB) => {
@@ -416,20 +418,50 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
   // 上个月的用量不能算进「本月」
   store.bumpUserDaily(uA.id, 99 * store.GB, '2026-10-31');
 
-  const rep = usageReport.build(NOW);
-  ok('报告标题带年月', /2026-11/.test(rep.title), rep.title);
-  ok('榜单按用量倒序、受人数限制', /1、甲用户/.test(rep.text) && /2、乙用户/.test(rep.text) && !/丙用户/.test(rep.text));
-  ok('总用量按本月区间求和（不含上月）', /本月全站总用量：20\.00 GB/.test(rep.text));
-  ok('榜单合计与占比正确', /17\.00 GB，占全站 85\.0%/.test(rep.text));
-  const overCount = store.db().users.filter((u) => store.publicUser(u).status === 'over').length;
-  ok('超额人数被统计', new RegExp(`超额 ${overCount} 位`).test(rep.text), `超额=${overCount}`);
-  ok('带额度与使用率的行格式正确', /1、甲用户 — 12\.00 GB \/ 100\.00 GB（12\.0%）/.test(rep.text));
+  /* ---------------------- 7.1 两个版本的内容形态 ---------------------- */
+  const pub = usageReport.buildPublic(NOW);
+  const full = usageReport.buildFull(NOW);
 
-  const hitsBefore = collect().length;
+  ok('群发版标题带年月', /2026-11/.test(pub.title), pub.title);
+  ok('群发版只列前 N 名（notifyUsageTop=2）',
+    /1、甲\*\*/.test(pub.text) && /2、乙\*\*/.test(pub.text) && !/丙/.test(pub.text));
+  ok('群发版里没有真实用户名', !/甲用户|乙用户|丙用户/.test(pub.text));
+  ok('群发版总用量按本月区间求和（不含上月）', /本月全站总用量：20\.00 GB/.test(pub.text));
+  ok('群发版榜单合计与占比正确', /17\.00 GB，占全站 85\.0%/.test(pub.text));
+  ok('群发版不透露运营口径（在册 / 超额 / 到期）', !/在册|超额|到期/.test(pub.text));
+
+  ok('完整版标题标出「完整版」', /完整版/.test(full.title), full.title);
+  ok('完整版列全部用户，不受前 N 名限制',
+    /1、甲用户/.test(full.text) && /2、乙用户/.test(full.text) && /3、丙用户/.test(full.text));
+  ok('完整版带额度与使用率', /1、甲用户 — 12\.00 GB \/ 100\.00 GB（12\.0%）/.test(full.text));
+  ok('完整版总用量与群发版一致', /本月总用量 20\.00 GB/.test(full.text));
+  const overCount = store.db().users.filter((u) => store.publicUser(u).status === 'over').length;
+  ok('完整版统计在册与超额', new RegExp(`超额 ${overCount} 位`).test(full.text), `超额=${overCount}`);
+
+  ok('脱敏：留首字，星号最多 3 个（长名字不透出长度）',
+    usageReport.maskName('林小满') === '林**' &&
+      usageReport.maskName('林小满满满') === '林***' &&
+      usageReport.maskName('林') === '林*' &&
+      usageReport.maskName('   ') === '匿名用户',
+    [usageReport.maskName('林小满'), usageReport.maskName('林小满满满'), usageReport.maskName('林')].join(' / '));
+
+  /* ------------------------ 7.2 定时发送与闸门 ------------------------ */
+  store.db().notify_channels.push({
+    id: 'ch-group',
+    name: '用户群',
+    type: 'webhook',
+    enabled: true,
+    events: ['usage.monthly'],
+    config: { url: `http://127.0.0.1:${web.port}/group`, format: 'json' },
+    createdAt: store.iso(),
+  });
+  const groupHits = () => web.hits.filter((h) => h.path === '/group').map((h) => JSON.parse(h.body));
+
   const r7 = await usageReport.sweep(NOW);
-  const monthly = collect().slice(hitsBefore).filter((b) => b.event === 'usage.monthly');
-  ok('月末到点发一次报告', r7.sent === 1 && monthly.length === 1, `sent=${r7.sent}`);
-  ok('报告正文随消息送达', monthly[0] && /月末盘点时间到/.test(monthly[0].body || ''));
+  const grp7 = groupHits();
+  ok('只勾群发版时只发一条', r7.sent === 1 && grp7.length === 1 && grp7[0].event === 'usage.monthly',
+    `sent=${r7.sent} 群=${grp7.length}`);
+  ok('群里收到的是打码榜单', /甲\*\*/.test(grp7[0].body || '') && !/甲用户/.test(grp7[0].body || ''));
   ok('发送后记下月份（幂等标记）', store.db().settings.notifyUsageLastAt === '2026-11');
 
   const r8 = await usageReport.sweep(NOW);
@@ -444,17 +476,53 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
   s.notifyEvents = 'user.over';
   s.notifyUsageLastAt = '';
   const r11 = await usageReport.sweep(NOW);
-  ok('没勾选「月末流量报告」就不发', r11.skipped === 'off');
+  ok('没勾选「月末报告」就不发', r11.skipped === 'off');
 
-  s.notifyEvents = 'usage.monthly';
+  /* --------------------- 7.3 两版并行：渠道各收各的 --------------------- */
+  s.notifyEvents = 'usage.monthly,usage.monthly.full';
+  store.db().notify_channels.push({
+    id: 'ch-admin',
+    name: '管理员私聊',
+    type: 'webhook',
+    enabled: true,
+    events: ['usage.monthly.full'],
+    config: { url: `http://127.0.0.1:${web.port}/admin`, format: 'json' },
+    createdAt: store.iso(),
+  });
+  ok('发送计划按「勾了 + 有人订阅」拆分',
+    JSON.stringify(usageReport.plan()) === '["usage.monthly","usage.monthly.full"]',
+    JSON.stringify(usageReport.plan()));
+
+  const before2 = web.hits.length;
+  const r14 = await usageReport.sweep(NOW);
+  const two = web.hits.slice(before2);
+  const grp = two.filter((h) => h.path === '/group').map((h) => JSON.parse(h.body));
+  const adm = two.filter((h) => h.path === '/admin').map((h) => JSON.parse(h.body));
+  ok('两版各发一次、互不串台', r14.sent === 2 && grp.length === 1 && adm.length === 1,
+    `sent=${r14.sent} 群=${grp.length} 管理=${adm.length}`);
+  ok('群渠道只收到打码版',
+    grp[0] && grp[0].event === 'usage.monthly' && /甲\*\*/.test(grp[0].body) && !/甲用户/.test(grp[0].body));
+  ok('管理员渠道只收到完整版',
+    adm[0] && adm[0].event === 'usage.monthly.full' && /甲用户/.test(adm[0].body));
+  ok('两版共用同一个月份标记（只发一次）', store.db().settings.notifyUsageLastAt === '2026-11');
+
+  // 只剩完整版的订阅者时，群发版不该发（哪怕事件还勾着）
+  store.db().notify_channels.splice(0, 1);
+  ok('群渠道撤掉后计划只剩完整版',
+    JSON.stringify(usageReport.plan()) === '["usage.monthly.full"]',
+    JSON.stringify(usageReport.plan()));
+
+  s.notifyUsageLastAt = '';
   const r12 = await usageReport.sendNow(NOW);
-  ok('手动发送不占用当月额度（月末照常发）', r12.sent === 1 && store.db().settings.notifyUsageLastAt === '');
+  ok('手动发送不占用当月额度（月末照常发）',
+    r12.sent === 1 && store.db().settings.notifyUsageLastAt === '',
+    `sent=${r12.sent} lastAt=${store.db().settings.notifyUsageLastAt}`);
 
-  // 渠道不订阅该事件时，广播不到它
+  // 所有渠道都不订阅这两个事件时，广播不到任何人
   store.db().notify_channels[0].events = ['user.over'];
   const r13 = await usageReport.sendNow(NOW);
   ok('渠道未订阅时报告发不出去', r13.skipped === 'noChannel', JSON.stringify(r13));
-  store.db().notify_channels[0].events = [];
+  store.db().notify_channels[0].events = ['usage.monthly.full'];
 
   web.server.close();
   store.close();

@@ -599,11 +599,12 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
 
   ok('设置页有「消息通知」卡片', /消息通知/.test(d8.querySelector('#view').textContent));
   ok('通知总开关存在', !!d8.querySelector('#nt-enabled'));
-  ok('九个事件都能勾选', d8.querySelectorAll('.nt-ev').length === 9,
+  ok('十个事件都能勾选', d8.querySelectorAll('.nt-ev').length === 10,
     `实际 ${d8.querySelectorAll('.nt-ev').length} 个`);
   ok('证书告警事件在列表里',
     !!d8.querySelector('.nt-ev[value="cert.expiring"]') && !!d8.querySelector('.nt-ev[value="cert.failed"]'));
-  ok('月末报告事件在列表里', !!d8.querySelector('.nt-ev[value="usage.monthly"]'));
+  ok('月末报告两版都能勾（群发版 / 完整版）',
+    !!d8.querySelector('.nt-ev[value="usage.monthly"]') && !!d8.querySelector('.nt-ev[value="usage.monthly.full"]'));
   ok('默认关注六个事件', d8.querySelectorAll('.nt-ev:checked').length === 6,
     `实际 ${d8.querySelectorAll('.nt-ev:checked').length} 个`);
   ok('触发参数回填（到期前 3 天）', Number(d8.querySelector('#nt-lead').value) === 3,
