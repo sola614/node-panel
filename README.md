@@ -747,21 +747,59 @@ curl -X POST -H "Authorization: Bearer <session>" \
 | 服务器离线 | 超过「离线判定」分钟（默认 10）没有心跳 |
 | 独立节点离线 | 同上，独立部署的机器 |
 | agent 版本落后 | 机器上的 agent 版本与面板不一致超过 7 天 |
+| 月末流量报告 | 每月最后一天到「发送时刻」（默认 23:00）盘点一次本月用量，当月只发一次 |
 
 「关注的事件」一个都不勾 = 全部关注；勾了之后只发勾上的那几类。
 管理员账号自己不参与（不会天天提醒你「你到期了」）。
+
+**月末流量报告**和上面几类不一样：它不是「出了问题」，而是每月一次的账本 ——
+按 `user_daily` 的本月区间统计（不是计费周期），列出用量前 N 名（默认 10 人）、
+全站总用量、榜单占比，以及正常 / 超额 / 已到期的人数。要收它得勾上这个事件；
+「发送示例报告」按钮可以立刻发一条看文案，**不占用当月额度**，月末那次照常会发。
 
 ### 三种渠道
 
 | 类型 | 要填什么 | 备注 |
 | --- | --- | --- |
-| Webhook | 地址 + 载荷格式（可选鉴权头） | 通用 JSON / 企业微信 / 钉钉 / 飞书 / Slack 五种格式，机器人字段名不一样，选对就行 |
+| Webhook | 地址 + 载荷格式（可选 Token / 自定义请求头） | 通用 JSON / 企业微信 / 钉钉 / 飞书 / Slack 五种内置格式，另有「自定义 JSON」模板 |
 | Telegram | Bot Token + Chat ID（可选反代地址） | 直连不了 `api.telegram.org` 时填自己的反代，只替换域名部分 |
 | 邮件 | SMTP 服务器 / 端口 / 加密 / 账号 / 密码 / 收件人 | 465 选「TLS」；587、25 选「STARTTLS」；内网自建 MTA 可选「不加密」 |
 
 邮件是**手写的 SMTP 客户端**（`lib/smtp.js`，跑在 `node:net` / `node:tls` 上）：
 支持 AUTH LOGIN 与 PLAIN、多收件人、中文标题（RFC 2047 编码）、HTML + 纯文本双段。
 不上 nodemailer 是为了保住「零依赖」这条底线。
+
+#### 自定义请求体与请求头
+
+内置五种格式覆盖不到的接口，选「自定义 JSON（模板）」，直接写请求体：
+
+```json
+{"msg":"{{title}}通知信息","msgType":10}
+```
+
+可用占位符 —— **必须写在引号里**，替换时按 JSON 字符串规则转义，标题里带双引号也不会把请求体弄坏：
+
+| 占位符 | 内容 |
+| --- | --- |
+| `{{title}}` | 消息标题，如「用户流量超额：林小满」 |
+| `{{text}}` | 消息正文（多行） |
+| `{{event}}` | 事件名，如 `user.over`、`usage.monthly` |
+| `{{level}}` | `info` / `warn` / `bad` |
+| `{{site}}` | 站点名 |
+| `{{time}}` | 发送时刻（ISO 8601） |
+
+保存时会拿示例值渲染一遍再 `JSON.parse`：漏引号、多逗号、占位符拼错都当场报错，
+不会等到半夜该发通知时才发现发不出去。模板留空则发 `{"title":"{{title}}","text":"{{text}}"}`。
+
+请求头同样是模板，一行一个 `Name: Value`，`#` 开头当注释，`{{token}}` 会替换成「Token」字段里的值：
+
+```text
+x-api-key: {{token}}
+```
+
+留空则沿用旧行为：填了 Token 就发 `Authorization: Bearer <token>`。
+Token 本身仍是打码字段；就算把它直接粘进请求头，保存时也会自动收回成 `{{token}}`，
+不会以明文出现在 `GET /api/notify/channels` 的响应里。
 
 > QQ / 163 / Gmail 要填**授权码**而不是登录密码。填错了「最近发送记录」里会看到
 > `SMTP 535：…` 这样的原始报错，照着改就行；webhook 404、连不上、超时也一样能定位。
@@ -1179,8 +1217,9 @@ POST /api/notify/channels                  新增渠道
 PUT  /api/notify/channels/:id              修改渠道（密钥字段留空/脱敏值 = 不修改）
 DELETE /api/notify/channels/:id            删除渠道
 POST /api/notify/test                      给指定渠道发一条测试消息
-PUT  /api/notify/settings                  通知开关 / 关注事件 / 阈值
+PUT  /api/notify/settings                  通知开关 / 关注事件 / 阈值 / 月末报告时刻与榜单人数
 POST /api/notify/sweep                     立刻巡检一次（等同定时任务）
+POST /api/notify/usage-report              立刻发一条月末报告（预览用，不占用当月额度）
 
 GET  /api/agent/config?token=TOKEN&ip=IP   拉配置（JSON，调试用）
 GET  /api/agent/bundle?token=TOKEN&ip=IP   拉配置包（shell 脚本；带 hash 且未变时只回 #UNCHANGED）
@@ -1237,6 +1276,7 @@ node-panel/
 │   ├── notify.js        通知渠道（webhook / Telegram / 邮件）+ 载荷格式 + 发送日志
 │   ├── smtp.js          手写 SMTP 客户端（TLS / STARTTLS / AUTH LOGIN / PLAIN）
 │   ├── alerts.js        告警巡检与去重（按 key + 冷却时间 + 恢复通知）
+│   ├── usage-report.js  月末流量报告（本月区间统计 + 按月份幂等发送）
 │   ├── keys.js          x25519 密钥对生成
 │   ├── totp.js          管理员二步验证（RFC 6238，node:crypto 手写 HMAC-SHA1）
 │   ├── qrcode.js        TOTP 绑定二维码（ISO/IEC 18004 子集：byte/UTF-8/ECC-M/V1-10，纯位运算）

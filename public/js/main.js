@@ -586,7 +586,24 @@ function notifyCardHtml(n) {
                 </label>
               </div>
             </div>
-            <button class="btn btn-primary" data-act="notify-save">保存通知设置</button>
+            <div class="form-row">
+              <div class="field">
+                <label>月末报告发送时刻（0–23 时）</label>
+                <input type="number" id="nt-usage-hour" min="0" max="23" value="${st.usageHour}">
+              </div>
+              <div class="field">
+                <label>报告榜单人数</label>
+                <input type="number" id="nt-usage-top" min="1" max="50" value="${st.usageTop}">
+              </div>
+            </div>
+            <p class="hint" style="margin:-4px 0 10px">
+              月末报告在每月最后一天按上面的时刻发一次；要收它，需勾选「月末流量报告」事件。
+              ${st.usageLastAt ? `已发到 <b>${esc(st.usageLastAt)}</b>。` : ''}
+            </p>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn btn-primary" data-act="notify-save">保存通知设置</button>
+              <button class="btn btn-sm btn-ghost" data-act="notify-usage-send" title="用已保存的设置发一条，不影响月末那一次">发送示例报告</button>
+            </div>
             <p class="hint">
               ${openCount ? `当前有 <b>${openCount}</b> 条告警未恢复，可在「立即检查」后查看发送记录。` : '当前没有未恢复的告警。'}
             </p>
@@ -816,6 +833,17 @@ function channelFieldsHtml(type, cfg) {
         允许自签证书（内网自建邮件服务器常见）
       </label>`;
   }
+  const whFormat = cfg.format || 'json';
+  const whVars = (state.data.notifyMeta && state.data.notifyMeta.webhookVars) || [];
+  const whVarRows = whVars
+    .map(
+      (v) => `<div style="display:flex;gap:8px;font-size:11.5px;line-height:1.9">
+        <code style="min-width:74px;flex-shrink:0;color:var(--code-fg)">{{${esc(v.key)}}}</code>
+        <span style="min-width:62px;flex-shrink:0;color:var(--text)">${esc(v.label)}</span>
+        <span style="color:var(--muted)">${esc(v.desc)}</span>
+      </div>`,
+    )
+    .join('');
   return `
     <div class="field">
       <label>Webhook 地址</label>
@@ -825,13 +853,41 @@ function channelFieldsHtml(type, cfg) {
       <label>载荷格式</label>
       <select id="nc-format">
         ${((state.data.notifyMeta && state.data.notifyMeta.formats) || [{ value: 'json', label: '通用 JSON' }])
-          .map((f) => `<option value="${esc(f.value)}" ${(cfg.format || 'json') === f.value ? 'selected' : ''}>${esc(f.label)}</option>`)
+          .map((f) => `<option value="${esc(f.value)}" ${whFormat === f.value ? 'selected' : ''}>${esc(f.label)}</option>`)
           .join('')}
       </select>
     </div>
+    <div class="field" id="nc-body-field" style="${whFormat === 'custom' ? '' : 'display:none'}">
+      <label>请求体模板（JSON）</label>
+      <textarea id="nc-body" rows="4" spellcheck="false" placeholder='{"msg":"{{title}}","msgType":10}'>${esc(cfg.body || '')}</textarea>
+      <div class="hint" style="margin:6px 0 0">
+        占位符必须写在引号里，如 <code>"{{title}}"</code>；留空则发
+        <code>{"title":"{{title}}","text":"{{text}}"}</code>。
+      </div>
+      ${
+        whVarRows
+          ? `<div style="margin-top:8px;padding:8px 10px;border:1px solid var(--line-soft);border-radius:8px;background:var(--bg-soft)">
+              <div style="font-size:11.5px;color:var(--text-dim);margin-bottom:3px">可用字段（系统会替换成对应内容）</div>
+              ${whVarRows}
+            </div>`
+          : ''
+      }
+    </div>
     <div class="field">
-      <label>鉴权头（可选）</label>
-      <input type="text" id="nc-token" value="${esc(cfg.token || '')}" placeholder="填了会以 Authorization: Bearer 发送" spellcheck="false">
+      <label>Token（可选）</label>
+      <input type="text" id="nc-token" value="${esc(cfg.token || '')}" placeholder="请求头里用 {{token}} 引用它" spellcheck="false">
+      <div class="hint">已保存的 Token 显示为 ••••••，不动它就保持原值。</div>
+    </div>
+    <div class="field">
+      <label>自定义请求头（可选）</label>
+      <textarea id="nc-headers" rows="3" spellcheck="false" placeholder="x-api-key: {{token}}">${esc(cfg.headers || '')}</textarea>
+      <div class="hint" style="margin:6px 0 0">
+        一行一个 <code>Name: Value</code>，<code>#</code> 开头当注释。可用字段：
+      </div>
+      <div style="display:flex;gap:8px;font-size:11.5px;line-height:1.9">
+        <code style="min-width:74px;flex-shrink:0;color:var(--code-fg)">{{token}}</code>
+        <span style="color:var(--muted)">上面填的 Token；留空则沿用 <code>Authorization: Bearer &lt;token&gt;</code></span>
+      </div>
     </div>`;
 }
 
@@ -890,6 +946,11 @@ function readChannelForm(mask) {
     config.url = val('#nc-url');
     config.format = val('#nc-format') || 'json';
     config.token = val('#nc-token');
+    // 模板要保留内部换行，不能像单行字段那样整段 trim 掉再拼
+    const bodyEl = mask.querySelector('#nc-body');
+    const headEl = mask.querySelector('#nc-headers');
+    config.body = bodyEl ? bodyEl.value.trim() : '';
+    config.headers = headEl ? headEl.value.trim() : '';
   } else if (type === 'telegram') {
     config.botToken = val('#nc-botToken');
     config.chatId = val('#nc-chatId');
@@ -913,6 +974,14 @@ function readChannelForm(mask) {
   };
 }
 
+/** 只有「自定义 JSON」才需要请求体模板，其它格式的载荷是内置的 */
+function syncWebhookBodyField(scope) {
+  const sel = scope.querySelector('#nc-format');
+  const box = scope.querySelector('#nc-body-field');
+  if (!sel || !box) return;
+  box.style.display = sel.value === 'custom' ? '' : 'none';
+}
+
 function channelFlow(ch) {
   const mask = openModal({
     title: ch ? '编辑渠道 · ' + ch.name : '添加通知渠道',
@@ -934,8 +1003,15 @@ function channelFlow(ch) {
     typeSel.addEventListener('change', () => {
       mask.querySelector('#nc-fields').innerHTML = channelFieldsHtml(typeSel.value, {});
       mask.querySelector('#nc-type-hint').textContent = NOTIFY_TYPE_HINT[typeSel.value] || '';
+      syncWebhookBodyField(mask);
     });
   }
+
+  // 载荷格式换成「自定义」时才露出模板框；字段区会被重画，所以用委托监听
+  mask.addEventListener('change', (e) => {
+    if (e.target && e.target.id === 'nc-format') syncWebhookBodyField(mask);
+  });
+  syncWebhookBodyField(mask);
 }
 
 /* ============================== 事件委托 ============================== */
@@ -952,6 +1028,7 @@ const ACT_LOADING = {
   'notify-save': '保存中',
   'notify-sweep': '检查中',
   'notify-test': '发送中',
+  'notify-usage-send': '发送中',
   'backup-now': '备份中',
   'backup-dl': '下载中',
   'backup-upload': '准备中',
@@ -1631,9 +1708,18 @@ async function runAction(act, btn, id) {
           offlineMin: Number($('#nt-offline').value) || 10,
           cooldownHours: Number($('#nt-cooldown').value) || 12,
           recovery: $('#nt-recovery').checked,
+          usageHour: Number($('#nt-usage-hour').value) || 0,
+          usageTop: Number($('#nt-usage-top').value) || 10,
         }),
       });
       toast('通知设置已保存', 'ok');
+      render();
+      break;
+    }
+    case 'notify-usage-send': {
+      const r = await api('/api/notify/usage-report', { method: 'POST' });
+      // 演示站是静态快照，写接口只回 { ok: true }：别把 undefined 拼进提示里
+      if (r.title) toast(`已发送「${r.title}」，送达 ${r.sent} 次`, 'ok');
       render();
       break;
     }

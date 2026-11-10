@@ -9,11 +9,14 @@
     "httpsCertId": "",
     "billingDay": "0",
     "notifyEnabled": "0",
-    "notifyEvents": "user.expiring,user.expired,user.over,server.offline,node.offline",
+    "notifyEvents": "user.expiring,user.expired,user.over,server.offline,node.offline,usage.monthly",
     "notifyLeadDays": "3",
     "notifyOfflineMin": "10",
     "notifyCooldownHours": "12",
-    "notifyRecovery": "1"
+    "notifyRecovery": "1",
+    "notifyUsageHour": "23",
+    "notifyUsageTop": "10",
+    "notifyUsageLastAt": ""
   },
   "admin": {
     "username": "admin",

@@ -9,6 +9,7 @@
 const store = require('../lib/store');
 const notify = require('../lib/notify');
 const alerts = require('../lib/alerts');
+const usageReport = require('../lib/usage-report');
 const { APP_VERSION } = require('./config');
 const { sendJson } = require('./http-util');
 const { auditAction } = require('./context');
@@ -17,6 +18,7 @@ const { auditAction } = require('./context');
 /** settings 里的通知开关都是字符串（key/value 表），这里统一解析成类型正确的对象 */
 function notifySettings() {
   const s = store.db().settings;
+  const hour = Number(s.notifyUsageHour);
   return {
     enabled: s.notifyEnabled === '1',
     events: String(s.notifyEvents || '')
@@ -27,6 +29,10 @@ function notifySettings() {
     offlineMin: Number(s.notifyOfflineMin) || 10,
     cooldownHours: Number(s.notifyCooldownHours) || 12,
     recovery: s.notifyRecovery === '1',
+    // 0 点是合法发送时刻，不能用 `|| 23`
+    usageHour: Number.isFinite(hour) ? hour : 23,
+    usageTop: Number(s.notifyUsageTop) || 10,
+    usageLastAt: String(s.notifyUsageLastAt || ''),
   };
 }
 
@@ -47,6 +53,8 @@ function listNotifyChannels(req, res) {
     items: db.notify_channels.map(channelOut),
     types: Object.entries(notify.TYPE_LABEL).map(([value, label]) => ({ value, label })),
     formats: notify.WEBHOOK_FORMATS,
+    /** 自定义模板可用的占位符（含含义与例子），前端直接渲染成清单 */
+    webhookVars: notify.WEBHOOK_VARS,
     events: notify.EVENTS,
     settings: notifySettings(),
     log: db.notify_log.slice(-30).reverse(),
@@ -133,6 +141,13 @@ function saveNotifySettings(req, res, params, body) {
     s.notifyCooldownHours = String(Math.min(720, Math.max(1, Number(body.cooldownHours) || 12)));
   }
   if (body.recovery !== undefined) s.notifyRecovery = body.recovery ? '1' : '0';
+  if (body.usageHour !== undefined) {
+    const h = Number(body.usageHour);
+    s.notifyUsageHour = String(Number.isFinite(h) ? Math.min(23, Math.max(0, Math.round(h))) : 23);
+  }
+  if (body.usageTop !== undefined) {
+    s.notifyUsageTop = String(Math.min(50, Math.max(1, Number(body.usageTop) || 10)));
+  }
   store.save();
   auditAction('notify.settings', '通知设置', `${s.notifyEnabled === '1' ? '已开启' : '已关闭'} · ${s.notifyEvents || '全部事件'}`);
   sendJson(res, 200, { ok: true, settings: notifySettings() });
@@ -142,6 +157,22 @@ function saveNotifySettings(req, res, params, body) {
 async function runNotifySweep(req, res) {
   const r = await alerts.sweep();
   sendJson(res, 200, { ok: true, ...r, settings: notifySettings() });
+}
+
+/**
+ * 手动发一次月末报告：只为让管理员先看看文案对不对。
+ * 刻意不写 notifyUsageLastAt —— 月末那一次照常会发（界面上写明了可能收到两条）。
+ */
+async function sendUsageReport(req, res) {
+  const r = await usageReport.sendNow();
+  if (r.skipped === 'disabled') return sendJson(res, 400, { error: '通知总开关没开，先把「启用通知」勾上' });
+  if (r.skipped === 'noChannel') return sendJson(res, 400, { error: '没有启用且订阅了「月末流量报告」的渠道' });
+  // 全部渠道都失败时别报成功：管理员点这个按钮就是为了确认能收到
+  if (!r.sent) {
+    const first = (r.results || []).find((x) => !x.ok) || {};
+    return sendJson(res, 400, { error: `发送失败：${first.error || '未知原因'}` });
+  }
+  sendJson(res, 200, { ok: true, sent: r.sent, title: r.title, text: r.text });
 }
 
 
@@ -154,4 +185,5 @@ module.exports = {
   testNotifyChannel,
   saveNotifySettings,
   runNotifySweep,
+  sendUsageReport,
 };

@@ -34,6 +34,42 @@
     {
       "value": "slack",
       "label": "Slack Incoming Webhook"
+    },
+    {
+      "value": "custom",
+      "label": "自定义 JSON（模板）"
+    }
+  ],
+  "webhookVars": [
+    {
+      "key": "title",
+      "label": "消息标题",
+      "desc": "如「用户流量超额：林小满」"
+    },
+    {
+      "key": "text",
+      "label": "消息正文",
+      "desc": "多行文本，含套餐 / 用量等明细"
+    },
+    {
+      "key": "event",
+      "label": "事件名",
+      "desc": "如 user.over、usage.monthly、test"
+    },
+    {
+      "key": "level",
+      "label": "级别",
+      "desc": "info / warn / bad"
+    },
+    {
+      "key": "site",
+      "label": "站点名",
+      "desc": "设置里的「站点名称」"
+    },
+    {
+      "key": "time",
+      "label": "发送时刻",
+      "desc": "ISO 8601，如 2026-11-10T09:00:00.000Z"
     }
   ],
   "events": [
@@ -76,6 +112,11 @@
       "kind": "cert.failed",
       "label": "证书签发失败",
       "desc": "DNS 凭据错误、域名没解析等，引用它的节点会起不来"
+    },
+    {
+      "kind": "usage.monthly",
+      "label": "月末流量报告",
+      "desc": "每月最后一天汇总全站用量与排行榜，当月只发一次"
     }
   ],
   "settings": {
@@ -90,9 +131,12 @@
     "leadDays": 3,
     "offlineMin": 10,
     "cooldownHours": 12,
-    "recovery": true
+    "recovery": true,
+    "usageHour": 23,
+    "usageTop": 10,
+    "usageLastAt": ""
   },
   "log": [],
   "openAlerts": [],
-  "appVersion": "0.1.35"
+  "appVersion": "0.1.36"
 }

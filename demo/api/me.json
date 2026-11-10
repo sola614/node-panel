@@ -14,7 +14,7 @@
     "notifyRecovery": "1"
   },
   "version": 8,
-  "appVersion": "0.1.35",
+  "appVersion": "0.1.36",
   "mustChangePassword": false,
   "totpEnabled": false,
   "uptime": 5611

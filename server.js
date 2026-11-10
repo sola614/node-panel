@@ -14,6 +14,7 @@ const crypto = require('crypto');
 
 const store = require('./lib/store');
 const alerts = require('./lib/alerts');
+const usageReport = require('./lib/usage-report');
 const logger = require('./lib/log');
 
 // ── 底座：配置 / 小工具 / 令牌 / HTTP / 共享状态 ──────────────────────────────
@@ -68,6 +69,7 @@ const {
 const {
   listNotifyChannels, createNotifyChannel, updateNotifyChannel,
   deleteNotifyChannel, testNotifyChannel, saveNotifySettings, runNotifySweep,
+  sendUsageReport,
 } = require('./server/notifications');
 const { statsView, userTraffic, listAudit } = require('./server/reports');
 const {
@@ -168,6 +170,7 @@ const ROUTES = [
   ['POST', '/api/notify/test', testNotifyChannel, true],
   ['PUT', '/api/notify/settings', saveNotifySettings, true],
   ['POST', '/api/notify/sweep', runNotifySweep, true],
+  ['POST', '/api/notify/usage-report', sendUsageReport, true],
 
   ['GET', '/api/stats', statsView, true],
   ['GET', '/api/users/:id/traffic', userTraffic, true],
@@ -392,6 +395,16 @@ function main() {
   setTimeout(() => {
     alerts.sweep().catch((err) => log.error('告警巡检异常', { err }));
   }, 15000).unref();
+  // 月末流量报告：10 分钟一轮只判断「到点没到点」，幂等靠 settings.notifyUsageLastAt
+  // 里的月份标记 —— 重启、多跑几轮都不会重复发。粒度不取整点是因为它不需要精确，
+  // 但重启后要能在当天补上；启动 60 秒后再补跑一次，避免启动瞬间和首轮 agent 拉取抢资源。
+  const usageReportTimer = setInterval(() => {
+    usageReport.sweep().catch((err) => log.error('月末报告异常', { err }));
+  }, 10 * 60 * 1000);
+  usageReportTimer.unref();
+  setTimeout(() => {
+    usageReport.sweep().catch((err) => log.error('月末报告异常', { err }));
+  }, 60 * 1000).unref();
   // 订阅模板定时同步：5 分钟一轮只是「闹钟」，真正发不发请求取决于设置里的
   // 「周几 + 几点」（最近一次尝试时间写在 settings.subTemplateSyncAt）。
   // 5 分钟粒度对上「整点」足够 —— 到点后的第一轮就会补上，界面显示的下次时间也是整点。

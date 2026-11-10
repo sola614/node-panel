@@ -21,6 +21,7 @@ const store = require('../lib/store');
 const smtp = require('../lib/smtp');
 const notify = require('../lib/notify');
 const alerts = require('../lib/alerts');
+const usageReport = require('../lib/usage-report');
 
 let pass = 0;
 let fail = 0;
@@ -225,6 +226,66 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
     ok(`webhook ${format} 载荷正确`, r.ok && shaped, hit ? '' : '（没收到请求）');
   }
 
+  /* ------------------- 3.1 自定义请求体 / 自定义请求头 ------------------- */
+  const customCfg = {
+    url: `http://127.0.0.1:${web.port}/custom`,
+    format: 'custom',
+    body: '{"msg":"{{title}}通知信息","msgType":10}',
+    token: 'tok-123456',
+    headers: 'x-api-key: {{token}}',
+  };
+
+  const beforeCustom = web.hits.length;
+  const rc = await notify.deliver({ id: 'c-custom', name: 'custom', type: 'webhook', config: customCfg }, msg);
+  const ch = web.hits[beforeCustom];
+  const cb = ch ? JSON.parse(ch.body) : {};
+  ok('自定义模板按占位符替换', rc.ok && cb.msg === '标题通知信息' && cb.msgType === 10, ch ? '' : '（没收到请求）');
+  ok('自定义请求头生效（x-api-key，且不再自动加 Bearer）',
+    !!ch && ch.headers['x-api-key'] === 'tok-123456' && !ch.headers.authorization,
+    ch ? JSON.stringify({ k: ch.headers['x-api-key'], a: ch.headers.authorization }) : '');
+
+  const beforeAuth = web.hits.length;
+  await notify.deliver(
+    { id: 'c-auth', name: 'auth', type: 'webhook', config: { url: `http://127.0.0.1:${web.port}/auth`, format: 'json', token: 'tok-abc' } },
+    msg,
+  );
+  const ah = web.hits[beforeAuth];
+  ok('没写请求头模板时保持 Authorization: Bearer', !!ah && ah.headers.authorization === 'Bearer tok-abc');
+
+  const beforeQuote = web.hits.length;
+  const rq = await notify.deliver(
+    { id: 'c-q', name: 'q', type: 'webhook', config: customCfg },
+    { ...msg, title: '带"引号"和\\反斜杠' },
+  );
+  const qb = JSON.parse(web.hits[beforeQuote].body);
+  ok('占位符按 JSON 字符串转义（引号 / 反斜杠不破坏请求体）',
+    rq.ok && qb.msg === '带"引号"和\\反斜杠通知信息', qb.msg);
+
+  const beforeDef = web.hits.length;
+  await notify.deliver(
+    { id: 'c-def', name: 'def', type: 'webhook', config: { url: `http://127.0.0.1:${web.port}/def`, format: 'custom' } },
+    msg,
+  );
+  const db = JSON.parse(web.hits[beforeDef].body);
+  ok('模板留空时用默认请求体', db.title === '标题' && db.text === '正文内容');
+
+  ok('自定义模板：未知占位符被拒',
+    /占位符不认识/.test(notify.validate('webhook', { ...customCfg, body: '{"a":"{{titel}}"}' })));
+  ok('自定义模板：替换后不是合法 JSON 被拒',
+    /不是合法 JSON/.test(notify.validate('webhook', { ...customCfg, body: '{"a":"{{title}}",}' })));
+  ok('请求头：缺少冒号被拒', /请求头格式不对/.test(notify.validate('webhook', { ...customCfg, headers: 'x-api-key' })));
+  ok('请求头：非法字段名被拒', /请求头名称不合法/.test(notify.validate('webhook', { ...customCfg, headers: 'x y: 1' })));
+  ok('合法的自定义配置通过校验', notify.validate('webhook', customCfg) === null);
+  ok('占位符清单带含义（界面要原样列给用户）',
+    notify.WEBHOOK_VARS.length === 6 &&
+      notify.WEBHOOK_VARS.every((v) => v.key && v.label && v.desc) &&
+      notify.WEBHOOK_VARS.some((v) => v.key === 'event' && /事件名/.test(v.label)),
+    notify.WEBHOOK_VARS.map((v) => v.key).join(','));
+  ok('请求头里粘的真实 Token 会被收回成占位符',
+    notify.mergeConfig('webhook', {
+      url: 'https://x.test', format: 'custom', token: 'secret-token-1', headers: 'x-api-key: secret-token-1',
+    }).headers === 'x-api-key: {{token}}');
+
   const beforeTg = web.hits.length;
   const tg = await notify.deliver(
     {
@@ -324,6 +385,76 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
   s.notifyEnabled = '0';
   const r6 = await alerts.sweep();
   ok('总开关关闭时完全不巡检', r6.disabled === true);
+
+  /* --------------------------- 7. 月末流量报告 --------------------------- */
+  console.log('\n— 月末流量报告 —');
+  s.notifyEnabled = '1';
+  s.notifyEvents = 'usage.monthly';
+  s.notifyUsageHour = '0';
+  s.notifyUsageTop = '2';
+  s.notifyUsageLastAt = '';
+
+  const NOW = new Date(2026, 10, 30, 23, 30); // 2026-11-30 23:30 本地
+  const mk = (name, quotaGB) => {
+    const u = {
+      id: store.uid(), name, uuid: store.newUuid(), token: store.rnd(8),
+      enabled: true, isAdmin: false, planId: null, quotaGB,
+      usedBytes: 0, expireAt: null, note: '', createdAt: store.iso(),
+      cycleStartAt: null, renewCount: 0, lastRenewAt: null,
+    };
+    store.db().users.push(u);
+    return u;
+  };
+  const uA = mk('甲用户', 100);
+  const uB = mk('乙用户', 50);
+  const uC = mk('丙用户', 1); // 本月 3 GB 已经超额
+  store.bumpUserDaily(uA.id, 10 * store.GB, '2026-11-05');
+  store.bumpUserDaily(uA.id, 2 * store.GB, '2026-11-20');
+  store.bumpUserDaily(uB.id, 5 * store.GB, '2026-11-10');
+  store.bumpUserDaily(uC.id, 3 * store.GB, '2026-11-11');
+  uC.usedBytes = 3 * store.GB; // 超额状态看的是 usedBytes，日表只影响本月用量
+  // 上个月的用量不能算进「本月」
+  store.bumpUserDaily(uA.id, 99 * store.GB, '2026-10-31');
+
+  const rep = usageReport.build(NOW);
+  ok('报告标题带年月', /2026-11/.test(rep.title), rep.title);
+  ok('榜单按用量倒序、受人数限制', /1、甲用户/.test(rep.text) && /2、乙用户/.test(rep.text) && !/丙用户/.test(rep.text));
+  ok('总用量按本月区间求和（不含上月）', /本月全站总用量：20\.00 GB/.test(rep.text));
+  ok('榜单合计与占比正确', /17\.00 GB，占全站 85\.0%/.test(rep.text));
+  const overCount = store.db().users.filter((u) => store.publicUser(u).status === 'over').length;
+  ok('超额人数被统计', new RegExp(`超额 ${overCount} 位`).test(rep.text), `超额=${overCount}`);
+  ok('带额度与使用率的行格式正确', /1、甲用户 — 12\.00 GB \/ 100\.00 GB（12\.0%）/.test(rep.text));
+
+  const hitsBefore = collect().length;
+  const r7 = await usageReport.sweep(NOW);
+  const monthly = collect().slice(hitsBefore).filter((b) => b.event === 'usage.monthly');
+  ok('月末到点发一次报告', r7.sent === 1 && monthly.length === 1, `sent=${r7.sent}`);
+  ok('报告正文随消息送达', monthly[0] && /月末盘点时间到/.test(monthly[0].body || ''));
+  ok('发送后记下月份（幂等标记）', store.db().settings.notifyUsageLastAt === '2026-11');
+
+  const r8 = await usageReport.sweep(NOW);
+  ok('同一个月不重复发送', r8.skipped === 'sent', JSON.stringify(r8));
+  const r9 = await usageReport.sweep(new Date(2026, 10, 20, 23, 30));
+  ok('不是月末不发', r9.skipped === 'notLastDay');
+  s.notifyUsageHour = '23';
+  const r10 = await usageReport.sweep(new Date(2026, 10, 30, 0, 30));
+  ok('没到设定时刻不发', r10.skipped === 'tooEarly');
+  s.notifyUsageHour = '0';
+
+  s.notifyEvents = 'user.over';
+  s.notifyUsageLastAt = '';
+  const r11 = await usageReport.sweep(NOW);
+  ok('没勾选「月末流量报告」就不发', r11.skipped === 'off');
+
+  s.notifyEvents = 'usage.monthly';
+  const r12 = await usageReport.sendNow(NOW);
+  ok('手动发送不占用当月额度（月末照常发）', r12.sent === 1 && store.db().settings.notifyUsageLastAt === '');
+
+  // 渠道不订阅该事件时，广播不到它
+  store.db().notify_channels[0].events = ['user.over'];
+  const r13 = await usageReport.sendNow(NOW);
+  ok('渠道未订阅时报告发不出去', r13.skipped === 'noChannel', JSON.stringify(r13));
+  store.db().notify_channels[0].events = [];
 
   web.server.close();
   store.close();

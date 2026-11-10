@@ -1663,6 +1663,12 @@ function totpCodeOf(secret) {
   const chList = await call('/api/notify/channels');
   ok('通知渠道列表可读且带事件定义',
     chList.status === 200 && Array.isArray(chList.data.items) && chList.data.events.length >= 6);
+  ok('自定义模板的可用字段随接口下发（含含义与例子）',
+    Array.isArray(chList.data.webhookVars) && chList.data.webhookVars.length === 6 &&
+      chList.data.webhookVars.every((v) => v.key && v.label && v.desc) &&
+      chList.data.webhookVars.some((v) => v.key === 'title' && /标题/.test(v.label)) &&
+      chList.data.webhookVars.some((v) => v.key === 'event' && /事件名/.test(v.label)),
+    JSON.stringify((chList.data.webhookVars || []).map((v) => v.key)));
 
   const chCreate = await call('/api/notify/channels', {
     method: 'POST',
@@ -1683,6 +1689,44 @@ function totpCodeOf(secret) {
   });
   ok('非法 webhook 地址被拒', badUrl.status === 400);
 
+  // 自定义模板：保存时就挡住拼错，别等到该发通知时才发现
+  const badTpl = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-坏模板', type: 'webhook',
+      config: { url: 'https://example.com/hook', format: 'custom', body: '{"a":"{{nope}}"}' },
+    }),
+  });
+  ok('自定义模板里的未知占位符被拒', badTpl.status === 400 && /占位符/.test(badTpl.data.error),
+    badTpl.data.error || '');
+  const badHdr = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-坏请求头', type: 'webhook',
+      config: { url: 'https://example.com/hook', headers: 'x-api-key' },
+    }),
+  });
+  ok('请求头模板缺冒号被拒', badHdr.status === 400 && /请求头/.test(badHdr.data.error), badHdr.data.error || '');
+
+  const customCh = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-自定义', type: 'webhook',
+      config: {
+        url: 'https://example.com/hook', format: 'custom',
+        body: '{"msg":"{{title}}通知信息","msgType":10}',
+        token: 'key-123456', headers: 'x-api-key: {{token}}',
+      },
+    }),
+  });
+  ok('自定义 JSON 渠道可创建',
+    customCh.status === 200 && /{{title}}/.test(customCh.data.item.config.body), customCh.data.error || '');
+  ok('自定义请求头里的 Token 不回显明文',
+    customCh.data.item.config.headers === 'x-api-key: {{token}}' &&
+      customCh.data.item.config.token === '••••••' && customCh.data.item.hasSecret.token === true,
+    JSON.stringify(customCh.data.item.config.headers));
+  await call('/api/notify/channels/' + customCh.data.item.id, { method: 'DELETE' });
+
   const tgCh = await call('/api/notify/channels', {
     method: 'POST',
     body: json({ name: 'SMOKE-TG', type: 'telegram', config: { botToken: 'secret-token', chatId: '1' } }),
@@ -1699,12 +1743,19 @@ function totpCodeOf(secret) {
 
   const notifSet = await call('/api/notify/settings', {
     method: 'PUT',
-    body: json({ enabled: true, events: ['user.over', 'server.offline'], leadDays: 5, offlineMin: 15, cooldownHours: 6, recovery: false }),
+    body: json({ enabled: true, events: ['user.over', 'server.offline'], leadDays: 5, offlineMin: 15, cooldownHours: 6, recovery: false, usageHour: 21, usageTop: 5 }),
   });
   ok('保存通知设置',
     notifSet.status === 200 && notifSet.data.settings.enabled === true &&
       notifSet.data.settings.leadDays === 5 && notifSet.data.settings.events.length === 2,
     JSON.stringify(notifSet.data.settings));
+  ok('月末报告参数可保存',
+    notifSet.data.settings.usageHour === 21 && notifSet.data.settings.usageTop === 5,
+    JSON.stringify({ h: notifSet.data.settings.usageHour, n: notifSet.data.settings.usageTop }));
+  const hourClamp = await call('/api/notify/settings', { method: 'PUT', body: json({ usageHour: 99, usageTop: 0 }) });
+  ok('月末报告参数越界被夹回（99→23、0→10）',
+    hourClamp.data.settings.usageHour === 23 && hourClamp.data.settings.usageTop === 10,
+    JSON.stringify({ h: hourClamp.data.settings.usageHour, n: hourClamp.data.settings.usageTop }));
   const dropped = await call('/api/notify/settings', { method: 'PUT', body: json({ events: ['nope', 'user.over'] }) });
   ok('未知事件名被过滤掉', dropped.data.settings.events.length === 1 && dropped.data.settings.events[0] === 'user.over');
 
@@ -1720,8 +1771,14 @@ function totpCodeOf(secret) {
   const chDel = await call('/api/notify/channels/' + chId, { method: 'DELETE' });
   ok('删除渠道', chDel.status === 200);
 
-  // 还原通知开关，避免影响后续手动使用测试库
-  await call('/api/notify/settings', { method: 'PUT', body: json({ enabled: false }) });
+  // 还原通知开关与关注事件，避免影响后续用例（UI 测试会断言默认勾选的那几项）
+  await call('/api/notify/settings', {
+    method: 'PUT',
+    body: json({
+      enabled: false,
+      events: ['user.expiring', 'user.expired', 'user.over', 'server.offline', 'node.offline', 'usage.monthly'],
+    }),
+  });
   await call('/api/notify/channels/' + tgCh.data.item.id, { method: 'DELETE' });
 
   /* ---------- 13. 批量建号与批量操作 ---------- */
