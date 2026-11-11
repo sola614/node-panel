@@ -139,6 +139,26 @@
     }
     if (api === '/api/audit') return load('audit.json').then(json);
     if (api === '/api/settings') return load('settings.json').then(json);
+    // 静态站查不了 GitHub（跨域 + 没有后端）。直接回「已是最新」，
+    // 否则点开侧栏版本号会看到一个「检查失败」，像是演示站坏了。
+    // current 取自 me.json，跟着版本号走，不会随录制时间过期。
+    if (api === '/api/update/check') {
+      return load('me.json').then(function (me) {
+        return json({
+          ok: true,
+          hasUpdate: false,
+          current: me.appVersion,
+          latest: '',
+          publishedAt: '',
+          notes: '',
+          url: 'https://github.com/sola614/node-panel/releases',
+          deployKind: 'docker',
+          command: 'docker compose pull && docker compose up -d',
+          note: '演示站不联网检查版本。',
+          cached: true,
+        });
+      });
+    }
     if (api === '/api/notify/channels') return load('notify-channels.json').then(json);
     if (api === '/api/invites') return load('invites.json').then(json);
     if (api === '/api/backups') return load('backups.json').then(json);

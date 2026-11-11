@@ -10,7 +10,7 @@
  *   · 「订阅对外域名」格式校验（填错不发请求）
  *   · 套餐自动续期表单（续期开关随有效期类型联动）
  *   · 通知设置卡片（渠道表单随类型切换、测试发送真的打出 webhook）
- *   · 侧栏版本号、拆分后各页渲染
+ *   · 侧栏版本号兼「检查更新」按钮（弹窗骨架、只读弹窗没有多余按钮）、拆分后各页渲染
  */
 const http = require('http');
 const fs = require('fs');
@@ -124,6 +124,36 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('默认图标是 ☀', topBtn.querySelector('.ico').textContent === '☀');
   ok('侧栏显示版本号', /^v\d+\.\d+\.\d+$/.test(d.querySelector('#side-ver').textContent),
     `(${d.querySelector('#side-ver').textContent})`);
+
+  /* ==================== 1.2 版本号兼「检查更新」按钮 ==================== */
+  // 面板换不了自己的版本（Docker 下 /app 是只读镜像层），所以这个按钮的产出
+  // 固定是「一个只读弹窗」。这里只验交互与骨架：有没有新版取决于线上状态，
+  // 断言 hasUpdate 会让测试在「刚发版」和「没发版」两种情况下结果不同。
+  console.log('\n── 版本检查弹窗 ──');
+  const verBtn = d.querySelector('#side-ver');
+  ok('版本号是个按钮（可以点开）', verBtn.tagName === 'BUTTON');
+  ok('按钮初始 title 提示可以点（检查结果还没回来）', /检查更新/.test(verBtn.getAttribute('title') || ''),
+    verBtn.getAttribute('title'));
+  click(verBtn, dom.window);
+  await waitFor(() => d.querySelector('.modal [data-recheck]'), '版本弹窗');
+  const updModal = d.querySelector('.modal');
+  ok('点击版本号弹出检查结果', !!updModal && /版本检查|发现新版本/.test(updModal.querySelector('h3').textContent),
+    updModal ? updModal.querySelector('h3').textContent : '(没弹)');
+  ok('弹窗里有「重新检查」', !!updModal.querySelector('[data-recheck]'));
+  ok('弹窗里回显当前版本（查失败时也要能看到）',
+    updModal.textContent.includes('v' + login.appVersion), `(期望 v${login.appVersion})`);
+  ok('弹窗底部有「关闭」而不是「保存」',
+    /关闭/.test(updModal.querySelector('[data-ok]').textContent));
+  // 只读弹窗里「取消」和「关闭」并排会让人犹豫哪个才是真关掉
+  ok('只读弹窗没有多余的「取消」按钮',
+    !updModal.querySelector('.modal-foot [data-close]'));
+  // 走到这里说明 paintVersion 已经跑过（弹窗就是它之后开的）
+  ok('检查后 title 变成当前版本 / 新版本',
+    /当前 v|新版本/.test(verBtn.getAttribute('title') || ''), verBtn.getAttribute('title'));
+  ok('没有新版本时不加高亮类（有的话加 has-update，样式里画那个点）',
+    verBtn.classList.contains('has-update') === /新版本/.test(verBtn.getAttribute('title') || ''));
+  dom.window.closeModal();
+  ok('关掉弹窗后遮罩被移除', !d.querySelector('.modal-mask'));
 
   click(topBtn, dom.window);
   await sleep(150);

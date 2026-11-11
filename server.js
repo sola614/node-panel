@@ -81,6 +81,7 @@ const {
 const { httpsState, wire, resolveHttpsCreds, syncHttpsServer } = require('./server/panel-https');
 const { getSettings, updateSettings, syncClashTemplate, sweepTemplateSync } =
   require('./server/settings');
+const { checkUpdate } = require('./server/update');
 
 
 const log = logger.create('http');
@@ -162,6 +163,9 @@ const ROUTES = [
   ['GET', '/api/settings', getSettings, true],
   ['PUT', '/api/settings', updateSettings, true],
   ['POST', '/api/settings/sync-template', syncClashTemplate, true],
+
+  // 面板自身：查有没有新版本（只读，不下载也不替换任何东西）
+  ['GET', '/api/update/check', checkUpdate, true],
 
   ['GET', '/api/notify/channels', listNotifyChannels, true],
   ['POST', '/api/notify/channels', createNotifyChannel, true],

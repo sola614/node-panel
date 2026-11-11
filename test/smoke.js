@@ -3329,7 +3329,40 @@ function totpCodeOf(secret) {
     }
   }
 
-  /* ---------- 16. 清理 ---------- */
+  /* ---------- 16. 版本检查 ---------- */
+  // 这条会真的去问一次 GitHub：请求是面板进程自己发的，测试没法替它把地址指到假服务上。
+  // 所以断言只落在「形状」上 —— 离线、限流、仓库还没发 Release 都是合法结果，
+  // 不能接受的是接口 500，或者把 current 回成别的版本号。
+  console.log('\n── 版本检查 ──');
+  const upd = await call('/api/update/check');
+  ok('版本检查接口可用（查不到新版本也算成功）', upd.status === 200, upd.data.error || '');
+  ok('回带当前应用版本', upd.data.current === pkgVersion, `(${upd.data.current})`);
+  ok('ok / hasUpdate 是两个独立布尔',
+    typeof upd.data.ok === 'boolean' && typeof upd.data.hasUpdate === 'boolean');
+  ok('部署形态只有 docker / source 两种',
+    upd.data.deployKind === 'docker' || upd.data.deployKind === 'source', `(${upd.data.deployKind})`);
+  ok('不管查没查成都给一条升级命令',
+    typeof upd.data.command === 'string' && upd.data.command.length > 8,
+    String(upd.data.command || '').split('\n')[0]);
+  ok('查失败时 hasUpdate 必须为 false（不能因为查不到就说有新版本）',
+    upd.data.ok === true || upd.data.hasUpdate === false);
+  // 真有新版时，hasUpdate 要跟版号比较对得上（避免「查到了但没比」）
+  if (upd.data.ok && upd.data.latest) {
+    const pick = (v) => String(v).replace(/^v/i, '').split('.').slice(0, 3).map(Number);
+    const a = pick(upd.data.latest);
+    const b = pick(upd.data.current);
+    const cmp = a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+    ok('hasUpdate 与版号比较一致', upd.data.hasUpdate === cmp > 0,
+      `(线上 ${upd.data.latest} / 本地 ${upd.data.current})`);
+  }
+  if (!upd.data.disabled) {
+    const updCached = await call('/api/update/check');
+    ok('第二次检查走内存缓存（不重复打 GitHub）', updCached.data.cached === true);
+    const updForce = await call('/api/update/check?force=1');
+    ok('force=1 绕过缓存（弹窗里的「重新检查」）', updForce.data.cached === false);
+  }
+
+  /* ---------- 17. 清理 ---------- */
   for (const [path] of cleanup.reverse()) {
     await call(path, { method: 'DELETE' });
   }

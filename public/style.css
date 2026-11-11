@@ -489,12 +489,74 @@ input.invalid:focus {
 .side-links { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .side-links a { color: var(--muted); transition: color 0.15s; }
 .side-links a:hover { color: var(--text); }
+/* 版本号兼「检查更新」按钮：点击打开弹窗，有新版本时文字变色 + 右上角一个点。
+ * 点用 ::after 画而不是再插一个元素 —— #side-ver 的 textContent 必须只剩版本号，
+ * test/ui.js 直接拿它做 /^v\d+\.\d+\.\d+$/ 断言。 */
 .side-ver {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 10.5px;
   opacity: 0.75;
   letter-spacing: 0.2px;
   white-space: nowrap;
+  /* 重置 <button> 的默认外观，让它看起来还是那行小字 */
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.side-ver:hover { opacity: 1; text-decoration: underline; }
+
+.side-ver.has-update {
+  position: relative;
+  opacity: 1;
+  color: var(--warn-text);
+}
+
+.side-ver.has-update::after {
+  content: '';
+  position: absolute;
+  top: -1px;
+  right: -6px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+/* ---------------------------- 版本检查弹窗 ---------------------------- */
+.upd-ver {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex-wrap: wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  color: var(--text-dim);
+}
+
+.upd-ver b { font-size: 17px; color: var(--warn-text); }
+.upd-ver .upd-same { font-size: 14px; color: var(--ok); }
+.upd-head { margin-bottom: 4px; }
+.upd-sec { margin: 16px 0 7px; font-size: 12.5px; font-weight: 600; color: var(--text-dim); }
+
+/* Release 正文是 Markdown，这里只当纯文本排版：解析 Markdown 就得引一个解析器，
+ * 而它来自外部（GitHub），渲染成 HTML 反而是个注入口。 */
+.upd-notes {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--code-fg);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .main { min-width: 0; display: flex; flex-direction: column; }

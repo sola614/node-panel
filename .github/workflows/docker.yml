@@ -37,6 +37,8 @@ jobs:
           node test/generators.js
           # 事务语义：水位与用量必须同进同退，回滚时内存要由调用方还原
           node test/tx.js
+          # 版本检查：假 GitHub API，验版本比较 / 缓存 / 404 / 500 降级
+          node test/update.js
           # ACME 临时目录：私钥不能留在磁盘上、目录必须 0700（Windows 上跑不了，
           # 这条只在 Linux 上才有区分度，所以必须在 CI 里跑）
           node test/acme.js
@@ -169,3 +171,80 @@ jobs:
             APP_VERSION=${{ steps.pkg.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # 镜像推完之后建 Release 与 v 标签：面板上的「检查更新」读的就是 releases/latest。
+  # 没有这一步，那个接口永远拿 404 —— 仓库原先既没有 tag 也没有 Release，
+  # 「最新版本」根本缺少一个可信来源。
+  #
+  # 用 GITHUB_TOKEN 建 Release 不会触发下面的 tag push 工作流（GitHub 对
+  # token 触发的事件有防递归限制），所以不会二次构建。换成 PAT 就会 —— 那时候
+  # 要么去掉 on.push.tags，要么给这个 job 加一道「tag 已存在就跳过」的判断。
+  release:
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取版本号
+        id: pkg
+        run: |
+          VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json)
+          if [ -z "$VERSION" ]; then
+            echo "✗ 没能从 package.json 读到 version" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "▸ 应用版本：$VERSION"
+
+      # 只推 chore / 文档时版本号没变，Release 已经存在 —— 跳过而不是报错
+      - name: 同名 Release 已存在就跳过
+        id: exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v${{ steps.pkg.outputs.version }}" >/dev/null 2>&1; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "▸ v${{ steps.pkg.outputs.version }} 已经有 Release，跳过"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 说明直接取 CHANGELOG 里这一版的段落：发版规矩本来就要求一版一段，
+      # 让 Release 和仓库里的更新日志是同一份文字，不另写一遍。
+      - name: 从 CHANGELOG 抽取本版说明
+        if: steps.exists.outputs.skip == '0'
+        run: |
+          node -e '
+            const fs = require("fs");
+            const ver = process.argv[1];
+            const lines = fs.readFileSync("CHANGELOG.md", "utf8").split(/\r?\n/);
+            const start = lines.findIndex((l) => l.startsWith("## [" + ver + "]"));
+            if (start < 0) {
+              console.log("本次发布没有在 CHANGELOG.md 里找到 v" + ver + " 段落，请补上。");
+              process.exit(0);
+            }
+            const out = [];
+            for (let i = start + 1; i < lines.length; i++) {
+              if (/^## \[/.test(lines[i])) break;
+              out.push(lines[i]);
+            }
+            process.stdout.write(out.join("\n").trim() + "\n");
+          ' "${{ steps.pkg.outputs.version }}" > /tmp/notes.md
+          echo "── Release 说明 ──"
+          head -20 /tmp/notes.md
+
+      - name: 创建 Release 与 v 标签
+        if: steps.exists.outputs.skip == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.pkg.outputs.version }}" \
+            --title "v${{ steps.pkg.outputs.version }}" \
+            --notes-file /tmp/notes.md \
+            --target "$GITHUB_SHA"
+          echo "▸ 已创建 https://github.com/${{ github.repository }}/releases/tag/v${{ steps.pkg.outputs.version }}"
+

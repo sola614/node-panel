@@ -1728,6 +1728,135 @@ async function runAction(act, btn, id) {
   }
 }
 
+/* ============================ 版本检查 ============================ */
+
+/**
+ * 侧栏那行版本号兼「检查更新」按钮。
+ *
+ * 只查、不升：Docker 下 /app 是只读镜像层、容器里没有 docker CLI，面板换不了自己的
+ * 版本。能给的只有「有没有新版 + 一条在宿主机上跑的命令」。
+ */
+let updateInfo = null;
+
+/**
+ * 开机后查一次，刻意不 await。
+ *
+ * 这是面板唯一一个往外发的请求，离线部署时它会一直等到 8 秒超时 ——
+ * 挡在 boot() 里等于每次打开面板都白等一次。查不到就什么都不显示。
+ */
+function checkUpdateSoon() {
+  api('/api/update/check')
+    .then((r) => {
+      updateInfo = r;
+      paintVersion(r);
+    })
+    .catch(() => { /* GitHub 连不上是常态，不该因此让侧栏看起来像出了故障 */ });
+}
+
+function paintVersion(r) {
+  const el = $('#side-ver');
+  if (!el) return;
+  const has = !!(r && r.ok && r.hasUpdate);
+  el.classList.toggle('has-update', has);
+  el.title = has
+    ? `发现新版本 v${r.latest}（当前 v${r.current}），点击查看`
+    : `当前 v${(r && r.current) || (state.me && state.me.appVersion) || '?'}，点击检查更新`;
+}
+
+/**
+ * Release 正文是 Markdown，这里**不解析成 HTML**。
+ *
+ * 它来自外部（GitHub），渲染成 HTML 就是一个注入口；为了一段更新说明引入
+ * Markdown 解析器也不划算。只把最扎眼的记号去掉，让人能读：
+ * `### 变更` → `变更`，`**x**` → `x`，`- x` → `· x`，引用块去掉 `>`。
+ * 输出仍然是纯文本，最后照样过 esc()。
+ */
+function plainNotes(md) {
+  return String(md || '')
+    .split('\n')
+    .map((line) => line
+      .replace(/^#{1,6}\s+/, '')
+      .replace(/^>\s?/, '')
+      .replace(/^(\s*)[-*]\s+/, (m, sp) => sp + '· ')
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/`([^`]+)`/g, '$1'))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** 弹窗正文：三种状态各一套，别把「没查成」和「已是最新」说成同一件事 */
+function updateBody(r) {
+  if (r.disabled) {
+    return `<p class="hint" style="margin:0">更新检查已关闭（环境变量 PANEL_UPDATE_CHECK=0），
+      当前 v${esc(r.current)}。手动升级按 CHANGELOG 里对应版本的「升级说明」操作。</p>`;
+  }
+  if (!r.ok) {
+    return `<p style="margin:0 0 10px;color:var(--bad-text)">${esc(r.error || '检查失败')}</p>
+      <p class="hint" style="margin:0">当前 v${esc(r.current)}。面板所在机器需要能访问
+      api.github.com 才能检查更新，离线或内网部署可以忽略这里，按 CHANGELOG 手动升级。</p>`;
+  }
+  if (r.noRelease) {
+    return `<p style="margin:0">仓库还没有发布过 Release，没有可比的版本。当前 v${esc(r.current)}。</p>`;
+  }
+
+  const head = r.hasUpdate
+    ? `<div class="upd-ver">v${esc(r.current)} <span>→</span> <b>v${esc(r.latest)}</b></div>
+       <div class="hint" style="margin-top:3px">当前 v${esc(r.current)}${
+         r.publishedAt ? ` · 新版发布于 ${esc(fmtDate(r.publishedAt))}` : ''
+       }</div>`
+    : `<div class="upd-ver"><span class="upd-same">已是最新</span> v${esc(r.current)}</div>
+       <div class="hint" style="margin-top:3px">${
+         r.publishedAt ? `这一版发布于 ${esc(fmtDate(r.publishedAt))}` : '没有比它更新的版本'
+       }</div>`;
+
+  // 说明与命令只在「真有新版」时出现：已是最新时贴一大段 CHANGELOG 只是噪音
+  const notes = r.hasUpdate
+    ? `<div class="upd-sec">更新说明</div>
+       <pre class="upd-notes">${esc(plainNotes(r.notes) || '（这一版没有写说明）')}</pre>`
+    : '';
+
+  const cmd = r.hasUpdate
+    ? `<div class="upd-sec">升级命令${r.deployKind === 'docker' ? '（Docker）' : '（源码运行）'}</div>
+       <div class="code-wrap">
+         <pre class="code" style="font-size:12px">${esc(r.command)}</pre>
+         <button class="btn btn-sm btn-primary copy-btn" type="button" data-copy="${esc(r.command)}">复制</button>
+       </div>
+       <p class="hint" style="margin-top:7px">${esc(r.note || '')}</p>`
+    : '';
+
+  return `<div class="upd-head">${head}</div>${notes}${cmd}`;
+}
+
+async function showUpdateDialog(force = false) {
+  let r;
+  try {
+    r = await api('/api/update/check' + (force ? '?force=1' : ''));
+  } catch (err) {
+    return showError(err);
+  }
+  updateInfo = r;
+  paintVersion(r);
+
+  const mask = openModal({
+    title: r.hasUpdate ? `发现新版本 v${r.latest}` : '版本检查',
+    body: updateBody(r),
+    wide: true,
+    okText: '关闭',
+    // 只读弹窗：只要「重新检查」和「关闭」，不要再并一个「取消」
+    cancelText: null,
+    onOk: () => {},
+    footActions: '<button class="btn btn-ghost" type="button" data-recheck>重新检查</button>',
+  });
+  // 重新检查必须走 force：否则 10 分钟缓存会把「刚发的版本」挡在外面
+  mask.querySelector('[data-recheck]').addEventListener('click', () => {
+    closeModal();
+    showUpdateDialog(true);
+  });
+}
+
+$('#side-ver').addEventListener('click', () => showUpdateDialog());
+
 /* ============================== 启动 ============================== */
 
 async function boot() {
@@ -1741,6 +1870,7 @@ async function boot() {
     $('#side-site').textContent = me.settings.siteName;
     $('#side-user').textContent = '登录为 ' + me.username;
     if (me.appVersion) $('#side-ver').textContent = 'v' + me.appVersion;
+    checkUpdateSoon();
     document.title = me.settings.siteName;
     applyCollapse(localStorage.getItem('np_collapsed') === '1');
 

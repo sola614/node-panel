@@ -74,6 +74,8 @@ PANEL_SEED_DEMO=1 node server.js
 | `PANEL_DB_FILE` | `$PANEL_DATA_DIR/panel.db` | 直接指定 SQLite 文件路径 |
 | `PANEL_SEED_DEMO` | 空 | 设为 `1` 才写入演示数据（正式部署别开） |
 | `PANEL_TRUST_PROXY` | 空 | 设为 `1` 时无条件采信 `X-Forwarded-For`；不设则只在前置代理来自本机/内网时采信 |
+| `PANEL_UPDATE_CHECK` | 开启 | 设为 `0` 关掉「检查更新」，面板不再访问 `api.github.com` |
+| `PANEL_DEPLOY_KIND` | 自动判断 | `docker` / `source`，决定弹窗里给哪条升级命令；默认按容器标记文件判断 |
 
 数据文件：`data/panel.db`（SQLite，WAL 模式）。老的 `data/db.json` 会在首次启动时
 自动导入并改名为 `db.json.imported`，不会丢数据。
@@ -1215,6 +1217,7 @@ POST /api/reality/keys                     生成 Reality 密钥对
 GET  /api/relay/script?to=&port=&proto=    生成中转（L4 转发）部署脚本
 POST /api/demo/traffic                     注入演示流量
 GET/PUT /api/settings                      站点设置（含 httpsCertId：面板自身 HTTPS 引用的证书）
+GET  /api/update/check?force=1             查有没有新版本（读 GitHub Release，10 分钟缓存）
 POST /api/admin/password                   修改管理员密码
 POST /api/admin/totp/setup                 生成待绑定的 TOTP 密钥（Base32 + otpauth URI）
 POST /api/admin/totp/enable                输入动态码确认开启（返回一次性恢复码）
@@ -1284,6 +1287,7 @@ node-panel/
 │   ├── notifications.js 消息通知域（通道 / 事件开关 / 手动巡检）
 │   ├── reports.js       报表域（流量明细 / 审计列表）
 │   ├── backup.js        备份恢复域
+│   ├── update.js        版本检查（读 GitHub Release，只读、带缓存）
 │   └── overview.js      概览页数据
 ├── lib/
 │   ├── store.js         数据层（SQLite，内置 node:sqlite + 内存读缓存）
@@ -1297,6 +1301,7 @@ node-panel/
 │   ├── alerts.js        告警巡检与去重（按 key + 冷却时间 + 恢复通知）
 │   ├── usage-report.js  月末报告（本月区间统计 + 群发版 / 完整版 + 按月份幂等发送）
 │   ├── keys.js          x25519 密钥对生成
+│   ├── update.js        有没有新版本（版本号比较 / GitHub Release 拉取 / 内存缓存）
 │   ├── totp.js          管理员二步验证（RFC 6238，node:crypto 手写 HMAC-SHA1）
 │   ├── qrcode.js        TOTP 绑定二维码（ISO/IEC 18004 子集：byte/UTF-8/ECC-M/V1-10，纯位运算）
 │   └── yaml.js          YAML 序列化
@@ -1323,6 +1328,7 @@ node-panel/
 │   ├── renew.js        自动续期单元测试（临时库）
 │   ├── security.js     强制改密 / 登录限流 / 升级前备份（自带独立实例）
 │   ├── notify.js       通知通道（假 SMTP + 假 HTTP，含告警去重与恢复）
+│   ├── update.js       版本检查（假 GitHub API：版本比较 / 缓存 / 404 / 500 降级）
 │   ├── agent.js        agent 自更新（假面板 + 真 agent.sh）
 │   └── ui.js           前端行为测试（需要 jsdom）
 ├── .github/            CI（测试 → 多架构构建 → 推 ghcr.io）、Issue / PR 模板
@@ -1354,6 +1360,7 @@ node test/hosts.js                      # 前后端共享的域名校验（requi
 node test/renew.js                      # 自动续期
 node test/security.js                   # 强制改密 / 登录限流 / 升级前备份（自带独立实例）
 node test/notify.js                     # 通知通道（假 SMTP + 假 HTTP）
+node test/update.js                     # 版本检查（假 GitHub API：比较 / 缓存 / 404 / 500 降级）
 node test/agent.js                      # agent 自更新（假面板 + 真 agent.sh）
 node test/qrcode.js                     # QR 编码器（结构断言；装了 jsqr 才跑端到端解码）
 
@@ -1387,7 +1394,8 @@ VLESS Encryption → uTLS 指纹 → 证书四态（路径 / 粘贴 / 自签 / A
 面板侧探测（可达 / 拒绝端口 / hy2 仅解析说明 / 证书不匹配呈现为证书异常态 /
 IP 型 SAN 不误报）→
 面板 HTTPS 独立实例（TLS 起服务 / 浏览器 301 / agent 路径
-不跳转 / 坏证书仍以 HTTP 服务 / 端口被占不跳死端口）→ 引用中的证书删除被拦 → 自动清理。
+不跳转 / 坏证书仍以 HTTP 服务 / 端口被占不跳死端口）→ 引用中的证书删除被拦 → 自动清理 →
+版本检查接口（形状 / 缓存 / `force`，查不到新版本也算成功）。
 
 **0.1.17 新增**：TOTP 绑定二维码（结构断言 + 光栅化解码回原文，两层验证）→
 订阅页登录与自助重置（**密码必填**：单建 / 批量 / 邀请缺密码均 400 /
@@ -1404,7 +1412,8 @@ IP 型 SAN 不误报）→
 
 `ui.js` 用 jsdom 真实跑一遍前端：日间/夜间皮肤切换（管理台 + 订阅页、刷新后保持）、
 接口 loading 锁（连点只发一次请求、弹窗按钮显示「处理中」）、订阅对外域名校验（填错不发请求）、
-套餐自动续期开关（默认勾选、自定义/永久时禁用、提交体正确）、侧栏版本号、
+套餐自动续期开关（默认勾选、自定义/永久时禁用、提交体正确）、
+侧栏版本号兼「检查更新」按钮（弹窗骨架、只读弹窗没有多余的「取消」）、
 通知设置卡片（六个事件、总开关、参数回填、渠道表单随类型切换字段、
 点「测试」真的打出一个 webhook 并校验载荷与发送记录）、
 用户检索与筛选（名字 / 状态 / 空态、计数）、勾选与批量条（累加、全选、取消、批量停用真的落库）、
@@ -1418,8 +1427,13 @@ IP 型 SAN 不误报）→
 登录页动态码输入框默认隐藏、
 拆分后八个页面都能渲染。
 
-`notify.js` 起一对**假服务**（SMTP 服务器 + HTTP 接收端），覆盖：SMTP 明文/TLS 分支的
-AUTH LOGIN 与 PLAIN、535 认证失败的错误透传、多收件人解析、RFC 2047 中文标题、
+`update.js`（0.1.38）起一个**假 GitHub API**（不联网，CI 里 GitHub 会限流且结果不稳定），
+覆盖：版本号解析（`v` 前缀 / 预发布后缀 / 构建元数据 / 多余段）与跨次版本比较、
+部署形态与命令、正常检查、10 分钟缓存与 `force` 绕过、失败降级（500 / 坏 JSON / 没有
+版本号的 Release）、`404`（仓库还没发过 Release）不当作故障、`PANEL_UPDATE_CHECK=0`
+时一个请求都不发、超长说明截断。
+
+`notify.js` 起一对**假服务**（SMTP 服务器 + HTTP 接收端），覆盖：SMTP 明文/TLS 分支的AUTH LOGIN 与 PLAIN、535 认证失败的错误透传、多收件人解析、RFC 2047 中文标题、
 base64 正文可解码、点号转义（`\r\n.` → `\r\n..`）不会提前结束 DATA、
 五种 webhook 载荷格式、Telegram 路径与 HTML 转义、发送失败会记日志并返回原因、
 告警去重与冷却、恢复通知、复现后再触发、离线服务器告警、从未上报的机器不误报、总开关关闭时不动。
@@ -1626,6 +1640,23 @@ docker compose pull && docker compose up -d
 ```bash
 git pull && npm test && systemctl restart node-panel
 ```
+
+#### 面板里怎么知道有没有新版本
+
+侧栏那行版本号本身就是按钮：有新版本时它会变色并在右上角多一个点，点开是
+「新版号 / 发布日期 / 更新说明 + 一条按部署形态生成的升级命令」，命令旁边有复制按钮。
+
+它**只查不升**。Docker 下 `/app` 是只读镜像层、容器里也没有 docker CLI，真要「一键换版本」
+就得把 `docker.sock` 挂进容器 —— 那等于把宿主机 root 交给面板，为了一个按钮不值得。
+
+- 数据来源是仓库的 Release，由 CI 在镜像推送成功后自动创建：标题 `v<版本>`，
+  正文直接取 `CHANGELOG.md` 里这一版的段落。仓库还没有 Release 时接口回「还没发布过」，
+  这不算错误。
+- 结果在内存里缓存 10 分钟（失败只缓存 1 分钟），因为未认证的 GitHub API 限额是 60 次/小时/IP。
+- 纯内网部署可以设 `PANEL_UPDATE_CHECK=0` 关掉，面板就完全不往外发请求；
+  地址写死在 `lib/update.js`，不接受前端传值（否则它就是个现成的 SSRF 探针）。
+- 部署形态靠容器标记文件判断（`/.dockerenv` / `/run/.containerenv`），
+  特殊情况可以用 `PANEL_DEPLOY_KIND=docker|source` 覆盖，决定弹窗里给哪条命令。
 
 升级时会发生什么：
 

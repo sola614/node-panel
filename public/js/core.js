@@ -526,6 +526,8 @@ function openModal({
   full,
   bodyClass = '',
   okText = '保存',
+  // 传 null 表示不要「取消」这个按钮：只读弹窗里「取消」和「关闭」并排会让人犹豫
+  // 到底哪个才是真关掉
   cancelText = '取消',
   onOk,
   footer = true,
@@ -544,7 +546,7 @@ function openModal({
       <div class="modal-body ${bodyClass}">${body}</div>
       ${footer ? `<div class="modal-foot">
         ${footActions}
-        <button class="btn btn-ghost" data-close>${esc(cancelText)}</button>
+        ${cancelText === null ? '' : `<button class="btn btn-ghost" data-close>${esc(cancelText)}</button>`}
         <button class="btn btn-primary" data-ok>${esc(okText)}</button>
       </div>` : ''}
     </div>`;
