@@ -1743,12 +1743,14 @@ function totpCodeOf(secret) {
 
   const notifSet = await call('/api/notify/settings', {
     method: 'PUT',
-    body: json({ enabled: true, events: ['user.over', 'server.offline'], leadDays: 5, offlineMin: 15, cooldownHours: 6, recovery: false, usageHour: 21, usageTop: 5 }),
+    body: json({ enabled: true, leadDays: 5, offlineMin: 15, cooldownHours: 6, recovery: false, usageHour: 21, usageTop: 5 }),
   });
   ok('保存通知设置',
     notifSet.status === 200 && notifSet.data.settings.enabled === true &&
-      notifSet.data.settings.leadDays === 5 && notifSet.data.settings.events.length === 2,
+      notifSet.data.settings.leadDays === 5 && notifSet.data.settings.cooldownHours === 6,
     JSON.stringify(notifSet.data.settings));
+  ok('通知设置里不再有全局「关注事件」（0.1.37 起只认渠道订阅）',
+    notifSet.data.settings.events === undefined);
   ok('月末报告参数可保存',
     notifSet.data.settings.usageHour === 21 && notifSet.data.settings.usageTop === 5,
     JSON.stringify({ h: notifSet.data.settings.usageHour, n: notifSet.data.settings.usageTop }));
@@ -1756,8 +1758,27 @@ function totpCodeOf(secret) {
   ok('月末报告参数越界被夹回（99→23、0→10）',
     hourClamp.data.settings.usageHour === 23 && hourClamp.data.settings.usageTop === 10,
     JSON.stringify({ h: hourClamp.data.settings.usageHour, n: hourClamp.data.settings.usageTop }));
-  const dropped = await call('/api/notify/settings', { method: 'PUT', body: json({ events: ['nope', 'user.over'] }) });
-  ok('未知事件名被过滤掉', dropped.data.settings.events.length === 1 && dropped.data.settings.events[0] === 'user.over');
+
+  // 新建渠道不传 events 时按预勾清单来（留空 = 全收，新渠道不该默认什么都接）
+  ok('新建渠道默认订阅「常用那几类」',
+    Array.isArray(chList.data.defaultEvents) && chList.data.defaultEvents.length > 0 &&
+      !chList.data.defaultEvents.includes('usage.monthly.full'),
+    (chList.data.defaultEvents || []).join(','));
+  const chDefault = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-默认订阅', type: 'webhook', config: { url: 'http://127.0.0.1:1/hook', format: 'json' } }),
+  });
+  ok('渠道不传订阅时落成默认清单',
+    chDefault.status === 200 && JSON.stringify(chDefault.data.item.events) === JSON.stringify(chList.data.defaultEvents),
+    JSON.stringify(chDefault.data.item.events));
+  const chBadEv = await call('/api/notify/channels', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-坏事件', type: 'webhook', events: ['nope', 'user.over'], config: { url: 'http://127.0.0.1:1/hook', format: 'json' } }),
+  });
+  ok('未知事件名被过滤掉', JSON.stringify(chBadEv.data.item.events) === '["user.over"]',
+    JSON.stringify(chBadEv.data.item.events));
+  await call('/api/notify/channels/' + chDefault.data.item.id, { method: 'DELETE' });
+  await call('/api/notify/channels/' + chBadEv.data.item.id, { method: 'DELETE' });
 
   // 月末报告两版各是一个事件：群发版进用户群，完整版只给管理员
   ok('月末报告两个版本都在事件清单里',
@@ -1782,14 +1803,8 @@ function totpCodeOf(secret) {
   const chDel = await call('/api/notify/channels/' + chId, { method: 'DELETE' });
   ok('删除渠道', chDel.status === 200);
 
-  // 还原通知开关与关注事件，避免影响后续用例（UI 测试会断言默认勾选的那几项）
-  await call('/api/notify/settings', {
-    method: 'PUT',
-    body: json({
-      enabled: false,
-      events: ['user.expiring', 'user.expired', 'user.over', 'server.offline', 'node.offline', 'usage.monthly'],
-    }),
-  });
+  // 还原通知开关，避免影响后续用例
+  await call('/api/notify/settings', { method: 'PUT', body: json({ enabled: false }) });
   await call('/api/notify/channels/' + tgCh.data.item.id, { method: 'DELETE' });
 
   /* ---------- 13. 批量建号与批量操作 ---------- */

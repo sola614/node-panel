@@ -862,7 +862,9 @@ tr.tree-child .cell-name { font-weight: 450; }
 .modal {
   width: 100%;
   max-width: 520px;
-  max-height: 88vh;
+  /* 92vh：渠道弹窗要放下 10 个订阅事件，88vh 时最后一行正好被底栏挡住，
+     看起来像「只有 9 个」。留一点余量，别让内容恰好卡在边界上 */
+  max-height: 92vh;
   /* 头尾固定、只有中间滚动：整块滚动时标题和「保存」会跟着跑出视野，
      节点弹窗这种长表单填到一半就找不到按钮了 */
   display: flex;

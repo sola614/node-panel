@@ -72,6 +72,14 @@
       "desc": "ISO 8601，如 2026-11-10T09:00:00.000Z"
     }
   ],
+  "defaultEvents": [
+    "user.expiring",
+    "user.expired",
+    "user.over",
+    "server.offline",
+    "node.offline",
+    "usage.monthly"
+  ],
   "events": [
     {
       "kind": "user.expiring",
@@ -126,13 +134,6 @@
   ],
   "settings": {
     "enabled": false,
-    "events": [
-      "user.expiring",
-      "user.expired",
-      "user.over",
-      "server.offline",
-      "node.offline"
-    ],
     "leadDays": 3,
     "offlineMin": 10,
     "cooldownHours": 12,
@@ -143,5 +144,5 @@
   },
   "log": [],
   "openAlerts": [],
-  "appVersion": "0.1.36"
+  "appVersion": "0.1.37"
 }

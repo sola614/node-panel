@@ -312,9 +312,15 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
 
   /* ---------------------------- 4. 告警去重 ---------------------------- */
   console.log('\n— 告警 —');
+  // 渠道订阅是「收不收消息」的唯一开关（0.1.37 起没有全局关注清单），
+  // 所以「新建渠道的预勾清单」不能带上完整版报告（真实用户名）
+  ok('新建渠道的默认订阅不含完整版报告',
+    notify.DEFAULT_EVENTS.includes('usage.monthly') && !notify.DEFAULT_EVENTS.includes('usage.monthly.full'),
+    notify.DEFAULT_EVENTS.join(','));
+  ok('默认订阅里每个事件都是已知事件',
+    notify.DEFAULT_EVENTS.every((k) => notify.EVENT_KINDS.includes(k)));
   const s = store.db().settings;
   s.notifyEnabled = '1';
-  s.notifyEvents = 'user.over,user.expiring,server.offline';
   s.notifyCooldownHours = '12';
   s.notifyRecovery = '1';
   s.notifyLeadDays = '3';
@@ -372,7 +378,7 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
     id: 's2', name: '刚添加还没装', host: 'new.example.com', token: 'tk2', note: '',
     ipMode: 'manual', reportedIp: '', createdAt: store.iso(), lastSeen: null, agentVersion: null,
   });
-  s.notifyEvents = 'server.offline,agent.old';
+  s.notifyEnabled = '1';
   store.db().alerts.length = 0;
 
   const r5 = await alerts.sweep();
@@ -380,16 +386,25 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
   ok('离线服务器触发告警', offline.length === 1 && /香港一号/.test(offline[0].title));
   ok('从未上报过的服务器不告警', !offline.some((b) => /还没装/.test(b.title)));
   ok('agent 版本落后单独告警', collect().some((b) => b.event === 'agent.old' && /0\.0\.1/.test(b.body)), `fired=${r5.fired}`);
+  // 0.1.37 起没有全局「关注的事件」：事件是否产生只由「问题成不成立」决定
+  ok('不再需要全局关注清单，问题成立就会进告警表',
+    alerts.openAlerts().some((a) => a.kind === 'user.over') &&
+      alerts.openAlerts().some((a) => a.kind === 'server.offline'),
+    alerts.openAlerts().map((a) => a.kind).join(','));
 
   /* --------------------------- 6. 关闭后静默 --------------------------- */
   s.notifyEnabled = '0';
+  const beforeOff = collect().length;
   const r6 = await alerts.sweep();
-  ok('总开关关闭时完全不巡检', r6.disabled === true);
+  ok('总开关关闭时不再发送', r6.disabled === true && collect().length === beforeOff);
+  // 但巡检照跑：告警表仍然是实时的（关通知不等于关监控）
+  ok('总开关关闭时告警表仍被更新', alerts.openAlerts().length > 0,
+    `未恢复 ${alerts.openAlerts().length} 条`);
+  s.notifyEnabled = '1';
 
   /* --------------------------- 7. 月末流量报告 --------------------------- */
   console.log('\n— 月末流量报告 —');
   s.notifyEnabled = '1';
-  s.notifyEvents = 'usage.monthly';
   s.notifyUsageHour = '0';
   s.notifyUsageTop = '2';
   s.notifyUsageLastAt = '';
@@ -459,7 +474,7 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
 
   const r7 = await usageReport.sweep(NOW);
   const grp7 = groupHits();
-  ok('只勾群发版时只发一条', r7.sent === 1 && grp7.length === 1 && grp7[0].event === 'usage.monthly',
+  ok('只订阅群发版时只发一条', r7.sent === 1 && grp7.length === 1 && grp7[0].event === 'usage.monthly',
     `sent=${r7.sent} 群=${grp7.length}`);
   ok('群里收到的是打码榜单', /甲\*\*/.test(grp7[0].body || '') && !/甲用户/.test(grp7[0].body || ''));
   ok('发送后记下月份（幂等标记）', store.db().settings.notifyUsageLastAt === '2026-11');
@@ -473,13 +488,7 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
   ok('没到设定时刻不发', r10.skipped === 'tooEarly');
   s.notifyUsageHour = '0';
 
-  s.notifyEvents = 'user.over';
-  s.notifyUsageLastAt = '';
-  const r11 = await usageReport.sweep(NOW);
-  ok('没勾选「月末报告」就不发', r11.skipped === 'off');
-
   /* --------------------- 7.3 两版并行：渠道各收各的 --------------------- */
-  s.notifyEvents = 'usage.monthly,usage.monthly.full';
   store.db().notify_channels.push({
     id: 'ch-admin',
     name: '管理员私聊',
@@ -489,10 +498,11 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
     config: { url: `http://127.0.0.1:${web.port}/admin`, format: 'json' },
     createdAt: store.iso(),
   });
-  ok('发送计划按「勾了 + 有人订阅」拆分',
+  ok('发送计划只看渠道订阅',
     JSON.stringify(usageReport.plan()) === '["usage.monthly","usage.monthly.full"]',
     JSON.stringify(usageReport.plan()));
 
+  s.notifyUsageLastAt = ''; // 上一条用例已经把 2026-11 标记写进去了，这里清掉重发
   const before2 = web.hits.length;
   const r14 = await usageReport.sweep(NOW);
   const two = web.hits.slice(before2);
@@ -523,6 +533,34 @@ const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
   const r13 = await usageReport.sendNow(NOW);
   ok('渠道未订阅时报告发不出去', r13.skipped === 'noChannel', JSON.stringify(r13));
   store.db().notify_channels[0].events = ['usage.monthly.full'];
+
+  /* ---------------- 8. 迁移：旧「关注的事件」并入渠道订阅 ---------------- */
+  console.log('\n— 迁移（删掉全局关注清单） —');
+  const mkc = (id, events) => ({
+    id, name: id, type: 'webhook', enabled: true, events,
+    config: { url: 'http://127.0.0.1:1/x', format: 'json' }, createdAt: store.iso(),
+  });
+  // 旧模型：AND(全局清单, 渠道订阅)，且「空」在两边含义相反
+  store.db().settings.notifyEvents = 'user.over,user.expiring';
+  store.db().notify_channels.length = 0;
+  store.db().notify_channels.push(
+    mkc('m-all', []), // 旧语义：全订阅，但被全局清单过滤成两类
+    mkc('m-none', ['server.offline']), // 与全局清单无交集 → 旧模型下一条也收不到
+    mkc('m-mix', ['user.over', 'cert.failed']), // 部分交集
+  );
+  store.save();
+  store.close();
+  store.load(); // 重新读库，migrate() 会跑一遍
+
+  const chs = store.db().notify_channels;
+  const byId = (id) => chs.find((c) => c.id === id) || { events: [], enabled: null };
+  ok('迁移：空订阅的渠道继承旧全局清单',
+    byId('m-all').events.join(',') === 'user.over,user.expiring', byId('m-all').events.join(','));
+  ok('迁移：有订阅的渠道取交集', byId('m-mix').events.join(',') === 'user.over', byId('m-mix').events.join(','));
+  ok('迁移：交集为空的渠道被停用（旧模型下它本来就收不到）',
+    byId('m-none').enabled === false && byId('m-none').events.length === 0);
+  ok('迁移后旧键被删除', store.db().settings.notifyEvents === undefined);
+  ok('迁移后新建渠道仍按默认清单预勾', notify.DEFAULT_EVENTS.length === 6);
 
   web.server.close();
   store.close();

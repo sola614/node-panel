@@ -577,7 +577,6 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     headers: { Authorization: 'Bearer ' + T, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       enabled: false,
-      events: ['user.expiring', 'user.expired', 'user.over', 'server.offline', 'node.offline', 'usage.monthly'],
       leadDays: 3, offlineMin: 10, cooldownHours: 12, recovery: true,
       usageHour: 23, usageTop: 10,
     }),
@@ -599,14 +598,9 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
 
   ok('设置页有「消息通知」卡片', /消息通知/.test(d8.querySelector('#view').textContent));
   ok('通知总开关存在', !!d8.querySelector('#nt-enabled'));
-  ok('十个事件都能勾选', d8.querySelectorAll('.nt-ev').length === 10,
+  ok('不再有全局「关注的事件」勾选块（只认渠道订阅）',
+    d8.querySelectorAll('.nt-ev').length === 0,
     `实际 ${d8.querySelectorAll('.nt-ev').length} 个`);
-  ok('证书告警事件在列表里',
-    !!d8.querySelector('.nt-ev[value="cert.expiring"]') && !!d8.querySelector('.nt-ev[value="cert.failed"]'));
-  ok('月末报告两版都能勾（群发版 / 完整版）',
-    !!d8.querySelector('.nt-ev[value="usage.monthly"]') && !!d8.querySelector('.nt-ev[value="usage.monthly.full"]'));
-  ok('默认关注六个事件', d8.querySelectorAll('.nt-ev:checked').length === 6,
-    `实际 ${d8.querySelectorAll('.nt-ev:checked').length} 个`);
   ok('触发参数回填（到期前 3 天）', Number(d8.querySelector('#nt-lead').value) === 3,
     `(${d8.querySelector('#nt-lead').value})`);
   ok('月末报告参数回填（23 时 / 10 人）',
@@ -622,6 +616,12 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     !!d8.querySelector('#nc-url') && !!d8.querySelector('#nc-format') && !!d8.querySelector('#nc-token'));
   ok('默认不是自定义格式时隐藏请求体模板', d8.querySelector('#nc-body-field').style.display === 'none');
   ok('请求头模板一栏常驻', !!d8.querySelector('#nc-headers'));
+  ok('订阅事件十项都在弹窗里', d8.querySelectorAll('.nc-ev').length === 10,
+    `实际 ${d8.querySelectorAll('.nc-ev').length} 个`);
+  ok('新建渠道预勾「常用那几类」（留空 = 全收，不能默认全选）',
+    d8.querySelectorAll('.nc-ev:checked').length === 6 &&
+      !d8.querySelector('.nc-ev[value="usage.monthly.full"]').checked,
+    `预勾 ${d8.querySelectorAll('.nc-ev:checked').length} 个`);
 
   const typeSel = d8.querySelector('#nc-type');
   const switchType = async (v) => {
@@ -646,6 +646,8 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   await switchType('webhook');
   d8.querySelector('#nc-name').value = 'UI-钩子';
   d8.querySelector('#nc-url').value = sinkUrl;
+  // 预勾的那六项先清掉，只留一个，验证「提交的就是勾上的」
+  for (const el of d8.querySelectorAll('.nc-ev')) el.checked = false;
   d8.querySelector('.nc-ev[value="user.over"]').checked = true;
   ntSeen.length = 0;
   click(d8.querySelector('.modal [data-ok]'), w8);
@@ -732,8 +734,7 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('提交体里带上开关与参数',
     !!sBody && sBody.enabled === true && sBody.leadDays === 5 && sBody.cooldownHours === 6,
     sBody ? JSON.stringify({ e: sBody.enabled, l: sBody.leadDays, c: sBody.cooldownHours }) : '');
-  ok('事件按勾选提交（数组）', !!sBody && Array.isArray(sBody.events) && sBody.events.length === 6,
-    sBody ? `(${sBody.events.length} 个)` : '');
+  ok('提交体里不再有全局事件清单', !!sBody && sBody.events === undefined);
   ok('月末报告参数一并提交', !!sBody && sBody.usageHour === 23 && sBody.usageTop === 10,
     sBody ? JSON.stringify({ h: sBody.usageHour, n: sBody.usageTop }) : '');
 
@@ -761,7 +762,6 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     headers: { Authorization: 'Bearer ' + T, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       enabled: false,
-      events: ['user.expiring', 'user.expired', 'user.over', 'server.offline', 'node.offline', 'usage.monthly'],
       leadDays: 3, offlineMin: 10, cooldownHours: 12, recovery: true,
       usageHour: 23, usageTop: 10,
     }),

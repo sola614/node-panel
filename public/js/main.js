@@ -488,18 +488,6 @@ function notifyCardHtml(n) {
   const st = n.settings;
   const enabled = st.enabled;
 
-  const eventRows = (n.events || [])
-    .map(
-      (e) => `<label style="display:flex;gap:9px;align-items:flex-start;padding:6px 0;cursor:pointer">
-        <input type="checkbox" class="nt-ev" value="${esc(e.kind)}" ${st.events.includes(e.kind) ? 'checked' : ''} style="margin-top:3px">
-        <span>
-          <b style="font-size:13px;font-weight:600">${esc(e.label)}</b>
-          <span style="display:block;font-size:11.5px;color:var(--muted);line-height:1.5">${esc(e.desc)}</span>
-        </span>
-      </label>`,
-    )
-    .join('');
-
   const channelRows = n.items.length
     ? n.items
         .map(
@@ -553,15 +541,10 @@ function notifyCardHtml(n) {
         <label style="display:flex;gap:9px;align-items:center;font-size:13px;cursor:pointer;margin-bottom:12px">
           <input type="checkbox" id="nt-enabled" ${enabled ? 'checked' : ''}>
           <b style="font-weight:600">启用通知</b>
-          <span class="hint" style="margin:0">关掉之后不再巡检，也不会发任何消息</span>
+          <span class="hint" style="margin:0">关掉之后不再发送消息；面板照常巡检，告警仍会记录</span>
         </label>
 
-        <div class="grid-2" style="gap:18px">
-          <div>
-            <div style="font-size:12.5px;color:var(--text-dim);margin-bottom:2px">关注的事件</div>
-            <div class="hint" style="margin:0 0 6px">不勾选任何事件 = 全部关注</div>
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 18px">${eventRows}</div>
-          </div>
+        <div style="max-width:760px">
           <div>
             <div style="font-size:12.5px;color:var(--text-dim);margin-bottom:8px">触发参数</div>
             <div class="form-row">
@@ -599,7 +582,7 @@ function notifyCardHtml(n) {
             <p class="hint" style="margin:-4px 0 10px">
               月末报告在每月最后一天按上面的时刻发一次。<b>群发版</b>只发前 N 名且名字打码，
               适合用户群；<b>完整版</b>含全部用户与真实用户名，建议只配给管理员自己的渠道。
-              两个事件都勾、且同一个渠道都订阅了，就会收到两条。
+              两版是两个独立事件，<b>渠道订阅了哪版就发哪版</b>，同一个渠道都订阅了就会收到两条。
               ${st.usageLastAt ? `已发到 <b>${esc(st.usageLastAt)}</b>。` : ''}
             </p>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
@@ -882,7 +865,7 @@ function channelFieldsHtml(type, cfg) {
     </div>
     <div class="field">
       <label>自定义请求头（可选）</label>
-      <textarea id="nc-headers" rows="3" spellcheck="false" placeholder="x-api-key: {{token}}">${esc(cfg.headers || '')}</textarea>
+      <textarea id="nc-headers" rows="2" spellcheck="false" placeholder="x-api-key: {{token}}">${esc(cfg.headers || '')}</textarea>
       <div class="hint" style="margin:6px 0 0">
         一行一个 <code>Name: Value</code>，<code>#</code> 开头当注释。可用字段：
       </div>
@@ -895,6 +878,10 @@ function channelFieldsHtml(type, cfg) {
 
 function channelFormBody(ch) {
   const type = ch ? ch.type : 'webhook';
+  // 新建渠道时预勾「常用那几类」：不预勾的话 `[]` 等于全收，
+  // 一个刚加的群机器人会立刻收到证书、agent 版本这类只有管理员关心的东西
+  const preset = (state.data.notifyMeta && state.data.notifyMeta.defaultEvents) || [];
+  const checked = (kind) => (ch ? (ch.events || []).includes(kind) : preset.includes(kind));
   return `
     <div class="form-row">
       <div class="field">
@@ -921,13 +908,12 @@ function channelFormBody(ch) {
       </label>
     </div>
     <div class="field">
-      <label>订阅事件</label>
-      <div class="hint" style="margin:0 0 6px">不勾选 = 全部事件</div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:4px 12px">
+      <label>订阅事件<span class="hint" style="margin:0 0 0 8px;font-weight:400">收不收消息只看这里，不勾 = 全部</span></label>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:2px 10px">
         ${((state.data.notifyMeta && state.data.notifyMeta.events) || [])
           .map(
-            (e) => `<label style="display:flex;gap:7px;align-items:center;font-size:12.5px;cursor:pointer">
-              <input type="checkbox" class="nc-ev" value="${esc(e.kind)}" ${ch && ch.events && ch.events.includes(e.kind) ? 'checked' : ''}>
+            (e) => `<label style="display:flex;gap:7px;align-items:center;font-size:12px;cursor:pointer">
+              <input type="checkbox" class="nc-ev" value="${esc(e.kind)}" ${checked(e.kind) ? 'checked' : ''}>
               ${esc(e.label)}
             </label>`,
           )
@@ -1705,7 +1691,6 @@ async function runAction(act, btn, id) {
         method: 'PUT',
         body: JSON.stringify({
           enabled: $('#nt-enabled').checked,
-          events: $$('.nt-ev:checked').map((x) => x.value),
           leadDays: Number($('#nt-lead').value) || 3,
           offlineMin: Number($('#nt-offline').value) || 10,
           cooldownHours: Number($('#nt-cooldown').value) || 12,
@@ -1732,8 +1717,9 @@ async function runAction(act, btn, id) {
     }
     case 'notify-sweep': {
       const r = await api('/api/notify/sweep', { method: 'POST' });
-      if (r.disabled) toast('通知总开关没开，先把「启用通知」勾上', 'err');
-      else if (r.noChannel) toast('还没有启用的渠道', 'err');
+      // 巡检本身永远会跑（告警表照常更新），所以这两条是「跑了但没发」，不是「没跑」
+      if (r.disabled) toast(`已巡检：当前 ${r.open || 0} 个问题；「启用通知」没开，没有发送`, 'err');
+      else if (r.noChannel) toast(`已巡检：当前 ${r.open || 0} 个问题；没有启用的渠道，没有发送`, 'err');
       else if (r.fired) toast(`巡检完成：触发 ${r.fired} 条，送达 ${r.sent} 次`, 'ok');
       else toast(`巡检完成：当前 ${r.open || 0} 个问题，没有需要新发的通知`, 'ok');
       render();

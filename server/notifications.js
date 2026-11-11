@@ -21,10 +21,6 @@ function notifySettings() {
   const hour = Number(s.notifyUsageHour);
   return {
     enabled: s.notifyEnabled === '1',
-    events: String(s.notifyEvents || '')
-      .split(',')
-      .map((x) => x.trim())
-      .filter(Boolean),
     leadDays: Number(s.notifyLeadDays) || 3,
     offlineMin: Number(s.notifyOfflineMin) || 10,
     cooldownHours: Number(s.notifyCooldownHours) || 12,
@@ -56,6 +52,8 @@ function listNotifyChannels(req, res) {
     /** 自定义模板可用的占位符（含含义与例子），前端直接渲染成清单 */
     webhookVars: notify.WEBHOOK_VARS,
     events: notify.EVENTS,
+    /** 新建渠道时预勾的事件（订阅是唯一开关，留空 = 全收，所以必须有默认） */
+    defaultEvents: notify.DEFAULT_EVENTS,
     settings: notifySettings(),
     log: db.notify_log.slice(-30).reverse(),
     openAlerts: alerts.openAlerts(),
@@ -78,7 +76,8 @@ function createNotifyChannel(req, res, params, body) {
     name,
     type,
     enabled: body.enabled !== false,
-    events: normalizeEvents(body.events),
+    // 没传就用预勾清单：留空等于「全收」，新渠道不该默认什么消息都接
+    events: normalizeEvents(body.events === undefined ? notify.DEFAULT_EVENTS : body.events),
     config,
     createdAt: store.iso(),
   };
@@ -132,7 +131,6 @@ async function testNotifyChannel(req, res, params, body) {
 function saveNotifySettings(req, res, params, body) {
   const s = store.db().settings;
   if (body.enabled !== undefined) s.notifyEnabled = body.enabled ? '1' : '0';
-  if (body.events !== undefined) s.notifyEvents = normalizeEvents(body.events).join(',');
   if (body.leadDays !== undefined) s.notifyLeadDays = String(Math.min(60, Math.max(1, Number(body.leadDays) || 3)));
   if (body.offlineMin !== undefined) {
     s.notifyOfflineMin = String(Math.min(1440, Math.max(2, Number(body.offlineMin) || 10)));
@@ -149,7 +147,7 @@ function saveNotifySettings(req, res, params, body) {
     s.notifyUsageTop = String(Math.min(50, Math.max(1, Number(body.usageTop) || 10)));
   }
   store.save();
-  auditAction('notify.settings', '通知设置', `${s.notifyEnabled === '1' ? '已开启' : '已关闭'} · ${s.notifyEvents || '全部事件'}`);
+  auditAction('notify.settings', '通知设置', s.notifyEnabled === '1' ? '已开启' : '已关闭');
   sendJson(res, 200, { ok: true, settings: notifySettings() });
 }
 
