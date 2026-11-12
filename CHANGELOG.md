@@ -3,6 +3,44 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.39] - 2026-11-12
+
+> 端口跳跃不再因为「本机没有 nft/iptables」直接报废：agent 会按系统装一个
+> （Alpine 上是 `apk add --no-cache nftables`），装完先探一次能不能真用。
+>
+> 这条报错只在开了跳跃的 Hysteria2 节点上出现，而且很隐蔽 —— 实例活得好好的、
+> 端口也在监听、面板显示已同步，但客户端跳到范围内任何端口都不通。
+
+### 新增
+
+- **agent 缺 nft/iptables 时自动安装**（`HOP_AUTO_INSTALL`，默认 `1`）
+  - 顺序 `nftables` → `iptables`，包管理器自动识别 `apk` / `apt-get` / `dnf` / `yum` /
+    `zypper` / `pacman`。Alpine 用 `apk add --no-cache`（不写 `/var/cache/apk` 索引，
+    容器里常常只读或没空间）
+  - 装完先 `nft list tables` / `iptables -t nat -S` **探一次**：容器里内核没有
+    `nf_tables`/`nf_nat` 时命令在、规则写不进去，把「命令存在」当成「装好了」
+    只会让后面整段下发失败，还以为是配置写错了
+  - 装不上写 `.hop-pkg-fail` 退避 30 分钟（与 hysteria 自安装同一套），
+    免得每分钟撞一次包管理器
+  - 包管理器调用带 `timeout 180`：断网 / 源不可达时 apk 会卡很久，而 agent 是
+    60 秒一轮的循环，卡住等于整机停更（配置不再收敛、流量不再上报）
+  - `HOP_AUTO_INSTALL=0`（写进 `agent.env`）完全不碰包管理器
+
+### 修正
+
+- 回执里的原因不再只有一句「本机没有 nft/iptables」，而是区分三种情况 ——
+  自动安装失败 / 自动安装被关掉 / 后端被 `HOP_BACKEND` 固定成 `none`，
+  并附上可直接执行的手动安装命令
+- 节点表单的「端口跳跃」提示补上「服务端需要 nft 或 iptables，agent 缺了会自己装」
+
+### 升级说明
+
+- 不需要迁移，也不需要重跑部署命令：agent 下一轮自更新后自动生效
+- 已经手动装过后端的机器不受影响（探测到就不再装）
+- 容器里装上了仍报 `Operation not permitted` / `table nat is incompatible`，说明容器
+  没有 `CAP_NET_ADMIN` 或宿主机内核没开 `nf_tables`/`nf_nat` —— 这时装包救不了，
+  换机器或关掉跳跃（见 `docs/troubleshoot-port.md` 第七节）
+
 ## [0.1.38] - 2026-11-11
 
 > 侧栏那行版本号现在能点了：有新版本时它变色、右上角多一个点，点开能看到新版号、

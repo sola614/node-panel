@@ -690,6 +690,102 @@ const runAgent = (box) =>
     ok('没装上时不谎报计数', !rcHop.hop, String(rcHop.hop || ''));
   }
 
+  // 最小化系统（Alpine minirootfs / slim 镜像）两个后端都没有：agent 自己装一个。
+  // HOP_BACKEND=missing 让「本机没有」成为确定条件（跑测试的机器上常有真 iptables），
+  // 假的 apk 在「安装成功」时造出 nft —— 顺带验证装完要再探一次能不能用。
+  {
+    const boxInst = makeSandbox(panel.port, PKG_VERSION, { env: { HOP_BACKEND: 'missing' } });
+    const instBin = path.join(boxInst.dir, 'bin');
+    fs.mkdirSync(instBin, { recursive: true });
+    fs.writeFileSync(
+      path.join(instBin, 'apk'),
+      [
+        '#!/bin/sh',
+        'echo "$*" >> opt/apk.calls',
+        "cat > bin/nft <<'NFT_STUB'",
+        '#!/bin/sh',
+        'echo "$*" >> opt/nft.calls',
+        'exit 0',
+        'NFT_STUB',
+        'chmod +x bin/nft 2>/dev/null',
+        'exit 0',
+        '',
+      ].join('\n'),
+    );
+    try {
+      fs.chmodSync(path.join(instBin, 'apk'), 0o755);
+    } catch {
+      /* Windows 上 chmod 是空操作 */
+    }
+    boxInst.env.PATH = instBin + path.delimiter + (boxInst.env.PATH || '');
+    fs.appendFileSync(path.join(boxInst.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
+    const nInst = panel.state.receipts.length;
+    const rInst = await runAgent(boxInst);
+    const outInst = rInst.stdout + rInst.stderr;
+    const rcInst = panel.state.receipts[nInst] || {};
+    const apkCalls = read(path.join(boxInst.stateDir, 'apk.calls'));
+    ok('缺后端时自动安装（apk add --no-cache nftables）', /add --no-cache nftables/.test(apkCalls),
+      apkCalls.trim());
+    ok('装上后当轮就把规则下发', rcInst.hop === '1/1' && rcInst.ok === true,
+      JSON.stringify({ hop: rcInst.hop, ok: rcInst.ok }));
+    ok('日志说明装了什么', /✓ 已安装 nftables/.test(outInst),
+      (outInst.split('\n').find((l) => /已安装/.test(l)) || '').slice(0, 80));
+  }
+
+  // 装不上（离线 / 没有包管理器 / 只读 rootfs）：写退避时间戳，
+  // 30 分钟内不再撞包管理器 —— 否则每分钟一次 apk 报错刷满日志。
+  {
+    const boxFail = makeSandbox(panel.port, PKG_VERSION, { env: { HOP_BACKEND: 'missing' } });
+    const failBin = path.join(boxFail.dir, 'bin');
+    fs.mkdirSync(failBin, { recursive: true });
+    fs.writeFileSync(path.join(failBin, 'apk'), '#!/bin/sh\necho "$*" >> opt/apk.calls\nexit 1\n');
+    try {
+      fs.chmodSync(path.join(failBin, 'apk'), 0o755);
+    } catch {
+      /* Windows 上 chmod 是空操作 */
+    }
+    boxFail.env.PATH = failBin + path.delimiter + (boxFail.env.PATH || '');
+    fs.appendFileSync(path.join(boxFail.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
+    const nFail = panel.state.receipts.length;
+    await runAgent(boxFail);
+    const rcFail = panel.state.receipts[nFail] || {};
+    ok('自动安装失败时回执仍说明端口跳跃未生效',
+      rcFail.ok === false && /端口跳跃未生效/.test(rcFail.error || ''),
+      String(rcFail.error || '').slice(0, 100));
+    ok('失败原因区分「装不上」而不是「没有后端」', /自动安装也没成功/.test(rcFail.error || ''),
+      String(rcFail.error || '').slice(0, 120));
+    ok('安装失败后留下退避时间戳', read(path.join(boxFail.stateDir, '.hop-pkg-fail')).trim() !== '');
+    const callsBefore = read(path.join(boxFail.stateDir, 'apk.calls')).trim().split('\n').length;
+    await runAgent(boxFail);
+    const callsAfter = read(path.join(boxFail.stateDir, 'apk.calls')).trim().split('\n').length;
+    ok('退避期内不再撞包管理器', callsAfter === callsBefore, `${callsBefore} → ${callsAfter}`);
+  }
+
+  // 想自己管依赖的机器：HOP_AUTO_INSTALL=0，一个包都不装，只把话说清楚
+  {
+    const boxOff = makeSandbox(panel.port, PKG_VERSION, {
+      env: { HOP_BACKEND: 'missing', HOP_AUTO_INSTALL: '0' },
+    });
+    const offBin = path.join(boxOff.dir, 'bin');
+    fs.mkdirSync(offBin, { recursive: true });
+    fs.writeFileSync(path.join(offBin, 'apk'), '#!/bin/sh\necho "$*" >> opt/apk.calls\nexit 0\n');
+    try {
+      fs.chmodSync(path.join(offBin, 'apk'), 0o755);
+    } catch {
+      /* Windows 上 chmod 是空操作 */
+    }
+    boxOff.env.PATH = offBin + path.delimiter + (boxOff.env.PATH || '');
+    fs.appendFileSync(path.join(boxOff.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
+    const nOff = panel.state.receipts.length;
+    await runAgent(boxOff);
+    const rcOff = panel.state.receipts[nOff] || {};
+    ok('HOP_AUTO_INSTALL=0 时完全不碰包管理器',
+      read(path.join(boxOff.stateDir, 'apk.calls')).trim() === '',
+      read(path.join(boxOff.stateDir, 'apk.calls')).trim());
+    ok('回执点明自动安装已关闭', /自动安装已关闭/.test(rcOff.error || ''),
+      String(rcOff.error || '').slice(0, 120));
+  }
+
   // iptables 后端的 nat 表分 v4/v6 两张，只写 v4 时 v6 客户端一条都命中不了，
   // 而回执照样是 x/y —— 线上表现成「面板显示已装、tcpdump 能看到范围内 dport、
   // counter 恒 0」。两个桩：双栈都成功 / v6 的 nat 表不可用。

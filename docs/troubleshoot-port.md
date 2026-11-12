@@ -176,3 +176,39 @@ journalctl -u xray -n 30 --no-pager
 
 升级方式：面板升级后，agent 会在下一轮自更新（`/api/agent/script` 下发新脚本），
 不需要重新执行部署命令。
+
+## 七、端口跳跃报「端口跳跃未生效：本机没有 nft/iptables」
+
+这条只在开了端口跳跃的 Hysteria2 节点上出现。跳跃不是「监听一段端口」：进程只 bind
+一个端口，范围内的其余端口靠 NAT 规则转发进来。规则写不了，客户端跳到任何端口都不通，
+而实例本身跑得好好的、面板也显示已同步 —— 所以它必须报错，不能只 warning。
+
+最小化系统（Alpine minirootfs、各种 slim 镜像）默认**两个都没有**：
+
+```sh
+command -v nft || command -v iptables     # 两个都空 = 缺后端
+```
+
+0.1.39 起 agent 会自己装：按 `nftables` → `iptables` 顺序调系统包管理器
+（Alpine `apk add --no-cache nftables`、Debian/Ubuntu `apt-get install -y nftables`、
+RHEL 系 `dnf`），装完先 `nft list tables` / `iptables -t nat -S` 探一次能不能真用。
+日志里能看到：
+
+```
+本机没有 nft/iptables，尝试自动安装 nftables
+✓ 已安装 nftables（端口跳跃后端：nft）
+✓ 端口跳跃规则已生效：1 段（nft）
+```
+
+装不上时（离线、只读 rootfs、没有包管理器、容器里没有 `NET_ADMIN`）会退避 30 分钟，
+回执写明原因，节点仍可按单端口使用。手动补：
+
+```sh
+apk add nftables            # Alpine
+apt install -y nftables     # Debian / Ubuntu
+dnf install -y nftables     # Rocky / Alma / Fedora
+```
+
+容器里装上了但 `nft` 报 `Operation not permitted` / `table nat is incompatible`，
+说明容器没有 `CAP_NET_ADMIN` 或宿主机内核没开 `nf_tables`/`nf_nat` —— 换一台机器，
+或把跳跃关掉。不想让 agent 碰包管理器就写 `HOP_AUTO_INSTALL=0` 到 `agent.env`。

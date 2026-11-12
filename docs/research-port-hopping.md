@@ -156,6 +156,13 @@ table inet nodepanel_hyhop {
 - **全关时删表**：面板上所有节点都关掉跳跃后，残留的表会把端口继续劫持到已经不存在的实例。
 - **iptables 回退**：本机没有 `nft` 时用自定义链 `NODEPANEL_HYHOP`（插到 PREROUTING 第 1 条，
   以免被 docker 塞的 ACCEPT 提前放行），逗号组合拆成多条 `--dport a:b`。
+- **缺后端时自己装**（0.1.39）：Alpine 的 minirootfs、各种 slim 镜像两个都没有，
+  而这是唯一「少一个包就整段失效」的功能 —— 订阅已经把范围发下去了，客户端跳到哪都不通，
+  实例却活得好好的。按 `nftables` → `iptables` 顺序用系统包管理器装（`apk add --no-cache`
+  / `apt-get install` / `dnf` …），装完先 `nft list tables` / `iptables -t nat -S` **探一次
+  能不能真用**：容器里内核没有 `nf_tables`/`nf_nat` 时命令在、规则写不进去，把「命令存在」
+  当成「装好了」只会让后面整段下发失败。失败写 `.hop-pkg-fail` 退避 30 分钟，
+  `HOP_AUTO_INSTALL=0` 可彻底关掉。
 - **`HOP_BACKEND` 环境变量**：`nft` / `iptables` / `none` 强制指定，测试用它走降级分支，
   免得在跑测试的机器上真去改防火墙。
 
@@ -168,8 +175,8 @@ Hysteria2 实例     4 个在跑
 端口跳跃规则       4/4 段已装
 ```
 
-规则装不上时 `RC_OK=0` + `RC_ERR` 带上原因（本机没有 nft/iptables、nft 报错原文），
-面板上直接是「同步失败」。**不能只 warning**：订阅已经按范围发下去了，规则没装就是整段不可达，
+规则装不上时 `RC_OK=0` + `RC_ERR` 带上原因（本机没有 nft/iptables 且自动安装失败、
+nft 报错原文），面板上直接是「同步失败」。**不能只 warning**：订阅已经按范围发下去了，规则没装就是整段不可达，
 而实例本身跑得好好的、端口也在监听 —— 这是最难自己发现的一类故障。
 
 ### 4.4 冲突校验（保存节点时挡住）

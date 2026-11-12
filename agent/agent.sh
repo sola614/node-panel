@@ -25,6 +25,9 @@
 #   HYSTERIA_DIR     Hysteria2 配置目录，默认 /etc/hysteria（伪装部署为 /etc/streamd）
 #   HYSTERIA_BIN     hysteria 可执行文件，默认 /usr/local/bin/hysteria（伪装部署为
 #                    /usr/local/bin/streamd —— 名字改了，二进制本身没动）
+#   HOP_AUTO_INSTALL 本机既没有 nft 也没有 iptables 时自动装一个（apk / apt / dnf …），
+#                    默认 1。端口跳跃是「装了 NAT 规则才生效」的功能，Alpine 的最小
+#                    系统两个都没有；设成 0 就只记日志，完全不碰包管理器
 #   ORPHAN_GRACE     面板回 401 持续多少秒后转低频重试，默认 21600（6 小时）。
 #                    401 的含义是「面板上没有这个 token 了」（服务器 / 节点记录被删，
 #                    或 token 被重置），和「连不上面板」是两回事 —— 后者永远按正常
@@ -44,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.38'
+VERSION='0.1.39'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -88,7 +91,8 @@ env_read() {
 
 if [ -f "$ENV_FILE" ]; then
   for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
-                  HYSTERIA_BIN HYSTERIA_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR HTTP_TIMEOUT LOG_MAX \
+                  HYSTERIA_BIN HYSTERIA_AUTO_INSTALL HOP_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR \
+                  HTTP_TIMEOUT LOG_MAX \
                   ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD ORPHAN_GRACE ORPHAN_INTERVAL; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
@@ -109,6 +113,8 @@ HYSTERIA_BIN=${HYSTERIA_BIN:-/usr/local/bin/hysteria}
 export XRAY_CONFIG HYSTERIA_DIR HYSTERIA_BIN
 # 有 hy2 实例却没有二进制时自己装一个（见 hy_install）；关掉就只记日志
 HYSTERIA_AUTO_INSTALL=${HYSTERIA_AUTO_INSTALL:-1}
+# 端口跳跃缺 nft/iptables 时自己装一个（见 hop_install_backend）；关掉就只记日志
+HOP_AUTO_INSTALL=${HOP_AUTO_INSTALL:-1}
 STATE_DIR=${STATE_DIR:-/opt/nodepanel}
 RUN_DIR=${RUN_DIR:-/run/nodepanel}
 LOG_DIR=${LOG_DIR:-/var/log/nodepanel}
@@ -832,13 +838,24 @@ probe_ports() {
 HOP_TABLE=nodepanel_hyhop
 HOP_CHAIN=NODEPANEL_HYHOP
 # 留环境变量入口：测试里 export HOP_BACKEND=none 就能走降级分支，
-# 而不必在跑测试的机器上真去改防火墙（SOCK_CMD 也是同一个套路）
+# 而不必在跑测试的机器上真去改防火墙（SOCK_CMD 也是同一个套路）。
+# HOP_BACKEND=missing 是另一个把手：「假装本机两个都没有，但仍然允许自动安装」——
+# 跑测试的机器上常常真的有 iptables，不给这个把手就永远测不到安装分支。
 HOP_BACKEND=${HOP_BACKEND:-}
 # v6 判定结果缓存：hop_apply / hop_present / hop_teardown 每轮都会问一次
 HOP_V6_NEED=''
 
+# HOP_BACKEND 是不是被**固定**成了某个后端。none 也算固定（明确不要装），
+# 只有空和 missing 表示「按探测结果走」。
+hop_backend_fixed() {
+  case "$HOP_BACKEND" in
+    '' | missing) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 hop_backend() {
-  [ -n "$HOP_BACKEND" ] && { printf '%s\n' "$HOP_BACKEND"; return 0; }
+  hop_backend_fixed && { printf '%s\n' "$HOP_BACKEND"; return 0; }
   if command -v nft >/dev/null 2>&1; then
     HOP_BACKEND=nft
   elif command -v iptables >/dev/null 2>&1; then
@@ -847,6 +864,99 @@ hop_backend() {
     HOP_BACKEND=none
   fi
   printf '%s\n' "$HOP_BACKEND"
+}
+
+# 缺后端时自己装一个。
+#
+# 动机：Alpine 的 minirootfs、各种 slim 镜像里常常既没有 nft 也没有 iptables，
+# 而端口跳跃是唯一「少一个包就整段失效」的功能 —— 订阅已经把范围发下去了，客户端
+# 跳到范围内任何端口都不可达，实例本身却活得好好的。为一个开关让运维登机器装包
+# 不值得，agent 自己补上（与 hy_install 同一个思路）。
+#
+# 装不上就冷静 30 分钟：没有包管理器、离线、只读 rootfs 都会失败，每分钟撞一次
+# 没有意义，只会把包管理器的报错刷满日志。
+hop_install_allowed() {
+  _f="$STATE_DIR/.hop-pkg-fail"
+  [ -f "$_f" ] || return 0
+  _ts=$(sed -n '1p' "$_f" 2>/dev/null)
+  case "$_ts" in '' | *[!0-9]*) _ts=0 ;; esac
+  [ $(( $(date +%s) - _ts )) -ge 1800 ]
+}
+
+# 带超时地跑一条命令。包管理器在断网 / 源不可达时会卡几分钟，而 agent 是 60 秒
+# 一轮的循环 —— 卡住等于整机停更（配置不再收敛、流量不再上报）。没有 timeout
+# 命令（极简 busybox）就直接跑，失败有 30 分钟退避兜底。
+hop_run() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 180 "$@"
+  else
+    "$@"
+  fi
+}
+
+# 用系统包管理器装一个包。返回 0 只代表「命令跑成功了」，能不能用要 hop_probe 再探。
+hop_pkg_add() {
+  if command -v apk >/dev/null 2>&1; then
+    # --no-cache：Alpine 默认要写 /var/cache/apk 索引，容器里常常是只读或没空间
+    hop_run apk add --no-cache "$1" >/dev/null 2>&1
+  elif command -v apt-get >/dev/null 2>&1; then
+    # 用 env 而不是 `VAR=val hop_run …`：POSIX 没规定赋值前缀对**函数调用**生效，
+    # dash 下会被当成给 hop_run 的临时变量，apt-get 根本收不到
+    hop_run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1" >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    hop_run dnf install -y -q "$1" >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    hop_run yum install -y -q "$1" >/dev/null 2>&1
+  elif command -v zypper >/dev/null 2>&1; then
+    hop_run zypper -q install -y "$1" >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    hop_run pacman -Sy --noconfirm "$1" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+# 后端能不能**真的用**。装上包 ≠ 能用：容器里内核可能没有 nf_tables / nf_nat，
+# 命令存在但一跑就报「table nat is incompatible」之类。把「命令存在」当「装好了」
+# 会让后面整段规则下发失败，还以为是配置写错了。
+#
+# $1 = 包名（nftables / iptables），探**这个包自带的工具**。不能用 hop_backend()
+# 的探测结果：nft 装上了但内核不认时它仍返回 nft，拿它去探 iptables 会永远失败，
+# 日志也会把原因指到 iptables 头上。
+hop_probe() {
+  case "$1" in
+    nftables) nft list tables >/dev/null 2>&1 ;;
+    iptables) iptables -t nat -S >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 装一个能用的后端。返回 0 = 现在有了。
+#
+# 顺序 nftables → iptables：nft 是整表原子替换，规则形状比 iptables 干净；
+# 而且 Alpine 的 iptables 是 legacy 版，nat 表还要额外依赖 nf_nat 模块。
+hop_install_backend() {
+  # HOP_BACKEND 被显式指定（运维手动指定后端 / 测试把手）时不要越过它去装包
+  hop_backend_fixed && return 1
+  [ "$HOP_AUTO_INSTALL" = '1' ] || return 1
+  hop_install_allowed || return 1
+  for _pkg in nftables iptables; do
+    log "本机没有 nft/iptables，尝试自动安装 $_pkg"
+    if ! hop_pkg_add "$_pkg"; then
+      log "! 装 $_pkg 失败：没有可用的包管理器，或包源不可达"
+      continue
+    fi
+    if hop_probe "$_pkg"; then
+      rm -f "$STATE_DIR/.hop-pkg-fail" 2>/dev/null
+      log "✓ 已安装 $_pkg（端口跳跃后端：$(hop_backend)）"
+      return 0
+    fi
+    log "! $_pkg 装上了但跑不起来：内核缺 netfilter 模块，或本机没有 NET_ADMIN"
+  done
+  printf '%s\n' "$(date +%s)" > "$STATE_DIR/.hop-pkg-fail" 2>/dev/null
+  log "! 装不上能用的后端：容器里常见（没有 CAP_NET_ADMIN / 内核没开 nf_tables）"
+  log "  30 分钟内不再尝试自动安装"
+  return 1
 }
 
 # 要不要同时装 v6 规则。
@@ -929,10 +1039,23 @@ hop_apply() {
   fi
 
   if [ "$(hop_backend)" = 'none' ]; then
-    log "! 端口跳跃需要 nft 或 iptables，本机都没有；节点仍可用单端口连接"
-    RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃未生效：本机没有 nft/iptables"
-    RC_OK=0
-    return 1
+    # 最小化系统（Alpine minirootfs、各种 slim 镜像）两个都没有，先自己补一个。
+    # 装上了就继续走下面的正常流程 —— 规则还没装，幂等判断会自然放行
+    if ! hop_install_backend; then
+      _why='本机没有 nft/iptables'
+      if hop_backend_fixed; then
+        : # 后端被显式固定成 none，不是安装失败
+      elif [ "$HOP_AUTO_INSTALL" != '1' ]; then
+        _why="$_why（自动安装已关闭）"
+      else
+        _why="$_why，自动安装也没成功"
+      fi
+      log "! 端口跳跃需要 nft 或 iptables，本机都没有；节点仍可用单端口连接"
+      log "  手动安装：apk add nftables（Alpine）/ apt install -y nftables（Debian/Ubuntu）"
+      RC_ERR="${RC_ERR}${RC_ERR:+；}端口跳跃未生效：${_why}；装一个 nftables 后重试"
+      RC_OK=0
+      return 1
+    fi
   fi
 
   _total=$(printf '%s' "$_spec" | tr ' ' '\n' | grep -c '[0-9]' 2>/dev/null)
