@@ -855,7 +855,15 @@ hop_backend_fixed() {
 }
 
 hop_backend() {
-  hop_backend_fixed && { printf '%s\n' "$HOP_BACKEND"; return 0; }
+  case "$HOP_BACKEND" in
+    # missing：测试把手 —— **假装本机什么都没有**。不能只是「允许安装」然后照常探测：
+    # CI 的 runner 上真的有 nft，但容器里没有 NET_ADMIN，探测会拿到一个「命令在、
+    # 用不了」的后端，安装分支永远走不到。装上之后 hop_install_backend 会把它清空，
+    # 让后续流程按真实探测走。
+    missing) printf '%s\n' none; return 0 ;;
+    '') : ;;
+    *) printf '%s\n' "$HOP_BACKEND"; return 0 ;;
+  esac
   if command -v nft >/dev/null 2>&1; then
     HOP_BACKEND=nft
   elif command -v iptables >/dev/null 2>&1; then
@@ -947,6 +955,8 @@ hop_install_backend() {
       continue
     fi
     if hop_probe "$_pkg"; then
+      # 清掉测试把手，让后面的流程按真实探测走（刚装上的工具现在能被找到）
+      HOP_BACKEND=''
       rm -f "$STATE_DIR/.hop-pkg-fail" 2>/dev/null
       log "✓ 已安装 $_pkg（端口跳跃后端：$(hop_backend)）"
       return 0

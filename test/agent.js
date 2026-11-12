@@ -718,6 +718,17 @@ const runAgent = (box) =>
       /* Windows 上 chmod 是空操作 */
     }
     boxInst.env.PATH = instBin + path.delimiter + (boxInst.env.PATH || '');
+    // 复刻 CI runner 的现场：真有 nft，但容器里没有 NET_ADMIN，一跑就报 netlink 错误。
+    // missing 必须把它当成「没有」，否则安装分支永远走不到（0.1.39 第一次推送就是这么红的）
+    fs.writeFileSync(
+      path.join(instBin, 'nft'),
+      '#!/bin/sh\necho "netlink: Error: cache initialization failed: Operation not permitted" >&2\nexit 1\n',
+    );
+    try {
+      fs.chmodSync(path.join(instBin, 'nft'), 0o755);
+    } catch {
+      /* Windows 上 chmod 是空操作 */
+    }
     fs.appendFileSync(path.join(boxInst.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
     const nInst = panel.state.receipts.length;
     const rInst = await runAgent(boxInst);
@@ -739,10 +750,14 @@ const runAgent = (box) =>
     const failBin = path.join(boxFail.dir, 'bin');
     fs.mkdirSync(failBin, { recursive: true });
     fs.writeFileSync(path.join(failBin, 'apk'), '#!/bin/sh\necho "$*" >> opt/apk.calls\nexit 1\n');
-    try {
-      fs.chmodSync(path.join(failBin, 'apk'), 0o755);
-    } catch {
-      /* Windows 上 chmod 是空操作 */
+    // 同上：本机有一个「命令在、用不了」的 nft，安装分支才必须自己说了算
+    fs.writeFileSync(path.join(failBin, 'nft'), '#!/bin/sh\nexit 1\n');
+    for (const name of ['apk', 'nft']) {
+      try {
+        fs.chmodSync(path.join(failBin, name), 0o755);
+      } catch {
+        /* Windows 上 chmod 是空操作 */
+      }
     }
     boxFail.env.PATH = failBin + path.delimiter + (boxFail.env.PATH || '');
     fs.appendFileSync(path.join(boxFail.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
@@ -769,10 +784,13 @@ const runAgent = (box) =>
     const offBin = path.join(boxOff.dir, 'bin');
     fs.mkdirSync(offBin, { recursive: true });
     fs.writeFileSync(path.join(offBin, 'apk'), '#!/bin/sh\necho "$*" >> opt/apk.calls\nexit 0\n');
-    try {
-      fs.chmodSync(path.join(offBin, 'apk'), 0o755);
-    } catch {
-      /* Windows 上 chmod 是空操作 */
+    fs.writeFileSync(path.join(offBin, 'nft'), '#!/bin/sh\nexit 1\n');
+    for (const name of ['apk', 'nft']) {
+      try {
+        fs.chmodSync(path.join(offBin, name), 0o755);
+      } catch {
+        /* Windows 上 chmod 是空操作 */
+      }
     }
     boxOff.env.PATH = offBin + path.delimiter + (boxOff.env.PATH || '');
     fs.appendFileSync(path.join(boxOff.stateDir, 'state.env'), "NP_HY_HOP='node-abc:443:40000-40499'\n");
