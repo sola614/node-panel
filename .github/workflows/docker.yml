@@ -39,6 +39,8 @@ jobs:
           node test/tx.js
           # 版本检查：假 GitHub API，验版本比较 / 缓存 / 404 / 500 降级
           node test/update.js
+          # 备份：加密往返 + 假 WebDAV / 假 S3 / 假 ssh+scp（SCP 段只在 Linux 上真跑）
+          node test/backup.js
           # ACME 临时目录：私钥不能留在磁盘上、目录必须 0700（Windows 上跑不了，
           # 这条只在 Linux 上才有区分度，所以必须在 CI 里跑）
           node test/acme.js

@@ -995,6 +995,9 @@ tr.tree-child .cell-name { font-weight: 450; }
 .x-close:hover { background: var(--tint-3); color: var(--text); }
 
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+/* 字段数不固定的行（如备份的三个数字框）：按最小宽度自动折行，
+   不用再为「3 列」单独写一条媒体查询 —— 窄屏会自己掉成两列 / 一列 */
+.form-row.auto { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 
 /* ------------------------------- 提示 --------------------------------- */
 

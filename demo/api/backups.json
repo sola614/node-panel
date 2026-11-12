@@ -10,5 +10,33 @@
   "dir": "/var/lib/node-panel/data/backups",
   "dbFile": "/var/lib/node-panel/data/panel.db",
   "dbSize": 4320832,
-  "totalSize": 184320
+  "totalSize": 184320,
+  "auto": {
+    "enabled": true,
+    "at": "03:30",
+    "next": "2026-10-31T19:30:00.000Z",
+    "lastAt": "2026-10-30T19:30:12.000Z",
+    "lastResult": "成功 · 已上传 → https://dav.example.com/nodepanel/panel-auto-20261030-033000.db.enc",
+    "keepLocal": 7,
+    "keepRemote": 7,
+    "encrypt": true,
+    "hasPassword": true,
+    "remote": {
+      "type": "webdav",
+      "url": "https://dav.example.com/dav",
+      "dir": "nodepanel",
+      "user": "backup",
+      "pass": "••••••"
+    },
+    "remoteTypes": [
+      "webdav",
+      "s3",
+      "scp"
+    ],
+    "remoteLabels": {
+      "webdav": "WebDAV",
+      "s3": "S3 兼容",
+      "scp": "SCP"
+    }
+  }
 }

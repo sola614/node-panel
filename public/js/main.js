@@ -342,6 +342,7 @@ RENDERERS.settings = async () => {
 
     <div class="tab-panel ${panelClass('backup')}" data-panel="backup">
       ${backupCardHtml(b)}
+      ${backupAutoCardHtml(b.auto)}
     </div>
 
     <div class="tab-panel ${panelClass('api')}" data-panel="api">
@@ -373,6 +374,7 @@ GET  /api/health                        健康检查（容器探针）</pre>
   bindSettingsTabs();
   bindSubBaseField();
   checkSubBaseField(false);
+  bindBackupAutoForm();
 };
 
 /* ------------------------------ 设置页页签 ------------------------------ */
@@ -616,6 +618,7 @@ function notifyCardHtml(n) {
 
 const BACKUP_KIND = {
   manual: ['手动备份', 'badge-dim'],
+  auto: ['定时', 'badge-ok'],
   upgrade: ['升级前', 'badge-warn'],
   prerestore: ['恢复前兜底', 'badge-warn'],
 };
@@ -683,11 +686,369 @@ function paintBackups(b) {
   box.querySelector('tbody').innerHTML = backupRowsHtml(b);
 }
 
+/* --------------------------- 自动备份（远端） --------------------------- */
+
+/** 只给状态行用：带时分，`fmtDate` 只有日期 */
+function fmtStamp(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function backupAutoStatusText(a) {
+  if (!a) return '';
+  const parts = [];
+  if (a.lastAt) {
+    parts.push(`上次 ${fmtStamp(a.lastAt)}：${esc(a.lastResult || '—')}`);
+  } else {
+    parts.push('还没有跑过');
+  }
+  if (a.enabled && a.next) parts.push(`下次 ${fmtStamp(a.next)}`);
+  if (!a.enabled) parts.push('开关关着，只在点「立即备份并上传」时跑一次');
+  return parts.join(' · ');
+}
+
+function backupAutoCardHtml(a) {
+  a = a || {};
+  const r = a.remote || null;
+  const type = r ? r.type : '';
+  const on = (v) => (type === v ? '' : ' hidden');
+  const labels = a.remoteLabels || { webdav: 'WebDAV', s3: 'S3 兼容', scp: 'SCP' };
+  const opts = (a.remoteTypes || ['webdav', 's3', 'scp'])
+    .map((t) => `<option value="${esc(t)}" ${type === t ? 'selected' : ''}>${esc(labels[t] || t)}</option>`)
+    .join('');
+  const pwHint = a.hasPassword ? '已设置；留空表示不修改' : '至少 8 位；留空则不加密上传';
+
+  return `
+    <div class="card" style="margin-top:14px">
+      <div class="card-head">
+        <h3>自动备份与远端</h3>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-sm btn-ghost" data-act="backup-test">测试连接</button>
+          <button class="btn btn-sm btn-ghost" data-act="backup-run">立即备份并上传</button>
+          <button class="btn btn-sm btn-primary" data-act="backup-save">保存</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <label class="ve-label" style="margin-bottom:10px">
+          <input type="checkbox" id="bk-auto" ${a.enabled ? 'checked' : ''} style="width:auto">
+          每天定时备份
+        </label>
+        <div class="form-row auto">
+          <div class="field">
+            <label>备份时刻</label>
+            <input type="time" id="bk-at" value="${esc(a.at || '03:30')}">
+          </div>
+          <div class="field">
+            <label>本地保留</label>
+            <input type="number" id="bk-keep-local" min="1" max="90" value="${esc(a.keepLocal || 7)}">
+          </div>
+          <div class="field">
+            <label>远端保留</label>
+            <input type="number" id="bk-keep-remote" min="1" max="90" value="${esc(a.keepRemote || 7)}">
+          </div>
+        </div>
+        <div class="hint" style="margin:-6px 0 14px">
+          保留份数只作用于<b>定时备份</b>（<code>panel-auto-*</code>）。手动备份、恢复前兜底、
+          升级前的快照都不会被自动清理。
+        </div>
+
+        <div class="section-title">远端存储（可选）</div>
+        <div class="form-row">
+          <div class="field">
+            <label>类型</label>
+            <select id="bk-remote-type">
+              <option value="" ${type === '' ? 'selected' : ''}>不推送（只存本地）</option>
+              ${opts}
+            </select>
+          </div>
+        </div>
+
+        <div id="bk-remote-webdav"${on('webdav')}>
+          <div class="form-row">
+            <div class="field">
+              <label>WebDAV 地址</label>
+              <input type="text" id="bk-wd-url" value="${esc(r && r.type === 'webdav' ? r.url || '' : '')}"
+                     placeholder="https://dav.jianguoyun.com/dav/">
+            </div>
+            <div class="field">
+              <label>目录</label>
+              <input type="text" id="bk-wd-dir" value="${esc(r && r.type === 'webdav' ? r.dir || '' : '')}"
+                     placeholder="nodepanel（不存在会自动创建）">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="field">
+              <label>用户名</label>
+              <input type="text" id="bk-wd-user" value="${esc(r && r.type === 'webdav' ? r.user || '' : '')}" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>密码 / 应用密码</label>
+              <input type="password" id="bk-wd-pass" value="" autocomplete="new-password"
+                     placeholder="${esc(r && r.type === 'webdav' && r.pass ? '已设置；留空表示不修改' : '坚果云要填「应用密码」')}">
+            </div>
+          </div>
+          <div class="hint" style="margin:-6px 0 12px">
+            坚果云 / Nextcloud / 群晖 / Seafile 都原生支持。想传百度网盘、阿里云盘、115、OneDrive，
+            装一个 <b>Alist</b> 把网盘挂上来，这里填 Alist 的 WebDAV 地址即可。
+          </div>
+        </div>
+
+        <div id="bk-remote-s3"${on('s3')}>
+          <div class="form-row">
+            <div class="field">
+              <label>Endpoint</label>
+              <input type="text" id="bk-s3-endpoint" value="${esc(r && r.type === 's3' ? r.endpoint || '' : '')}"
+                     placeholder="https://s3.us-east-1.amazonaws.com">
+            </div>
+            <div class="field">
+              <label>Bucket</label>
+              <input type="text" id="bk-s3-bucket" value="${esc(r && r.type === 's3' ? r.bucket || '' : '')}" placeholder="my-backups">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="field">
+              <label>Region</label>
+              <input type="text" id="bk-s3-region" value="${esc(r && r.type === 's3' ? r.region || '' : '')}" placeholder="us-east-1">
+            </div>
+            <div class="field">
+              <label>前缀（可选）</label>
+              <input type="text" id="bk-s3-prefix" value="${esc(r && r.type === 's3' ? r.prefix || '' : '')}" placeholder="nodepanel">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="field">
+              <label>Access Key</label>
+              <input type="text" id="bk-s3-key" value="${esc(r && r.type === 's3' ? r.accessKey || '' : '')}" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>Secret Key</label>
+              <input type="password" id="bk-s3-secret" value="" autocomplete="new-password"
+                     placeholder="${esc(r && r.type === 's3' && r.secretKey ? '已设置；留空表示不修改' : '只写不读')}">
+            </div>
+          </div>
+          <label class="ve-label" style="margin-bottom:6px">
+            <input type="checkbox" id="bk-s3-pathstyle" ${!r || r.type !== 's3' || r.pathStyle !== false ? 'checked' : ''} style="width:auto">
+            路径风格（MinIO / R2 / OSS / COS 选它；AWS 官方 S3 也可以）
+          </label>
+          <div class="hint" style="margin:0 0 12px">
+            阿里云 OSS / 腾讯云 COS 的 S3 兼容端点、Cloudflare R2、Backblaze B2 都走这一路。
+            密钥只需要「写对象 + 列前缀 + 删对象」这三样权限。
+          </div>
+        </div>
+
+        <div id="bk-remote-scp"${on('scp')}>
+          <div class="form-row">
+            <div class="field">
+              <label>主机</label>
+              <input type="text" id="bk-scp-host" value="${esc(r && r.type === 'scp' ? r.host || '' : '')}" placeholder="backup.example.com">
+            </div>
+            <div class="field">
+              <label>端口</label>
+              <input type="number" id="bk-scp-port" min="1" max="65535"
+                     value="${esc(r && r.type === 'scp' ? r.port || 22 : 22)}">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="field">
+              <label>用户名</label>
+              <input type="text" id="bk-scp-user" value="${esc(r && r.type === 'scp' ? r.user || '' : '')}" placeholder="backup">
+            </div>
+            <div class="field">
+              <label>远端目录</label>
+              <input type="text" id="bk-scp-dir" value="${esc(r && r.type === 'scp' ? r.dir || '' : '')}" placeholder="/home/backup/nodepanel">
+            </div>
+          </div>
+          <div class="field">
+            <label>私钥（PEM）</label>
+            <textarea id="bk-scp-key" rows="3" spellcheck="false"
+                      placeholder="${esc(r && r.type === 'scp' && r.privateKey ? '已设置；留空表示不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----')}"></textarea>
+          </div>
+          <div class="hint" style="margin:-6px 0 12px">
+            只支持<b>私钥认证</b>：密码认证要 sshpass，那个东西不该进镜像。私钥只用一次，
+            写完 0600 临时文件立刻删；主机指纹记在数据目录的 <code>.ssh_known_hosts</code> 里。
+          </div>
+        </div>
+
+        <div class="section-title">加密</div>
+        <label class="ve-label" style="margin-bottom:8px">
+          <input type="checkbox" id="bk-encrypt" ${a.encrypt ? 'checked' : ''} style="width:auto">
+          上传前加密（AES-256-GCM）
+        </label>
+        <div class="form-row">
+          <div class="field">
+            <label>备份密码</label>
+            <input type="password" id="bk-password" value="" autocomplete="new-password" placeholder="${esc(pwHint)}">
+          </div>
+        </div>
+        <div class="hint" style="margin:-6px 0 12px">
+          备份里是整库：密码 hash、节点私钥、订阅 token。传到第三方网盘等于把这些全交出去，
+          所以默认加密。密码存在面板库里 —— 想让它和备份不放在一起，用环境变量
+          <code>PANEL_BACKUP_PASSWORD</code> 覆盖。恢复时面板会要求输入这个密码。
+        </div>
+
+        <p class="hint" id="bk-auto-status" style="margin:0">${backupAutoStatusText(a)}</p>
+      </div>
+    </div>`;
+}
+
+/** 按当前类型显示对应的字段块 */
+function syncBackupRemoteType() {
+  const sel = $('#bk-remote-type');
+  if (!sel) return;
+  for (const t of ['webdav', 's3', 'scp']) {
+    const box = $('#bk-remote-' + t);
+    if (box) box.classList.toggle('hidden', sel.value !== t);
+  }
+}
+
+/** 设置页渲染完调一次：类型切换要立刻切字段块，不能等保存 */
+function bindBackupAutoForm() {
+  const sel = $('#bk-remote-type');
+  if (!sel) return;
+  sel.addEventListener('change', syncBackupRemoteType);
+  syncBackupRemoteType();
+}
+
+/** 收集表单。密钥字段留空表示「不修改」，所以空值直接不放进对象 */
+function collectBackupAutoForm() {
+  const val = (id) => {
+    const el = $('#' + id);
+    return el ? String(el.value || '').trim() : '';
+  };
+  const type = val('bk-remote-type');
+  const remote = type ? { type } : null;
+  if (type === 'webdav') {
+    Object.assign(remote, { url: val('bk-wd-url'), dir: val('bk-wd-dir'), user: val('bk-wd-user') });
+    if (val('bk-wd-pass')) remote.pass = val('bk-wd-pass');
+  } else if (type === 's3') {
+    Object.assign(remote, {
+      endpoint: val('bk-s3-endpoint'),
+      bucket: val('bk-s3-bucket'),
+      region: val('bk-s3-region'),
+      prefix: val('bk-s3-prefix'),
+      accessKey: val('bk-s3-key'),
+      pathStyle: !!(document.getElementById('bk-s3-pathstyle') || {}).checked,
+    });
+    if (val('bk-s3-secret')) remote.secretKey = val('bk-s3-secret');
+  } else if (type === 'scp') {
+    Object.assign(remote, {
+      host: val('bk-scp-host'),
+      port: Number(val('bk-scp-port')) || 22,
+      user: val('bk-scp-user'),
+      dir: val('bk-scp-dir'),
+    });
+    if (val('bk-scp-key')) remote.privateKey = val('bk-scp-key');
+  }
+
+  const body = {
+    auto: !!($('#bk-auto') || {}).checked,
+    at: val('bk-at') || '03:30',
+    keepLocal: Number(val('bk-keep-local')) || 7,
+    keepRemote: Number(val('bk-keep-remote')) || 7,
+    encrypt: !!($('#bk-encrypt') || {}).checked,
+    remote,
+  };
+  // 密码留空 = 不改：发空串会把已存的密码清掉
+  if (val('bk-password')) body.password = val('bk-password');
+  return body;
+}
+
+/** 保存/测试/立即跑之后只刷新状态行与备份表，不整页重渲染（别的页签可能还有没保存的输入） */
+function paintBackupAuto(a) {
+  if (!a) return;
+  if (state.data.backups) state.data.backups.auto = a;
+  const line = $('#bk-auto-status');
+  if (line) line.innerHTML = backupAutoStatusText(a);
+}
+
+async function saveBackupAuto() {
+  const r = await api('/api/backups/settings', { method: 'PUT', body: JSON.stringify(collectBackupAutoForm()) });
+  paintBackupAuto(r);
+  toast('自动备份设置已保存', 'ok');
+}
+
+async function testBackupRemote() {
+  const form = collectBackupAutoForm();
+  if (!form.remote) return toast('先选一个远端类型再测试', 'err');
+  const r = await api('/api/backups/test', { method: 'POST', body: JSON.stringify({ remote: form.remote }) });
+  toast(r.detail || '连接正常', 'ok');
+}
+
+async function runBackupUpload() {
+  const r = await api('/api/backups/run', { method: 'POST' });
+  paintBackupAuto(r.auto);
+  await refreshBackups();
+  toast(r.uploaded ? `已备份并上传：${r.file}` : `已备份到本地：${r.file}`, 'ok');
+}
+
 /** 只重画备份表：设置页上还有没保存的输入框，不能整页重渲染 */
 async function refreshBackups() {
   const b = await api('/api/backups');
   paintBackups(b);
   return b;
+}
+
+/* --------------------------- 加密备份的恢复 --------------------------- */
+
+const BACKUP_MAGIC = 'NPBKP1\u0000';
+
+/**
+ * 只看文件头判断要不要密码。
+ * 先读 7 个字节，比「上传一次失败再问」快得多，也不会白白覆盖一次数据库。
+ */
+async function isEncryptedFile(file) {
+  try {
+    const head = new Uint8Array(await file.slice(0, 7).arrayBuffer());
+    return String.fromCharCode(...head) === BACKUP_MAGIC;
+  } catch {
+    return false;
+  }
+}
+
+/** 问密码。取消时 resolve('')，调用方据此中止 */
+function askBackupPassword(title, hint) {
+  return new Promise((resolve) => {
+    const mask = openModal({
+      title,
+      body: `<p class="hint" style="margin:0 0 10px">${esc(hint)}</p>
+        <div class="field">
+          <label>备份密码</label>
+          <input type="password" id="bk-restore-pw" autocomplete="new-password">
+        </div>`,
+      okText: '解密并恢复',
+      onOk: (m) => {
+        const v = $('#bk-restore-pw', m).value;
+        if (!v) {
+          toast('请输入备份密码', 'err');
+          return false;
+        }
+        resolve(v);
+        return true;
+      },
+      onCancel: () => resolve(''),
+    });
+    const input = $('#bk-restore-pw', mask);
+    if (input) setTimeout(() => input.focus(), 30);
+  });
+}
+
+function restoreFromFile(file, password) {
+  return api('/api/backups/restore', {
+    method: 'POST',
+    body: JSON.stringify(password ? { file, password } : { file }),
+  });
+}
+
+function restoreFromUpload(file, password) {
+  // 裸上传没有 JSON 可以塞密码，走请求头（服务端会 decodeURIComponent）
+  return apiRaw(
+    '/api/backups/restore',
+    file,
+    password ? { headers: { 'X-Backup-Password': encodeURIComponent(password) } } : {},
+  );
 }
 
 function backupUploadFlow() {
@@ -705,18 +1066,38 @@ function backupUploadFlow() {
 
       if (file.size < 4096) return toast('这个文件太小，不像数据库备份', 'err'), resolve();
 
+      // 加密备份先问密码：放在确认弹窗之前，因为 openModal 会关掉上一个弹窗，
+      // 在 onOk 里再开一个会把「确认覆盖」那一步顶掉
+      let pw = '';
+      if (await isEncryptedFile(file)) {
+        pw = await askBackupPassword(
+          '这份备份是加密的',
+          '输入当初设置的备份密码。解密在面板本地完成，密码不会被存下来。',
+        );
+        if (!pw) return resolve();
+      }
+
       openModal({
         title: '确认恢复',
         body: `<p style="margin:0 0 10px;color:var(--text-dim);line-height:1.75">
-            即将用 <b>${esc(file.name)}</b>（${fmtBytes(file.size)}）覆盖当前数据库。
+            即将用 <b>${esc(file.name)}</b>（${fmtBytes(file.size)}）覆盖当前数据库${pw ? '（加密备份，已输入密码）' : ''}。
           </p>
           <p style="margin:0;color:var(--text-dim);line-height:1.75">
             恢复会先自动备份当前状态，但恢复完成后<b>所有登录会话会失效</b>，需要用备份里那个管理员账号的密码重新登录。
           </p>`,
         okText: '覆盖并恢复',
         onOk: async () => {
-          await apiRaw('/api/backups/restore', file);
+          try {
+            await restoreFromUpload(file, pw);
+          } catch (err) {
+            if (!err.encrypted) throw err;
+            // 密码不对：确认这一步用户已经做过了，直接再问一次就重试
+            const again = await askBackupPassword('密码不对', err.message);
+            if (!again) return false;
+            await restoreFromUpload(file, again);
+          }
           toast('已恢复，请重新登录', 'ok');
+          closeModal();
           setTimeout(() => logoutLocal(true), 1200);
           return false; // 让登录页接管，别关弹窗
         },
@@ -1022,6 +1403,9 @@ const ACT_LOADING = {
   'backup-upload': '准备中',
   'backup-del': '删除中',
   'backup-restore': '恢复中',
+  'backup-save': '保存中',
+  'backup-test': '连接中',
+  'backup-run': '备份中',
   'user-bulk-act': '处理中',
   'node-bulk-del': '删除中',
   'node-enabled': '处理中',
@@ -1146,11 +1530,28 @@ async function runAction(act, btn, id) {
         '从备份恢复',
         `将用「${id}」覆盖当前数据库。恢复前会自动把现在的库再备份一份，管理员会话会失效、需要重新登录。确定继续？`,
         async () => {
-          await api('/api/backups/restore', { method: 'POST', body: JSON.stringify({ file: id }) });
+          try {
+            await restoreFromFile(id, '');
+          } catch (err) {
+            if (!err.encrypted) throw err;
+            // 本地备份默认是明文，但用户也可能把网盘上的 .db.enc 直接丢进备份目录
+            const pw = await askBackupPassword('这份备份是加密的', err.message);
+            if (!pw) return;
+            await restoreFromFile(id, pw);
+          }
           toast('已恢复，请重新登录', 'ok');
           setTimeout(() => logoutLocal(true), 1200);
         },
       );
+      break;
+    case 'backup-save':
+      await saveBackupAuto();
+      break;
+    case 'backup-test':
+      await testBackupRemote();
+      break;
+    case 'backup-run':
+      await runBackupUpload();
       break;
     case 'backup-upload':
       await backupUploadFlow();

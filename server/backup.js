@@ -10,6 +10,10 @@ const fs = require('fs');
 const path = require('path');
 const store = require('../lib/store');
 const logger = require('../lib/log');
+const backupLib = require('../lib/backup');
+const backupAuto = require('../lib/backup-auto');
+const backupRemote = require('../lib/backup-remote');
+const backupCrypt = require('../lib/backup-crypt');
 const { sendJson } = require('./http-util');
 const { sessions, auditAction } = require('./context');
 
@@ -18,47 +22,8 @@ const logData = logger.create('data');
 
 /* -------------------------------- 备份恢复 -------------------------------- */
 
-const BACKUP_NAME_RE = /^panel-[A-Za-z0-9._-]+\.db$/;
-
-function backupName(prefix) {
-  const stamp = store.iso().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '-');
-  // 时间戳精确到秒，连点两次「立即备份」会生成同名文件、后一份把前一份覆盖掉。
-  // 撞名就加 -2 / -3，保证每次备份都能在列表里看到。
-  const base = `panel-${prefix}-${stamp}`;
-  let file = `${base}.db`;
-  for (let i = 2; fs.existsSync(path.join(store.BACKUP_DIR, file)) && i < 100; i++) {
-    file = `${base}-${i}.db`;
-  }
-  return file;
-}
-
-function backupView(file) {
-  const full = path.join(store.BACKUP_DIR, file);
-  let st = null;
-  try {
-    st = fs.statSync(full);
-  } catch {
-    return null;
-  }
-  return {
-    file,
-    size: st.size,
-    mtime: st.mtime.toISOString(),
-    // 文件名里能看出用途：manual 手动 / prerestore 恢复前兜底 / v<数字> 升级前
-    kind: /^panel-v\d/.test(file) ? 'upgrade' : file.includes('-prerestore-') ? 'prerestore' : 'manual',
-  };
-}
-
 function listBackups(req, res) {
-  let files = [];
-  try {
-    files = fs.readdirSync(store.BACKUP_DIR).filter((f) => BACKUP_NAME_RE.test(f));
-  } catch { /* 目录还不存在：当作空列表 */ }
-
-  const items = files
-    .map(backupView)
-    .filter(Boolean)
-    .sort((a, b) => b.mtime.localeCompare(a.mtime));
+  const items = backupLib.list();
 
   sendJson(res, 200, {
     items,
@@ -66,18 +31,20 @@ function listBackups(req, res) {
     dbFile: store.DB_FILE,
     dbSize: store.dbFileSize(),
     totalSize: items.reduce((a, x) => a + x.size, 0),
+    // 自动备份的状态跟列表一起下发：备份页只需要一次请求就能画完
+    auto: backupAuto.status(),
   });
 }
 
 function createBackup(req, res) {
   const started = Date.now();
   try {
-    const file = backupName('manual');
+    const file = backupLib.name('manual');
     store.backupTo(path.join(store.BACKUP_DIR, file));
     const size = store.dbFileSize();
     logData.info('手动备份完成', { rid: req.__rid, file, kb: Math.round(size / 1024), ms: Date.now() - started });
     auditAction('backup.create', file, `${Math.round(size / 1024)} KB`);
-    sendJson(res, 200, { ok: true, item: backupView(file) });
+    sendJson(res, 200, { ok: true, item: backupLib.view(file) });
   } catch (err) {
     logData.error('手动备份失败', { rid: req.__rid, err, ms: Date.now() - started });
     sendJson(res, 500, { error: '备份失败：' + err.message });
@@ -86,7 +53,7 @@ function createBackup(req, res) {
 
 function downloadBackup(req, res, params) {
   const file = String(params.file || '');
-  if (!BACKUP_NAME_RE.test(file) || file.includes('..')) {
+  if (!backupLib.NAME_RE.test(file) || file.includes('..')) {
     return sendJson(res, 400, { error: '文件名不合法' });
   }
   const full = path.join(store.BACKUP_DIR, file);
@@ -106,7 +73,7 @@ function downloadBackup(req, res, params) {
 
 function deleteBackup(req, res, params) {
   const file = String(params.file || '');
-  if (!BACKUP_NAME_RE.test(file) || file.includes('..')) {
+  if (!backupLib.NAME_RE.test(file) || file.includes('..')) {
     return sendJson(res, 400, { error: '文件名不合法' });
   }
   const full = path.join(store.BACKUP_DIR, file);
@@ -135,13 +102,35 @@ async function restoreBackup(req, res, params, body, session, ctx) {
     from = '上传的文件';
   } else if (body.file) {
     const file = String(body.file);
-    if (!BACKUP_NAME_RE.test(file) || file.includes('..')) return sendJson(res, 400, { error: '文件名不合法' });
+    if (!backupLib.NAME_RE.test(file) || file.includes('..')) return sendJson(res, 400, { error: '文件名不合法' });
     const full = path.join(store.BACKUP_DIR, file);
     if (!fs.existsSync(full)) return sendJson(res, 404, { error: '备份不存在' });
     buf = fs.readFileSync(full);
     from = file;
   } else {
     return sendJson(res, 400, { error: '请选择要恢复的备份，或上传一个 .db 文件' });
+  }
+
+  // 加密备份：密码可以走 JSON 字段，也可以走请求头（上传是裸 octet-stream，
+  // 没有 JSON 可以塞）。前端先不带密码发一次，拿到 encrypted:true 再弹窗重试。
+  if (backupCrypt.isEncrypted(buf)) {
+    const rawPw = String((body && body.password) || req.headers['x-backup-password'] || '');
+    let pw = rawPw;
+    try {
+      pw = decodeURIComponent(rawPw);
+    } catch {
+      /* 不是编码过的就按原样用 */
+    }
+    if (!pw) {
+      return sendJson(res, 400, { error: '这是加密备份，请输入备份密码', encrypted: true });
+    }
+    try {
+      buf = backupCrypt.decrypt(buf, pw);
+      from += '（已解密）';
+    } catch (err) {
+      logData.warn('恢复被拒绝：解密失败', { rid: ctx.rid, from, bytes: buf.length });
+      return sendJson(res, 400, { error: err.message, encrypted: true });
+    }
   }
 
   if (buf.length < 4096 || buf.subarray(0, 16).toString('latin1') !== 'SQLite format 3\u0000') {
@@ -174,7 +163,7 @@ async function restoreBackup(req, res, params, body, session, ctx) {
   // 1. 先给「现在」留个后路
   let safety = '';
   try {
-    safety = backupName('prerestore');
+    safety = backupLib.name('prerestore');
     store.backupTo(path.join(store.BACKUP_DIR, safety));
   } catch (err) {
     logData.error('恢复前备份失败，已中止', { rid: ctx.rid, from, err });
@@ -213,4 +202,131 @@ async function restoreBackup(req, res, params, body, session, ctx) {
   });
 }
 
-module.exports = { listBackups, createBackup, downloadBackup, deleteBackup, restoreBackup };
+/* ------------------------------ 自动备份设置 ------------------------------ */
+
+function getBackupSettings(req, res) {
+  sendJson(res, 200, backupAuto.status());
+}
+
+/**
+ * 保存自动备份设置。两段式：先算进 next，全部校验通过才一次性写回 s ——
+ * 与 updateSettings 同一条规矩，半套配置被下一次任何保存带进库是最难查的。
+ */
+function saveBackupSettings(req, res, params, body) {
+  const s = store.db().settings;
+  const next = {};
+
+  if (body.auto !== undefined) next.backupAuto = body.auto ? '1' : '0';
+
+  if (body.at !== undefined) {
+    const at = backupAuto.normAt(body.at);
+    if (!at) return sendJson(res, 400, { error: '备份时刻要写成 HH:MM（如 03:30）' });
+    next.backupAt = at;
+  }
+
+  for (const [key, field, label] of [
+    [body.keepLocal, 'backupKeepLocal', '本地保留份数'],
+    [body.keepRemote, 'backupKeepRemote', '远端保留份数'],
+  ]) {
+    if (key === undefined) continue;
+    const n = Math.floor(Number(key));
+    if (!Number.isFinite(n) || n < 1 || n > 90) {
+      return sendJson(res, 400, { error: `${label}只能是 1–90` });
+    }
+    next[field] = String(n);
+  }
+
+  if (body.encrypt !== undefined) next.backupEncrypt = body.encrypt ? '1' : '0';
+
+  // 打码值表示「没改」：前端拿到的就是 MASK，原样提交回来不能把密码清空
+  if (body.password !== undefined && body.password !== backupAuto.MASK) {
+    next.backupPassword = String(body.password);
+  }
+
+  if (body.remote !== undefined) {
+    let cfg = null;
+    try {
+      cfg = backupAuto.mergeRemote(backupAuto.parseRemote(s.backupRemote), body.remote);
+      if (cfg) backupRemote.validate(cfg);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    next.backupRemote = cfg ? JSON.stringify(cfg) : '';
+  }
+
+  const pick = (k) => (next[k] !== undefined ? next[k] : s[k]);
+  const autoOn = pick('backupAuto') === '1';
+  const encrypt = pick('backupEncrypt') === '1';
+  const hasRemote = !!backupAuto.parseRemote(pick('backupRemote'));
+  const hasPw = !!(String(pick('backupPassword') || '') || process.env.PANEL_BACKUP_PASSWORD);
+  // 开着加密 + 配了远端却没有密码：存进去也跑不了，第二天只会收到一条失败通知
+  if (autoOn && hasRemote && encrypt && !hasPw) {
+    return sendJson(res, 400, { error: '开启了加密但没设备份密码：填一个密码，或关掉加密' });
+  }
+
+  Object.assign(s, next);
+  store.save();
+  auditAction('backup.settings', '自动备份', `开关=${autoOn ? '开' : '关'} · 时刻=${s.backupAt}`);
+  logData.info('自动备份设置已保存', {
+    rid: req.__rid,
+    enabled: autoOn,
+    at: s.backupAt,
+    remote: hasRemote ? backupAuto.parseRemote(s.backupRemote).type : '',
+    encrypt,
+  });
+  sendJson(res, 200, { ok: true, ...backupAuto.status() });
+}
+
+/** 测试远端连通性。body.remote 可以带未保存的表单内容，方便「先测再存」 */
+async function testBackupRemote(req, res, params, body) {
+  let cfg;
+  try {
+    const prev = backupAuto.parseRemote(store.db().settings.backupRemote);
+    cfg = body.remote
+      ? backupAuto.mergeRemote(prev, body.remote)
+      : prev;
+    if (cfg) backupRemote.validate(cfg);
+  } catch (err) {
+    return sendJson(res, 400, { error: err.message });
+  }
+  if (!cfg) return sendJson(res, 400, { error: '先选一个远端类型再测试' });
+
+  const started = Date.now();
+  try {
+    const out = await backupRemote.test(backupAuto.prepareRemote(cfg));
+    logData.info('远端备份连通性测试通过', { rid: req.__rid, type: cfg.type, ms: Date.now() - started });
+    sendJson(res, 200, { ok: true, detail: out.detail, ms: Date.now() - started });
+  } catch (err) {
+    logData.warn('远端备份连通性测试失败', {
+      rid: req.__rid,
+      type: cfg.type,
+      err: err.message,
+      ms: Date.now() - started,
+    });
+    sendJson(res, 400, { error: err.message });
+  }
+}
+
+/** 立即备份一次并按当前设置上传（不看「自动备份」开关，也不看时刻） */
+async function runBackupNow(req, res) {
+  if (backupAuto.isRunning()) return sendJson(res, 409, { error: '上一轮备份还没结束' });
+  const out = await backupAuto.runOnce(backupAuto.config());
+  if (out.ok) {
+    auditAction('backup.upload', out.file, out.uploaded ? `已上传 ${out.uploaded}` : '仅本地');
+    sendJson(res, 200, { ok: true, ...out, auto: backupAuto.status() });
+  } else {
+    sendJson(res, 502, { error: out.error, ...out, auto: backupAuto.status() });
+  }
+}
+
+module.exports = {
+  listBackups,
+  createBackup,
+  downloadBackup,
+  deleteBackup,
+  restoreBackup,
+  getBackupSettings,
+  saveBackupSettings,
+  testBackupRemote,
+  runBackupNow,
+};

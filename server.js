@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const store = require('./lib/store');
 const alerts = require('./lib/alerts');
 const usageReport = require('./lib/usage-report');
+const backupAuto = require('./lib/backup-auto');
 const logger = require('./lib/log');
 
 // ── 底座：配置 / 小工具 / 令牌 / HTTP / 共享状态 ──────────────────────────────
@@ -74,6 +75,7 @@ const {
 const { statsView, userTraffic, listAudit } = require('./server/reports');
 const {
   listBackups, createBackup, downloadBackup, deleteBackup, restoreBackup,
+  getBackupSettings, saveBackupSettings, testBackupRemote, runBackupNow,
 } = require('./server/backup');
 const {
   subApi, subLogin, subReset, subLogout, subPage, applySubNameTemplates,
@@ -125,6 +127,11 @@ const ROUTES = [
   ['GET', '/api/audit', listAudit, true],
   ['GET', '/api/backups', listBackups, true],
   ['POST', '/api/backups', createBackup, true],
+  // 静态段放在 :file 之前：/api/backups/settings 不该被当成某个备份文件
+  ['GET', '/api/backups/settings', getBackupSettings, true],
+  ['PUT', '/api/backups/settings', saveBackupSettings, true],
+  ['POST', '/api/backups/test', testBackupRemote, true],
+  ['POST', '/api/backups/run', runBackupNow, true],
   ['POST', '/api/backups/restore', restoreBackup, true],
   ['GET', '/api/backups/:file/download', downloadBackup, true],
   ['DELETE', '/api/backups/:file', deleteBackup, true],
@@ -421,6 +428,17 @@ function main() {
   setTimeout(() => {
     sweepTemplateSync(false).catch((err) => log.error('订阅模板定时同步异常', { err }));
   }, 30 * 1000).unref();
+  // 自动备份：同样只是「闹钟」，到点没到点看设置里的 HH:MM 与 backupLastAt。
+  // 粒度取 5 分钟：备份是重活（VACUUM + 上传），晚几分钟无所谓，但重启后欠下的
+  // 那次要能补上 —— 所以「上次成功时间」必须落盘，不能只放在内存里。
+  // 启动后先等 90 秒：避开启动瞬间的初始化、agent 首轮拉取与证书扫描
+  const backupTimer = setInterval(() => {
+    backupAuto.sweep(false).catch((err) => log.error('自动备份异常', { err }));
+  }, 5 * 60 * 1000);
+  backupTimer.unref();
+  setTimeout(() => {
+    backupAuto.sweep(false).catch((err) => log.error('自动备份异常', { err }));
+  }, 90 * 1000).unref();
   // 过期会话原本只在「再次被访问」时删除，长期运行会缓慢堆积（正常一两个管理员
   // 在线，堆不了几条，但零成本顺手清掉）；每 30 分钟扫一遍，超出硬上限时淘汰最早过期的一批。
   const SESSION_HARD_LIMIT = 500;

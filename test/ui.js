@@ -646,8 +646,12 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     !!d8.querySelector('#nc-url') && !!d8.querySelector('#nc-format') && !!d8.querySelector('#nc-token'));
   ok('默认不是自定义格式时隐藏请求体模板', d8.querySelector('#nc-body-field').style.display === 'none');
   ok('请求头模板一栏常驻', !!d8.querySelector('#nc-headers'));
-  ok('订阅事件十项都在弹窗里', d8.querySelectorAll('.nc-ev').length === 10,
-    `实际 ${d8.querySelectorAll('.nc-ev').length} 个`);
+  // 事件清单由接口下发（notifyMeta.events），别在这里写死数字：
+  // 加一个事件（0.1.40 加了 backup.failed）就红，红得莫名其妙
+  const notifyMeta = await json('/api/notify/channels', {}, T);
+  ok('订阅事件与接口下发的清单一致',
+    d8.querySelectorAll('.nc-ev').length === notifyMeta.events.length,
+    `${d8.querySelectorAll('.nc-ev').length} / ${notifyMeta.events.length}`);
   ok('新建渠道预勾「常用那几类」（留空 = 全收，不能默认全选）',
     d8.querySelectorAll('.nc-ev:checked').length === 6 &&
       !d8.querySelector('.nc-ev[value="usage.monthly.full"]').checked,
@@ -1487,6 +1491,53 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('点「立即备份」后表格多出一行', bkCount() === bkRowsBefore + 1, `${bkRowsBefore} → ${bkCount()}`);
   ok('备份行带下载 / 恢复 / 删除', !!d9.querySelector('#bk-body [data-act="backup-dl"]') &&
     !!d9.querySelector('#bk-body [data-act="backup-restore"]'));
+
+  /* ---- 自动备份卡片 ---- */
+  console.log('\n── 自动备份卡片 ──');
+  ok('有开关 / 时刻 / 保留份数',
+    !!d9.querySelector('#bk-auto') && !!d9.querySelector('#bk-at') &&
+    !!d9.querySelector('#bk-keep-local') && !!d9.querySelector('#bk-keep-remote'));
+  const bkTypes = [...d9.querySelectorAll('#bk-remote-type option')].map((o) => o.value).join(',');
+  ok('远端可选「不推送 + 三种类型」', bkTypes === ',webdav,s3,scp', bkTypes);
+  ok('默认不显示任何远端字段块',
+    d9.querySelector('#bk-remote-webdav').classList.contains('hidden') &&
+    d9.querySelector('#bk-remote-s3').classList.contains('hidden') &&
+    d9.querySelector('#bk-remote-scp').classList.contains('hidden'));
+  ok('有加密开关与密码框', !!d9.querySelector('#bk-encrypt') && !!d9.querySelector('#bk-password'));
+  ok('状态行说明还没跑过', /还没有跑过/.test(d9.querySelector('#bk-auto-status').textContent),
+    d9.querySelector('#bk-auto-status').textContent.trim().slice(0, 40));
+
+  const bkTypeSel = d9.querySelector('#bk-remote-type');
+  const pickType = (v) => {
+    bkTypeSel.value = v;
+    bkTypeSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  };
+  pickType('webdav');
+  ok('切到 WebDAV 只露出 WebDAV 字段',
+    !d9.querySelector('#bk-remote-webdav').classList.contains('hidden') &&
+    d9.querySelector('#bk-remote-s3').classList.contains('hidden') &&
+    !!d9.querySelector('#bk-wd-url'));
+  pickType('s3');
+  ok('切到 S3 露出 Endpoint / Bucket / 密钥',
+    !d9.querySelector('#bk-remote-s3').classList.contains('hidden') &&
+    !!d9.querySelector('#bk-s3-endpoint') && !!d9.querySelector('#bk-s3-secret'));
+  pickType('scp');
+  ok('切到 SCP 露出私钥框与端口',
+    !d9.querySelector('#bk-remote-scp').classList.contains('hidden') &&
+    !!d9.querySelector('#bk-scp-key') && !!d9.querySelector('#bk-scp-port'));
+  pickType('');
+  ok('切回「不推送」时全部收起',
+    d9.querySelector('#bk-remote-scp').classList.contains('hidden'));
+
+  // 保存：时刻归一 + 回读，验证前后端字段名对得上
+  d9.querySelector('#bk-at').value = '04:15';
+  d9.querySelector('#bk-keep-local').value = '5';
+  click(d9.querySelector('[data-act="backup-save"]'), w9);
+  await waitFor(() => /上次|还没有跑过/.test(d9.querySelector('#bk-auto-status').textContent), '保存完成');
+  const saved = await json('/api/backups/settings', {}, T);
+  ok('保存后服务端记住时刻与保留份数', saved.at === '04:15' && saved.keepLocal === 5,
+    `${saved.at} · ${saved.keepLocal}`);
+  ok('远端被清空（选的是「不推送」）', saved.remote === null);
 
   /* ---- 审计页 ---- */
   console.log('\n── 审计日志页 ──');

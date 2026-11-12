@@ -76,6 +76,7 @@ PANEL_SEED_DEMO=1 node server.js
 | `PANEL_TRUST_PROXY` | 空 | 设为 `1` 时无条件采信 `X-Forwarded-For`；不设则只在前置代理来自本机/内网时采信 |
 | `PANEL_UPDATE_CHECK` | 开启 | 设为 `0` 关掉「检查更新」，面板不再访问 `api.github.com` |
 | `PANEL_DEPLOY_KIND` | 自动判断 | `docker` / `source`，决定弹窗里给哪条升级命令；默认按容器标记文件判断 |
+| `PANEL_BACKUP_PASSWORD` | 空 | 备份加密密码；设了它就不用把密码存在面板库里（和备份分开存放） |
 
 数据文件：`data/panel.db`（SQLite，WAL 模式）。老的 `data/db.json` 会在首次启动时
 自动导入并改名为 `db.json.imported`，不会丢数据。
@@ -1006,6 +1007,36 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 所以恢复错了还能再恢复回来。唯一需要注意的是 **`audit_log` 会一起回滚**到备份时点，
 只有「恢复」这条会写进新库 —— 这是恢复语义本身决定的，不是漏记。
 
+### 定时备份与远端（0.1.40）
+
+「设置 → 备份」下方那张卡片：每天固定时刻自动备份，可选推到远端。
+
+| 远端 | 覆盖 | 认证 |
+| --- | --- | --- |
+| **WebDAV** | 坚果云、Nextcloud、群晖、Seafile、**Alist**（Alist 再挂百度网盘 / 阿里云盘 / 115 / OneDrive / Google Drive） | Basic |
+| **S3 兼容** | MinIO、Cloudflare R2、阿里云 OSS、腾讯云 COS、Backblaze B2、AWS S3 | Access Key + Secret（SigV4） |
+| **SCP** | 任意 Linux 机器 | **只支持私钥**（密码认证要 sshpass，不进镜像） |
+
+想传百度网盘这类没有公开 API 的网盘，装一个 [Alist](https://alist.nn.ci/) 把网盘挂上来，
+这里填 Alist 的 WebDAV 地址就行 —— 面板侧不用为每个网盘写一套 SDK。
+
+**加密**：默认开启，`scrypt` 派生 + `AES-256-GCM`，产物是 `.db.enc`。备份里是整库
+（密码 hash、节点私钥、订阅 token），传到第三方网盘等于把这些全交出去。密码存在面板库里，
+想让它和备份不放在一起就用环境变量 `PANEL_BACKUP_PASSWORD` 覆盖。恢复时面板会问密码，
+也可以把 `.db.enc` 拖进「上传恢复」，前端认得出文件头。
+
+**保留**：本地 / 远端各留 N 份（默认 7），**只清理 `panel-auto-*`** —— 手动备份、
+恢复前兜底、升级前快照都不参与，按「保留 N 份」一刀切会把它们连根删掉。
+
+**调度**：按「上次成功时刻早于最近一次该备份的时刻」判断，不是「距上次超过 N 小时」。
+面板停机错过一次，重启当天会补上；改时刻也不用重算基准。失败也推进「上次时间」
+（否则地址填错会变成每 5 分钟重试一次的隐形压力），失败通过通知渠道的
+`backup.failed` 事件告警，恢复后再补一条「已恢复」。
+
+**SCP 的已知限制**：容器里跑 `ssh`/`scp` 需要 `openssh-client`（0.1.40 起镜像自带）；
+远端目录必须是绝对路径且只含 `A-Za-z0-9._/-` —— 它会被拼进远端 shell 命令，
+而 scp 的目标路径不做引号处理。主机指纹记在数据目录的 `.ssh_known_hosts` 里。
+
 ### 审计日志
 
 侧栏「日志」页，记录**谁、什么时候、对什么、做了什么**：
@@ -1228,9 +1259,13 @@ GET  /api/users/:id/traffic?days=30        单个用户的每日用量
 
 GET  /api/audit?limit=200&q=&action=&before= 审计日志（关键字 / 类型 / 翻页）
 
-GET  /api/backups                          备份列表 + 库大小
+GET  /api/backups                          备份列表 + 库大小 + 自动备份状态
 POST /api/backups                          立即备份（VACUUM INTO）
-POST /api/backups/restore                  恢复（JSON {file} 或 octet-stream 上传 .db）
+GET  /api/backups/settings                 自动备份状态（时刻 / 保留份数 / 远端，密钥打码）
+PUT  /api/backups/settings                 保存自动备份设置（远端密钥留空或传打码值 = 不修改）
+POST /api/backups/test                     测试远端连通性（真写一个探针文件再删掉）
+POST /api/backups/run                      立即备份并按当前设置上传（不看开关与时刻）
+POST /api/backups/restore                  恢复（JSON {file,password} 或 octet-stream 上传 .db/.db.enc）
 GET  /api/backups/:file/download           下载备份
 DELETE /api/backups/:file                  删除备份
 
@@ -1286,7 +1321,7 @@ node-panel/
 │   ├── panel-https.js   面板自身 HTTPS（证书来源 / 监听生命周期）
 │   ├── notifications.js 消息通知域（通道 / 事件开关 / 手动巡检）
 │   ├── reports.js       报表域（流量明细 / 审计列表）
-│   ├── backup.js        备份恢复域
+│   ├── backup.js        备份恢复域（手动 / 恢复 / 自动备份设置与远端）
 │   ├── update.js        版本检查（读 GitHub Release，只读、带缓存）
 │   └── overview.js      概览页数据
 ├── lib/
@@ -1301,6 +1336,10 @@ node-panel/
 │   ├── alerts.js        告警巡检与去重（按 key + 冷却时间 + 恢复通知）
 │   ├── usage-report.js  月末报告（本月区间统计 + 群发版 / 完整版 + 按月份幂等发送）
 │   ├── keys.js          x25519 密钥对生成
+│   ├── backup.js        备份文件的命名 / 列举 / 清理（只碰 panel-auto-*）
+│   ├── backup-auto.js   定时备份（每天固定时刻 / 保留份数 / 失败通知）
+│   ├── backup-crypt.js  备份加密（scrypt + AES-256-GCM，产物 .db.enc）
+│   ├── backup-remote.js 远端传输（WebDAV / S3 SigV4 / SCP，零依赖）
 │   ├── update.js        有没有新版本（版本号比较 / GitHub Release 拉取 / 内存缓存）
 │   ├── totp.js          管理员二步验证（RFC 6238，node:crypto 手写 HMAC-SHA1）
 │   ├── qrcode.js        TOTP 绑定二维码（ISO/IEC 18004 子集：byte/UTF-8/ECC-M/V1-10，纯位运算）
@@ -1361,6 +1400,7 @@ node test/renew.js                      # 自动续期
 node test/security.js                   # 强制改密 / 登录限流 / 升级前备份（自带独立实例）
 node test/notify.js                     # 通知通道（假 SMTP + 假 HTTP）
 node test/update.js                     # 版本检查（假 GitHub API：比较 / 缓存 / 404 / 500 降级）
+node test/backup.js                     # 备份：加密往返 + 假 WebDAV / 假 S3 / 假 ssh+scp
 node test/agent.js                      # agent 自更新（假面板 + 真 agent.sh）
 node test/qrcode.js                     # QR 编码器（结构断言；装了 jsqr 才跑端到端解码）
 
@@ -1386,7 +1426,9 @@ VLESS Encryption → uTLS 指纹 → 证书四态（路径 / 粘贴 / 自签 / A
 批量建号（数量 / 名单、去重、超长跳过、套餐继承）→ 批量操作（启停 / 改套餐 / 重置 / 删除、管理员保护）→
 邀请（生成 / 公开信息 / 领取 / 重名 409 / 名额用尽 410 / 停用）→
 回执（未回执 → 已同步 → 待同步 → 同步失败、节点继承服务器状态、token 校验）→
-备份（创建 / 列表 / 下载 / 路径穿越 400 / 恢复 / 恢复前兜底 / 会话失效 / 上传非 SQLite 拒绝 / 删除）→
+备份（创建 / 列表 / 下载 / 路径穿越 400 / 恢复 / 恢复前兜底 / 会话失效 / 上传非 SQLite 拒绝 / 删除 /
+自动备份设置（默认值、时刻与份数校验、加密无密码被拒、远端密码打码回填、类型校验）/
+立即备份并上传 / 加密备份恢复（无密码 400 + `encrypted`、密码错、带密码成功））→
 审计（关键字、类型、翻页、操作者与 IP）→
 **0.1.16 新增**：管理员 TOTP 全流程（绑定需密码 / 两段式登录 /
 动态码重放被拒 / 恢复码一次性 / 密码关闭）→ sing-box 订阅结构与订阅头 → v2 流量上报（新代数建基线 /

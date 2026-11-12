@@ -2077,6 +2077,109 @@ function totpCodeOf(secret) {
   ok('删掉的备份不再出现',
     !(await call('/api/backups')).data.items.some((x) => x.file === restored.data.safety));
 
+  /* ---------- 13.3b 自动备份与远端 ---------- */
+  const bs = await call('/api/backups/settings');
+  ok('自动备份默认关闭', bs.status === 200 && bs.data.enabled === false, JSON.stringify(bs.data.enabled));
+  ok('默认时刻与保留份数', bs.data.at === '03:30' && bs.data.keepLocal === 7 && bs.data.keepRemote === 7,
+    `${bs.data.at} · ${bs.data.keepLocal}/${bs.data.keepRemote}`);
+  ok('默认开启加密', bs.data.encrypt === true);
+  ok('默认没有远端', bs.data.remote === null);
+  ok('下发三种远端类型', Array.isArray(bs.data.remoteTypes) && bs.data.remoteTypes.join(',') === 'webdav,s3,scp',
+    (bs.data.remoteTypes || []).join(','));
+  ok('备份列表里带 auto 状态', bkList.data.auto && bkList.data.auto.at === '03:30');
+
+  ok('时刻写错被拒',
+    (await call('/api/backups/settings', { method: 'PUT', body: json({ at: '25:00' }) })).status === 400);
+  ok('保留份数越界被拒',
+    (await call('/api/backups/settings', { method: 'PUT', body: json({ keepLocal: 0 }) })).status === 400);
+  ok('开了加密 + 远端却没密码时拒绝保存',
+    (await call('/api/backups/settings', {
+      method: 'PUT',
+      body: json({
+        auto: true,
+        encrypt: true,
+        remote: { type: 'webdav', url: 'http://127.0.0.1:1/dav', dir: 'x', user: 'u', pass: 'p' },
+      }),
+    })).status === 400);
+  ok('远端类型写错被拒',
+    (await call('/api/backups/settings', { method: 'PUT', body: json({ remote: { type: 'ftp' } }) })).status === 400);
+
+  const bsSave = await call('/api/backups/settings', {
+    method: 'PUT',
+    body: json({
+      auto: false,
+      at: '4:05',
+      keepLocal: 5,
+      keepRemote: 3,
+      encrypt: true,
+      password: 'smoke-bak-pass',
+      remote: { type: 'webdav', url: 'http://127.0.0.1:1/dav', dir: 'np', user: 'u', pass: 'dav-secret' },
+    }),
+  });
+  ok('保存自动备份设置', bsSave.status === 200 && bsSave.data.at === '04:05',
+    bsSave.data.at || JSON.stringify(bsSave.data).slice(0, 80));
+  ok('远端密码读回来是打码的', bsSave.data.remote.pass === '••••••',
+    String(bsSave.data.remote && bsSave.data.remote.pass));
+  ok('密码不回显，只告诉「已设置」', bsSave.data.hasPassword === true && bsSave.data.password === undefined);
+
+  const badTest = await call('/api/backups/test', {
+    method: 'POST',
+    body: json({ remote: { type: 'webdav', url: 'http://127.0.0.1:1/dav', dir: 'np', user: 'u', pass: 'x' } }),
+  });
+  ok('测试连接失败时把原因带回来', badTest.status === 400 && !!badTest.data.error,
+    String(badTest.data.error || '').slice(0, 40));
+  ok('没有远端时测试被拒', (await call('/api/backups/test', { method: 'POST', body: json({}) })).status === 400);
+
+  // 立即备份并上传：没配远端（先把远端清掉），应当只存本地且成功
+  await call('/api/backups/settings', { method: 'PUT', body: json({ remote: null }) });
+  const runNow = await call('/api/backups/run', { method: 'POST' });
+  ok('立即备份（无远端）成功', runNow.status === 200 && runNow.data.ok === true, runNow.data.file || runNow.data.error);
+  ok('生成的是定时备份（kind=auto）', /^panel-auto-[\d-]+\.db$/.test(runNow.data.file || ''),
+    runNow.data.file || '');
+  ok('列表能认出这是定时备份',
+    (await call('/api/backups')).data.items.some((x) => x.file === runNow.data.file && x.kind === 'auto'));
+  ok('状态里记下了上次结果', /^成功/.test((await call('/api/backups/settings')).data.lastResult || ''),
+    (await call('/api/backups/settings')).data.lastResult);
+
+  // 加密备份的恢复：没有密码 → 400 + encrypted 标记；给了密码 → 恢复成功
+  const encBackup = require('../lib/backup-crypt').encrypt(dlBuf, 'smoke-bak-pass');
+  const noPw = await fetch(`${BASE}/api/backups/restore`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/octet-stream' },
+    body: encBackup,
+  });
+  const noPwBody = await noPw.json();
+  ok('加密备份不给密码时被拒（400 + encrypted）',
+    noPw.status === 400 && noPwBody.encrypted === true, String(noPwBody.error || ''));
+
+  const wrongPw = await fetch(`${BASE}/api/backups/restore`, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'Content-Type': 'application/octet-stream',
+      'X-Backup-Password': encodeURIComponent('not-the-password'),
+    },
+    body: encBackup,
+  });
+  ok('密码不对时明确失败', wrongPw.status === 400, String((await wrongPw.json()).error || '').slice(0, 30));
+
+  const goodPw = await fetch(`${BASE}/api/backups/restore`, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'Content-Type': 'application/octet-stream',
+      'X-Backup-Password': encodeURIComponent('smoke-bak-pass'),
+    },
+    body: encBackup,
+  });
+  const goodPwBody = await goodPw.json();
+  ok('带对密码就能恢复加密备份', goodPw.status === 200 && /已解密/.test(goodPwBody.from || ''),
+    String(goodPwBody.from || goodPwBody.error || '').slice(0, 40));
+  token = (await call('/api/login', { method: 'POST', body: json({ username: ADMIN_USER, password: ADMIN_PASS }) })).data.token;
+  // 恢复把库退回到备份时点，后面那条「backup.delete 被记录」需要一次新的删除动作
+  const anyBk = (await call('/api/backups')).data.items.find((x) => x.kind === 'manual');
+  if (anyBk) await call('/api/backups/' + anyBk.file, { method: 'DELETE' });
+
   /* ---------- 13.4 审计日志 ---------- */
   const audit = await call('/api/audit?limit=200');
   ok('审计日志可读', audit.status === 200 && audit.data.items.length > 0, `共 ${audit.data.total} 条`);

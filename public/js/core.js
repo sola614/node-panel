@@ -479,7 +479,11 @@ async function api(path, options = {}) {
       logoutLocal(true);
       throw new Error('登录已失效');
     }
-    throw new Error(data.error || `请求失败 (${res.status})`);
+    const err = new Error(data.error || `请求失败 (${res.status})`);
+    // 与 apiRaw 一致：加密备份要先问密码再重发，靠文案判断不了
+    err.data = data;
+    err.encrypted = !!data.encrypted;
+    throw err;
   }
   return data;
 }
@@ -488,8 +492,8 @@ async function api(path, options = {}) {
  * 二进制上传：备份文件动辄几十兆，走 base64 进 JSON 会膨胀 33%，
  * 还可能撞上 1.5 MB 的请求体上限，所以直接把 File 丢进 body。
  */
-async function apiRaw(path, blob) {
-  const headers = { 'Content-Type': 'application/octet-stream' };
+async function apiRaw(path, blob, options = {}) {
+  const headers = { 'Content-Type': 'application/octet-stream', ...(options.headers || {}) };
   if (state.token) headers.Authorization = 'Bearer ' + state.token;
 
   const res = await fetch(path, { method: 'POST', headers, body: blob });
@@ -503,7 +507,11 @@ async function apiRaw(path, blob) {
       logoutLocal(true);
       throw new Error('登录已失效');
     }
-    throw new Error(data.error || `上传失败 (${res.status})`);
+    const err = new Error(data.error || `上传失败 (${res.status})`);
+    // 把结构化字段带出去：加密备份要先问密码再重发，光靠一句 error 文案判断不了
+    err.data = data;
+    err.encrypted = !!data.encrypted;
+    throw err;
   }
   return data;
 }
@@ -530,6 +538,8 @@ function openModal({
   // 到底哪个才是真关掉
   cancelText = '取消',
   onOk,
+  // 点「取消」/× 时的回调：不传就没有。要「取消也 resolve 一个值」的流程靠它
+  onCancel,
   footer = true,
   // 额外按钮插在「取消」左边：给「放大编辑」那类次要动作留位置
   footActions = '',
@@ -556,7 +566,10 @@ function openModal({
   // 只允许通过按钮关闭：点击遮罩层不再收起弹窗，
   // 避免编辑长表单时手滑点到外面，输入全部丢失
   mask.addEventListener('click', (e) => {
-    if (e.target.closest('[data-close]')) closeModal();
+    if (e.target.closest('[data-close]')) {
+      if (onCancel) onCancel();
+      closeModal();
+    }
   });
 
   const okBtn = $('[data-ok]', mask);

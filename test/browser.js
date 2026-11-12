@@ -751,6 +751,14 @@ async function main() {
     if (unexpectedErr.length) console.log('    控制台细节：\n      ' + unexpectedErr.slice(0, 8).join('\n      '));
 
     await shot('99-settings', cdp);
+    // 「自动备份与远端」卡片在折叠线以下：滚过去再拍一张，布局问题（裁切、错位）
+    // 只有在整张卡片可见时才看得出来
+    await evalJs(
+      "document.querySelector('#bk-auto-status') && document.querySelector('#bk-auto-status').scrollIntoView({block:'center'}); return 1;",
+      cdp,
+    );
+    await sleep(250);
+    await shot('99-settings-backup', cdp);
     if (subShot) console.log(`\n截图：${SHOT_DIR}`);
   } finally {
     try { await cdp.send('Browser.close'); } catch { /* ignore */ }

@@ -30,9 +30,11 @@ COPY agent ./agent
 # 入口脚本负责把数据目录属主修好再降权运行，su-exec 是 Alpine 上的 gosu 等价物
 # openssl：面板侧签证书时 acme.sh 要用它生成 EC 私钥（镜像里默认只有 libssl，没有 CLI）
 # curl：acme.sh 的下载与部分 DNS 插件依赖它，busybox wget 能凑合但不稳
+# ca-certificates：备份推到 WebDAV / S3 时走 HTTPS，缺了根证书会直接 CERT 校验失败
+# openssh-client：备份的 SCP 传输要 ssh/scp（0.1.40 起）
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh \
-    && apk add --no-cache su-exec openssl curl
+    && apk add --no-cache su-exec openssl curl ca-certificates openssh-client
 
 RUN mkdir -p /app/data && chown -R node:node /app
 

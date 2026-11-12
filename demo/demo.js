@@ -162,6 +162,11 @@
     if (api === '/api/notify/channels') return load('notify-channels.json').then(json);
     if (api === '/api/invites') return load('invites.json').then(json);
     if (api === '/api/backups') return load('backups.json').then(json);
+    // 自动备份的保存 / 测试 / 立即跑在演示站里都是空操作，但返回结构要对得上，
+    // 否则点一下「保存」界面上的状态行会被清空
+    if (api === '/api/backups/settings') {
+      return load('backups.json').then(function (d) { return json(d.auto || {}); });
+    }
     if (api === '/api/stats') {
       var days = Number(url.searchParams.get('days'));
       var file = 'stats-' + (STATS_DAYS.indexOf(days) >= 0 ? days : 14) + '.json';
