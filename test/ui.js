@@ -1669,11 +1669,11 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
 
   // 顶层 const 在经典脚本里共享同一个全局词法环境，但不会挂到 window 上，所以用 eval 读
   const keys = w7.eval('Object.keys(RENDERERS).sort().join(",")');
-  ok('十个脚本按序加载，九个渲染器都注册上了',
-    keys === 'audit,certs,dashboard,nodes,plans,servers,settings,stats,users', `(${keys})`);
+  ok('十一个脚本按序加载，十个渲染器都注册上了',
+    keys === 'audit,certs,dashboard,nodes,plans,relays,servers,settings,stats,users', `(${keys})`);
   ok('跨文件的工具函数可见', w7.eval('typeof api === "function" && typeof fmtBytes === "function"'));
 
-  for (const view of ['users', 'plans', 'nodes', 'stats', 'servers', 'certs', 'audit', 'settings', 'dashboard']) {
+  for (const view of ['users', 'plans', 'nodes', 'stats', 'servers', 'relays', 'certs', 'audit', 'settings', 'dashboard']) {
     click(d7.querySelector(`.nav-item[data-view="${view}"]`), w7);
     await sleep(400);
     const text = d7.querySelector('#view').textContent || '';
