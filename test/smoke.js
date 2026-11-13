@@ -1309,6 +1309,53 @@ function totpCodeOf(secret) {
   const hy2ip = (subHy2.data.links || []).find((l) => l.name.includes('SMOKE-HY2'));
   ok('Hysteria2 链接使用上报的 IP', !!hy2ip && hy2ip.host === REPORTED_IP, `host=${hy2ip && hy2ip.host}`);
 
+  /* ---------- 11.5b 分享链接导入 + 外部订阅 ---------- */
+
+  // 批量导入：重复链接去重、坏链接逐条回报，成功的一律 mode=imported
+  const IMPORT_LINK =
+    'vless://share-uuid-abc@import.example.com:443?security=reality&sni=www.apple.com&fp=chrome' +
+    '&pbk=imp-pbk&sid=12345678&type=tcp&flow=xtls-rprx-vision#%E5%90%88%E7%A7%9F%E9%A6%99%E6%B8%AF';
+  const imp = await call('/api/nodes/import', {
+    method: 'POST',
+    body: json({ links: [IMPORT_LINK, IMPORT_LINK, 'not-a-link'].join('\n') }),
+  });
+  ok('导入分享链接（重复去重、坏行拒收）',
+    imp.status === 200 && imp.data.count === 1 && (imp.data.failed || []).length === 1,
+    `count=${imp.data.count}`);
+  const impNode = imp.data.items && imp.data.items[0];
+  if (impNode) cleanup.push(['/api/nodes/' + impNode.id]);
+
+  const impList = (await call('/api/nodes')).data.items.find((n) => n.id === (impNode && impNode.id));
+  ok('导入节点 mode=imported 且无 token',
+    !!impList && impList.mode === 'imported' && impList.imported === true && !impList.token);
+  ok('导入节点凭证存 credential', !!impList && impList.credential && impList.credential.uuid === 'share-uuid-abc');
+
+  const subImp = await call(`/api/sub/${u2.token}`);
+  const impLink = (subImp.data.links || []).find((l) => l.name.includes('合租香港'));
+  ok('订阅输出分享节点且用分享 UUID', !!impLink && impLink.uri.startsWith('vless://share-uuid-abc@import.example.com:443?'));
+  ok('分享节点的 Reality 参数保留', !!impLink && impLink.uri.includes('pbk=imp-pbk') && impLink.uri.includes('sid=12345678'));
+
+  // 分享节点改名（部分更新）：不得丢 credential / importLink
+  const impRename = await call('/api/nodes/' + impNode.id, { method: 'PUT', body: json({ name: 'SMOKE-IMPORT' }) });
+  ok('导入节点改名后凭证保留',
+    impRename.status === 200 && impRename.data.item.name === 'SMOKE-IMPORT'
+      && impRename.data.item.credential && impRename.data.item.credential.uuid === 'share-uuid-abc'
+      && impRename.data.item.importLink === IMPORT_LINK);
+
+  // agent token 认领不到导入节点：它没有 token，也不可能进任何配置包
+  const impCfg = await call(`/api/agent/config?token=nonexistent`, { method: 'GET' });
+  ok('野 token 拿不到配置', impCfg.status === 401 || impCfg.status === 403);
+
+  // 外部订阅 CRUD：地址不可达时拉取失败也要落成状态记录，而不是 500
+  const es = await call('/api/extsubs', { method: 'POST', body: json({ name: 'SMOKE-EXTSUB', url: 'https://ext.example.invalid/sub' }) });
+  ok('新增外部订阅', es.status === 200 && es.data.item && es.data.item.enabled === true);
+  if (es.data.item) cleanup.push(['/api/extsubs/' + es.data.item.id]);
+  const esFetch = await call(`/api/extsubs/${es.data.item.id}/fetch`, { method: 'POST' });
+  ok('外部订阅拉取失败不抛 500', esFetch.status === 200 && esFetch.data.ok === false,
+    `error=${(esFetch.data && esFetch.data.error || '').slice(0, 40)}`);
+  const esList = (await call('/api/extsubs')).data.items;
+  ok('外部订阅列表含状态', esList.some((s) => s.name === 'SMOKE-EXTSUB' && s.lastFetch && s.lastFetch.ok === false));
+
   /* ---------- 11.6 证书 / uTLS / VLESS Encryption / 中转入口 ---------- */
 
   // 粘贴证书内容

@@ -49,9 +49,12 @@ const {
 } = require('./server/users');
 const { overview } = require('./server/overview');
 const {
-  listNodes, createNode, updateNode, deleteNode, batchDeleteNodes,
+  listNodes, createNode, importNodes, updateNode, deleteNode, batchDeleteNodes,
   reorderNodes, nodePreview, rotateNodeToken, probeNode, generateRealityKeys,
 } = require('./server/nodes');
+const {
+  listExtsubs, createExtsub, updateExtsub, deleteExtsub, fetchExtsub,
+} = require('./server/extsubs');
 const {
   agentConfig, agentReport, agentReceipt, agentBundleHandler, demoTick, agentScript, flushSaves,
 } = require('./server/agent');
@@ -138,6 +141,8 @@ const ROUTES = [
 
   ['GET', '/api/nodes', listNodes, true],
   ['POST', '/api/nodes', createNode, true],
+  // 分享链接批量导入：固定路径必须排在 :id 变体之前
+  ['POST', '/api/nodes/import', importNodes, true],
   ['POST', '/api/nodes/order', reorderNodes, true],
   ['POST', '/api/nodes/batch-delete', batchDeleteNodes, true],
   ['PUT', '/api/nodes/:id', updateNode, true],
@@ -147,6 +152,13 @@ const ROUTES = [
   ['POST', '/api/nodes/:id/probe', probeNode, true],
   ['GET', '/api/nodes/:id/install', nodeInstallScript, false],
   ['GET', '/api/nodes/:id/uninstall', nodeUninstallScript, false],
+
+  ['GET', '/api/extsubs', listExtsubs, true],
+  ['POST', '/api/extsubs', createExtsub, true],
+  // 手动拉取固定路径排在 :id 变体之前
+  ['PUT', '/api/extsubs/:id', updateExtsub, true],
+  ['DELETE', '/api/extsubs/:id', deleteExtsub, true],
+  ['POST', '/api/extsubs/:id/fetch', fetchExtsub, true],
 
   ['GET', '/api/certs', listCerts, true],
   ['POST', '/api/certs', createCert, true],

@@ -1529,6 +1529,18 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('切到 SCP 露出私钥框与端口',
     bkShown('bk-remote-scp') && !bkShown('bk-remote-s3') &&
     !!d9.querySelector('#bk-scp-key') && !!d9.querySelector('#bk-scp-port'));
+  ok('SCP 默认私钥认证，并给出生成密钥的命令',
+    d9.querySelector('#bk-scp-auth').value === 'key' &&
+    bkShown('bk-scp-key-box') && !bkShown('bk-scp-pass-box') &&
+    /ssh-keygen/.test(d9.querySelector('#bk-remote-scp').textContent));
+  const scpAuthSel = d9.querySelector('#bk-scp-auth');
+  scpAuthSel.value = 'password';
+  scpAuthSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  ok('切成密码认证时换成密码框（私钥块收起）',
+    bkShown('bk-scp-pass-box') && !bkShown('bk-scp-key-box') && !!d9.querySelector('#bk-scp-pass'));
+  scpAuthSel.value = 'key';
+  scpAuthSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  ok('切回私钥认证时密码框收起', bkShown('bk-scp-key-box') && !bkShown('bk-scp-pass-box'));
   pickType('');
   ok('切回「不推送」时全部收起',
     !bkShown('bk-remote-webdav') && !bkShown('bk-remote-s3') && !bkShown('bk-remote-scp'));
@@ -1542,6 +1554,38 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('保存后服务端记住时刻与保留份数', saved.at === '04:15' && saved.keepLocal === 5,
     `${saved.at} · ${saved.keepLocal}`);
   ok('远端被清空（选的是「不推送」）', saved.remote === null);
+
+  // SCP 双认证：先存一份私钥配置，再切成密码 —— 两套凭据都要能各自落库、互不覆盖
+  pickType('scp');
+  d9.querySelector('#bk-scp-host').value = 'backup.example.com';
+  d9.querySelector('#bk-scp-user').value = 'bk';
+  d9.querySelector('#bk-scp-dir').value = '/srv/backup';
+  d9.querySelector('#bk-scp-key').value = '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----';
+  click(d9.querySelector('[data-act="backup-save"]'), w9);
+  await sleep(500);
+  const savedKey = await json('/api/backups/settings', {}, T);
+  ok('SCP 私钥认证能保存，私钥只回打码值',
+    !!savedKey.remote && savedKey.remote.auth === 'key' && savedKey.remote.privateKey === '••••••',
+    JSON.stringify(savedKey.remote && { auth: savedKey.remote.auth, key: savedKey.remote.privateKey }));
+
+  const authSel2 = d9.querySelector('#bk-scp-auth');
+  authSel2.value = 'password';
+  authSel2.dispatchEvent(new w9.Event('change', { bubbles: true }));
+  d9.querySelector('#bk-scp-pass').value = 'pw-123456';
+  click(d9.querySelector('[data-act="backup-save"]'), w9);
+  await sleep(500);
+  const savedScp = await json('/api/backups/settings', {}, T);
+  ok('切成密码认证后 auth 落库，密码只回打码值',
+    !!savedScp.remote && savedScp.remote.type === 'scp' && savedScp.remote.auth === 'password' &&
+      savedScp.remote.password === '••••••',
+    JSON.stringify(savedScp.remote && { auth: savedScp.remote.auth, pass: savedScp.remote.password }));
+  ok('切认证方式不会把另一套凭据清掉（私钥还在，只是打码）',
+    savedScp.remote.privateKey === '••••••', String(savedScp.remote.privateKey));
+
+  // 收尾：把远端清掉，别把后面依赖「无远端」的用例带偏
+  pickType('');
+  click(d9.querySelector('[data-act="backup-save"]'), w9);
+  await sleep(400);
 
   /* ---- 审计页 ---- */
   console.log('\n── 审计日志页 ──');

@@ -39,6 +39,7 @@ RENDERERS.nodes = async () => {
       ? `<button class="btn btn-sm btn-ghost" data-act="node-sort-cancel">取消</button>
          <button class="btn btn-primary btn-sm" data-act="node-sort-submit">提交排序</button>`
       : `<button class="btn btn-sm btn-ghost" data-act="node-sort-start">排序</button>
+         <button class="btn btn-sm btn-ghost" data-act="extsubs-open">外部订阅</button>
          <button class="btn btn-primary btn-sm" data-act="node-new">+ 新增节点</button>`,
   );
 
@@ -91,6 +92,7 @@ RENDERERS.nodes = async () => {
           <span class="badge ${PROTO_BADGE[n.protocol] || 'badge-dim'}">${n.protocol}</span>
           ${n.security === 'reality' ? '<span class="badge badge-purple" style="margin-left:4px">reality</span>' : ''}
           ${n.mode === 'standalone' ? '<span class="badge badge-dim" style="margin-left:4px">独立</span>' : ''}
+          ${n.mode === 'imported' ? '<span class="badge badge-purple" style="margin-left:4px">分享</span>' : ''}
         </td>
         <td class="mono">${n.port}</td>
         <td>
@@ -103,7 +105,11 @@ RENDERERS.nodes = async () => {
           </div>
         </td>
         <td>
-          <span class="badge ${n.online ? 'badge-ok' : 'badge-dim'}"><i class="dot"></i>${n.online ? '在线' : '离线'}</span>
+          ${
+            n.mode === 'imported'
+              ? '<span class="badge badge-dim"><i class="dot"></i>分享节点</span>'
+              : `<span class="badge ${n.online ? 'badge-ok' : 'badge-dim'}"><i class="dot"></i>${n.online ? '在线' : '离线'}</span>`
+          }
           ${n.enabled ? '' : '<span class="badge badge-warn" style="margin-left:4px">停用</span>'}
           ${n.hidden ? '<span class="badge badge-dim" style="margin-left:4px">直连隐藏</span>' : ''}
         </td>
@@ -119,7 +125,7 @@ RENDERERS.nodes = async () => {
             ${n.enabled
               ? '<button class="btn btn-sm btn-ghost" data-act="node-enabled" data-id="' + n.id + '" title="停用后端口停止监听、订阅同步移除">停用</button>'
               : '<button class="btn btn-sm btn-primary" data-act="node-enabled" data-id="' + n.id + '">启用</button>'}
-            <button class="btn btn-sm btn-ghost" data-act="node-preview" data-id="${n.id}">配置</button>
+            ${n.mode !== 'imported' ? '<button class="btn btn-sm btn-ghost" data-act="node-preview" data-id="' + n.id + '">配置</button>' : ''}
             <button class="btn btn-sm btn-ghost" data-act="node-copy" data-id="${n.id}">复制</button>
             <button class="btn btn-sm btn-ghost" data-act="node-edit" data-id="${n.id}">编辑</button>
             <button class="btn btn-sm btn-danger" data-act="node-del" data-id="${n.id}">删</button>
@@ -457,8 +463,18 @@ function nodeForm(node, servers) {
       <div class="seg" id="n-mode">
         <button type="button" data-mode="server" class="${n.mode === 'server' ? 'on' : ''}">跟随服务器</button>
         <button type="button" data-mode="standalone" class="${n.mode === 'standalone' ? 'on' : ''}">独立部署</button>
+        <button type="button" data-mode="imported" class="${n.mode === 'imported' ? 'on' : ''}">导入分享</button>
       </div>
       <div class="hint" id="n-mode-hint"></div>
+    </div>
+
+    <div id="import-box" class="hidden">
+      <div class="field">
+        <label>分享链接（每行一条）</label>
+        <textarea id="n-links" rows="7" placeholder="vless://... （也支持 vmess:// / trojan:// / ss:// / hysteria2://）
+每行一条，支持一次粘贴多条批量导入">${esc(n.importLink || '')}</textarea>
+        <div class="hint" id="n-links-hint"></div>
+      </div>
     </div>
 
     <div class="form-row">
@@ -484,7 +500,7 @@ function nodeForm(node, servers) {
       </div>
     </div>
 
-    <div class="form-row">
+    <div class="form-row" id="wrap-proto">
       <div class="field">
         <label>协议</label>
         <select id="n-protocol">${opt(nodeFormProtocols(n.protocol), n.protocol)}</select>
@@ -781,17 +797,19 @@ function nodeForm(node, servers) {
       </div>
     </div>
 
-    <div class="section-title">出站</div>
-    <label class="ve-label">
-      <input type="checkbox" id="n-force-v4" ${n.forceV4 ? 'checked' : ''} style="width:auto">
-      强制 IPv4 出站
-    </label>
-    <div class="hint">
-      只影响<b>服务端主动连目标网站</b>时用哪个协议栈，入站照旧双栈 —— 客户端仍然可以用 IPv6 连进来。
-      适用于「v6 能连、但机器 v6 出口不通」的情况：那种机器上访问任何网站都超时，
-      日志里是一串 <code>dial tcp6 … i/o timeout</code>。<br>
-      另一种可选项是「优先 v4、v6 兜底」，本面板暂时只做严格 v4：先保证能用，
-      真需要双栈回退再说。
+    <div id="egress-box">
+      <div class="section-title">出站</div>
+      <label class="ve-label">
+        <input type="checkbox" id="n-force-v4" ${n.forceV4 ? 'checked' : ''} style="width:auto">
+        强制 IPv4 出站
+      </label>
+      <div class="hint">
+        只影响<b>服务端主动连目标网站</b>时用哪个协议栈，入站照旧双栈 —— 客户端仍然可以用 IPv6 连进来。
+        适用于「v6 能连、但机器 v6 出口不通」的情况：那种机器上访问任何网站都超时，
+        日志里是一串 <code>dial tcp6 … i/o timeout</code>。<br>
+        另一种可选项是「优先 v4、v6 兜底」，本面板暂时只做严格 v4：先保证能用，
+        真需要双栈回退再说。
+      </div>
     </div>
 
     <div class="section-title">归属套餐</div>
@@ -839,7 +857,9 @@ function bindNodeForm(mask) {
     $('#n-mode-hint', mask).textContent =
       mode === 'server'
         ? '跟随服务器：使用服务器 token，随服务器 agent 一起下发'
-        : '独立部署：生成独立 token 与部署命令，适合单机单节点';
+        : mode === 'standalone'
+          ? '独立部署：生成独立 token 与部署命令，适合单机单节点'
+          : '导入分享：粘贴他人提供的分享链接（合租节点 / 机场单节点）。不部署 agent、不动别人的服务器，仅进订阅；凭证来自链接，可照常配置中转入口';
   };
 
   /**
@@ -876,6 +896,8 @@ function bindNodeForm(mask) {
     const proto = $('#n-protocol', mask).value;
     const security = $('#n-security', mask).value;
     const net = $('#n-network', mask).value;
+    const isHy2 = proto === 'hysteria2';
+    const isImported = mode === 'imported';
 
     $('#wrap-server', mask).classList.toggle('hidden', mode !== 'server');
     $('#wrap-address', mask).classList.toggle('hidden', mode !== 'standalone');
@@ -885,10 +907,19 @@ function bindNodeForm(mask) {
       ? '部署后由 agent 自动上报公网 IP，这里可留空'
       : '客户端实际连接的地址，必须是客户端能访问到的 IP 或域名';
 
-    const isHy2 = proto === 'hysteria2';
-    $('#xray-box', mask).classList.toggle('hidden', isHy2);
-    $('#hy2-box', mask).classList.toggle('hidden', !isHy2);
-    $('#ss-box', mask).classList.toggle('hidden', proto !== 'ss');
+    // 导入分享：自建节点的整套配置（协议 / 端口 / 传输 / 安全 / 证书 / 出站）不适用，
+    // 字段全部来自链接解析，表单只留链接、名称、套餐、中转入口与启停 / 显隐
+    $('#import-box', mask).classList.toggle('hidden', !isImported);
+    $('#n-links-hint', mask).textContent = isImported
+      ? '节点名称留空时使用链接里的名字；凭证与 Reality / TLS 参数都从链接解析。导入后想换节点，在编辑里重新粘贴链接即可'
+      : '';
+    $('#wrap-proto', mask).classList.toggle('hidden', isImported);
+    $('#xray-box', mask).classList.toggle('hidden', isImported || isHy2);
+    $('#hy2-box', mask).classList.toggle('hidden', isImported || !isHy2);
+    $('#egress-box', mask).classList.toggle('hidden', isImported);
+
+
+    $('#ss-box', mask).classList.toggle('hidden', isImported || proto !== 'ss');
     $('#reality-box', mask).classList.toggle('hidden', security !== 'reality' || isHy2);
     $('#wrap-path', mask).classList.toggle('hidden', net === 'tcp');
 
@@ -1238,6 +1269,26 @@ function bindNodeForm(mask) {
 function readNodeForm(mask) {
   const v = (id) => ($(id, mask) ? $(id, mask).value.trim() : '');
   const mode = $('#n-mode button.on', mask).dataset.mode;
+
+  // 导入分享：字段全部来自链接解析，表单只回传链接与通用项。
+  // 名称留空交给后端用链接 fragment；服务端会解析失败逐条回报
+  if (mode === 'imported') {
+    const draftI = state.entryDraft || [];
+    const badI = draftI.find((e) => !e.host);
+    if (badI) {
+      throw new Error(`中转入口「${badI.name || '未命名'}」还没有填地址，请补上或删除该行`);
+    }
+    return {
+      mode,
+      name: v('#n-name'),
+      links: $('#n-links', mask) ? $('#n-links', mask).value.trim() : '',
+      planIds: [...(state.planDraft || [])],
+      entries: draftI.filter((e) => e.host),
+      enabled: $('#n-enabled', mask).checked,
+      hidden: $('#n-hidden', mask).checked,
+    };
+  }
+
   const protocol = v('#n-protocol');
   const security = protocol === 'hysteria2' ? 'tls' : v('#n-security');
   const certMode = v('#n-certmode') || 'path';
@@ -1376,6 +1427,17 @@ async function nodeNewFlow(template) {
     okText: copy ? '复制' : '创建',
     onOk: async (m) => {
       const payload = readNodeForm(m);
+      // 导入分享走批量导入接口：一条链接一个节点，失败逐条回报，不走单节点创建
+      if (payload.mode === 'imported') {
+        if (!payload.links) throw new Error('请粘贴分享链接（每行一条）');
+        const r = await api('/api/nodes/import', { method: 'POST', body: JSON.stringify(payload) });
+        toast(
+          `已导入 ${r.count} 个节点${r.failed.length ? `，${r.failed.length} 条失败（${r.failed[0].error}）` : ''}`,
+          r.failed.length ? 'warn' : 'ok',
+        );
+        render();
+        return;
+      }
       if (!payload.name) throw new Error('请填写节点名称');
       await ensureRealityKeys(payload);
       const r = await api('/api/nodes', { method: 'POST', body: JSON.stringify(payload) });
@@ -1399,6 +1461,16 @@ async function nodeEditFlow(id) {
     body: nodeForm(n, state.data.serverList || []),
     onOk: async (m) => {
       const payload = readNodeForm(m);
+      // 分享节点的编辑：名称 + 重新粘贴的链接（可选）+ 套餐 / 入口 / 启停，
+      // 后端在 links 非空时重新解析并覆盖解析字段
+      if (payload.mode === 'imported') {
+        if (!payload.name) throw new Error('请填写节点名称');
+        const r = await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify(payload) });
+        toast('已保存', 'ok');
+        if (r.warnings && r.warnings.length) toast(r.warnings.join('；'), 'warn');
+        render();
+        return;
+      }
       if (!payload.name) throw new Error('请填写节点名称');
       await ensureRealityKeys(payload);
       const r = await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify(payload) });
@@ -1526,4 +1598,115 @@ ${n.protocol === 'hysteria2' ? 'ls /run/nodepanel/                  # Hysteria2 
         该节点还没有配置中转入口。在「编辑节点 → 中转入口」里添加入口地址后，这里会为每个入口生成转发脚本。
       </p>`;
   }
+}
+/* --------------------------- 外部订阅管理（0.1.42） --------------------------- */
+
+/**
+ * 外部订阅弹窗：一行一条机场订阅 URL，拉取结果与自建节点合并输出到订阅。
+ * 列表内操作（拉取 / 启停 / 删除）就地反馈；「添加」走弹窗的确认按钮。
+ */
+async function extsubsFlow() {
+  const d = await api('/api/extsubs');
+  const items = d.items || [];
+
+  const rowHtml = items.length
+    ? items
+        .map((s) => {
+          const lf = s.lastFetch || {};
+          const status = !s.enabled
+            ? '<span class="badge badge-dim">已停用</span>'
+            : lf.ok
+              ? `<span class="badge badge-ok"><i class="dot"></i>${lf.count} 个节点</span>`
+              : lf.at
+                ? `<span class="badge badge-warn" title="${esc(lf.error || '')}">拉取失败</span>`
+                : '<span class="badge badge-dim">未拉取</span>';
+          return `<div class="entry-row" style="border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:9px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <b style="flex:0 0 auto;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</b>
+          ${status}
+          <span class="mono" style="flex:1;min-width:160px;font-size:12px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.url)}">${esc(s.url)}</span>
+          <button class="btn btn-sm btn-ghost" data-xact="fetch" data-id="${s.id}">拉取</button>
+          <button class="btn btn-sm btn-ghost" data-xact="toggle" data-id="${s.id}">${s.enabled ? '停用' : '启用'}</button>
+          <button class="btn btn-sm btn-danger" data-xact="del" data-id="${s.id}">删</button>
+        </div>
+        <div class="hint" style="margin:6px 0 0">${
+          lf.at
+            ? `最近拉取 ${esc(String(lf.at).slice(0, 19).replace('T', ' '))}${lf.error ? ' · ' + esc(lf.error) : ''}`
+            : '还没有拉取过，点「拉取」验证地址可用'
+        }</div>
+      </div>`;
+        })
+        .join('')
+    : '<div class="hint" style="margin:0 0 6px">还没有外部订阅。添加机场订阅链接后，它的节点会追加在自建节点后面输出到所有订阅格式。</div>';
+
+  const mask = openModal({
+    title: '外部订阅',
+    wide: true,
+    okText: '添加',
+    body: `
+      <div class="form-row">
+        <div class="field">
+          <label>名称</label>
+          <input type="text" id="x-name" placeholder="如：某机场 HK">
+        </div>
+        <div class="field">
+          <label>订阅地址</label>
+          <input type="text" id="x-url" placeholder="https://example.com/api/v1/client/subscribe?token=...">
+        </div>
+      </div>
+      <p class="hint" style="margin:0 0 14px">
+        面板每 5 分钟自动拉取一次，节点追加在自建节点后面输出（Base64 / Clash / sing-box 三种格式都会带上）。
+        停用或删除后立即从订阅里消失；拉取失败时沿用上一次的节点列表，不会清空订阅。
+      </p>
+      <div class="section-title">已添加（${items.length}）</div>
+      <div id="x-list">${rowHtml}</div>`,
+    onOk: async (m) => {
+      const name = $('#x-name', m).value.trim();
+      const url = $('#x-url', m).value.trim();
+      if (!name) throw new Error('请填写名称');
+      if (!url) throw new Error('请填写订阅地址');
+      await api('/api/extsubs', { method: 'POST', body: JSON.stringify({ name, url }) });
+      toast('已添加，正在后台拉取', 'ok');
+      render();
+    },
+  });
+
+  $('#x-list', mask).addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-xact]');
+    if (!btn) return;
+    const id = btn.dataset.id;
+    const act = btn.dataset.xact;
+    const row = items.find((x) => x.id === id);
+    if (!row) return;
+
+    if (act === 'del') {
+      confirmDialog('删除外部订阅', `确定删除「${row.name}」？它的节点会立即从所有订阅里消失。`, async () => {
+        await api('/api/extsubs/' + id, { method: 'DELETE' });
+        toast('已删除', 'ok');
+        closeModal();
+        extsubsFlow();
+      });
+      return;
+    }
+
+    await withLoading(
+      btn,
+      async () => {
+        if (act === 'fetch') {
+          const r = await api('/api/extsubs/' + id + '/fetch', { method: 'POST' });
+          if (r.ok) toast(`拉取成功，${r.count} 个节点`, 'ok');
+          else toast(`拉取失败：${r.error}`, 'err');
+        } else if (act === 'toggle') {
+          await api('/api/extsubs/' + id, {
+            method: 'PUT',
+            body: JSON.stringify({ enabled: !row.enabled }),
+          });
+          toast(row.enabled ? '已停用，订阅里不再输出该订阅的节点' : '已启用，稍后自动拉取', 'ok');
+        }
+        closeModal();
+        extsubsFlow();
+      },
+      act === 'fetch' ? '拉取中' : '处理中',
+    );
+  });
 }

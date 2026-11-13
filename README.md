@@ -1015,7 +1015,7 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 | --- | --- | --- |
 | **WebDAV** | 坚果云、Nextcloud、群晖、Seafile、**Alist**（Alist 再挂百度网盘 / 阿里云盘 / 115 / OneDrive / Google Drive） | Basic |
 | **S3 兼容** | MinIO、Cloudflare R2、阿里云 OSS、腾讯云 COS、Backblaze B2、AWS S3 | Access Key + Secret（SigV4） |
-| **SCP** | 任意 Linux 机器 | **只支持私钥**（密码认证要 sshpass，不进镜像） |
+| **SCP** | 任意 Linux 机器 | **私钥**（推荐）或**密码**（密码走 sshpass，0.1.42 起镜像自带） |
 
 想传百度网盘这类没有公开 API 的网盘，装一个 [Alist](https://alist.nn.ci/) 把网盘挂上来，
 这里填 Alist 的 WebDAV 地址就行 —— 面板侧不用为每个网盘写一套 SDK。
@@ -1033,9 +1033,23 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 （否则地址填错会变成每 5 分钟重试一次的隐形压力），失败通过通知渠道的
 `backup.failed` 事件告警，恢复后再补一条「已恢复」。
 
-**SCP 的已知限制**：容器里跑 `ssh`/`scp` 需要 `openssh-client`（0.1.40 起镜像自带）；
-远端目录必须是绝对路径且只含 `A-Za-z0-9._/-` —— 它会被拼进远端 shell 命令，
-而 scp 的目标路径不做引号处理。主机指纹记在数据目录的 `.ssh_known_hosts` 里。
+**SCP 的两种认证**：
+
+- **私钥（推荐）**：界面上有现成的生成命令，复制到任意一台能连对端的 Linux 跑一次即可：
+
+  ```bash
+  ssh-keygen -t ed25519 -f ~/.ssh/nodepanel -N ''     # -N '' = 不要密码短语，面板用不了带短语的私钥
+  ssh-copy-id -i ~/.ssh/nodepanel.pub 用户@主机
+  cat ~/.ssh/nodepanel                                # 把这一整段（没有 .pub 的那个）粘到面板里
+  ```
+
+  私钥会写进 0600 的临时文件、用完立刻删；主机指纹记在数据目录的 `.ssh_known_hosts`。
+- **密码**：走 `sshpass -e`，密码经 `SSHPASS` 环境变量传给子进程 —— **不进命令行参数**，
+  `ps` 里看不到。代价是密码和私钥一样以明文存在面板库里，能用密钥就别用密码。
+
+**SCP 的已知限制**：容器里需要 `openssh-client` 与 `sshpass`（0.1.42 起镜像自带；
+裸机装 `apk add sshpass` / `apt install sshpass`）；远端目录必须是绝对路径且只含
+`A-Za-z0-9._/-` —— 它会被拼进远端 shell 命令，而 scp 的目标路径不做引号处理。
 
 ### 审计日志
 

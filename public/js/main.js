@@ -722,6 +722,10 @@ function backupAutoCardHtml(a) {
     .map((t) => `<option value="${esc(t)}" ${type === t ? 'selected' : ''}>${esc(labels[t] || t)}</option>`)
     .join('');
   const pwHint = a.hasPassword ? '已设置；留空表示不修改' : '至少 8 位；留空则不加密上传';
+  // SCP 的认证方式：老配置（0.1.41 及更早）只有 privateKey，按私钥显示
+  const scpAuth = r && r.type === 'scp'
+    ? (r.auth || (r.privateKey ? 'key' : r.password ? 'password' : 'key'))
+    : 'key';
 
   return `
     <div class="card" style="margin-top:14px">
@@ -863,14 +867,44 @@ function backupAutoCardHtml(a) {
               <input type="text" id="bk-scp-dir" value="${esc(r && r.type === 'scp' ? r.dir || '' : '')}" placeholder="/home/backup/nodepanel">
             </div>
           </div>
-          <div class="field">
-            <label>私钥（PEM）</label>
-            <textarea id="bk-scp-key" rows="3" spellcheck="false"
-                      placeholder="${esc(r && r.type === 'scp' && r.privateKey ? '已设置；留空表示不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----')}"></textarea>
+          <div class="form-row">
+            <div class="field">
+              <label>认证方式</label>
+              <select id="bk-scp-auth">
+                <option value="key" ${scpAuth === 'key' ? 'selected' : ''}>私钥（推荐）</option>
+                <option value="password" ${scpAuth === 'password' ? 'selected' : ''}>密码</option>
+              </select>
+            </div>
           </div>
-          <div class="hint" style="margin:-6px 0 12px">
-            只支持<b>私钥认证</b>：密码认证要 sshpass，那个东西不该进镜像。私钥只用一次，
-            写完 0600 临时文件立刻删；主机指纹记在数据目录的 <code>.ssh_known_hosts</code> 里。
+
+          <div id="bk-scp-key-box" class="${scpAuth === 'key' ? '' : 'hidden'}">
+            <div class="field">
+              <label>私钥（PEM）</label>
+              <textarea id="bk-scp-key" rows="3" spellcheck="false"
+                        placeholder="${esc(r && r.type === 'scp' && r.privateKey ? '已设置；留空表示不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----')}"></textarea>
+            </div>
+            <div class="hint" style="margin:-6px 0 12px">
+              没有密钥就在<b>任意一台能连上这台机器的 Linux</b> 上跑（不要设密码短语，否则面板用不了）：
+              <pre class="code" style="white-space:pre-wrap;margin:6px 0">ssh-keygen -t ed25519 -f ~/.ssh/nodepanel -N ''
+ssh-copy-id -i ~/.ssh/nodepanel.pub 用户@主机</pre>
+              然后把 <code>~/.ssh/nodepanel</code>（<b>没有 .pub 后缀的那个</b>）整段粘到上面。
+              私钥只写进 0600 临时文件、用完立刻删；主机指纹记在数据目录的
+              <code>.ssh_known_hosts</code> 里，换机器时会提示指纹不匹配。
+            </div>
+          </div>
+
+          <div id="bk-scp-pass-box" class="${scpAuth === 'password' ? '' : 'hidden'}">
+            <div class="field">
+              <label>登录密码</label>
+              <input type="password" id="bk-scp-pass" value="" autocomplete="new-password"
+                     placeholder="${esc(r && r.type === 'scp' && r.password ? '已设置；留空表示不修改' : '对端用户的登录密码')}">
+            </div>
+            <div class="hint" style="margin:-6px 0 12px">
+              密码认证要用 <code>sshpass</code>：Docker 镜像已自带，裸机需要
+              <code>apk add sshpass</code> / <code>apt install sshpass</code>。
+              密码经环境变量传给 sshpass，不进命令行参数（<code>ps</code> 看不到）；
+              但它和私钥一样以明文存在面板库里 —— 能用密钥就别用密码。
+            </div>
           </div>
         </div>
 
@@ -906,12 +940,26 @@ function syncBackupRemoteType() {
   }
 }
 
-/** 设置页渲染完调一次：类型切换要立刻切字段块，不能等保存 */
+/** SCP 的两种认证方式各自一块字段，切换时立刻换掉 */
+function syncScpAuth() {
+  const sel = $('#bk-scp-auth');
+  if (!sel) return;
+  const useKey = sel.value !== 'password';
+  const keyBox = $('#bk-scp-key-box');
+  const passBox = $('#bk-scp-pass-box');
+  if (keyBox) keyBox.classList.toggle('hidden', !useKey);
+  if (passBox) passBox.classList.toggle('hidden', useKey);
+}
+
+/** 设置页渲染完调一次：类型 / 认证方式切换要立刻生效，不能等保存 */
 function bindBackupAutoForm() {
   const sel = $('#bk-remote-type');
   if (!sel) return;
   sel.addEventListener('change', syncBackupRemoteType);
   syncBackupRemoteType();
+  const auth = $('#bk-scp-auth');
+  if (auth) auth.addEventListener('change', syncScpAuth);
+  syncScpAuth();
 }
 
 /** 收集表单。密钥字段留空表示「不修改」，所以空值直接不放进对象 */
@@ -936,13 +984,17 @@ function collectBackupAutoForm() {
     });
     if (val('bk-s3-secret')) remote.secretKey = val('bk-s3-secret');
   } else if (type === 'scp') {
+    const auth = val('bk-scp-auth') || 'key';
     Object.assign(remote, {
       host: val('bk-scp-host'),
       port: Number(val('bk-scp-port')) || 22,
       user: val('bk-scp-user'),
       dir: val('bk-scp-dir'),
+      auth,
     });
-    if (val('bk-scp-key')) remote.privateKey = val('bk-scp-key');
+    // 只提交当前认证方式对应的字段：留空 = 不修改，另一个字段留着不动（切回去还在）
+    if (auth === 'key' && val('bk-scp-key')) remote.privateKey = val('bk-scp-key');
+    if (auth === 'password' && val('bk-scp-pass')) remote.password = val('bk-scp-pass');
   }
 
   const body = {
@@ -1583,6 +1635,9 @@ async function runAction(act, btn, id) {
       break;
     case 'node-new':
       await nodeNewFlow();
+      break;
+    case 'extsubs-open':
+      await extsubsFlow();
       break;
     case 'node-copy':
       nodeCopyFlow(id);

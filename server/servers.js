@@ -204,7 +204,7 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
   const node = db.nodes.find((x) => x.id === params.id);
   if (!node) return sendJson(res, 404, { error: '节点不存在' });
   if (node.mode !== 'standalone') {
-    return sendJson(res, 400, { error: '该节点跟随服务器部署，请使用服务器页的部署命令' });
+    return sendJson(res, 400, { error: '该节点不是独立部署，无需安装脚本（分享导入的节点没有 agent）' });
   }
 
   const tokenInUrl = ctx.query.get('token');
@@ -240,7 +240,7 @@ function nodeUninstallScript(req, res, params, body, session, ctx) {
   const node = store.db().nodes.find((x) => x.id === params.id);
   if (!node) return sendJson(res, 404, { error: '节点不存在' });
   if (node.mode !== 'standalone') {
-    return sendJson(res, 400, { error: '该节点跟随服务器部署，请使用服务器页的卸载命令' });
+    return sendJson(res, 400, { error: '该节点不是独立部署，无需卸载脚本（分享导入的节点没有 agent）' });
   }
   sendUninstallScript(res, {
     item: node,

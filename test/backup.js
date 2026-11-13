@@ -259,11 +259,41 @@ async function main() {
 
   let keyErr = '';
   try {
-    remote.validate({ type: 'scp', host: 'h', user: 'u', dir: '/b', privateKey: 'not a key' });
+    remote.validate({ type: 'scp', host: 'h', user: 'u', dir: '/b', auth: 'key', privateKey: 'not a key' });
   } catch (err) {
     keyErr = err.message;
   }
-  ok('SCP 必须给私钥（不支持密码认证）', /私钥/.test(keyErr), keyErr);
+  ok('私钥认证必须给私钥全文', /私钥/.test(keyErr), keyErr);
+
+  let pwErr = '';
+  try {
+    remote.validate({ type: 'scp', host: 'h', user: 'u', dir: '/b', auth: 'password', password: '' });
+  } catch (err) {
+    pwErr = err.message;
+  }
+  ok('密码认证必须给密码', /密码/.test(pwErr), pwErr);
+
+  let authErr = '';
+  try {
+    remote.validate({ type: 'scp', host: 'h', user: 'u', dir: '/b', auth: 'telnet', password: 'p' });
+  } catch (err) {
+    authErr = err.message;
+  }
+  ok('认证方式只能是私钥或密码', /私钥.*密码|密码.*私钥/.test(authErr), authErr);
+
+  const passOk = (cfg) => {
+    try {
+      remote.validate(cfg);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  ok('密码认证配置能通过校验',
+    passOk({ type: 'scp', host: 'h', user: 'u', dir: '/b', auth: 'password', password: 'p' }));
+  // 老配置（0.1.41 及更早）没有 auth 字段：有私钥就按私钥走，不能因为升级就报错
+  ok('老配置（只有 privateKey、没有 auth）仍可用',
+    passOk({ type: 'scp', host: 'h', user: 'u', dir: '/b', privateKey: 'x PRIVATE KEY x' }));
 
   if (process.platform === 'win32') {
     console.log('  · 跳过真实 ssh/scp 调用（Windows 的 spawn 不能直接执行 shebang 脚本）');
@@ -299,6 +329,36 @@ async function main() {
       ok('带 StrictHostKeyChecking=accept-new 与持久 known_hosts', /accept-new/.test(calls) && /UserKnownHostsFile=/.test(calls));
       const names = await remote.prune(scpCfg, 1);
       ok('SCP 列目录能解析出备份名', names.ok && names.deleted >= 0, JSON.stringify(names));
+
+      // 密码认证：套一层 sshpass，密码只走 SSHPASS 环境变量（不进 argv）
+      const recPw = path.join(TMP, 'scp-pw.calls');
+      fs.writeFileSync(
+        path.join(bin, 'sshpass'),
+        [
+          '#!/bin/sh',
+          `echo "sshpass $* env=$([ -n "$SSHPASS" ] && echo yes || echo no)" >> ${recPw}`,
+          'shift',
+          'exec "$@"',
+          '',
+        ].join('\n'),
+        { mode: 0o755 },
+      );
+      const pwCfg = {
+        type: 'scp',
+        host: 'backup.example.com',
+        port: 22,
+        user: 'bk',
+        dir: '/srv/backup',
+        auth: 'password',
+        password: 'p@ss word',
+      };
+      const pwOut = await remote.upload(pwCfg, src, 'panel-auto-20260102-030000.db');
+      ok('密码认证也能上传', pwOut.ok, pwOut.target);
+      const pwCalls = fs.readFileSync(recPw, 'utf8');
+      ok('走的是 sshpass -e（密码不进命令行）', /^sshpass -e ssh /m.test(pwCalls), pwCalls.split('\n')[0]);
+      ok('SSHPASS 环境变量有值', /env=yes/.test(pwCalls));
+      ok('密码认证不带 -i 私钥、也不带 BatchMode',
+        !/-i \//.test(pwCalls) && !/BatchMode/.test(pwCalls) && /PubkeyAuthentication=no/.test(pwCalls));
     } finally {
       process.env.PATH = oldPath;
     }

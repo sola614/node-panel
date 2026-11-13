@@ -17,6 +17,7 @@ const hysteria = require('../lib/hysteria');
 const cert = require('../lib/cert');
 const keys = require('../lib/keys');
 const probeLib = require('../lib/probe');
+const parse = require('../lib/parse-link');
 const logger = require('../lib/log');
 const { sendJson } = require('./http-util');
 const { PORT, TLS_PORT } = require('./config');
@@ -35,6 +36,13 @@ const NETWORKS = ['tcp', 'ws', 'grpc', 'httpupgrade'];
 const SECURITIES = ['none', 'tls', 'reality'];
 const CERT_MODES = ['path', 'content', 'self', 'acme', 'ref'];
 const FINGERPRINTS = ['', 'chrome', 'firefox', 'safari', 'randomized'];
+const MODES = ['server', 'standalone', 'imported'];
+
+/** 分享节点的凭证（vless/vmess/trojan 的 uuid / hysteria2 的 password），只认这两个字段 */
+function normCredential(c) {
+  const o = c && typeof c === 'object' && !Array.isArray(c) ? c : {};
+  return { uuid: String(o.uuid || ''), password: String(o.password || '') };
+}
 
 function normalizeNode(body, prev = {}) {
   // 部分更新时必须沿用未指定的字段，否则一次小改动会把独立节点降级成服务器节点
@@ -42,7 +50,11 @@ function normalizeNode(body, prev = {}) {
   const network = NETWORKS.includes(body.network) ? body.network : prev.network || 'tcp';
   const security = SECURITIES.includes(body.security) ? body.security : prev.security || 'none';
   const mode =
-    body.mode !== undefined ? (body.mode === 'standalone' ? 'standalone' : 'server') : prev.mode || 'server';
+    body.mode !== undefined
+      ? MODES.includes(body.mode)
+        ? body.mode
+        : 'server'
+      : prev.mode || 'server';
 
   const node = {
     name: String(body.name ?? prev.name ?? '').trim(),
@@ -50,6 +62,12 @@ function normalizeNode(body, prev = {}) {
     serverId: mode === 'server' ? String(body.serverId ?? prev.serverId ?? '') : '',
     address: String(body.address ?? prev.address ?? '').trim(),
     token: prev.token || '',
+    // 分享导入（0.1.42）：凭证来自分享链接而不是面板用户，没有 agent（token 恒空）。
+    // 切回 server / standalone 时这些字段一并清掉，节点回到「由面板发证、发 UUID」的语义
+    imported: mode === 'imported',
+    credential: mode === 'imported' ? normCredential(body.credential !== undefined ? body.credential : prev.credential) : null,
+    importLink: mode === 'imported' ? String(body.importLink ?? prev.importLink ?? '') : '',
+    insecure: mode === 'imported' ? (body.insecure !== undefined ? !!body.insecure : !!prev.insecure) : false,
     protocol,
     // 用 ?? 而不是 !== undefined：部分更新时 body.port 可能是 null，
     // 那也应该沿用原值（旧代码的 `body.port ?? prev.port` 就是这个语义）
@@ -136,8 +154,12 @@ function normalizeNode(body, prev = {}) {
   node.selfCN = String(body.selfCN !== undefined ? body.selfCN : prev.selfCN || '');
   node.certId = String(body.certId !== undefined ? body.certId : prev.certId || '');
   // 自签证书 SHA-256 指纹：agent 现场生成证书后随回执上报，管理端不提供编辑入口，
-  // 编辑节点其它字段时原样保留（否则一次改名就把指纹抹掉，订阅回退 allowInsecure）
-  node.certFingerprint = String(prev.certFingerprint || '');
+  // 编辑节点其它字段时原样保留（否则一次改名就把指纹抹掉，订阅回退 allowInsecure）。
+  // 例外是分享导入节点：链接自带的 pinSHA256 / pcs 由导入路径写入，允许 body 覆盖
+  node.certFingerprint =
+    mode === 'imported'
+      ? String(body.certFingerprint !== undefined ? body.certFingerprint : prev.certFingerprint || '')
+      : String(prev.certFingerprint || '');
 
   // uTLS 指纹（客户端侧，空串表示不模拟）
   const fpRaw = body.fp !== undefined ? body.fp : prev.fp;
@@ -213,7 +235,7 @@ function hopError(node, selfId) {
   const sameBox = (n) =>
     node.mode === 'server'
       ? n.mode === 'server' && n.serverId === node.serverId
-      : n.mode === 'standalone' && n.id === node.id;
+      : n.id === node.id;
 
   for (const n of db.nodes) {
     if (!sameBox(n) || (n.id && n.id === selfId)) continue;
@@ -264,7 +286,12 @@ function listNodes(req, res) {
   sendJson(res, 200, {
     items: orderedNodes(db.nodes).map((n) => ({
       ...n,
-      serverName: n.mode === 'standalone' ? '独立部署' : (db.servers.find((s) => s.id === n.serverId) || {}).name || '未绑定',
+      serverName:
+        n.mode === 'standalone'
+          ? '独立部署'
+          : n.mode === 'imported'
+            ? '分享导入'
+            : (db.servers.find((s) => s.id === n.serverId) || {}).name || '未绑定',
       online: store.nodeOnline(n),
       // 独立节点有自己的 agent；跟随服务器的节点看所属服务器的回执
       sync: n.mode === 'standalone' ? syncView(n, scopeOfNode(n)) : serverSync.get(n.serverId) || null,
@@ -439,6 +466,13 @@ function createNode(req, res, params, body) {
 function updateNode(req, res, params, body) {
   const node = store.db().nodes.find((n) => n.id === params.id);
   if (!node) return sendJson(res, 404, { error: '节点不存在' });
+  // 分享节点编辑时重新粘贴了链接：先解析，再把解析字段（协议/地址/端口/凭证/Reality…）
+  // 合并进 body。名称不来自链接 —— 以表单里的名字为准
+  if (node.mode === 'imported' && String(body.links || '').trim()) {
+    const parsed = parse.parseShareLink(String(body.links).trim());
+    if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+    Object.assign(body, parsed.node, { importLink: String(body.links).trim() });
+  }
   const next = normalizeNode({ ...body }, node);
   if (nameTaken(store.db().nodes, next.name, node.id)) {
     return sendJson(res, 409, { error: '已存在同名节点，换个名字' });
@@ -455,6 +489,100 @@ function updateNode(req, res, params, body) {
   store.save();
   auditAction('node.update', node.name, `${node.protocol} · 端口 ${node.port}${node.enabled ? '' : ' · 已停用'}`);
   sendJson(res, 200, { ok: true, item: node, warnings: portWarnings(node) });
+}
+
+/**
+ * 分享链接批量导入（0.1.42）：把他人提供的 vless:// / vmess:// / trojan:// / ss:// /
+ * hysteria2:// 链接（如合租节点）导入为「分享节点」。
+ *
+ * 与表单新建的区别：
+ *   - mode 固定 imported：没有 agent、没有 token，凭证存 node.credential，
+ *     订阅输出用分享凭证而不是面板用户 UUID（见 lib/sub.js authUuid / authHy2）；
+ *   - 字段全部来自链接解析（lib/parse-link.js），所以不需要也不接受表单的
+ *     协议/端口/证书那一套；名称来自链接 fragment，重名自动加序号；
+ *   - 套餐 / 中转入口 / 启停 / 显隐照常生效 —— 合租节点同样可以只卖中转、隐藏落地。
+ */
+function importNodes(req, res, params, body) {
+  const raw = String(body.links || '');
+  // 去重 + 去空行：粘贴的文本常带行尾空格，重复链接导入两份只会让订阅里出现重名节点
+  const lines = [...new Set(raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean))];
+  if (!lines.length) {
+    return sendJson(res, 400, { error: '请粘贴至少一条分享链接（支持 vless / vmess / trojan / ss / hysteria2）' });
+  }
+  if (lines.length > 100) {
+    return sendJson(res, 400, { error: `一次最多导入 100 条链接（当前 ${lines.length} 条）` });
+  }
+
+  const db = store.db();
+  // 名称查重用集合而非 nameTaken：循环里每导入一条都要立刻知道「这个名字被占了吗」
+  const taken = new Set(db.nodes.map((n) => String(n.name).trim().toLowerCase()));
+  const uniqueName = (base) => {
+    if (!taken.has(base.toLowerCase())) {
+      taken.add(base.toLowerCase());
+      return base;
+    }
+    for (let i = 2; ; i++) {
+      const next = `${base} ${i}`;
+      if (!taken.has(next.toLowerCase())) {
+        taken.add(next.toLowerCase());
+        return next;
+      }
+    }
+  };
+  const planIds = Array.isArray(body.planIds)
+    ? body.planIds.filter((id) => db.plans.some((p) => p.id === id))
+    : [];
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+
+  const items = [];
+  const failed = [];
+  for (const line of lines) {
+    const parsed = parse.parseShareLink(line);
+    if (!parsed.ok) {
+      // 失败回执里截断长链接：失败原因要能对上是哪一行，又不至于把弹窗撑爆
+      failed.push({ line: line.length > 60 ? line.slice(0, 57) + '…' : line, error: parsed.error });
+      continue;
+    }
+    const data = normalizeNode(
+      {
+        mode: 'imported',
+        ...parsed.node,
+        importLink: line,
+        planIds,
+        entries,
+        enabled: body.enabled === undefined ? true : !!body.enabled,
+        hidden: !!body.hidden,
+      },
+      {},
+    );
+    const node = {
+      id: store.uid(),
+      createdAt: store.iso(),
+      // 与 createNode 一致：新导入的排在最后
+      sort: db.nodes.reduce((max, n) => Math.max(max, Number(n.sort) || 0), 0) + 1,
+      lastSeen: null,
+      agentVersion: null,
+      sync: null,
+      ...data,
+    };
+    node.name = uniqueName(node.name);
+    db.nodes.push(node);
+    items.push(node);
+  }
+
+  if (!items.length) {
+    return sendJson(res, 400, {
+      error: failed.length ? `全部导入失败：${failed[0].error}` : '没有可导入的链接',
+      failed,
+    });
+  }
+  store.save();
+  auditAction(
+    'node.import',
+    `${items.length} 个节点`,
+    `${lines.length} 条链接${failed.length ? `，失败 ${failed.length} 条` : ''}`,
+  );
+  sendJson(res, 200, { ok: true, count: items.length, items, failed });
 }
 
 function deleteNode(req, res, params) {
@@ -784,6 +912,7 @@ module.exports = {
   listNodes,
   certRefError,
   createNode,
+  importNodes,
   updateNode,
   deleteNode,
   batchDeleteNodes,

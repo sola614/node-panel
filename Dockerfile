@@ -32,9 +32,10 @@ COPY agent ./agent
 # curl：acme.sh 的下载与部分 DNS 插件依赖它，busybox wget 能凑合但不稳
 # ca-certificates：备份推到 WebDAV / S3 时走 HTTPS，缺了根证书会直接 CERT 校验失败
 # openssh-client：备份的 SCP 传输要 ssh/scp（0.1.40 起）
+# sshpass：SCP 的密码认证（0.1.42 起）。密码经 SSHPASS 环境变量传，不进 argv
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh \
-    && apk add --no-cache su-exec openssl curl ca-certificates openssh-client
+    && apk add --no-cache su-exec openssl curl ca-certificates openssh-client sshpass
 
 RUN mkdir -p /app/data && chown -R node:node /app
 

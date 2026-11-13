@@ -680,7 +680,31 @@ async function main() {
       cdp,
     );
     ok('切到 SCP 时字段块真的展开（不是被 hidden 属性藏住）', scpShown === true);
+    await evalJs(`document.querySelector('#bk-scp-key-box').scrollIntoView({ block: 'center' }); return 1;`, cdp);
+    await sleep(200);
     await shot('99-settings-scp', cdp);
+    // 认证方式切换同理：私钥 / 密码两套字段必须真的换掉
+    await evalJs(
+      `const s = document.querySelector('#bk-scp-auth');
+       s.value = 'password';
+       s.dispatchEvent(new Event('change', { bubbles: true }));
+       return 1;`,
+      cdp,
+    );
+    const passShown = await evalJs(
+      `const el = document.querySelector('#bk-scp-pass-box');
+       return !!el && getComputedStyle(el).display !== 'none' && el.getBoundingClientRect().height > 30;`,
+      cdp,
+    );
+    const keyHidden = await evalJs(
+      `const el = document.querySelector('#bk-scp-key-box');
+       return !!el && getComputedStyle(el).display === 'none';`,
+      cdp,
+    );
+    ok('切成密码认证时换成密码框（私钥块收起）', passShown === true && keyHidden === true);
+    await evalJs(`document.querySelector('#bk-scp-pass-box').scrollIntoView({ block: 'center' }); return 1;`, cdp);
+    await sleep(200);
+    await shot('99-settings-scp-password', cdp);
     await evalJs(
       `const s = document.querySelector('#bk-remote-type');
        s.value = '';

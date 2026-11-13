@@ -23,6 +23,7 @@ const { getSession } = require('./tokens');
 const { sweepExpiredTotp } = require('./auth');
 const { subFormatList, sweepRenewals, usersForNode } = require('./users');
 const { orderedNodes } = require('./nodes');
+const extsubs = require('./extsubs');
 
 const logData = logger.create('data');
 
@@ -68,6 +69,11 @@ function subscriptionPayload(user, req) {
   // 否则会出现「订阅里没有、节点里却注入了这个用户」
   const isEntryVisible = (n, e) => store.planCovers(store.planOf(user), e.planIds);
   const links = sub.buildLinks(nodesForLinks, servers, user, isNodeVisible, isEntryVisible);
+  // 外部订阅（0.1.42）：机场订阅解析出的虚拟节点追加在自建节点之后。
+  // 只读内存缓存（刷新由 extsubs 域的定时任务负责，订阅请求绝不现场 fetch）；
+  // ext=true 的节点不做套餐过滤 —— 外部订阅是整包，没有按套餐拆分的语义
+  const extLinks = sub.buildLinks(extsubs.extNodes(), servers, user, () => true, null);
+  const allLinks = links.concat(extLinks);
 
   const base = baseUrl(req);
   // 今日用量：订阅页放一行，用户能自己判断「今天是不是用多了」
@@ -93,7 +99,7 @@ function subscriptionPayload(user, req) {
       planColor: pub.planColor,
       todayBytes,
       autoRenew: !!pub.autoRenew,
-      nodeCount: links.length,
+      nodeCount: allLinks.length,
       // 订阅页据此渲染：有可用密码的用户登录后给「一键重置」；没有的给指引
       // （默认管理员用户走 subPasswordHash → 与面板密码一致，这里同样是 true）
       hasPassword: !!subPasswordHash(user),
@@ -102,7 +108,7 @@ function subscriptionPayload(user, req) {
       siteName: db.settings.siteName,
       notice: db.settings.notice,
     },
-    links,
+    links: allLinks,
     subUrl: `${base}/s/${user.token}`,
     clashUrl: `${base}/s/${user.token}?format=clash`,
     singboxUrl: `${base}/s/${user.token}?format=singbox`,
@@ -398,21 +404,23 @@ function subPage(req, res, params, body, session, ctx) {
   };
 
   if (format === 'base64' || format === 'v2ray' || format === 'txt') {
+    // payload.links 已是「自建 + 外部订阅」合并后的清单（subscriptionPayload 内拼接）
     return sendText(res, 200, sub.toBase64Subscription(payload.links, info), 'text/plain; charset=utf-8', userinfo);
   }
 
   if (format === 'clash') {
     const db = store.db();
-    // 与 JSON 订阅保持一致：只按 enabled 预过滤，套餐与显隐交给 toClash 按端点粒度判断
-    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled));
+    // 与 JSON 订阅保持一致：只按 enabled 预过滤，套餐与显隐交给 toClash 按端点粒度判断；
+    // ext=true 的外部节点跳过套餐判断（整包语义），其余照旧
+    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled)).concat(extsubs.extNodes());
     const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
-    const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
+    const nodesForLinks = nodes.map((n) => ({ ...n, address: n.ext ? n.address : store.nodeHost(n) }));
     const yaml = sub.toClash(
       nodesForLinks,
       servers,
       user,
       db.settings.siteName,
-      (n) => store.nodeUsableBy(n, user),
+      (n) => (n.ext ? true : store.nodeUsableBy(n, user)),
       (n, e) => store.planCovers(store.planOf(user), e.planIds),
       { info, template: db.settings.clashTemplate },
     );
@@ -426,15 +434,15 @@ function subPage(req, res, params, body, session, ctx) {
   // 必须是纯 JSON，头部注释都会让客户端的严格解析失败
   if (format === 'singbox') {
     const db = store.db();
-    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled));
+    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled)).concat(extsubs.extNodes());
     const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
-    const nodesForLinks = nodes.map((n) => ({ ...n, address: store.nodeHost(n) }));
+    const nodesForLinks = nodes.map((n) => ({ ...n, address: n.ext ? n.address : store.nodeHost(n) }));
     const json = sub.toSingBox(
       nodesForLinks,
       servers,
       user,
       db.settings.siteName,
-      (n) => store.nodeUsableBy(n, user),
+      (n) => (n.ext ? true : store.nodeUsableBy(n, user)),
       (n, e) => store.planCovers(store.planOf(user), e.planIds),
       { info },
     );
