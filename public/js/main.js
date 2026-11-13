@@ -1814,6 +1814,33 @@ async function runAction(act, btn, id) {
       );
       break;
     }
+
+    /* ------------------------------ 中转管理 ------------------------------ */
+
+    case 'relay-servers':
+      await relayServersManageFlow();
+      break;
+    case 'relay-server-new':
+      await relayServerNewFlow(btn.dataset.then || '');
+      break;
+    case 'relay-server-edit':
+      await relayServerEditFlow(id);
+      break;
+    case 'relay-server-del':
+      relayServerDelFlow(id);
+      break;
+    case 'relay-new':
+      await relayNewFlow();
+      break;
+    case 'relay-edit':
+      await relayEditFlow(id);
+      break;
+    case 'relay-del':
+      relayDelFlow(id);
+      break;
+    case 'relay-script':
+      relayScriptFlow(id);
+      break;
     case 'save-settings': {
       // 域名格式先在前端拦一道，填错了直接标红，不必等后端往返
       const base = checkSubBaseField(true);

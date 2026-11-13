@@ -1122,9 +1122,22 @@ function bindNodeForm(mask) {
     name: e.name || '',
     host: e.host || '',
     port: e.port || '',
+    // relayId 非空 = 关联「中转」页里的一条规则：host/port 以规则为准（保存时后端会再覆盖一遍）
+    relayId: e.relayId || '',
     planIds: Array.isArray(e.planIds) ? e.planIds.slice() : [],
     hidden: !!e.hidden,
   }));
+
+  // 中转规则下拉的数据源：异步拉一次，回来后刷新入口行（弹窗开着时也不丢状态，
+  // input 事件已把输入值实时同步进 entries 数组，重建只是重画 DOM）
+  let relayRules = (state.data.relayItems || []).slice();
+  api('/api/relays')
+    .then((d) => {
+      relayRules = d.items || [];
+      state.data.relayItems = relayRules;
+      if ($('.entry-row', mask)) renderEntries();
+    })
+    .catch(() => {});
 
   const planOptions = (state.data.planList || []).map((p) => p.id);
   const planNames = new Map((state.data.planList || []).map((p) => [p.id, p.name]));
@@ -1141,11 +1154,25 @@ function bindNodeForm(mask) {
       .map((e, i) => {
         const names = (e.planIds || []).map((pid) => planNames.get(pid)).filter(Boolean);
         const label = names.length ? names.join('、') : '继承节点套餐';
+        // 关联了中转规则的入口：host/port 由规则决定（后端保存时也会覆盖一遍），
+        // 输入框锁定只防误改 —— 真要改端口去「中转」页改规则，或在下拉里换一条
+        const locked = !!e.relayId;
         return `<div class="entry-row" data-i="${i}" style="border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:9px">
         <div style="display:flex;gap:8px;align-items:center">
           <input type="text" class="e-name" value="${esc(e.name)}" placeholder="名称，如：广州中转" style="flex:0 0 130px">
-          <input type="text" class="e-host" value="${esc(e.host)}" placeholder="入口地址 1.2.3.4 或域名" style="flex:1">
-          <input type="number" class="e-port" value="${esc(e.port)}" placeholder="端口" style="flex:0 0 92px">
+          <select class="e-relay" style="flex:0 0 190px;min-width:0">
+            <option value="">手填地址</option>
+            ${relayRules
+              .map(
+                (r) =>
+                  `<option value="${esc(r.id)}" ${e.relayId === r.id ? 'selected' : ''}>${esc(r.name)} · ${esc(r.serverHost || '')}:${esc(r.listenPort)}</option>`,
+              )
+              .join('')}
+          </select>
+          <input type="text" class="e-host" value="${esc(e.host)}" ${locked ? 'readonly' : ''} ${
+            locked ? 'title="地址由中转规则决定：改端口请到「中转」页改规则，或在下拉里换一条"' : 'placeholder="入口地址 1.2.3.4 或域名"'
+          } style="flex:1">
+          <input type="number" class="e-port" value="${esc(e.port)}" ${locked ? 'readonly' : ''} placeholder="端口" style="flex:0 0 92px">
           <button class="btn btn-sm btn-danger e-del" type="button" style="flex-shrink:0">删</button>
         </div>
         <div style="display:flex;gap:12px;align-items:center;margin-top:9px;flex-wrap:wrap">
@@ -1238,7 +1265,24 @@ function bindNodeForm(mask) {
   });
 
   $('#entry-add', mask).addEventListener('click', () => {
-    entries.push({ id: '', name: '', host: '', port: '', planIds: [], hidden: false });
+    entries.push({ id: '', name: '', host: '', port: '', relayId: '', planIds: [], hidden: false });
+    renderEntries();
+  });
+
+  // 下拉选中转规则：地址/端口直接带出并锁定；选回「手填地址」恢复可编辑
+  $('#entries-list', mask).addEventListener('change', (e) => {
+    if (!e.target.matches('select.e-relay')) return;
+    const row = e.target.closest('.entry-row');
+    const i = Number(row.dataset.i);
+    const rule = relayRules.find((r) => r.id === e.target.value);
+    if (rule) {
+      entries[i].relayId = rule.id;
+      entries[i].host = rule.serverHost || entries[i].host;
+      entries[i].port = rule.listenPort;
+      if (!entries[i].name) entries[i].name = rule.name;
+    } else {
+      entries[i].relayId = '';
+    }
     renderEntries();
   });
 

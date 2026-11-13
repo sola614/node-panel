@@ -64,6 +64,11 @@ const {
   nodeInstallScript, nodeUninstallScript, relayScript,
 } = require('./server/servers');
 const {
+  listRelayServers, createRelayServer, updateRelayServer, deleteRelayServer,
+  listRelays, createRelay, updateRelay, deleteRelay,
+  relayRuleScript, relayAck,
+} = require('./server/relays');
+const {
   listInvites, createInvite, updateInvite, deleteInvite,
   inviteInfoApi, claimInvite, invitePage,
 } = require('./server/invites');
@@ -177,6 +182,20 @@ const ROUTES = [
 
   ['POST', '/api/reality/keys', generateRealityKeys, true],
   ['GET', '/api/relay/script', relayScript, true],
+
+  // 中转管理（0.1.43）：入口机台账 + 端口转发规则。脚本下发要管理员会话；
+  // ack 是脚本执行后的免登录回执（deployToken 恒时比较 + IP 限流，见 server/relays.js）
+  ['GET', '/api/relay-servers', listRelayServers, true],
+  ['POST', '/api/relay-servers', createRelayServer, true],
+  ['PUT', '/api/relay-servers/:id', updateRelayServer, true],
+  ['DELETE', '/api/relay-servers/:id', deleteRelayServer, true],
+  ['GET', '/api/relays', listRelays, true],
+  ['POST', '/api/relays', createRelay, true],
+  ['PUT', '/api/relays/:id', updateRelay, true],
+  ['DELETE', '/api/relays/:id', deleteRelay, true],
+  ['GET', '/api/relays/:id/script', relayRuleScript, true],
+  ['POST', '/api/relay/ack', relayAck, false],
+
   ['POST', '/api/demo/traffic', demoTick, true],
 
   ['GET', '/api/settings', getSettings, true],

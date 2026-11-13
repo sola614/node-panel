@@ -168,18 +168,33 @@ function normalizeNode(body, prev = {}) {
   node.vlessEncryption =
     body.vlessEncryption !== undefined ? !!body.vlessEncryption : !!prev.vlessEncryption;
 
-  // 中转入口
+  // 中转入口：relayId 非空 = 关联「中转管理」里的一条规则（下拉选择），
+  // host/port 以规则为准（防手改不一致）；规则已被删则回落手填值并断开关联。
+  // relayId 为空 = 传统手填模式，行为与旧版完全一致。
   node.entries = Array.isArray(body.entries)
     ? body.entries
         .filter((e) => e && String(e.host || '').trim())
-        .map((e) => ({
-          id: e.id || store.uid(),
-          name: String(e.name || '').trim(),
-          host: String(e.host || '').trim(),
-          port: e.port === '' || e.port === null || e.port === undefined ? null : Number(e.port),
-          planIds: Array.isArray(e.planIds) ? e.planIds.filter((p) => store.db().plans.some((x) => x.id === p)) : [],
-          hidden: !!e.hidden,
-        }))
+        .map((e) => {
+          const entry = {
+            id: e.id || store.uid(),
+            name: String(e.name || '').trim(),
+            host: String(e.host || '').trim(),
+            port: e.port === '' || e.port === null || e.port === undefined ? null : Number(e.port),
+            planIds: Array.isArray(e.planIds) ? e.planIds.filter((p) => store.db().plans.some((x) => x.id === p)) : [],
+            hidden: !!e.hidden,
+          };
+          const relayId = String(e.relayId || '').trim();
+          const relay = relayId ? store.db().relays.find((r) => r.id === relayId) : null;
+          if (relay) {
+            const server = store.db().relay_servers.find((s) => s.id === relay.serverId);
+            entry.relayId = relay.id;
+            if (server) entry.host = server.host;
+            entry.port = relay.listenPort;
+          } else {
+            entry.relayId = '';
+          }
+          return entry;
+        })
     : prev.entries || [];
 
   // 订阅层显隐：只影响订阅，不影响 agent 是否监听（中转链路因此不受节点隐藏影响）

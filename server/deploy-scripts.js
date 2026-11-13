@@ -999,11 +999,411 @@ echo "  · 删除规则：iptables -t nat -L PREROUTING -n --line-numbers 找到
 `;
 }
 
+
+/* ------------------------ 中转规则脚本（0.1.43，三态） ------------------------ */
+
+/**
+ * 中转规则脚本：install / uninstall / check 三态，按 tool 分发到 iptables 或 gost。
+ *
+ * 与旧 buildRelayScript（一次性脚本，保留兼容）的区别：
+ *   - 规则带 ID：iptables 打 comment 标签 np-relay:<id>，gost 用独立 systemd unit，
+ *     卸载按标签 / unit 名精确删除，不依赖行号
+ *   - 执行末尾 curl 回执（免登录 /api/relay/ack，deployToken 鉴权），面板据此把
+ *     status 从 planned 推进到 applied —— 回执失败只提示，绝不影响规则本身
+ *   - install 前置端口占用预检：脚本跑成功了但流量根本不通，比报错退出难查得多
+ *
+ * bash 模板里的 ${VAR} 是「给 systemd / 间接展开保留的字面量」，写 JS 模板串时
+ * 必须转义成 \${VAR}；普通的 "$VAR" 引号形式不含 {，无需转义 —— 两者别混着改。
+ */
+
+/** gost 版本白名单：只认 x.y.z 纯数字版本（nightly / rc 一律拒绝，资产名不可预测） */
+const GOST_VER_RE = /^\d+\.\d+\.\d+$/;
+const DEFAULT_GOST_VER = '3.5.1';
+
+/** 三条脚本共用的开头：站点 / 规则 / 回执参数，全部洗过一遍再进 shell */
+function relayHeader({ rule, mode, panelUrl, site, comment }) {
+  return `#!/usr/bin/env bash
+# ${site} · 中转规则脚本（${rule.tool} · ${mode}）
+# 规则：${shellSafe(rule.name || rule.id)}   本机 :${Number(rule.listenPort) || 443} → ${shellSafe(rule.targetHost)}:${Number(rule.targetPort) || 443}
+${comment ? `# ${comment}\n` : ''}# 生成时间：${new Date().toISOString()}
+# 用法：sh relay-${shellSafe(rule.id)}-${mode}.sh   （需要 root：直接以 root 执行，或先 su -；脚本不依赖 sudo）
+set -euo pipefail
+
+RELAY_ID="${shellSafe(rule.id)}"
+RELAY_TOKEN="${shellSafe(rule.deployToken)}"
+MODE="${mode}"
+PANEL_URL="${urlSafe(panelUrl)}"
+`;
+}
+
+function relayRootCheck() {
+  return `if [ "$(id -u)" != '0' ]; then
+  echo "✗ 需要 root 权限：用 root 执行，或先 su - 再跑"
+  exit 1
+fi
+`;
+}
+
+/** 执行结果回执：免登录 /api/relay/ack（deployToken 恒时比较），失败只提示 */
+function relayAck() {
+  return `
+# 回执：把执行结果告诉面板（deployToken 是生成脚本时新发的一次性凭证）
+# 回执失败只影响面板上的状态展示，不影响规则本身
+if command -v curl >/dev/null 2>&1 && [ -n "\${PANEL_URL}" ]; then
+  curl -fsS -m 10 -X POST "\${PANEL_URL}/api/relay/ack" \\
+    -H 'Content-Type: application/json' \\
+    -d "{\\"id\\":\\"\${RELAY_ID}\\",\\"token\\":\\"\${RELAY_TOKEN}\\",\\"mode\\":\\"\${MODE}\\",\\"ok\\":\${OK}}" \\
+    >/dev/null 2>&1 || echo "! 回执失败（不影响规则，可忽略）"
+fi
+`;
+}
+
+/* ------------------------------- iptables 三态 ------------------------------ */
+
+function buildIptablesRelayScript({ rule, mode, panelUrl }) {
+  const site = shellSafe(store.db().settings.siteName);
+  const id = shellSafe(rule.id);
+  const listenPort = Number(rule.listenPort) || 443;
+  const target = shellSafe(rule.targetHost);
+  const targetPort = Number(rule.targetPort) || 443;
+  const protocols = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto === 'udp' ? 'udp' : 'tcp'];
+
+  if (mode === 'install') {
+    const dnatLines = protocols
+      .map((p) => `add_rule PREROUTING -p ${p} --dport "$LISTEN_PORT" -j DNAT --to-destination "$TARGET_HOST:$TARGET_PORT" $TAG`)
+      .join('\n');
+
+    return `${relayHeader({ rule, mode, panelUrl, site, comment: `规则 ID：${id}（iptables 注释标签 np-relay:${id}，卸载脚本按标签精确删除）` })}
+LISTEN_PORT=${listenPort}
+TARGET_HOST="${target}"
+TARGET_PORT=${targetPort}
+# 卸载脚本按这个标签找规则；comment 模块缺失时降级为按目标地址匹配（见下）
+TAG='-m comment --comment np-relay:${id}'
+
+${relayRootCheck()}
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "✗ 未检测到 iptables，请先安装：apt install -y iptables"
+  exit 1
+fi
+
+# comment 模块探测：有标签才能在卸载时精确定位
+if ! iptables -m comment -h >/dev/null 2>&1; then
+  echo "! iptables 缺少 comment 模块：本次规则不带标签，卸载只能按目标地址匹配（精度略降）"
+  TAG=''
+fi
+
+echo "→ 开启内核转发"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null; then
+  sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+else
+  echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+fi
+
+# 端口预检：同一监听端口已有别的 DNAT 规则时明确报错 —— 静默冲突的表现是
+# 「脚本跑成功了但流量不通」，排查成本远高于现在多打这两行
+if iptables -t nat -S PREROUTING | grep -E -- "--dport $LISTEN_PORT( |$)" | grep -vF "np-relay:\$RELAY_ID" >/dev/null 2>&1; then
+  echo "✗ 端口 $LISTEN_PORT 已被其它 DNAT 规则占用："
+  iptables -t nat -S PREROUTING | grep -E -- "--dport $LISTEN_PORT( |$)" || true
+  echo "  请换一个监听端口，或先清理占用该端口的规则再重跑"
+  exit 1
+fi
+
+# 幂等写入 NAT 规则（已存在则跳过）
+add_rule() {
+  iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"
+}
+
+add_rule POSTROUTING -d "$TARGET_HOST" -j MASQUERADE $TAG
+${dnatLines}
+
+echo ""
+echo "✓ 中转规则已生效"
+echo "  本机 :$LISTEN_PORT  →  $TARGET_HOST:$TARGET_PORT"
+echo ""
+echo "当前 NAT 规则："
+iptables -t nat -S PREROUTING | grep -F "np-relay:\$RELAY_ID" || true
+iptables -t nat -S POSTROUTING | grep -F "np-relay:\$RELAY_ID" || true
+
+# 持久化（不同发行版命令不同，失败不影响本次生效）
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save && echo "✓ 规则已持久化"
+elif command -v iptables-save >/dev/null 2>&1; then
+  mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && echo "✓ 规则已保存到 /etc/iptables/rules.v4"
+else
+  echo "! 未找到持久化工具，重启后规则会丢失"
+fi
+
+OK=1
+${relayAck()}
+
+echo ""
+echo "提示："
+echo "  · 流量仍记在落地节点（$TARGET_HOST）上，计费与统计不受影响"
+echo "  · 记得在中转服务器放行 $LISTEN_PORT 端口（安全组 / 防火墙）"
+`;
+  }
+
+  if (mode === 'uninstall') {
+    return `${relayHeader({ rule, mode, panelUrl, site, comment: `按标签 np-relay:${id} 精确删除；无标签（comment 模块缺失时安装的旧规则）按目标地址匹配兜底` })}
+LISTEN_PORT=${listenPort}
+TARGET_HOST="${target}"
+TARGET_PORT=${targetPort}
+
+${relayRootCheck()}
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "✗ 未检测到 iptables"
+  exit 1
+fi
+
+if ! iptables -m comment -h >/dev/null 2>&1; then
+  echo "! iptables 缺少 comment 模块：按目标地址匹配删除（精度略降）"
+fi
+
+# 把 -S 输出的规则行转成 -D 参数逐条删：行号会漂移，规则全文才是稳定锚点
+del_tag() {
+  iptables -t nat -S "$1" | grep -F "np-relay:\$RELAY_ID" | sed "s/^-A $1 //" | while IFS= read -r r; do
+    echo "→ 删除（$1）：$r"
+    iptables -t nat -D "$1" $r || echo "! 删除失败（可能已被清除）"
+  done
+}
+
+# 无标签兜底：dport（监听端口）+ to-destination（落地地址:端口）联合匹配，
+# 唯一性由面板侧的端口冲突校验保证 —— 同监听端口不允许出现两条规则
+del_target() {
+  iptables -t nat -S "$1" \\
+    | grep -E -- "--dport $LISTEN_PORT( |$)" \\
+    | grep -F -- "--to-destination $TARGET_HOST:$TARGET_PORT" \\
+    | sed "s/^-A $1 //" \\
+    | while IFS= read -r r; do
+        echo "→ 删除（$1）：$r"
+        iptables -t nat -D "$1" $r || echo "! 删除失败（可能已被清除）"
+      done
+}
+
+echo "→ 清理中转规则 np-relay:\$RELAY_ID"
+if iptables -m comment -h >/dev/null 2>&1; then
+  del_tag PREROUTING
+  del_tag POSTROUTING
+else
+  del_target PREROUTING
+  echo "  MASQUERADE 未删（无标签无法精确定位，可能被同目标规则共用）："
+  iptables -t nat -S POSTROUTING | grep -F -- "-d $TARGET_HOST" || echo "  （没有该目标的 MASQUERADE）"
+fi
+
+# 标签与目标两种途径都过一遍（幂等：删过了就静默跳过），防止历史遗留混装
+del_target PREROUTING 2>/dev/null || true
+
+echo ""
+echo "✓ 卸载完成：中转规则已从中转服务器移除"
+echo "  面板里的规则记录还在，重新生成 install 脚本执行即可恢复。"
+
+OK=1
+${relayAck()}
+`;
+  }
+
+  // check：只读盘点，回执 ok=1 → applied / ok=0 → unknown
+  return `${relayHeader({ rule, mode, panelUrl, site, comment: '只读检查：本规则是否存活 + 本机全部面板中转规则盘点' })}
+LISTEN_PORT=${listenPort}
+TARGET_HOST="${target}"
+TARGET_PORT=${targetPort}
+
+${relayRootCheck()}
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "✗ 未检测到 iptables"
+  exit 1
+fi
+
+OK=0
+if iptables -m comment -h >/dev/null 2>&1; then
+  if iptables -t nat -S PREROUTING | grep -F "np-relay:\$RELAY_ID" >/dev/null 2>&1; then
+    OK=1
+    echo "✓ 规则存活（np-relay:\$RELAY_ID）"
+  else
+    echo "✗ 规则不在 NAT 表里（未安装或已被清除）"
+  fi
+else
+  if iptables -t nat -S PREROUTING \\
+      | grep -E -- "--dport $LISTEN_PORT( |$)" \\
+      | grep -F -- "--to-destination $TARGET_HOST:$TARGET_PORT" >/dev/null 2>&1; then
+    OK=1
+    echo "✓ 规则存活（按目标地址匹配）"
+  else
+    echo "✗ 规则不在 NAT 表里（未安装或已被清除）"
+  fi
+fi
+
+echo ""
+echo "本机全部面板中转规则："
+iptables -t nat -S PREROUTING | grep -F 'np-relay:' || echo "  （没有带 np-relay: 标签的规则）"
+
+${relayAck()}
+`;
+}
+
+/* --------------------------------- gost 三态 -------------------------------- */
+
+/**
+ * gost 转发（v3，go-gost）：每条规则一个 systemd unit（gost-relay-<id>.service）
+ * + 一份环境文件（/etc/gost/relay-<id>.env）。unit 名就是「卸载时找到规则」的锚点。
+ */
+function buildGostRelayScript({ rule, mode, panelUrl }) {
+  const site = shellSafe(store.db().settings.siteName);
+  const id = shellSafe(rule.id);
+  const listenPort = Number(rule.listenPort) || 443;
+  const target = shellSafe(rule.targetHost);
+  const targetPort = Number(rule.targetPort) || 443;
+
+  // proto 裁剪成 -L 参数（gost 的 TCP 与 UDP 是两个独立监听，可同端口并存）。
+  // \${NP_LISTEN}/\${NP_TARGET} 是 systemd 的 EnvironmentFile 变量，必须保留字面
+  const forwards = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto === 'udp' ? 'udp' : 'tcp'];
+  const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}/\${NP_TARGET}`).join(' ');
+
+  if (mode === 'install') {
+    return `${relayHeader({ rule, mode, panelUrl, site, comment: `systemd unit：gost-relay-${id}.service（卸载 / 状态检查按 unit 名定位）` })}
+LISTEN_PORT=${listenPort}
+TARGET_ADDR="${target}:${targetPort}"
+GOST_VER="${DEFAULT_GOST_VER}"
+GOST_BIN=/usr/local/bin/gost
+UNIT="gost-relay-\${RELAY_ID}.service"
+ENV_FILE="/etc/gost/relay-\${RELAY_ID}.env"
+
+${relayRootCheck()}
+case "$(uname -m)" in
+  x86_64)          ARCH=amd64 ;;
+  aarch64|arm64)   ARCH=arm64 ;;
+  *) echo "✗ 不支持的架构：$(uname -m)（gost 官方只发 amd64 / arm64）"; exit 1 ;;
+esac
+
+# gost 二进制：已存在就复用（不覆盖用户自装的版本），缺了才下载。
+# GitHub 连不上时：GOST_DL_BASE=https://your-mirror/gost-releases sh relay-*.sh 重跑
+if [ ! -x "$GOST_BIN" ]; then
+  echo "→ 下载 gost v\${GOST_VER}（linux/\${ARCH}）"
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+  curl -fsSL "\${GOST_DL_BASE:-https://github.com/go-gost/gost/releases/download}/v\${GOST_VER}/gost_\${GOST_VER}_linux_\${ARCH}.tar.gz" -o "$TMP/gost.tgz"
+  tar -xzf "$TMP/gost.tgz" -C "$TMP"
+  install -m 755 "$TMP/gost" "$GOST_BIN"
+  echo "✓ gost 已安装：$("$GOST_BIN" -V 2>&1 | head -n 1 || echo '(版本信息获取失败，但不影响安装)')"
+fi
+
+# 端口预检：先停本规则旧 unit（重跑更新配置的场景），再确认端口没被别人占着
+systemctl stop "$UNIT" >/dev/null 2>&1 || true
+if ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
+  echo "✗ 端口 \${LISTEN_PORT} 已被其它进程占用："
+  ss -lntup 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" || true
+  echo "  请换一个监听端口，或先停掉占用方再重跑"
+  exit 1
+fi
+
+echo "→ 写入配置 \$ENV_FILE"
+mkdir -p /etc/gost
+cat > "$ENV_FILE" <<EOF
+# nodepanel relay \${RELAY_ID}
+NP_LISTEN=\${LISTEN_PORT}
+NP_TARGET=\${TARGET_ADDR}
+EOF
+
+echo "→ 写入 systemd unit \$UNIT"
+# heredoc 用 'EOF' 禁止 bash 展开：unit 里的 \${NP_LISTEN}/\${NP_TARGET}
+# 是给 systemd 的 EnvironmentFile 变量，必须原样落盘；其余值由面板直接拼好
+cat > "/etc/systemd/system/\$UNIT" <<'EOF'
+[Unit]
+Description=nodepanel relay ${id} (${listenPort} -> ${target}:${targetPort})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/gost/relay-${id}.env
+ExecStart=/usr/local/bin/gost ${execArgs}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now "$UNIT"
+
+# 端口自检：服务 active 但端口没监听 = applied 也是假的，必须当场戳穿
+sleep 1
+OK=0
+if systemctl is-active --quiet "$UNIT" 2>/dev/null && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
+  OK=1
+  echo "✓ gost 转发已生效：本机 :\${LISTEN_PORT} → \${TARGET_ADDR}"
+else
+  echo "✗ 服务已提交但端口未监听，排查：journalctl -u \$UNIT -n 20"
+  exit 1
+fi
+${relayAck()}
+
+echo ""
+echo "提示："
+echo "  · 服务名：\$UNIT（journalctl -u \$UNIT -f 看实时日志）"
+echo "  · 记得在中转服务器放行 \${LISTEN_PORT} 端口（安全组 / 防火墙）"
+`;
+  }
+
+  if (mode === 'uninstall') {
+    return `${relayHeader({ rule, mode, panelUrl, site, comment: `移除 gost-relay-${id}.service 与 /etc/gost/relay-${id}.env` })}
+GOST_BIN=/usr/local/bin/gost
+UNIT="gost-relay-\${RELAY_ID}.service"
+ENV_FILE="/etc/gost/relay-\${RELAY_ID}.env"
+
+${relayRootCheck()}
+echo "→ 停止并移除 \$UNIT"
+systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+rm -f "/etc/systemd/system/\$UNIT" "$ENV_FILE"
+systemctl daemon-reload
+
+OK=1
+echo "✓ 卸载完成：中转规则已从中转服务器移除"
+echo "  面板里的规则记录还在，重新生成 install 脚本执行即可恢复。"
+
+# --purge：所有中转规则都清完时连 gost 二进制一起删（保守：还有别的规则就不动）
+if [ "\${1:-}" = '--purge' ] && ! ls /etc/systemd/system/gost-relay-*.service >/dev/null 2>&1; then
+  rm -f "$GOST_BIN"
+  echo "✓ 已删除 \$GOST_BIN（最后一个中转规则）"
+fi
+
+${relayAck()}
+`;
+  }
+
+  // check：unit active + 端口真的在监听才算存活
+  return `${relayHeader({ rule, mode, panelUrl, site, comment: '只读检查：gost-relay 服务与端口监听状态' })}
+LISTEN_PORT=${listenPort}
+UNIT="gost-relay-\${RELAY_ID}.service"
+
+${relayRootCheck()}
+OK=0
+if systemctl is-active --quiet "$UNIT" 2>/dev/null && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
+  OK=1
+  echo "✓ 规则存活：\$UNIT active，端口 \${LISTEN_PORT} 监听中"
+else
+  echo "✗ 规则不在运行（未安装或已停止）"
+  systemctl status "$UNIT" --no-pager -n 5 2>/dev/null || echo "  （unit 不存在）"
+fi
+
+${relayAck()}
+`;
+}
+
+/** 按 tool 分发：gost / iptables 各自的三态生成器 */
+function buildRelayRuleScript({ rule, mode = 'install', panelUrl = '' }) {
+  const gen = rule.tool === 'iptables' ? buildIptablesRelayScript : buildGostRelayScript;
+  return gen({ rule, mode, panelUrl });
+}
+
 module.exports = {
   buildInstallScript,
   readAgentSource,
   buildUninstallScript,
   buildRelayScript,
+  buildRelayRuleScript,
   relayTarget,
+  GOST_VER_RE,
   shellSafe,
 };

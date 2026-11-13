@@ -29,8 +29,10 @@ const {
   buildInstallScript,
   buildUninstallScript,
   buildRelayScript,
-  readAgentSource,
+  buildRelayRuleScript,
   relayTarget,
+  GOST_VER_RE,
+  readAgentSource,
 } = require('../server/deploy-scripts');
 const { toYaml } = require('../lib/yaml');
 
@@ -95,6 +97,21 @@ const SHELL_CASES = [
     proto: 'tcp',
     label: '',
   })],
+  // 中转规则三态脚本（0.1.43）：gost / iptables × install / uninstall / check
+  ...['gost', 'iptables'].flatMap((tool) =>
+    ['install', 'uninstall', 'check'].map((mode) => [
+      `中转规则（${tool} · ${mode}）`,
+      () => buildRelayRuleScript({
+        rule: {
+          id: 'ab12cd34', name: '香港入口 → 日本节点', tool, proto: 'both',
+          listenPort: 8443, targetHost: '5.6.7.8', targetPort: 443,
+          deployToken: 'f0e1d2c3b4a5f6e7', status: 'planned',
+        },
+        mode,
+        panelUrl: 'https://panel.example.com:8080',
+      }),
+    ]),
+  ),
 ];
 
 // 恶意输入：脚本仍然必须是合法 shell（注入被剥掉，而不是把脚本搞坏）
@@ -224,6 +241,96 @@ const TARGET_CASES = [
 for (const [input, expected] of TARGET_CASES) {
   ok(`relayTarget(${JSON.stringify(input)}) = ${JSON.stringify(expected)}`, relayTarget(input) === expected);
 }
+
+/* ------------------- 三·五、中转规则三态脚本（0.1.43） ------------------- */
+
+console.log('\n中转规则三态脚本（标签 / unit / 回执）');
+
+const RELAY_RULE = {
+  id: 'ab12cd34',
+  name: '香港入口 → 日本节点',
+  tool: 'gost',
+  proto: 'both',
+  listenPort: 8443,
+  targetHost: '5.6.7.8',
+  targetPort: 443,
+  deployToken: 'f0e1d2c3b4a5f6e7',
+  status: 'planned',
+};
+const relayRuleScript = (mode, tool = 'gost', overrides = {}) =>
+  buildRelayRuleScript({ rule: { ...RELAY_RULE, tool, ...overrides }, mode, panelUrl: 'https://panel.example.com:8080' });
+
+if (hasBash) {
+  // 恶意 name 进注释行：三态 × 两工具全部必须保持合法 shell 且行数不变
+  for (const [name, evil] of HOSTILE) {
+    for (const tool of ['gost', 'iptables']) {
+      const base = relayRuleScript('install', tool, { name: 'HK-1' });
+      const evilScript = relayRuleScript('install', tool, { name: evil });
+      const err = syntaxError(evilScript);
+      ok(
+        `${name}：${tool} install 仍合法`,
+        err === null,
+        err ? err : '',
+      );
+      ok(
+        `${name}：${tool} install 行数未变`,
+        evilScript.split('\n').length === base.split('\n').length,
+      );
+    }
+  }
+}
+
+// iptables：规则必须带标签（卸载靠它精确定位），MASQUERADE 同标签
+const ipInst = relayRuleScript('install', 'iptables');
+ok('iptables install 打上 np-relay:<id> 标签', ipInst.includes("TAG='-m comment --comment np-relay:ab12cd34'"));
+ok('iptables install 的 DNAT 引用 $TAG', ipInst.includes('-j DNAT --to-destination "$TARGET_HOST:$TARGET_PORT" $TAG'));
+ok('iptables install 含 MASQUERADE', ipInst.includes('add_rule POSTROUTING -d "$TARGET_HOST" -j MASQUERADE $TAG'));
+ok('iptables install 有端口占用预检', ipInst.includes('已被其它 DNAT 规则占用'));
+const ipUni = relayRuleScript('uninstall', 'iptables');
+ok('iptables uninstall 按标签删除（-S 转 -D，不依赖行号）', ipUni.includes('grep -F "np-relay:$RELAY_ID"'));
+ok('iptables uninstall 有无标签兜底（目标联合匹配）', ipUni.includes('--to-destination $TARGET_HOST:$TARGET_PORT'));
+const ipChk = relayRuleScript('check', 'iptables');
+ok('iptables check 只读盘点全部面板规则', ipChk.includes("grep -F 'np-relay:'"));
+
+// gost：每规则一个 systemd unit + env 文件；ExecStart 里的 ${NP_*} 必须原样保留给 systemd
+const gInst = relayRuleScript('install', 'gost');
+ok(
+  'gost install 的 ExecStart 保留 systemd 变量字面',
+  gInst.includes('ExecStart=/usr/local/bin/gost -L tcp://:${NP_LISTEN}/${NP_TARGET} -L udp://:${NP_LISTEN}/${NP_TARGET}'),
+);
+ok('gost install 的 EnvironmentFile 是实际路径', gInst.includes('EnvironmentFile=/etc/gost/relay-ab12cd34.env'));
+ok('gost install 的 env 文件带 bash 展开的端口', gInst.includes('NP_LISTEN=${LISTEN_PORT}') && gInst.includes('NP_TARGET=${TARGET_ADDR}') && gInst.includes('TARGET_ADDR="5.6.7.8:443"'));
+ok('gost install 的 unit 名含规则 ID', gInst.includes('gost-relay-ab12cd34.service'));
+ok('gost install 有端口占用预检', gInst.includes('已被其它进程占用'));
+ok('gost install 有端口监听自检', gInst.includes('端口未监听'));
+ok('gost install 官方 release 下载 + 镜像变量', gInst.includes('go-gost/gost/releases/download') && gInst.includes('GOST_DL_BASE'));
+const gUni = relayRuleScript('uninstall', 'gost');
+ok('gost uninstall 停删 unit 与 env', gUni.includes('disable --now') && gUni.includes('rm -f "/etc/systemd/system/$UNIT"'));
+ok('gost uninstall 的 --purge 保护其它规则', gUni.includes('gost-relay-*.service'));
+const gChk = relayRuleScript('check', 'gost');
+ok('gost check 校验 unit active + 端口监听', gChk.includes('is-active --quiet') && gChk.includes('ss -lntu'));
+
+// 回执：三态 × 两工具都要带 ack（deployToken / mode / ok）。
+// JSON 体内嵌在 bash 双引号里，引号以 \" 转义落盘；mode 由脚本头部的
+// MODE="<mode>" 赋值行传入（JSON 里是 ${MODE} 变量），按实际字节匹配
+for (const tool of ['gost', 'iptables']) {
+  for (const mode of ['install', 'uninstall', 'check']) {
+    const s = relayRuleScript(mode, tool);
+    ok(
+      `${tool}/${mode} 带回执（ack + token + mode）`,
+      s.includes('/api/relay/ack') &&
+        s.includes(`MODE="${mode}"`) &&
+        s.includes('\\"id\\":\\"${RELAY_ID}\\"') &&
+        s.includes('\\"token\\":\\"${RELAY_TOKEN}\\"') &&
+        s.includes('\\"mode\\":\\"${MODE}\\"') &&
+        s.includes('\\"ok\\":${OK}'),
+    );
+  }
+}
+
+// gost 版本白名单：nightly / rc 必须拒绝（release 资产名不可预测）
+ok('GOST_VER_RE 放行 x.y.z', GOST_VER_RE.test('3.5.1'));
+ok('GOST_VER_RE 拒绝 nightly', !GOST_VER_RE.test('3.0.0-nightly.20240101') && !GOST_VER_RE.test('3.5.1-rc1'));
 
 /* -------------------------- 四、YAML 标量类型 -------------------------- */
 

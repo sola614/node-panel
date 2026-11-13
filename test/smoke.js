@@ -231,6 +231,11 @@ function totpCodeOf(secret) {
     await stale('/api/nodes');
     await stale('/api/servers');
     await stale('/api/plans');
+    // 中转管理（0.1.43）：先删规则再删服务器 —— 有规则的服务器删除会被拦
+    await stale('/api/relays');
+    await stale('/api/relay-servers');
+    // 外部订阅：残留的同名订阅会让「新增外部订阅」撞 URL
+    await stale('/api/extsubs');
     console.log('  · 已清理上次运行的残留数据');
   }
 
@@ -1654,6 +1659,171 @@ function totpCodeOf(secret) {
   const subAcme = await call(`/api/sub/${u2.token}`);
   const acmeLink = (subAcme.data.links || []).find((l) => l.name.includes('SMOKE-ACME'));
   ok('ACME 证书不需要 allowInsecure', !!acmeLink && !acmeLink.uri.includes('allowInsecure'));
+
+  /* ---------- 11.7 中转管理：服务器台账 / 转发规则 / 回执（0.1.43） ---------- */
+
+  const rsNew = await call('/api/relay-servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-中转A', host: '198.51.100.10' }),
+  });
+  ok('新增中转服务器', rsNew.status === 200 && rsNew.data.item.host === '198.51.100.10');
+  const rsId = rsNew.data.item.id;
+  cleanup.push(['/api/relay-servers/' + rsId]);
+
+  ok('中转服务器名重复被拦', (await call('/api/relay-servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-中转A', host: '198.51.100.11' }),
+  })).status === 409);
+  ok('非法地址被拦（带端口）', (await call('/api/relay-servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-中转B', host: '198.51.100.1:443' }),
+  })).status === 400);
+
+  const rlNew = await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId, name: 'SMOKE-规则1', tool: 'gost', proto: 'both',
+      listenPort: 8443, targetHost: '203.0.113.9', targetPort: 443,
+    }),
+  });
+  ok('新增 gost 转发规则', rlNew.status === 200 && rlNew.data.item.tool === 'gost' && rlNew.data.item.status === 'planned');
+  const rlId = rlNew.data.item.id;
+  cleanup.push(['/api/relays/' + rlId]);
+
+  // 同一台中转服务器上监听端口跨工具冲突：iptables 抢 8443 必须被拦
+  ok('同机同端口冲突（跨工具）', (await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId, name: 'SMOKE-规则2', tool: 'iptables', proto: 'both',
+      listenPort: 8443, targetHost: '203.0.113.9', targetPort: 8443,
+    }),
+  })).status === 409);
+
+  const rsNew2 = await call('/api/relay-servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-中转C', host: '198.51.100.12' }),
+  });
+  const rsId2 = rsNew2.data.item.id;
+  cleanup.push(['/api/relay-servers/' + rsId2]);
+  const rlIp = await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId2, name: 'SMOKE-规则3', tool: 'iptables', proto: 'tcp',
+      listenPort: 8443, targetHost: '203.0.113.9', targetPort: 443,
+    }),
+  });
+  ok('不同机同端口合法', rlIp.status === 200);
+  const rlIpId = rlIp.data.item.id;
+  cleanup.push(['/api/relays/' + rlIpId]);
+
+  // 有规则的服务器不能删（防「删了台账，入口机上的规则彻底失控」）
+  ok('有规则的中转服务器不能删', (await call('/api/relay-servers/' + rsId2, { method: 'DELETE' })).status === 400);
+
+  // 节点入口下拉联动：选了规则，host/port 以规则为准（手填值被覆盖）
+  const nodeRelay = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-RL节点', mode: 'standalone', address: 'rl.example.com',
+      protocol: 'vless', port: 20444, network: 'tcp', security: 'none',
+      enabled: true,
+      entries: [{ name: '入口1', relayId: rlId, host: '手填值会被覆盖.example.com', port: 1 }],
+    }),
+  });
+  ok('节点入口关联中转规则：host/port 以规则为准',
+    nodeRelay.status === 200
+    && nodeRelay.data.item.entries[0].host === '198.51.100.10'
+    && Number(nodeRelay.data.item.entries[0].port) === 8443
+    && nodeRelay.data.item.entries[0].relayId === rlId);
+  const nodeRelayId = nodeRelay.data.item.id;
+  cleanup.push(['/api/nodes/' + nodeRelayId]);
+
+  // 规则删除后入口回落手填模式：relayId 清空，host/port 保留关联时的快照
+  const rlTemp = await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId, name: 'SMOKE-规则临时', tool: 'gost', proto: 'tcp',
+      listenPort: 9443, targetHost: '203.0.113.9', targetPort: 443,
+    }),
+  });
+  await call('/api/nodes/' + nodeRelayId, {
+    method: 'PUT',
+    body: json({ entries: [{ name: '入口1', relayId: rlTemp.data.item.id, host: 'x', port: 9 }] }),
+  });
+  const rlTempDel = await call('/api/relays/' + rlTemp.data.item.id, { method: 'DELETE' });
+  ok('未部署规则删除不提示卸载', rlTempDel.status === 200 && rlTempDel.data.needsUninstall === false);
+  // 节点域没有 GET /api/nodes/:id 路由，读回走列表接口
+  const nodeAfterList = await call('/api/nodes');
+  const afterEntry = (nodeAfterList.data.items.find((n) => n.id === nodeRelayId) || { entries: [] }).entries[0] || {};
+  ok('规则删除后入口回落手填（relayId 清空，快照保留）',
+    afterEntry.relayId === ''
+    && afterEntry.host === '198.51.100.10'
+    && Number(afterEntry.port) === 9443);
+
+  // 三态脚本下发：生成即轮换凭证；token 只出现在脚本正文里，列表不回显
+  const relayList = await call('/api/relays');
+  ok('列表不回显 deployToken', relayList.data.items.every((r) => r.deployToken === undefined));
+  // 脚本正文 JSON 里是 ${RELAY_TOKEN} 变量；实际值只在头部赋值行 RELAY_TOKEN="..."
+  const tokenFromScript = (text) => (text.match(/RELAY_TOKEN="([0-9a-f]+)"/) || [])[1];
+
+  const gScript = await fetch(`${BASE}/api/relays/${rlId}/script?mode=install`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const gText = await gScript.text();
+  ok('gost install 脚本下发（unit + ack）', gScript.status === 200 && gText.includes('gost-relay-' + rlId) && gText.includes('/api/relay/ack'));
+  const t1 = tokenFromScript(gText);
+  ok('脚本正文嵌回执凭证', !!t1);
+
+  ok('ack 错误 token 被拒', (await call('/api/relay/ack', {
+    method: 'POST', body: json({ id: rlId, token: 'wrong-token', mode: 'install', ok: 1 }),
+  })).status === 401);
+  ok('ack 非法 mode 被拒', (await call('/api/relay/ack', {
+    method: 'POST', body: json({ id: rlId, token: t1, mode: 'hack', ok: 1 }),
+  })).status === 404);
+  const ackOk = await call('/api/relay/ack', {
+    method: 'POST', body: json({ id: rlId, token: t1, mode: 'install', ok: 1 }),
+  });
+  ok('ack install → applied', ackOk.status === 200 && ackOk.data.status === 'applied');
+
+  // 重新生成 = rotate：旧脚本 token 立即失效（未执行的旧脚本回执不再被接受）
+  const gScript2 = await fetch(`${BASE}/api/relays/${rlId}/script?mode=uninstall`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const t2 = tokenFromScript(await gScript2.text());
+  ok('rotate 后旧 token 失效', (await call('/api/relay/ack', {
+    method: 'POST', body: json({ id: rlId, token: t1, mode: 'install', ok: 1 }),
+  })).status === 401);
+  const ackUni = await call('/api/relay/ack', {
+    method: 'POST', body: json({ id: rlId, token: t2, mode: 'uninstall', ok: 1 }),
+  });
+  ok('ack uninstall → planned', ackUni.status === 200 && ackUni.data.status === 'planned');
+
+  const cScript = await fetch(`${BASE}/api/relays/${rlId}/script?mode=check`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const t3 = tokenFromScript(await cScript.text());
+  const ackBad = await call('/api/relay/ack', {
+    method: 'POST', body: json({ id: rlId, token: t3, mode: 'check', ok: 0 }),
+  });
+  ok('ack check ok=0 → unknown', ackBad.status === 200 && ackBad.data.status === 'unknown');
+
+  // iptables 侧：脚本带规则标签（卸载按标签精确删除）
+  const ipScript = await fetch(`${BASE}/api/relays/${rlIpId}/script?mode=install`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const ipText = await ipScript.text();
+  ok('iptables install 脚本带 np-relay 标签', ipScript.status === 200 && ipText.includes('np-relay:' + rlIpId));
+
+  // 已部署规则删除时提醒先卸载
+  const ipScript2 = await fetch(`${BASE}/api/relays/${rlIpId}/script?mode=install`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const ipT = tokenFromScript(await ipScript2.text());
+  await call('/api/relay/ack', { method: 'POST', body: json({ id: rlIpId, token: ipT, mode: 'install', ok: 1 }) });
+  const ipDel = await call('/api/relays/' + rlIpId, { method: 'DELETE' });
+  ok('已部署规则删除提示 needsUninstall', ipDel.status === 200 && ipDel.data.needsUninstall === true);
+  // cleanup 是 const 数组：已手动删掉的规则要从清理清单里摘掉，收尾时不能二次 DELETE
+  const ci = cleanup.findIndex((p) => p[0] === '/api/relays/' + rlIpId);
+  if (ci >= 0) cleanup.splice(ci, 1);
 
   /* ---------- 11.9 设置 · 订阅对外域名校验 ---------- */
   const baseBefore = (await call('/api/settings')).data.settings.subBase;

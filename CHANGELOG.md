@@ -3,6 +3,41 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.43] - 2026-11-13
+
+> 新增「中转」管理页：中转服务器台账 + 端口转发规则（gost / iptables 可选），
+> 节点编辑里的「中转入口」可以直接下拉选择已有的规则，不用再手抄地址端口。
+>
+> 面板只生成脚本、不碰入口机：三态脚本（install / uninstall / check）复制到
+> 中转服务器以 root 执行，执行结果自动回执面板更新状态。
+
+### 新增
+
+- **中转管理**（新侧栏页）
+  - 「中转服务器」：端口转发的宿主机台账（名称 / 地址 / 备注），一期不装 agent，
+    脚本由管理员手动执行；有规则的服务器删除会被拦
+  - 「转发规则」：每条规则可选 **gost**（用户态，systemd 常驻，每规则一个
+    `gost-relay-<id>.service`）或 **iptables**（内核态 DNAT，零常驻进程），
+    协议 TCP / UDP / both 可选，可关联落地节点
+  - 三态脚本下发：install（幂等 + 端口占用预检 + 持久化）、uninstall（按标签
+    `np-relay:<id>` / unit 名精确删除，不依赖行号）、check（只读盘点 + 存活回执）
+  - 执行回执（`POST /api/relay/ack`，免登录）：deployToken 恒时比较 + IP 限流
+    （30 次/分钟），status 流转 planned → applied → planned / unknown；
+    每次生成脚本即轮换凭证，旧脚本回执立即失效；token 不在列表 / 详情回显
+  - 冲突校验前置：同一中转服务器同一监听端口只允许一条规则（gost 与 iptables
+    混用也算），节点入口手填地址撞端口同样被拦
+- **节点入口联动**：中转入口可下拉选择中转管理里已有的规则，地址与端口自动带出
+  并锁定（后端保存时同样以规则为准）；规则删除后入口回落手填模式（快照保留）。
+  旧的手填模式与既有用例行为完全不变
+- gost 版本白名单（`x.y.z` 纯数字），`GOST_DL_BASE` 环境变量支持自托管镜像重跑
+
+### 变更
+
+- schema 11 → 12：新增 `relay_servers` / `relays` 两表（只加法迁移，升级前自动备份）
+- 新路由：`/api/relay-servers` CRUD、`/api/relays` CRUD、
+  `GET /api/relays/:id/script?mode=install|uninstall|check`、`POST /api/relay/ack`
+- 旧 `GET /api/relay/script` 保留不删（一次性脚本兼容既有工作流）
+
 ## [0.1.42] - 2026-11-13
 
 > 可以「白嫖」了：把别人分享的节点（比如合租的 HK 节点）粘贴进来，
