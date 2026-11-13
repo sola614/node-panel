@@ -665,6 +665,36 @@ async function main() {
     })();`, cdp);
     ok('新备份文件名可读', /^panel-manual-\d{8}-\d{6}(-\d+)?\.db$/.test(bkFile), bkFile);
 
+    // 远端字段块：切换类型必须**真的**显示出来。0.1.40 用 hidden 属性藏、用 class 切，
+    // 结果「属性还在、类没了」—— jsdom 里看 classList 的断言全绿，真浏览器里却永远展不开
+    await evalJs(
+      `const s = document.querySelector('#bk-remote-type');
+       s.value = 'scp';
+       s.dispatchEvent(new Event('change', { bubbles: true }));
+       return 1;`,
+      cdp,
+    );
+    const scpShown = await evalJs(
+      `const el = document.querySelector('#bk-remote-scp');
+       return !!el && getComputedStyle(el).display !== 'none' && el.getBoundingClientRect().height > 40;`,
+      cdp,
+    );
+    ok('切到 SCP 时字段块真的展开（不是被 hidden 属性藏住）', scpShown === true);
+    await shot('99-settings-scp', cdp);
+    await evalJs(
+      `const s = document.querySelector('#bk-remote-type');
+       s.value = '';
+       s.dispatchEvent(new Event('change', { bubbles: true }));
+       return 1;`,
+      cdp,
+    );
+    const scpHidden = await evalJs(
+      `const el = document.querySelector('#bk-remote-scp');
+       return !!el && getComputedStyle(el).display === 'none';`,
+      cdp,
+    );
+    ok('切回「不推送」时字段块收起', scpHidden === true);
+
     // 恢复要二次确认：点一下「恢复」但不确认
     await click('#bk-body [data-act="backup-restore"]', cdp);
     await waitFor(`return !!document.querySelector('.modal-mask')`, '恢复确认', cdp);

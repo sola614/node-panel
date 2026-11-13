@@ -1499,10 +1499,15 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     !!d9.querySelector('#bk-keep-local') && !!d9.querySelector('#bk-keep-remote'));
   const bkTypes = [...d9.querySelectorAll('#bk-remote-type option')].map((o) => o.value).join(',');
   ok('远端可选「不推送 + 三种类型」', bkTypes === ',webdav,s3,scp', bkTypes);
+  // 字段块的可见性要用**两个维度**判断：0.1.40 这里出过 bug —— 渲染时写的是
+  // hidden 属性，切换时 classList.toggle 删的是 class，结果「属性还在、类没了」，
+  // 只看 classList 的断言全绿，用户那边却永远展不开
+  const bkShown = (id) => {
+    const el = d9.querySelector('#' + id);
+    return !!el && !el.hasAttribute('hidden') && !el.classList.contains('hidden');
+  };
   ok('默认不显示任何远端字段块',
-    d9.querySelector('#bk-remote-webdav').classList.contains('hidden') &&
-    d9.querySelector('#bk-remote-s3').classList.contains('hidden') &&
-    d9.querySelector('#bk-remote-scp').classList.contains('hidden'));
+    !bkShown('bk-remote-webdav') && !bkShown('bk-remote-s3') && !bkShown('bk-remote-scp'));
   ok('有加密开关与密码框', !!d9.querySelector('#bk-encrypt') && !!d9.querySelector('#bk-password'));
   ok('状态行说明还没跑过', /还没有跑过/.test(d9.querySelector('#bk-auto-status').textContent),
     d9.querySelector('#bk-auto-status').textContent.trim().slice(0, 40));
@@ -1514,20 +1519,19 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   };
   pickType('webdav');
   ok('切到 WebDAV 只露出 WebDAV 字段',
-    !d9.querySelector('#bk-remote-webdav').classList.contains('hidden') &&
-    d9.querySelector('#bk-remote-s3').classList.contains('hidden') &&
+    bkShown('bk-remote-webdav') && !bkShown('bk-remote-s3') && !bkShown('bk-remote-scp') &&
     !!d9.querySelector('#bk-wd-url'));
   pickType('s3');
   ok('切到 S3 露出 Endpoint / Bucket / 密钥',
-    !d9.querySelector('#bk-remote-s3').classList.contains('hidden') &&
+    bkShown('bk-remote-s3') && !bkShown('bk-remote-webdav') &&
     !!d9.querySelector('#bk-s3-endpoint') && !!d9.querySelector('#bk-s3-secret'));
   pickType('scp');
   ok('切到 SCP 露出私钥框与端口',
-    !d9.querySelector('#bk-remote-scp').classList.contains('hidden') &&
+    bkShown('bk-remote-scp') && !bkShown('bk-remote-s3') &&
     !!d9.querySelector('#bk-scp-key') && !!d9.querySelector('#bk-scp-port'));
   pickType('');
   ok('切回「不推送」时全部收起',
-    d9.querySelector('#bk-remote-scp').classList.contains('hidden'));
+    !bkShown('bk-remote-webdav') && !bkShown('bk-remote-s3') && !bkShown('bk-remote-scp'));
 
   // 保存：时刻归一 + 回读，验证前后端字段名对得上
   d9.querySelector('#bk-at').value = '04:15';

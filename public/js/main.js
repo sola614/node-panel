@@ -714,7 +714,9 @@ function backupAutoCardHtml(a) {
   a = a || {};
   const r = a.remote || null;
   const type = r ? r.type : '';
-  const on = (v) => (type === v ? '' : ' hidden');
+  // 用 **class** 而不是 hidden 属性：切换类型时 syncBackupRemoteType() 改的是
+  // classList，写 hidden 属性会得到一个「删不掉的隐藏」—— 0.1.40 的 bug 就出在这
+  const on = (v) => `class="${type === v ? '' : 'hidden'}"`;
   const labels = a.remoteLabels || { webdav: 'WebDAV', s3: 'S3 兼容', scp: 'SCP' };
   const opts = (a.remoteTypes || ['webdav', 's3', 'scp'])
     .map((t) => `<option value="${esc(t)}" ${type === t ? 'selected' : ''}>${esc(labels[t] || t)}</option>`)
