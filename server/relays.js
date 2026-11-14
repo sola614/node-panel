@@ -11,6 +11,7 @@
  * 脚本模板在 server/deploy-scripts.js（buildRelayRuleScript / buildRelaySyncScript）。
  */
 
+const net = require('node:net');
 const store = require('../lib/store');
 const { sendJson, sendText } = require('./http-util');
 const { auditAction, clientIp } = require('./context');
@@ -22,11 +23,74 @@ const { buildRelayRuleScript, relayTarget } = require('./deploy-scripts');
 const TOOLS = ['gost', 'iptables'];
 const PROTOS = ['tcp', 'udp', 'both'];
 const MODES = ['install', 'uninstall', 'check'];
+/** 一条规则最多允许的目标数：再多就不是「故障切换」，而是把入口机当负载均衡器用了 */
+const MAX_TARGETS = 8;
 /** 同一台中转服务器上，同一监听端口只允许一条规则（跨工具也冲突） */
 const portOk = (v) => {
   const n = Number(v);
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
 };
+
+/**
+ * 目标地址解析：接受三种输入，统一收敛成 `[{ host, port }]`
+ *   · 字符串数组 / 换行文本：`203.0.113.9:443`（端口省略时 443）
+ *   · 对象数组：前端表单直接提交解析结果
+ *   · 旧调用方：只有 targetHost/targetPort
+ *
+ * 顺序就是故障切换顺序。地址仍过 relayTarget 白名单（会拼进 gost URL 与 iptables 参数）。
+ */
+function parseTargets(body) {
+  let raw = body && body.targets;
+  if (typeof raw === 'string') raw = raw.split(/\r?\n/);
+  if (!Array.isArray(raw) || !raw.length) {
+    raw = body && body.targetHost ? [{ host: body.targetHost, port: body.targetPort }] : [];
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    let host = '';
+    let port = 443;
+    if (item && typeof item === 'object') {
+      host = String(item.host || '').trim();
+      port = Number(item.port) || 443;
+    } else {
+      const line = String(item || '').trim();
+      if (!line) continue;
+      const m = line.match(/^([^:\s]+):(\d{1,5})$/);
+      if (m) {
+        host = m[1];
+        port = Number(m[2]);
+      } else {
+        host = line;
+      }
+    }
+    if (!host) continue;
+    if (host.includes(':')) {
+      return { error: '目标地址暂不支持 IPv6（当前只接受 IPv4 / 域名）', targets: [] };
+    }
+    if (!relayTarget(host)) {
+      return { error: `目标地址「${host}」不合法：只能是 IPv4 或域名（不带 http://、端口、路径）`, targets: [] };
+    }
+    if (portOk(port) === null) return { error: `目标端口 ${port} 不合法：只能是 1–65535`, targets: [] };
+    const key = `${host}:${port}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ host, port });
+    if (out.length > MAX_TARGETS) return { error: `目标地址最多 ${MAX_TARGETS} 个`, targets: [] };
+  }
+  if (!out.length) return { error: '请至少填写一个目标地址（每行一个，可写 host:port）', targets: [] };
+  return { targets: out };
+}
+
+/** 规则的当前目标列表：以 targets 为准，老数据回落单目标字段 */
+function targetsOf(rule) {
+  if (rule && Array.isArray(rule.targets) && rule.targets.length) return rule.targets;
+  if (rule && rule.targetHost) return [{ host: rule.targetHost, port: Number(rule.targetPort) || 443 }];
+  return [];
+}
+
+const targetText = (t) => `${t.host}:${t.port}`;
 
 /* --------------------------------- 限流 --------------------------------- */
 
@@ -75,7 +139,7 @@ function listRelayServers(req, res) {
 
 /**
  * 规则字段的统一校验（创建 / 更新共用）。返回错误文案，空串表示通过。
- * targetHost 会拼进 iptables --to-destination 与 gost 的转发 URL，必须过白名单。
+ * 目标地址不在这里校验：由 parseTargets 统一解析并逐个过 relayTarget 白名单。
  */
 function ruleFieldError(body, db) {
   const server = relayServers(db).find((x) => x.id === String(body.serverId || ''));
@@ -86,10 +150,6 @@ function ruleFieldError(body, db) {
   if (!TOOLS.includes(body.tool)) return '转发工具只能是 gost 或 iptables';
   if (!PROTOS.includes(body.proto)) return '协议只能是 tcp / udp / both';
   if (portOk(body.listenPort) === null) return '监听端口只能是 1–65535';
-  if (portOk(body.targetPort) === null) return '落地端口只能是 1–65535';
-  if (!relayTarget(body.targetHost)) {
-    return '落地地址只能是 IPv4 或域名（不带 http://、端口、路径；IPv6 暂不支持）';
-  }
   return '';
 }
 
@@ -144,6 +204,8 @@ function listRelays(req, res) {
 
 function createRelay(req, res, params, body) {
   const db = store.db();
+  const parsed = parseTargets(body);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
   const err = ruleFieldError(body, db);
   if (err) return sendJson(res, 400, { error: err });
 
@@ -154,8 +216,10 @@ function createRelay(req, res, params, body) {
     tool: body.tool,
     proto: body.proto,
     listenPort: portOk(body.listenPort),
-    targetHost: relayTarget(body.targetHost),
-    targetPort: portOk(body.targetPort),
+    // 第一项目标同时写进旧字段：旧脚本、旧前端、订阅诊断都还在读它们
+    targetHost: parsed.targets[0].host,
+    targetPort: parsed.targets[0].port,
+    targets: parsed.targets,
     nodeId: String(body.nodeId || ''),
     status: 'planned',
     deployToken: store.rnd(16),
@@ -170,7 +234,11 @@ function createRelay(req, res, params, body) {
 
   db.relays.push(rule);
   store.save();
-  auditAction('relay.create', rule.name, `${rule.tool} ${rule.listenPort} → ${rule.targetHost}:${rule.targetPort}`);
+  auditAction(
+    'relay.create',
+    rule.name,
+    `${rule.tool} ${rule.listenPort} → ${parsed.targets.map(targetText).join(' / ')}`,
+  );
   sendJson(res, 200, { ok: true, item: rule });
 }
 
@@ -180,11 +248,14 @@ function updateRelay(req, res, params, body) {
   if (!rule) return sendJson(res, 404, { error: '中转规则不存在' });
 
   const merged = { ...rule, ...body, __selfId: rule.id };
+  const parsed = parseTargets(merged);
+  if (parsed.error) return sendJson(res, 400, { error: parsed.error });
   const err = ruleFieldError(merged, db);
   if (err) return sendJson(res, 400, { error: err });
   merged.listenPort = portOk(merged.listenPort);
-  merged.targetPort = portOk(merged.targetPort);
-  merged.targetHost = relayTarget(merged.targetHost);
+  merged.targets = parsed.targets;
+  merged.targetHost = parsed.targets[0].host;
+  merged.targetPort = parsed.targets[0].port;
   if (portConflict(db, merged, rule.id)) {
     return sendJson(res, 409, { error: `该中转服务器的端口 ${merged.listenPort} 已被其它规则占用（跨工具也算）` });
   }
@@ -193,8 +264,9 @@ function updateRelay(req, res, params, body) {
 
   // 转发语义变了：旧脚本指向旧配置，status 回「未部署」并轮换凭证 ——
   // 旧 install 脚本的回执从此失效，避免「改完配置，面板还亮着旧状态」
-  const changed = ['serverId', 'tool', 'proto', 'listenPort', 'targetHost', 'targetPort']
-    .some((k) => String(rule[k]) !== String(merged[k]));
+  const changed =
+    ['serverId', 'tool', 'proto', 'listenPort'].some((k) => String(rule[k]) !== String(merged[k]))
+    || JSON.stringify(targetsOf(rule)) !== JSON.stringify(merged.targets);
   Object.assign(rule, merged);
   delete rule.__selfId;
   if (changed) {
@@ -220,8 +292,55 @@ function deleteRelay(req, res, params) {
     }
   }
   store.save();
-  auditAction('relay.delete', gone.name, `${gone.tool} ${gone.listenPort} → ${gone.targetHost}:${gone.targetPort}`);
+  auditAction('relay.delete', gone.name, `${gone.tool} ${gone.listenPort} → ${targetsOf(gone).map(targetText).join(' / ')}`);
   sendJson(res, 200, { ok: true, needsUninstall: gone.status === 'applied' });
+}
+
+/* ------------------------------ 目标诊断 ------------------------------- */
+
+/** 单个目标的 TCP 连通性探测，返回耗时（ms） */
+function probeTarget(t, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const started = process.hrtime.bigint();
+    const sock = net.connect({ host: t.host, port: t.port });
+    let done = false;
+    const finish = (ok, error) => {
+      if (done) return;
+      done = true;
+      sock.destroy();
+      resolve({
+        host: t.host,
+        port: t.port,
+        ok,
+        ms: Math.max(1, Math.round(Number(process.hrtime.bigint() - started) / 1e6)),
+        error: error || '',
+      });
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true, ''));
+    sock.once('timeout', () => finish(false, '连接超时'));
+    sock.once('error', (e) => finish(false, e.code || e.message || '连接失败'));
+  });
+}
+
+/**
+ * 逐个目标做 TCP 握手：返回每个目标的可用性与延迟，并指出「按顺序第一个可达」的目标。
+ * 探测从面板所在机器发起 —— 入口机到目标的链路可能不同，结果里明确带 source=panel。
+ */
+async function relayDiag(req, res, params) {
+  const rule = store.db().relays.find((x) => x.id === params.id);
+  if (!rule) return sendJson(res, 404, { error: '中转规则不存在' });
+  const targets = targetsOf(rule);
+  if (!targets.length) return sendJson(res, 400, { error: '这条规则还没有目标地址' });
+  const results = await Promise.all(targets.map((t) => probeTarget(t)));
+  const active = results.findIndex((r) => r.ok);
+  sendJson(res, 200, {
+    ok: true,
+    source: 'panel',
+    at: store.iso(),
+    active,
+    targets: results,
+  });
 }
 
 /* ------------------------------ 脚本下发 / 回执 ------------------------------ */
@@ -278,5 +397,6 @@ function relayAck(req, res, params, body, session, ctx) {
 module.exports = {
   listRelayServers,
   listRelays, createRelay, updateRelay, deleteRelay,
+  relayDiag,
   relayRuleScript, relayAck,
 };

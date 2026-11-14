@@ -1922,6 +1922,9 @@ async function runAction(act, btn, id) {
     case 'relay-script':
       relayScriptFlow(id);
       break;
+    case 'relay-diag':
+      await relayDiagFlow(id);
+      break;
     case 'save-settings': {
       // 域名格式先在前端拦一道，填错了直接标红，不必等后端往返
       const base = checkSubBaseField(true);

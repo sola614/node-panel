@@ -113,8 +113,14 @@ const SHELL_CASES = [
   ['中转收敛包（无规则）', () => buildRelaySyncScript({ rules: [] })],
   ['中转收敛包（混合规则）', () => buildRelaySyncScript({
     rules: [
-      { id: 'ab12cd34', name: '香港 → 日本', tool: 'gost', proto: 'both', listenPort: 8443, targetHost: '5.6.7.8', targetPort: 443 },
-      { id: 'ef56ab78', name: '香港 → 新加坡', tool: 'iptables', proto: 'tcp', listenPort: 9443, targetHost: '9.9.9.9', targetPort: 8443 },
+      {
+        id: 'ab12cd34', name: '香港 → 日本', tool: 'gost', proto: 'both', listenPort: 8443,
+        targets: [{ host: '5.6.7.8', port: 443 }, { host: '5.6.7.9', port: 443 }],
+      },
+      {
+        id: 'ef56ab78', name: '香港 → 新加坡', tool: 'iptables', proto: 'tcp', listenPort: 9443,
+        targets: [{ host: '9.9.9.9', port: 8443 }, { host: '9.9.9.10', port: 8443 }],
+      },
     ],
   })],
   // 中转规则三态脚本（0.1.43）：gost / iptables × install / uninstall / check
@@ -125,6 +131,8 @@ const SHELL_CASES = [
         rule: {
           id: 'ab12cd34', name: '香港入口 → 日本节点', tool, proto: 'both',
           listenPort: 8443, targetHost: '5.6.7.8', targetPort: 443,
+          // 多目标（0.1.46）：顺序即故障切换顺序
+          targets: [{ host: '5.6.7.8', port: 443 }, { host: '5.6.7.9', port: 443 }],
           deployToken: 'f0e1d2c3b4a5f6e7', status: 'planned',
         },
         mode,
@@ -192,13 +200,40 @@ if (!hasBash) {
 
   const sync = buildRelaySyncScript({
     rules: [
-      { id: 'ab12cd34', tool: 'gost', proto: 'both', listenPort: 8443, targetHost: '5.6.7.8', targetPort: 443 },
-      { id: 'ef56ab78', tool: 'iptables', proto: 'tcp', listenPort: 9443, targetHost: '9.9.9.9', targetPort: 8443 },
+      {
+        id: 'ab12cd34', tool: 'gost', proto: 'both', listenPort: 8443,
+        targets: [{ host: '5.6.7.8', port: 443 }, { host: '5.6.7.9', port: 443 }],
+      },
+      {
+        id: 'ef56ab78', tool: 'iptables', proto: 'tcp', listenPort: 9443,
+        targets: [{ host: '9.9.9.9', port: 8443 }, { host: '9.9.9.10', port: 8443 }],
+      },
     ],
   });
   ok('中转收敛包含 gost unit', sync.includes('gost-relay-ab12cd34.service'));
   ok('中转收敛包含 iptables 标签', sync.includes('np-relay:ef56ab78'));
   ok('中转收敛包含过期规则清理', sync.includes('已移除过期'));
+
+  // 多目标（0.1.46）：gost 交给进程内 fifo 切换；iptables 每轮探测选一个
+  const gostInstall = buildRelayRuleScript({
+    rule: {
+      id: 'ab12cd34', tool: 'gost', proto: 'tcp', listenPort: 8443,
+      targets: [{ host: '5.6.7.8', port: 443 }, { host: '5.6.7.9', port: 443 }],
+      deployToken: 'f0e1d2c3b4a5f6e7',
+    },
+    mode: 'install',
+  });
+  ok('gost 多目标使用 fifo 故障切换', gostInstall.includes('strategy=fifo') && gostInstall.includes('5.6.7.8:443,5.6.7.9:443'));
+  const iptInstall = buildRelayRuleScript({
+    rule: {
+      id: 'ef56ab78', tool: 'iptables', proto: 'tcp', listenPort: 9443,
+      targets: [{ host: '9.9.9.9', port: 8443 }, { host: '9.9.9.10', port: 8443 }],
+      deployToken: 'f0e1d2c3b4a5f6e7',
+    },
+    mode: 'install',
+  });
+  ok('iptables 安装时探测目标', iptInstall.includes("TARGETS=('9.9.9.9:8443' '9.9.9.10:8443')") && iptInstall.includes('pick_target'));
+  ok('中转收敛包含多目标', sync.includes('NP_TARGETS=5.6.7.8:443,5.6.7.9:443') && sync.includes('nc -z -w 2'));
 }
 
 /* --------------------- 二、注入串不得成为可执行语句 --------------------- */
@@ -340,7 +375,7 @@ ok('iptables install 含 MASQUERADE', ipInst.includes('add_rule POSTROUTING -d "
 ok('iptables install 有端口占用预检', ipInst.includes('已被其它 DNAT 规则占用'));
 const ipUni = relayRuleScript('uninstall', 'iptables');
 ok('iptables uninstall 按标签删除（-S 转 -D，不依赖行号）', ipUni.includes('grep -F "np-relay:$RELAY_ID"'));
-ok('iptables uninstall 有无标签兜底（目标联合匹配）', ipUni.includes('--to-destination $TARGET_HOST:$TARGET_PORT'));
+ok('iptables uninstall 有无标签兜底（按监听端口匹配）', ipUni.includes('--dport $LISTEN_PORT'));
 const ipChk = relayRuleScript('check', 'iptables');
 ok('iptables check 只读盘点全部面板规则', ipChk.includes("grep -F 'np-relay:'"));
 
@@ -348,10 +383,10 @@ ok('iptables check 只读盘点全部面板规则', ipChk.includes("grep -F 'np-
 const gInst = relayRuleScript('install', 'gost');
 ok(
   'gost install 的 ExecStart 保留 systemd 变量字面',
-  gInst.includes('ExecStart=/usr/local/bin/gost -L tcp://:${NP_LISTEN}/${NP_TARGET} -L udp://:${NP_LISTEN}/${NP_TARGET}'),
+  gInst.includes('ExecStart=/usr/local/bin/gost -L tcp://:${NP_LISTEN}/${NP_TARGETS} -L udp://:${NP_LISTEN}/${NP_TARGETS}'),
 );
 ok('gost install 的 EnvironmentFile 是实际路径', gInst.includes('EnvironmentFile=/etc/gost/relay-ab12cd34.env'));
-ok('gost install 的 env 文件带 bash 展开的端口', gInst.includes('NP_LISTEN=${LISTEN_PORT}') && gInst.includes('NP_TARGET=${TARGET_ADDR}') && gInst.includes('TARGET_ADDR="5.6.7.8:443"'));
+ok('gost install 的 env 文件带 bash 展开的端口', gInst.includes('NP_LISTEN=${LISTEN_PORT}') && gInst.includes('NP_TARGETS=${TARGETS_ADDR}') && gInst.includes('TARGET_ADDR="5.6.7.8:443"'));
 ok('gost install 的 unit 名含规则 ID', gInst.includes('gost-relay-ab12cd34.service'));
 ok('gost install 有端口占用预检', gInst.includes('已被其它进程占用'));
 ok('gost install 有端口监听自检', gInst.includes('端口未监听'));

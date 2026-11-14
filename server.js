@@ -66,6 +66,7 @@ const {
 const {
   listRelayServers,
   listRelays, createRelay, updateRelay, deleteRelay,
+  relayDiag,
   relayRuleScript, relayAck,
 } = require('./server/relays');
 const {
@@ -191,6 +192,8 @@ const ROUTES = [
   ['POST', '/api/relays', createRelay, true],
   ['PUT', '/api/relays/:id', updateRelay, true],
   ['DELETE', '/api/relays/:id', deleteRelay, true],
+  // 目标诊断（0.1.46）：面板侧 TCP 握手，返回每个目标的延迟与可用性
+  ['POST', '/api/relays/:id/diag', relayDiag, true],
   ['GET', '/api/relays/:id/script', relayRuleScript, true],
   ['POST', '/api/relay/ack', relayAck, false],
 

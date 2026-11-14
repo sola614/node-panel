@@ -97,6 +97,13 @@ const r1 = db.relays.find((r) => r.id === 'rule-0001') || {};
 const r2 = db.relays.find((r) => r.id === 'rule-0002') || {};
 ok('规则1 仍挂在原中转机', r1.serverId === 'rly-0001');
 ok('规则2 的 serverId 跟着重映射', r2.serverId === tokyo.id);
+ok(
+  '旧规则自动补 targets（单目标）',
+  Array.isArray(r1.targets)
+    && r1.targets.length === 1
+    && r1.targets[0].host === '203.0.113.9'
+    && r1.targets[0].port === 443,
+);
 
 console.log('\n下发隔离');
 const nodePayload = agent.buildAgentPayload(agent.scopeOfServer(db.servers.find((s) => s.id === 'srv-0001')));
@@ -112,12 +119,31 @@ const relayPayload = agent.buildAgentPayload(agent.scopeOfServer(tokyo));
 ok('中转机 payload 只含规则',
   !!relayPayload.relay && relayPayload.relay.rules.length === 1 && relayPayload.nodes.length === 0 && relayPayload.userCount === 0);
 ok('中转机 payload 不带 xray / certs', relayPayload.xray === undefined && relayPayload.certs === undefined);
-ok('中转机 hash 随规则变化', (() => {
+ok(
+  '中转机 payload 带 targets 字段',
+  Array.isArray(relayPayload.relay.rules[0].targets)
+    && relayPayload.relay.rules[0].targets.length === 1
+    && relayPayload.relay.rules[0].targets[0].host === '203.0.113.9',
+);
+ok('中转机 hash 随目标变化', (() => {
   const before = relayPayload.hash;
-  db.relays.find((r) => r.id === 'rule-0002').targetPort = 8444;
-  const after = agent.buildAgentPayload(agent.scopeOfServer(tokyo)).hash;
-  return before !== after;
+  db.relays.find((r) => r.id === 'rule-0002').targets = [
+    { host: '203.0.113.9', port: 443 },
+    { host: '203.0.113.10', port: 443 },
+  ];
+  const after = agent.buildAgentPayload(agent.scopeOfServer(tokyo));
+  return before !== after.hash && after.relay.rules[0].targets.length === 2;
 })());
+
+const bundle = require('../lib/agentBundle');
+const iptBundle = bundle.buildBundle(relayPayload, { siteName: '测试站' });
+ok('iptables 规则不进入端口自检（NAT 无监听 socket）', iptBundle.includes("NP_LISTEN_PORTS=''"));
+ok('中转包包含 iptables 收敛段', iptBundle.includes('np-relay:rule-0002'));
+
+db.relays.find((r) => r.id === 'rule-0002').tool = 'gost';
+const gostBundle = bundle.buildBundle(agent.buildAgentPayload(agent.scopeOfServer(tokyo)), { siteName: '测试站' });
+ok('gost 规则进入端口自检', gostBundle.includes("NP_LISTEN_PORTS='tcp:9443'"));
+ok('gost 多目标写入 unit', gostBundle.includes('NP_TARGETS=203.0.113.9:443,203.0.113.10:443'));
 
 /* ------------------------- 3. 旧表必须被清掉 ------------------------- */
 

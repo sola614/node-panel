@@ -293,15 +293,24 @@ function buildRelayPayload(scope) {
     .filter((r) => r.serverId === scope.id)
     .slice()
     .sort((a, b) => Number(a.listenPort) - Number(b.listenPort) || String(a.id).localeCompare(String(b.id)))
-    .map((r) => ({
-      id: r.id,
-      name: r.name,
-      tool: r.tool,
-      proto: r.proto,
-      listenPort: Number(r.listenPort) || 443,
-      targetHost: r.targetHost,
-      targetPort: Number(r.targetPort) || 443,
-    }));
+    .map((r) => {
+      const targets = Array.isArray(r.targets) && r.targets.length
+        ? r.targets.map((t) => ({ host: String(t.host), port: Number(t.port) || 443 }))
+        : r.targetHost
+          ? [{ host: r.targetHost, port: Number(r.targetPort) || 443 }]
+          : [];
+      return {
+        id: r.id,
+        name: r.name,
+        tool: r.tool,
+        proto: r.proto,
+        listenPort: Number(r.listenPort) || 443,
+        // 顺序即故障切换顺序（0.1.46）
+        targets,
+        targetHost: targets[0] ? targets[0].host : '',
+        targetPort: targets[0] ? targets[0].port : 443,
+      };
+    });
 
   return {
     ok: true,

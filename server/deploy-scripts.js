@@ -1062,11 +1062,31 @@ echo "  · 删除规则：iptables -t nat -L PREROUTING -n --line-numbers 找到
 const GOST_VER_RE = /^\d+\.\d+\.\d+$/;
 const DEFAULT_GOST_VER = '3.5.1';
 
+/**
+ * 规则的目标列表（0.1.46）：targets 优先，老数据回落到 targetHost/targetPort。
+ * 全部过 shellSafe —— 这两个字段会被拼进 systemd unit 与 iptables 参数。
+ */
+function relayTargets(rule) {
+  const raw = Array.isArray(rule.targets) && rule.targets.length
+    ? rule.targets
+    : rule.targetHost
+      ? [{ host: rule.targetHost, port: rule.targetPort }]
+      : [];
+  return raw
+    .map((t) => ({ host: shellSafe((t && t.host) || ''), port: Number(t && t.port) || 443 }))
+    .filter((t) => t.host);
+}
+
+const targetListText = (list) => list.map((t) => `${t.host}:${t.port}`).join(' / ');
+
 /** 三条脚本共用的开头：站点 / 规则 / 回执参数，全部洗过一遍再进 shell */
 function relayHeader({ rule, mode, panelUrl, site, comment }) {
+  const targets = relayTargets(rule);
   return `#!/usr/bin/env bash
 # ${site} · 中转规则脚本（${rule.tool} · ${mode}）
-# 规则：${shellSafe(rule.name || rule.id)}   本机 :${Number(rule.listenPort) || 443} → ${shellSafe(rule.targetHost)}:${Number(rule.targetPort) || 443}
+# 规则：${shellSafe(rule.name || rule.id)}   本机 :${Number(rule.listenPort) || 443} → ${targetListText(targets)}${
+    targets.length > 1 ? `（共 ${targets.length} 个目标，按顺序故障切换）` : ''
+  }
 ${comment ? `# ${comment}\n` : ''}# 生成时间：${new Date().toISOString()}
 # 用法：sh relay-${shellSafe(rule.id)}-${mode}.sh   （需要 root：直接以 root 执行，或先 su -；脚本不依赖 sudo）
 set -euo pipefail
@@ -1106,8 +1126,10 @@ function buildIptablesRelayScript({ rule, mode, panelUrl }) {
   const site = shellSafe(store.db().settings.siteName);
   const id = shellSafe(rule.id);
   const listenPort = Number(rule.listenPort) || 443;
-  const target = shellSafe(rule.targetHost);
-  const targetPort = Number(rule.targetPort) || 443;
+  const targets = relayTargets(rule);
+  const target = targets[0] ? targets[0].host : '';
+  const targetPort = targets[0] ? targets[0].port : 443;
+  const targetsBash = targets.map((t) => `'${t.host}:${t.port}'`).join(' ');
   const protocols = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto === 'udp' ? 'udp' : 'tcp'];
 
   if (mode === 'install') {
@@ -1117,9 +1139,9 @@ function buildIptablesRelayScript({ rule, mode, panelUrl }) {
 
     return `${relayHeader({ rule, mode, panelUrl, site, comment: `规则 ID：${id}（iptables 注释标签 np-relay:${id}，卸载脚本按标签精确删除）` })}
 LISTEN_PORT=${listenPort}
-TARGET_HOST="${target}"
-TARGET_PORT=${targetPort}
-# 卸载脚本按这个标签找规则；comment 模块缺失时降级为按目标地址匹配（见下）
+# 目标顺序 = 故障切换顺序（0.1.46）；安装时探测一次，选第一个可达
+TARGETS=(${targetsBash})
+# 卸载脚本按这个标签找规则；comment 模块缺失时降级为按监听端口匹配（见下）
 TAG='-m comment --comment np-relay:${id}'
 
 ${relayRootCheck()}
@@ -1156,12 +1178,64 @@ add_rule() {
   iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"
 }
 
+# 目标探测：按顺序取第一个能建立 TCP 连接的。iptables 规则是静态的，
+# 切换只发生在「安装 / 重跑脚本」时；agent 托管的中转机由每轮收敛重新选目标。
+pick_target() {
+  local t h p
+  for t in "\${TARGETS[@]}"; do
+    h="\${t%:*}"; p="\${t##*:}"
+    if command -v nc >/dev/null 2>&1; then
+      nc -z -w 2 "$h" "$p" >/dev/null 2>&1 && { echo "$t"; return 0; }
+    else
+      (exec 3<>"/dev/tcp/$h/$p") 2>/dev/null && { echo "$t"; return 0; }
+    fi
+  done
+  return 1
+}
+
+echo "→ 探测目标（按顺序第一个可达）"
+PICK=$(pick_target || true)
+if [ -z "$PICK" ]; then
+  echo "! 所有目标都不可达，先按第一个写入：\${TARGETS[0]}（恢复后重跑本脚本即可重选）"
+  PICK="\${TARGETS[0]}"
+fi
+TARGET_HOST="\${PICK%:*}"
+TARGET_PORT="\${PICK##*:}"
+echo "  使用目标：$TARGET_HOST:$TARGET_PORT"
+
+# 目标探测：按顺序取第一个能建立 TCP 连接的。iptables 规则是静态的，
+# 切换只发生在「安装 / 重跑脚本」时；agent 托管的中转机由每轮收敛重新选目标。
+pick_target() {
+  local t h p
+  for t in "\${TARGETS[@]}"; do
+    h="\${t%:*}"; p="\${t##*:}"
+    if command -v nc >/dev/null 2>&1; then
+      nc -z -w 2 "$h" "$p" >/dev/null 2>&1 && { echo "$t"; return 0; }
+    else
+      (exec 3<>"/dev/tcp/$h/$p") 2>/dev/null && { echo "$t"; return 0; }
+    fi
+  done
+  return 1
+}
+
+echo "→ 探测目标（按顺序第一个可达）"
+PICK=$(pick_target || true)
+if [ -z "$PICK" ]; then
+  echo "! 所有目标都不可达，先按第一个写入：\${TARGETS[0]}（恢复后重跑本脚本即可重选）"
+  PICK="\${TARGETS[0]}"
+fi
+TARGET_HOST="\${PICK%:*}"
+TARGET_PORT="\${PICK##*:}"
+echo "  使用目标：$TARGET_HOST:$TARGET_PORT"
+
 add_rule POSTROUTING -d "$TARGET_HOST" -j MASQUERADE $TAG
 ${dnatLines}
 
 echo ""
 echo "✓ 中转规则已生效"
 echo "  本机 :$LISTEN_PORT  →  $TARGET_HOST:$TARGET_PORT"
+echo "  目标列表（按顺序故障切换）：${targetListText(targets)}"
+echo "  · 安装了 agent 的中转机会每轮自动重选；纯手动模式请在本机重跑脚本切换"
 echo ""
 echo "当前 NAT 规则："
 iptables -t nat -S PREROUTING | grep -F "np-relay:\$RELAY_ID" || true
@@ -1210,12 +1284,11 @@ del_tag() {
   done
 }
 
-# 无标签兜底：dport（监听端口）+ to-destination（落地地址:端口）联合匹配，
-# 唯一性由面板侧的端口冲突校验保证 —— 同监听端口不允许出现两条规则
+# 无标签兜底：按 dport（监听端口）匹配。多目标切换后机器上的 to-destination
+# 可能不是当前第一项，不能再按目标地址筛；同端口唯一性由面板侧冲突校验保证
 del_target() {
   iptables -t nat -S "$1" \\
     | grep -E -- "--dport $LISTEN_PORT( |$)" \\
-    | grep -F -- "--to-destination $TARGET_HOST:$TARGET_PORT" \\
     | sed "s/^-A $1 //" \\
     | while IFS= read -r r; do
         echo "→ 删除（$1）：$r"
@@ -1267,8 +1340,7 @@ if iptables -m comment -h >/dev/null 2>&1; then
   fi
 else
   if iptables -t nat -S PREROUTING \\
-      | grep -E -- "--dport $LISTEN_PORT( |$)" \\
-      | grep -F -- "--to-destination $TARGET_HOST:$TARGET_PORT" >/dev/null 2>&1; then
+      | grep -E -- "--dport $LISTEN_PORT( |$)" >/dev/null 2>&1; then
     OK=1
     echo "✓ 规则存活（按目标地址匹配）"
   else
@@ -1294,18 +1366,23 @@ function buildGostRelayScript({ rule, mode, panelUrl }) {
   const site = shellSafe(store.db().settings.siteName);
   const id = shellSafe(rule.id);
   const listenPort = Number(rule.listenPort) || 443;
-  const target = shellSafe(rule.targetHost);
-  const targetPort = Number(rule.targetPort) || 443;
+  const targets = relayTargets(rule);
+  const target = targets[0] ? targets[0].host : '';
+  const targetPort = targets[0] ? targets[0].port : 443;
+  const targetAddr = targets.map((t) => `${t.host}:${t.port}`).join(',');
 
   // proto 裁剪成 -L 参数（gost 的 TCP 与 UDP 是两个独立监听，可同端口并存）。
-  // \${NP_LISTEN}/\${NP_TARGET} 是 systemd 的 EnvironmentFile 变量，必须保留字面
+  // \${NP_LISTEN}/\${NP_TARGETS} 是 systemd 的 EnvironmentFile 变量，必须保留字面。
+  // 多目标用 fifo + max_fails：客户端始终优先走第一个目标，失败后自动切下一个
   const forwards = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto === 'udp' ? 'udp' : 'tcp'];
-  const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}/\${NP_TARGET}`).join(' ');
+  const query = targets.length > 1 ? '?strategy=fifo&max_fails=1&fail_timeout=30s' : '';
+  const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}${query}/\${NP_TARGETS}`).join(' ');
 
   if (mode === 'install') {
     return `${relayHeader({ rule, mode, panelUrl, site, comment: `systemd unit：gost-relay-${id}.service（卸载 / 状态检查按 unit 名定位）` })}
 LISTEN_PORT=${listenPort}
 TARGET_ADDR="${target}:${targetPort}"
+TARGETS_ADDR="${targetAddr}"
 GOST_VER="${DEFAULT_GOST_VER}"
 GOST_BIN=/usr/local/bin/gost
 UNIT="gost-relay-\${RELAY_ID}.service"
@@ -1344,7 +1421,8 @@ mkdir -p /etc/gost
 cat > "$ENV_FILE" <<EOF
 # nodepanel relay \${RELAY_ID}
 NP_LISTEN=\${LISTEN_PORT}
-NP_TARGET=\${TARGET_ADDR}
+# 多目标逗号分隔，顺序即故障切换顺序
+NP_TARGETS=\${TARGETS_ADDR}
 EOF
 
 echo "→ 写入 systemd unit \$UNIT"
@@ -1352,7 +1430,7 @@ echo "→ 写入 systemd unit \$UNIT"
 # 是给 systemd 的 EnvironmentFile 变量，必须原样落盘；其余值由面板直接拼好
 cat > "/etc/systemd/system/\$UNIT" <<'EOF'
 [Unit]
-Description=nodepanel relay ${id} (${listenPort} -> ${target}:${targetPort})
+Description=nodepanel relay ${id} (${listenPort} -> ${targets.length > 1 ? `${targets.length} targets` : `${target}:${targetPort}`})
 After=network-online.target
 Wants=network-online.target
 
@@ -1375,6 +1453,7 @@ OK=0
 if systemctl is-active --quiet "$UNIT" 2>/dev/null && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
   OK=1
   echo "✓ gost 转发已生效：本机 :\${LISTEN_PORT} → \${TARGET_ADDR}"
+  echo "  目标列表（按顺序故障切换）：${targetListText(targets)}"
 else
   echo "✗ 服务已提交但端口未监听，排查：journalctl -u \$UNIT -n 20"
   exit 1
@@ -1452,20 +1531,22 @@ function buildRelaySyncScript({ rules = [] } = {}) {
   const gostBlock = (r) => {
     const id = shellSafe(r.id);
     const listen = Number(r.listenPort) || 443;
-    const target = shellSafe(r.targetHost);
-    const targetPort = Number(r.targetPort) || 443;
+    const targets = relayTargets(r);
+    const targetList = targets.map((t) => `${t.host}:${t.port}`).join(',');
     const forwards = r.proto === 'both' ? ['tcp', 'udp'] : [r.proto === 'udp' ? 'udp' : 'tcp'];
-    const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}/\${NP_TARGET}`).join(' ');
+    // 多目标交给 gost 自己按 fifo 顺序做故障切换（首个优先，失败后剔除）
+    const query = targets.length > 1 ? '?strategy=fifo&max_fails=1&fail_timeout=30s' : '';
+    const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}${query}/\${NP_TARGETS}`).join(' ');
     return `
 # ---- gost 规则 ${id} ----
 mkdir -p /etc/gost
 cat > "/etc/gost/relay-${id}.env" <<'NP_ENV_EOF'
 NP_LISTEN=${listen}
-NP_TARGET=${target}:${targetPort}
+NP_TARGETS=${targetList}
 NP_ENV_EOF
 cat > "/etc/systemd/system/gost-relay-${id}.service" <<'NP_UNIT_EOF'
 [Unit]
-Description=nodepanel relay ${id}
+Description=nodepanel relay ${id} (${targets.length} targets)
 After=network-online.target
 Wants=network-online.target
 
@@ -1480,7 +1561,7 @@ WantedBy=multi-user.target
 NP_UNIT_EOF
 systemctl daemon-reload >/dev/null 2>&1 || true
 if systemctl enable --now "gost-relay-${id}.service" >/dev/null 2>&1; then
-  echo "✓ gost 规则就位 ${id}（:${listen} → ${target}:${targetPort}）"
+  echo "✓ gost 规则就位 ${id}（:${listen} → ${targetListText(targets)}）"
 else
   echo "! gost 规则启动失败 ${id}：journalctl -u gost-relay-${id} -n 20"
   NP_FAIL=1
@@ -1491,18 +1572,48 @@ fi
   const iptBlock = (r) => {
     const id = shellSafe(r.id);
     const listen = Number(r.listenPort) || 443;
-    const target = shellSafe(r.targetHost);
-    const targetPort = Number(r.targetPort) || 443;
+    const targets = relayTargets(r);
+    const targetList = targets.map((t) => `${t.host}:${t.port}`).join(' ');
     const protos = r.proto === 'both' ? ['tcp', 'udp'] : [r.proto === 'udp' ? 'udp' : 'tcp'];
     const dnat = protos
-      .map((p) => `add_rule PREROUTING -p ${p} --dport ${listen} -j DNAT --to-destination "${target}:${targetPort}" $TAG || NP_FAIL=1`)
+      .map((p) => `add_rule PREROUTING -p ${p} --dport ${listen} -j DNAT --to-destination "$_h:$_p" $TAG || NP_FAIL=1`)
       .join('\n');
     return `
 # ---- iptables 规则 ${id} ----
 TAG=''
 [ "$HAS_COMMENT" = '1' ] && TAG='-m comment --comment np-relay:${id}'
-add_rule POSTROUTING -d "${target}" -j MASQUERADE $TAG || NP_FAIL=1
+NP_TARGETS='${targetList}'
+# 按顺序探测，取第一个可达目标；iptables 是静态规则，切换粒度 = 本收敛包的运行周期
+PICK=''
+for _t in $NP_TARGETS; do
+  _h=\${_t%:*}; _p=\${_t##*:}
+  if command -v nc >/dev/null 2>&1 && nc -z -w 2 "$_h" "$_p" >/dev/null 2>&1; then PICK=$_t; break; fi
+done
+if [ -z "$PICK" ]; then
+  for _t in $NP_TARGETS; do PICK=$_t; break; done
+  echo "! iptables 规则 ${id}：目标都不可达，暂用 $PICK"
+  NP_FAIL=1
+fi
+_h=\${PICK%:*}; _p=\${PICK##*:}
+# 先删本规则旧标签再写：目标可能已切换，不删会留下指向旧目标的 DNAT
+del_tag() {
+  iptables -t nat -S "$1" 2>/dev/null | grep -F "np-relay:${id}" | sed "s/^-A $1 //" | while IFS= read -r _r; do
+    [ -n "$_r" ] || continue
+    iptables -t nat -D "$1" $_r 2>/dev/null || true
+  done
+}
+if [ "$HAS_COMMENT" = '1' ]; then
+  del_tag PREROUTING
+  del_tag POSTROUTING
+else
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- "--dport ${listen}( |$)" | sed 's/^-A PREROUTING //' | while IFS= read -r _r; do
+    [ -n "$_r" ] || continue
+    iptables -t nat -D PREROUTING $_r 2>/dev/null || true
+  done
+fi
+add_rule POSTROUTING -d "$_h" -j MASQUERADE $TAG || NP_FAIL=1
 ${dnat}
+echo "· iptables 规则 ${id} 使用目标 $_h:$_p（候选 ${targets.length} 个）"
 `;
   };
 

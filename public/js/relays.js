@@ -24,8 +24,21 @@ function relayStateOf(r) {
   return RELAY_STATE[r.status] || RELAY_STATE.planned;
 }
 
+function relayTargetsOf(r) {
+  if (Array.isArray(r.targets) && r.targets.length) return r.targets;
+  return r.targetHost ? [{ host: r.targetHost, port: Number(r.targetPort) || 443 }] : [];
+}
+
+function relayTargetsText(r) {
+  return relayTargetsOf(r).map((t) => `${t.host}:${t.port}`).join('\n');
+}
+
 function relayTargetText(r) {
-  return `${esc(r.serverHost || '?')}:${esc(r.listenPort)} → ${esc(r.targetHost)}:${esc(r.targetPort)}`;
+  const list = relayTargetsOf(r);
+  const first = list.length ? `${esc(list[0].host)}:${esc(list[0].port)}` : '?';
+  return `${esc(r.serverHost || '?')}:${esc(r.listenPort)} → ${first}${
+    list.length > 1 ? ` <span class="chip" title="共 ${list.length} 个目标">+${list.length - 1}</span>` : ''
+  }`;
 }
 
 RENDERERS.relays = async () => {
@@ -61,6 +74,7 @@ RENDERERS.relays = async () => {
         <td>
           <div class="row-actions">
             <button class="btn btn-sm btn-primary" data-act="relay-script" data-id="${r.id}">脚本</button>
+            <button class="btn btn-sm btn-ghost" data-act="relay-diag" data-id="${r.id}">诊断</button>
             <button class="btn btn-sm btn-ghost" data-act="relay-edit" data-id="${r.id}">编辑</button>
             <button class="btn btn-sm btn-danger" data-act="relay-del" data-id="${r.id}">删</button>
           </div>
@@ -144,16 +158,12 @@ function relayFormBody(r, d) {
         <input type="number" id="rl-listen" value="${r ? esc(r.listenPort) : ''}" placeholder="8443" min="1" max="65535">
       </div>
     </div>
-    <div class="form-row">
-      <div class="field" style="flex:2">
-        <label>落地地址</label>
-        <input type="text" id="rl-target" value="${r ? esc(r.targetHost) : ''}" placeholder="落地机 IPv4 或域名">
-        <div class="hint">流量最终落到这台机器；填节点的公网地址（IPv4 / 域名，IPv6 暂不支持）。</div>
-      </div>
-      <div class="field">
-        <label>落地端口</label>
-        <input type="number" id="rl-target-port" value="${r ? esc(r.targetPort) : ''}" placeholder="443" min="1" max="65535">
-        <div class="hint">一般是节点自己的监听端口。</div>
+    <div class="field">
+      <label>目标地址（一行一个，按顺序故障切换）</label>
+      <textarea class="code-area" id="rl-targets" style="min-height:104px" placeholder="203.0.113.9:443&#10;203.0.113.10:443">${r ? esc(relayTargetsText(r)) : ''}</textarea>
+      <div class="hint">
+        每行一个目标，写成 <b>host:port</b>（省略端口默认 443），最多 8 个。第一个不通时自动切到下一个；
+        gost 由进程内即时切换，iptables 由 agent 每轮同步时重选（未装 agent 则重跑 install 脚本）。
       </div>
     </div>
     <div class="field">
@@ -176,15 +186,14 @@ function relayFormBody(r, d) {
 
 function readRelayForm(mask) {
   const listenPort = Number($('#rl-listen', mask).value);
-  const targetPort = Number($('#rl-target-port', mask).value);
   return {
     serverId: $('#rl-server', mask).value,
     name: $('#rl-name', mask).value.trim(),
     tool: $('#rl-tool', mask).value,
     proto: $('#rl-proto', mask).value,
     listenPort,
-    targetHost: $('#rl-target', mask).value.trim(),
-    targetPort,
+    // 后端会逐行解析（host:port），这里保持原始文本，便于一次报出具体哪一行不合法
+    targets: $('#rl-targets', mask).value,
     nodeId: $('#rl-node', mask).value,
     note: $('#rl-note', mask).value.trim(),
   };
@@ -194,8 +203,19 @@ function validateRelayForm(p) {
   if (!p.name) return '请填写规则名称';
   if (!p.serverId) return '请先添加中转服务器';
   if (!Number.isInteger(p.listenPort) || p.listenPort < 1 || p.listenPort > 65535) return '监听端口只能是 1–65535';
-  if (!Number.isInteger(p.targetPort) || p.targetPort < 1 || p.targetPort > 65535) return '落地端口只能是 1–65535';
-  if (!p.targetHost) return '请填写落地地址';
+  const lines = String(p.targets || '')
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!lines.length) return '请至少填写一个目标地址';
+  if (lines.length > 8) return '目标地址最多 8 个';
+  for (const [i, line] of lines.entries()) {
+    const m = line.match(/^([^:\s]+):(\d{1,5})$/);
+    const host = m ? m[1] : line;
+    const port = m ? Number(m[2]) : 443;
+    if (host.includes(':')) return `第 ${i + 1} 行暂不支持 IPv6`;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return `第 ${i + 1} 行端口不合法`;
+  }
   return '';
 }
 
@@ -248,9 +268,10 @@ async function relayEditFlow(id) {
 function relayDelFlow(id) {
   const r = (state.data.relayItems || []).find((x) => x.id === id);
   if (!r) return;
+  const targetText = relayTargetsOf(r).map((t) => `${t.host}:${t.port}`).join(' / ') || '?';
   confirmDialog(
     '删除中转规则',
-    `确定删除「${r.name}」（${r.serverHost}:${r.listenPort} → ${r.targetHost}:${r.targetPort}）？\n\n` +
+    `确定删除「${r.name}」（${r.serverHost}:${r.listenPort} → ${targetText}）？\n\n` +
       (r.status === 'applied'
         ? `这条规则已在入口机上生效。${
             r.serverOnline
@@ -264,6 +285,74 @@ function relayDelFlow(id) {
       render();
     },
   );
+}
+
+/* ------------------------------- 目标诊断 ------------------------------- */
+
+/**
+ * 从面板侧逐个 TCP 握手目标，返回延迟与可用性。
+ * 说明清楚「来源是面板」：入口机到目标的链路可能不同，面板可达 ≠ 入口机可达。
+ */
+async function relayDiagFlow(id) {
+  const r = (state.data.relayItems || []).find((x) => x.id === id);
+  if (!r) return;
+  const mask = openModal({
+    title: '目标诊断 · ' + r.name,
+    wide: true,
+    footer: false,
+    body: `
+      <div id="rd-body"><div class="hint" style="margin:0">正在从面板探测目标…</div></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+        <button class="btn btn-sm btn-primary" type="button" id="rd-again">重新测试</button>
+        <span class="hint" style="margin:0">探测超时 3 秒；目标按表单顺序作为故障切换顺序</span>
+      </div>`,
+  });
+
+  const run = async () => {
+    const box = $('#rd-body', mask);
+    box.innerHTML = '<div class="hint" style="margin:0">正在从面板探测目标…</div>';
+    try {
+      const d = await api('/api/relays/' + id + '/diag', { method: 'POST' });
+      box.innerHTML = `
+        <div class="alert alert-warn" style="margin:0 0 12px;font-size:12px;line-height:1.7">
+          探测从 <b>面板所在机器</b> 发起（不是从入口机发起）：面板到目标可达，不代表入口机到目标也可达。
+          需要入口机视角时，可在入口机上执行检查脚本，或用 <span class="mono">nc -z -w 2 host port</span> 手工验证。
+        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>#</th><th>目标</th><th>结果</th><th>延迟</th><th>说明</th></tr></thead>
+          <tbody>
+            ${d.targets
+              .map(
+                (t, i) => `<tr>
+                  <td>${i + 1}${i === d.active ? ' <span class="badge badge-ok">当前首选</span>' : ''}</td>
+                  <td class="mono">${esc(t.host)}:${esc(t.port)}</td>
+                  <td><span class="badge ${t.ok ? 'badge-ok' : 'badge-bad'}">${t.ok ? '可达' : '不可达'}</span></td>
+                  <td class="mono">${t.ok ? t.ms + ' ms' : '—'}</td>
+                  <td class="cell-sub">${t.error ? esc(t.error) : '—'}</td>
+                </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table></div>
+        <p class="hint" style="margin-top:10px">
+          ${
+            d.active < 0
+              ? '所有目标都探测失败：这条规则当前没有可用落地地址（gost 连接会失败；iptables 会保留但流量不通）。'
+              : `按顺序第一个可达的是 <b>#${d.active + 1}</b>：${esc(d.targets[d.active].host)}:${esc(d.targets[d.active].port)}。`
+          }
+          ${
+            r.tool === 'iptables'
+              ? 'iptables 是静态规则：已装 agent 的中转机每轮同步（约 60s）重选；纯手动模式需要重跑 install 脚本。'
+              : 'gost 在进程内按 fifo 顺序自动切换，无需人工介入。'
+          }
+        </p>`;
+    } catch (err) {
+      box.innerHTML = `<div class="alert alert-danger" style="margin:0">${esc(err.message)}</div>`;
+    }
+  };
+
+  $('#rd-again', mask).addEventListener('click', run);
+  run();
 }
 
 /* ------------------------------- 脚本下发 ------------------------------- */
@@ -324,7 +413,13 @@ function relayScriptFlow(id, mode = 'install') {
     });
     $('#rl-script-tip', mask).innerHTML =
       m === 'install'
-        ? `在<b>中转服务器</b>（${esc(r.serverHost)}）上执行：开启转发、写入 ${esc(r.tool)} 规则（本机 :${esc(r.listenPort)} → ${esc(r.targetHost)}:${esc(r.targetPort)}）、持久化并回执。幂等，可重复执行。`
+        ? `在<b>中转服务器</b>（${esc(r.serverHost)}）上执行：开启转发、写入 ${esc(r.tool)} 规则（本机 :${esc(r.listenPort)} → ${relayTargetsOf(r)
+            .map((t) => `${esc(t.host)}:${esc(t.port)}`)
+            .join(' / ')}）、持久化并回执。幂等，可重复执行。${
+            relayTargetsOf(r).length > 1
+              ? '多目标：gost 由进程内按顺序切换；iptables 安装时探测选一个，重跑脚本可重新选择。'
+              : ''
+          }`
         : m === 'uninstall'
           ? `在<b>中转服务器</b>上执行：按标签精确删除本条规则（gost 停删 systemd unit；iptables 按标签删 NAT 规则）。`
           : `在<b>中转服务器</b>上执行：只读检查本规则是否存活，并列出本机全部面板中转规则。`;

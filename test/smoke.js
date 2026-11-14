@@ -1731,12 +1731,48 @@ function totpCodeOf(secret) {
     method: 'POST',
     body: json({
       serverId: rsId, name: 'SMOKE-规则1', tool: 'gost', proto: 'both',
-      listenPort: 8443, targetHost: '203.0.113.9', targetPort: 443,
+      listenPort: 8443,
+      // 多目标（0.1.46）：一行一个，顺序即故障切换顺序
+      targets: '203.0.113.9:443\n203.0.113.10:443',
     }),
   });
-  ok('新增 gost 转发规则', rlNew.status === 200 && rlNew.data.item.tool === 'gost' && rlNew.data.item.status === 'planned');
+  ok('新增 gost 多目标规则',
+    rlNew.status === 200
+    && rlNew.data.item.tool === 'gost'
+    && rlNew.data.item.status === 'planned'
+    && rlNew.data.item.targets.length === 2
+    && rlNew.data.item.targetHost === '203.0.113.9'
+    && rlNew.data.item.targetPort === 443);
   const rlId = rlNew.data.item.id;
   cleanup.push(['/api/relays/' + rlId]);
+
+  // 目标诊断（0.1.46）：面板侧 TCP 握手。用面板自己的端口做「可达」，1 端口做「不可达」
+  const PANEL_PORT = Number(new URL(BASE).port || (BASE.startsWith('https') ? 443 : 80));
+  const diagNew = await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId, name: 'SMOKE-诊断规则', tool: 'iptables', proto: 'tcp',
+      listenPort: 9445,
+      targets: `127.0.0.1:${PANEL_PORT}\n127.0.0.1:1`,
+    }),
+  });
+  ok('诊断用多目标规则创建成功', diagNew.status === 200 && diagNew.data.item.targets.length === 2);
+  const diagId = diagNew.data.item.id;
+  cleanup.push(['/api/relays/' + diagId]);
+  const diag = await call('/api/relays/' + diagId + '/diag', { method: 'POST' });
+  ok('诊断返回每个目标的延迟',
+    diag.status === 200
+    && diag.data.targets.length === 2
+    && diag.data.targets.every((t) => typeof t.ms === 'number'));
+  ok('诊断识别可达/不可达与当前首选',
+    diag.data.targets[0].ok === true && diag.data.targets[1].ok === false && diag.data.active === 0);
+  ok('非法目标被拦（IPv6）', (await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId, name: 'SMOKE-非法目标', tool: 'gost', proto: 'tcp',
+      listenPort: 9444, targets: '[::1]:443',
+    }),
+  })).status === 400);
 
   // 同一台中转服务器上监听端口跨工具冲突：iptables 抢 8443 必须被拦
   ok('同机同端口冲突（跨工具）', (await call('/api/relays', {
