@@ -1003,7 +1003,8 @@ tr.tree-child .cell-name { font-weight: 450; }
 
 #toast-root {
   position: fixed;
-  bottom: 26px;
+  /* 提示放在页面上方：底部容易被操作区/滚动位置挡住，尤其是在长表单与表格页 */
+  top: 18px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -1011,6 +1012,8 @@ tr.tree-child .cell-name { font-weight: 450; }
   gap: 8px;
   z-index: 200;
   align-items: center;
+  pointer-events: none;
+  max-width: 92vw;
 }
 
 .toast {
@@ -1021,8 +1024,14 @@ tr.tree-child .cell-name { font-weight: 450; }
   border-radius: 10px;
   font-size: 13px;
   box-shadow: var(--shadow);
-  animation: rise 0.18s ease;
-  max-width: 80vw;
+  animation: drop 0.18s ease;
+  max-width: 88vw;
+  pointer-events: auto;
+}
+
+@keyframes drop {
+  from { opacity: 0; transform: translateY(-8px) scale(0.99); }
+  to { opacity: 1; transform: none; }
 }
 
 .toast.ok { border-color: rgba(52, 211, 153, 0.4); }

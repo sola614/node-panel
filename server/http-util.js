@@ -8,6 +8,9 @@
 
 const fs = require('fs');
 const path = require('path');
+// 静态资源版本：HTML 里的 ?v=__V__ 会替换成它。升级后 JS/CSS 的 URL 变化，
+// 浏览器不会再拿「上一版的前端 + 这一版的后端」混着跑（那会表现成页面状态过期）
+const APP_VERSION = require('../package.json').version;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -123,10 +126,19 @@ function serveFile(res, filePath) {
   fs.readFile(filePath, (err, data) => {
     if (err) return sendText(res, 404, 'Not Found');
     const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.html') {
+      const text = data.toString('utf8').replace(/__V__/g, APP_VERSION);
+      res.writeHead(200, {
+        ...SECURITY_HEADERS,
+        'Content-Type': MIME[ext] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+      });
+      return res.end(text);
+    }
     res.writeHead(200, {
       ...SECURITY_HEADERS,
       'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=300',
+      'Cache-Control': 'public, max-age=300',
     });
     res.end(data);
   });

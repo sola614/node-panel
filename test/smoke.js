@@ -1774,6 +1774,42 @@ function totpCodeOf(secret) {
     }),
   })).status === 400);
 
+  // 入口流量（0.1.47）：agent 上报计数器原值，面板按差值累计；归零时按当前值重算
+  const rc1 = await call('/api/agent/receipt?token=' + rsToken, {
+    method: 'POST',
+    body: json({ hash: 't1', ok: true, traffic: { [rlId]: 1000 } }),
+  });
+  ok('回执记录入口流量', rc1.status === 200);
+  const relayTraffic1 = (await call('/api/relays')).data.items.find((x) => x.id === rlId) || {};
+  ok('入口流量累计 1000 字节并记录最近使用',
+    relayTraffic1.trafficBytes === 1000 && !!relayTraffic1.lastUsedAt && !!relayTraffic1.trafficAt);
+  await call('/api/agent/receipt?token=' + rsToken, {
+    method: 'POST',
+    body: json({ hash: 't2', ok: true, traffic: { [rlId]: 3500 } }),
+  });
+  const relayTraffic2 = (await call('/api/relays')).data.items.find((x) => x.id === rlId) || {};
+  ok('入口流量按差值累计', relayTraffic2.trafficBytes === 3500);
+  await call('/api/agent/receipt?token=' + rsToken, {
+    method: 'POST',
+    body: json({ hash: 't3', ok: true, traffic: { [rlId]: 500 } }),
+  });
+  const relayTraffic3 = (await call('/api/relays')).data.items.find((x) => x.id === rlId) || {};
+  ok('计数器归零后按当前值重算', relayTraffic3.trafficBytes === 4000);
+
+  // agent 自动同步（0.1.47）：回执的 hash 与面板期望一致时，规则状态应自动推进到 applied，
+  // 不能再依赖「手动执行脚本 + ack」
+  const relayCfg = await call('/api/agent/config?token=' + rsToken);
+  ok('agent 配置包可拉取（relay scope）',
+    relayCfg.status === 200 && !!relayCfg.data.hash && !!relayCfg.data.relay);
+  const rcSync = await call('/api/agent/receipt?token=' + rsToken, {
+    method: 'POST',
+    body: json({ hash: relayCfg.data.hash, ok: true, traffic: { [rlId]: 4000 } }),
+  });
+  ok('agent 回执成功', rcSync.status === 200);
+  const relaySynced = (await call('/api/relays')).data.items.find((x) => x.id === rlId) || {};
+  ok('agent 自动同步后规则状态推进为 applied',
+    relaySynced.status === 'applied' && !!relaySynced.appliedAt);
+
   // 同一台中转服务器上监听端口跨工具冲突：iptables 抢 8443 必须被拦
   ok('同机同端口冲突（跨工具）', (await call('/api/relays', {
     method: 'POST',

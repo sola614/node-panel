@@ -1874,10 +1874,36 @@ receipt_escape() {
   sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g' | tr -d '\r' | tr '\n' ' ' | cut -c1-400
 }
 
+# 入口流量采集（中转机）：读 iptables 计数器，按规则 ID 汇总入站字节。
+#   np-relay:<id>        iptables DNAT 规则（PREROUTING）
+#   np-relay-count:<id>  gost 规则的计数规则（自定义链 NP_RELAY_COUNT）
+# 输出 id bytes 到 relay-traffic.txt；面板按「本次原值 - 上次原值」累计。
+# 注意：只统计客户端 → 入口机方向；回程由 conntrack 反向 NAT，不进 PREROUTING。
+collect_relay_traffic() {
+  [ "$RELAY_ONLY" = '1' ] || return 0
+  command -v iptables >/dev/null 2>&1 || return 0
+  mkdir -p "$RUN_DIR" 2>/dev/null
+  {
+    iptables -t nat -L PREROUTING -v -n -x 2>/dev/null
+    iptables -t nat -L NP_RELAY_COUNT -v -n -x 2>/dev/null
+  } | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^np-relay-count:/) { id = $i; sub(/^np-relay-count:/, "", id); sum[id] += $2; break }
+        if ($i ~ /^np-relay:/) { id = $i; sub(/^np-relay:/, "", id); sum[id] += $2; break }
+      }
+    }
+    END { for (id in sum) print id, sum[id] }
+  ' > "$RUN_DIR/relay-traffic.txt" 2>/dev/null || true
+  return 0
+}
+
 send_receipt() {
   # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发。
   # 指纹清单也进签名：证书重签 → 指纹变化 → 回执立即重发，面板订阅里的 pcs 才不会拿着旧指纹
-  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${RC_HOP:-}|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")"
+  # 流量总量也进签名：有流量就刷新回执，没流量则不重复发
+  _traffic_sum=$(awk '{ s += $2 } END { print s + 0 }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
+  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${RC_HOP:-}|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")|${_traffic_sum:-0}"
   _last=''
   _ts=0
   if [ -f "$STATE_DIR/.receipt" ]; then
@@ -1900,9 +1926,13 @@ send_receipt() {
   fi
   mkdir -p "$RUN_DIR" "$STATE_DIR" 2>/dev/null
   _f="$RUN_DIR/receipt.$$.json"
-  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","hop":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s"}\n' \
+  _traffic=''
+  if [ -s "$RUN_DIR/relay-traffic.txt" ]; then
+    _traffic=$(awk '{ printf "%s\"%s\":%s", sep, $1, $2; sep="," }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
+  fi
+  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","hop":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s","traffic":{%s}}\n' \
     "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${RC_HOP:-}" "${BAD_PORTS:-}" \
-    "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" > "$_f" 2>/dev/null
+    "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" "$_traffic" > "$_f" 2>/dev/null
 
   if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
     printf '%s\n%s\n' "$_now" "$_sig" > "$STATE_DIR/.receipt" 2>/dev/null
@@ -2021,6 +2051,7 @@ tick() {
   if apply_bundle; then
     apply_services changed
     if [ "$RELAY_ONLY" = '1' ]; then
+      collect_relay_traffic
       log "面板在线 · ${NP_SCOPE:-未知} · ${NP_RELAY_RULES:-0} 条转发规则"
     else
       log "面板在线 · ${NP_SCOPE:-未知} · ${NP_NODES:-0} 个节点 / ${NP_USERS:-0} 位可用用户"

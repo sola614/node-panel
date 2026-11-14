@@ -144,6 +144,8 @@ db.relays.find((r) => r.id === 'rule-0002').tool = 'gost';
 const gostBundle = bundle.buildBundle(agent.buildAgentPayload(agent.scopeOfServer(tokyo)), { siteName: '测试站' });
 ok('gost 规则进入端口自检', gostBundle.includes("NP_LISTEN_PORTS='tcp:9443'"));
 ok('gost 多目标写入 unit', gostBundle.includes('NP_TARGETS=203.0.113.9:443,203.0.113.10:443'));
+ok('中转包带流量计数链', gostBundle.includes('NP_RELAY_COUNT') && gostBundle.includes('np-relay-count:rule-0002'));
+ok('旧规则补流量默认值', r1.trafficBytes === 0 && r1.trafficRaw === 0 && r1.trafficAt === null);
 
 /* ------------------------- 3. 旧表必须被清掉 ------------------------- */
 

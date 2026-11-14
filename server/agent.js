@@ -719,6 +719,46 @@ function agentReceipt(req, res, params, body, session, ctx) {
   };
   if (item.sync.agentVersion) item.agentVersion = item.sync.agentVersion;
 
+  // 中转入口流量（0.1.47）：agent 上报的是 iptables 计数器「原值」，
+  // 面板按差值累计。计数器因规则重建归零时（n < last），本次原值直接作为增量。
+  // 只用于「这条入口有没有人用 / 用了多少」，不参与用户额度计费（计费点在落地机）。
+  if (scope.type === 'relay' && body.traffic && typeof body.traffic === 'object' && !Array.isArray(body.traffic)) {
+    const now = store.iso();
+    let applied = 0;
+    for (const [rid, raw] of Object.entries(body.traffic)) {
+      const rule = db.relays.find((r) => r.id === rid && r.serverId === scope.id);
+      const n = Number(raw);
+      if (!rule || !Number.isFinite(n) || n < 0) continue;
+      const last = Number(rule.trafficRaw) || 0;
+      const delta = n >= last ? n - last : n;
+      rule.trafficBytes = (Number(rule.trafficBytes) || 0) + delta;
+      rule.trafficRaw = n;
+      rule.trafficAt = now;
+      if (delta > 0) rule.lastUsedAt = now;
+      applied++;
+    }
+    if (applied) logAgent.debug('中转入口流量已记录', { rid: ctx.rid, scope: scope.name, rules: applied });
+  }
+
+  // agent 自动同步成功后，把该机规则推进到 applied。
+  // 以前只有手动脚本的 ack 会推进状态，导致「agent 已经部署好了，列表还显示未部署」。
+  // 用 hash 匹配而不是只看 ok：旧 agent / 节点包的回执不能算数。
+  if (
+    scope.type === 'relay'
+    && item.sync.ok
+    && item.sync.hash
+    && item.sync.hash === desiredHashOf(scope)
+  ) {
+    let marked = 0;
+    for (const r of db.relays) {
+      if (r.serverId !== scope.id || r.status === 'applied') continue;
+      r.status = 'applied';
+      r.appliedAt = store.iso();
+      marked++;
+    }
+    if (marked) logAgent.info('中转规则已由 agent 自动同步', { rid: ctx.rid, scope: scope.name, rules: marked });
+  }
+
   // 自签证书指纹（nodeId → 64 位 hex）：证书在节点机上现场生成，面板只有拿到
   // 指纹才能在订阅里写 pcs=（Xray-core v25 起移除 allowInsecure 后的替代方案）。
   // 只认 certMode=self 的节点；agent 把整个清单报上来，逐条挑有效的

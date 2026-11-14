@@ -222,10 +222,18 @@ function syncDetailFlow(sync, name) {
  * 但 JS 内部错误（ReferenceError / TypeError 等）是英文的，
  * 这类不该直接甩给用户，换成中文并保留线索在控制台。
  */
-const TECH_ERROR = /is not defined|is not a function|Cannot read propert|Cannot set propert|undefined is not|null is not|Unexpected token|Failed to fetch|NetworkError|Load failed/i;
+const TECH_ERROR = /is not defined|is not a function|Cannot read propert|Cannot set propert|undefined is not|null is not|Unexpected token/i;
+// 网络层失败（面板重启 / 断网 / 反代 502）与「页面状态过期」是两回事：
+// 前者刷新页面也没用，必须给出可执行的提示
+const NET_ERROR = /Failed to fetch|NetworkError|Load failed|Network request failed/i;
 
 function showError(err) {
   const raw = String((err && err.message) || err || '');
+  if (NET_ERROR.test(raw)) {
+    console.error('[网络错误]', err);
+    toast('无法连接面板（可能正在重启或网络中断），请稍后重试', 'err');
+    return;
+  }
   if (TECH_ERROR.test(raw)) {
     console.error('[界面错误]', err);
     toast('操作失败，页面状态可能已过期，请刷新后重试', 'err');
@@ -479,9 +487,17 @@ async function api(path, options = {}) {
       logoutLocal(true);
       throw new Error('登录已失效');
     }
-    const err = new Error(data.error || `请求失败 (${res.status})`);
+
+    // 429 的响应体在反向代理后面往往是 HTML（拿不到 data.error），必须给一句
+    // 能指向真正原因的兜底文案：面板自身没有对 /api/relays 之类的写接口限流
+    const fallback = res.status === 429
+      ? '请求过于频繁（HTTP 429）：可能是反向代理限流或面板正在重启，请稍后重试'
+      : `请求失败 (${res.status})`;
+    const err = new Error(data.error || fallback);
     // 与 apiRaw 一致：加密备份要先问密码再重发，靠文案判断不了
     err.data = data;
+    err.status = res.status;
+    err.retryAfter = res.headers.get('retry-after') || '';
     err.encrypted = !!data.encrypted;
     throw err;
   }

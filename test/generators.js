@@ -234,6 +234,8 @@ if (!hasBash) {
   });
   ok('iptables 安装时探测目标', iptInstall.includes("TARGETS=('9.9.9.9:8443' '9.9.9.10:8443')") && iptInstall.includes('pick_target'));
   ok('中转收敛包含多目标', sync.includes('NP_TARGETS=5.6.7.8:443,5.6.7.9:443') && sync.includes('nc -z -w 2'));
+  ok('gost 规则带流量计数链', sync.includes('NP_RELAY_COUNT') && sync.includes('np-relay-count:ab12cd34'));
+  ok('iptables 规则未变化时保留计数器', sync.includes('保留计数器'));
 }
 
 /* --------------------- 二、注入串不得成为可执行语句 --------------------- */

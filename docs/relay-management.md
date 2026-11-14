@@ -1,6 +1,6 @@
 # 中转管理方案（relay management）
 
-> 2026-11-14 · v4（0.1.46 增量：多目标故障切换 + 目标诊断）· 状态：已实施
+> 2026-11-14 · v5（0.1.47 增量：中转入口流量统计 + 前端错误提示修正）· 状态：已实施
 >
 > 需求：① 新增「中转服务器」管理，可往中转机上用主流工具（gost / iptables）添加端口转发实现节点中转；② 节点新增/编辑时中转入口可下拉选择中转管理中已有的规则；③ **中转机与落地机统一在「服务器」页管理（tab 分组），装 agent 后规则自动同步**；④ **一个入口支持多个目标地址，按顺序故障切换；规则列表可一键诊断目标连通性与延迟**。
 
@@ -35,7 +35,7 @@
 - **转发工具按规则选择**：`tool: gost | iptables`。gost 为用户态转发（systemd 托管进程，无需改内核转发，适配 NAT/受限环境）；iptables 为内核态 DNAT（零进程、性能最优）。字段预留扩展位（后续可加 realm / socat 等，生成器按 tool 分发）。
 - **节点联动**：`node.entries` 元素新增可选 `relayId`。选中中转规则后 host/port 自动以规则为准；手填模式保留（兼容旧数据）。
 
-## 3. 数据模型（lib/store.js TABLE_SPECS，schema 13 → 14，只加法迁移）
+## 3. 数据模型（lib/store.js TABLE_SPECS，schema 14 → 15，只加法迁移）
 
 ```js
 // servers：统一机器台账（0.1.44）
@@ -55,12 +55,20 @@
   targets: [],           // [{ host, port }]，顺序即故障切换顺序，最多 8 个（0.1.46）
   targetHost: '',        // targets[0] 的镜像：兼容旧脚本 / 旧前端 / 旧 API
   targetPort: 443,       // 同上
+
   nodeId: '',            // 可选：关联落地节点（仅台账展示用）
   status: 'planned',     // planned | applied | unknown
   deployToken: '',       // 手动脚本回执鉴权，rotate 能力
   appliedAt: null, note: '',
+  // 入口流量（0.1.47）：agent 读 iptables 计数器上报原值，面板按差值累计
+  trafficBytes: 0,       // 累计入站字节（客户端 → 入口机方向）
+  trafficRaw: 0,         // 上次读到的计数器原值
+  trafficAt: null,       // 最近一次采集时间（null = 从未采集，通常是没装 agent）
+  lastUsedAt: null,      // 最近一次流量增长时间（判断「有没有人用」）
 }
 ```
+
+- **迁移（入口流量）**：旧规则没有流量列，加载时补 0 / null；非数字一律归零，避免 NaN 污染累计
 
 - **迁移（旧 `relay_servers` → `servers`）**：每条旧台账转成 `type='relay'` 的 servers 行，
   补设备级 `token`、`ipMode='manual'` 与心跳字段；id 与既有 servers 冲突时重新分配并同步
@@ -83,6 +91,7 @@
 | `GET /api/relays/:id/script?mode=install\|uninstall\|check` | 按 tool 分发生成三态脚本，并 rotate deployToken（手动通道） |
 | `POST /api/relays/:id/diag` | **目标诊断**（0.1.46）：从面板逐个 TCP 握手所有目标，返回 `{ ok, ms, error }` 与「按顺序第一个可达」的 `active` 下标；`source=panel` |
 | `POST /api/relay/ack` | **免登录回执**：relayId + deployToken（恒时比较）→ status=applied/unknown + appliedAt。沿袭免登录 POST 1.5MB 限额与限流（http-util.js readBody 机制） |
+| `POST /api/agent/receipt`（relay token） | 除同步状态外，额外接受 `traffic: { ruleId: 计数器原值 }`（0.1.47），按差值累计到规则 |
 | `GET /api/servers/:id/install`（relay 型） | relayOnly 安装脚本：只部署 agent，不安装 Xray / Hysteria2 |
 | `GET /api/agent/bundle`（relay token） | relay 配置包：只含规则收敛脚本，不读 nodes / users / certs |
 
@@ -117,10 +126,11 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 
 `buildRelaySyncScript({ rules })` 生成 POSIX sh 收敛脚本，由 relay bundle 每轮执行：
 
-1. 枚举 `gost-relay-*.service` 与带 `np-relay:` 标签的 NAT 规则，**删除面板已不存在的**（删规则 / 改端口 / 换 tool 自动生效）
-2. 期望规则逐条写入：gost 写 env + systemd unit（多目标直接写全量）并 `enable --now`；iptables **每轮按顺序探测目标**，先删本规则旧标签再写当前可达目标（切换粒度 = 轮询周期）
-3. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
-4. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入），失败通过 receipt 暴露
+1. 枚举 `gost-relay-*.service` 与带 `np-relay:` / `np-relay-count:` 标签的 NAT 规则，**删除面板已不存在的**（删规则 / 改端口 / 换 tool 自动生效）
+2. 期望规则逐条写入：gost 写 env + systemd unit（多目标直接写全量）并 `enable --now`；iptables 每轮按顺序探测目标，**期望规则已在位时跳过重建**（否则计数器每秒归零），目标变化才删旧标签重写
+3. gost 没有 DNAT 规则可挂计数器，收敛时在固定计数链 `NP_RELAY_COUNT` 里插一条 `RETURN` 规则（标签 `np-relay-count:<id>`），只建一次、不重建
+4. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
+5. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入，只统计 gost 规则），失败通过 receipt 暴露
 
 与手动三态脚本共用同一套命名的好处：两条通道可以互相接手，不留第二套规则。
 
@@ -139,6 +149,7 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
   - 规则表在机器名旁提示「入口机离线」；服务器 CRUD 入口已移除（统一在服务器页）
   - 目标地址改为**大文本框**（一行一个 `host:port`，最多 8 个），列表转发方向显示首个目标 + `+N`
   - 每行新增「诊断」按钮：弹窗展示每个目标的可达性、TCP 延迟与当前首选目标，可重新测试
+  - 规则表新增「使用」列（0.1.47）：累计入口字节 + 最近使用时间；从未采集时显式提示「需要 agent」
 - 部署到中转机后，规则由 agent 自动同步；每行仍保留三态脚本按钮（未装 agent / 排查用）
 
 ## 7. 安全考量
@@ -148,33 +159,47 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 - `GOST_VER` 白名单校验；下载 URL 仅由面板生成
 - `/api/relay/ack` 免登录：deployToken 恒时比较 + 1.5MB 限额 + IP 限流
 - 生成脚本 root 自检 + 幂等 + 端口占用预检三件套
+- 入口流量只用于展示（判断入口是否有人使用），**不参与用户额度计费**：计费仍以落地机 Xray 的真实转发为准，避免同一份流量被重复计入
 
 ## 8. 测试
 
 - `test/generators.js`：gost / iptables 三态脚本 + relayOnly 安装/卸载 + relay 收敛包 `bash -n` 真解析；
   标签、GOST_VER 白名单、shellSafe 转义、中转机不装 Xray/Hysteria 断言
-- `test/relay.js`：schema 12→14 迁移（id 冲突重映射、relays.serverId 跟随、旧表删除、
-  旧规则自动补 targets）、落地机 payload 字段集合不变、中转机 payload 带 targets
+- `test/relay.js`：schema 12→15 迁移（id 冲突重映射、relays.serverId 跟随、旧表删除、
+  旧规则自动补 targets / 流量默认值）、落地机 payload 字段集合不变、中转机 payload 带 targets
 - `test/smoke.js`：servers(type=relay) CRUD、多目标规则创建与解析、目标诊断（可达/不可达/延迟/
-  当前首选）、IPv6 目标拦截、同机端口冲突 400（跨工具）、ack 鉴权（错 token / 重放）、
-  status 流转、节点入口联动（选 relay → host/port 覆盖；relay 删除 → entry 保留手填值）、
-  中转机安装/卸载脚本分叉、兼容只读端点
+  当前首选）、IPv6 目标拦截、入口流量回执（累计 / 差值 / 计数器归零）、同机端口冲突 400（跨工具）、
+  ack 鉴权（错 token / 重放）、status 流转、节点入口联动（选 relay → host/port 覆盖；
+  relay 删除 → entry 保留手填值）、中转机安装/卸载脚本分叉、兼容只读端点
 - 回归：`npm test`（含 smoke 全量）与 `npm run test:ui`
 
 ## 9. 影响分析
 
 | 维度 | 影响 |
 |------|------|
-| 数据 | schema 12→14：`servers` 增 `type`、`relays` 增 `targets`；旧 `relay_servers` 行迁入并 DROP 旧表；自动备份后迁移 |
+| 数据 | schema 12→15：`servers` 增 `type`、`relays` 增 `targets` 与流量字段；旧 `relay_servers` 行迁入并 DROP 旧表；自动备份后迁移 |
 | 兼容 | `node.entries` 仅增可选 `relayId`；旧规则单目标自动补 `targets`；`targetHost/targetPort` 保留为第一项镜像；`GET /api/relay-servers` 保留只读一个版本；写入端点已移除 |
 | 落地机 agent | **零影响**：payload 字段集合与 hash 输入不变，不触发重下发（test/relay.js 锁死） |
-| 中转机侧 | 装 agent 后新增 `gost-relay-<id>.service` / `np-relay:<id>` 的 60s 自动收敛；多目标切换：gost 进程内、iptables 每轮重选；未装 agent 仍可手动执行脚本 |
-| 安全面 | 中转机获得设备级 token（可被下发 root shell），relay bundle 只由固定模板生成，不接受自由字段 |
-| 风险点 | 极精简系统无 `comment` match → iptables 降级无标签（过期规则无法自动清理）；无 `nc` 时 iptables 目标探测退化为取第一个；gost 下载依赖 GitHub 连通性（`GOST_DL_BASE` 可指镜像）；同机双角色（既入口又落地）不支持，需后续 capabilities 模型 |
+| 中转机侧 | 装 agent 后新增 `gost-relay-<id>.service` / `np-relay:<id>` 的 60s 自动收敛；多目标切换：gost 进程内、iptables 每轮重选（未变化不重建，保留计数器）；入口流量随回执上报 |
+| 安全面 | 中转机获得设备级 token（可被下发 root shell），relay bundle 只由固定模板生成，不接受自由字段；流量数字仅作展示 |
+| 风险点 | 入口流量只统计单向（客户端 → 入口机），且依赖 `iptables` + `comment`；计数器在目标切换 / 规则重建时归零，面板按「原值下降视为重置」处理；无 `nc` 时 iptables 目标探测退化为取第一个；gost 下载依赖 GitHub 连通性（`GOST_DL_BASE` 可指镜像）；同机双角色（既入口又落地）不支持 |
 
 ## 10. 分期
 
 - **一期（0.1.43，已完成）**：中转台账 + API + gost/iptables 三态脚本 + 中转视图 + 节点下拉联动 + 测试
 - **二期（0.1.44，已完成）**：中转机并入 servers 台账（type=relay）+ relay-only agent（规则 60s 自动收敛）+ 服务器页 tab 分组 + 手动脚本保留为兜底
 - **三期（0.1.46，已完成）**：单入口多目标（最多 8 个，按顺序故障切换）+ 目标诊断（TCP 延迟 / 当前首选）
+- **四期（0.1.47，已完成）**：入口流量统计（判断入口是否有人使用）+ 前端错误提示与静态资源版本化修正
 - **后续（评估）**：同一台机器同时承担入口与落地（需要 capabilities 多角色模型）；tool 扩展（realm / socat）；入口机侧诊断回执
+
+## 11. 0.1.47 附带修复的两个前端问题
+
+1. **429 被误报成「页面状态可能已过期」**：`showError` 以前把 `Failed to fetch` 这类网络错误
+   混进了技术错误分支。现在网络失败单独提示「无法连接面板（可能正在重启或网络中断）」；
+   `api()` 对 429 优先使用后端 `data.error`，拿不到时提示「可能是反向代理限流 / 面板重启」，
+   并保留 `err.status` / `retry-after`。
+   > 排查提示：面板自身没有给 `/api/relays` 加限流。若 DevTools 里看到 429 且响应体是 HTML，
+   > 检查前面的 nginx `limit_req` / frp 或云厂商 WAF，而不是面板。
+2. **升级后新旧前端混跑**：静态 JS/CSS 以前缓存 5 分钟且 URL 不带版本，升级后旧页面继续提交
+   旧字段会表现为「页面状态过期」。现在 HTML 里的 `?v=__V__` 由服务端替换成 `APP_VERSION`，
+   升级后资源 URL 变化，浏览器不会再拿上一版前端配这一版后端。

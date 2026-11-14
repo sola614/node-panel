@@ -1566,6 +1566,16 @@ else
   echo "! gost 规则启动失败 ${id}：journalctl -u gost-relay-${id} -n 20"
   NP_FAIL=1
 fi
+# 入口流量计数（gost 没有 DNAT 规则可挂计数器）：往固定计数链里插一条 RETURN 规则。
+# 规则只建一次、不重建，所以计数器跨轮累积；agent 每轮读它上报。
+if [ "$HAS_COMMENT" = '1' ]; then
+  iptables -t nat -N NP_RELAY_COUNT 2>/dev/null || true
+  iptables -t nat -C PREROUTING -j NP_RELAY_COUNT 2>/dev/null || iptables -t nat -A PREROUTING -j NP_RELAY_COUNT || true
+  for _cp in ${forwards.join(' ')}; do
+    iptables -t nat -C NP_RELAY_COUNT -p $_cp --dport ${listen} -m comment --comment np-relay-count:${id} -j RETURN 2>/dev/null \
+      || iptables -t nat -A NP_RELAY_COUNT -p $_cp --dport ${listen} -m comment --comment np-relay-count:${id} -j RETURN || NP_FAIL=1
+  done
+fi
 `;
   };
 
@@ -1577,6 +1587,9 @@ fi
     const protos = r.proto === 'both' ? ['tcp', 'udp'] : [r.proto === 'udp' ? 'udp' : 'tcp'];
     const dnat = protos
       .map((p) => `add_rule PREROUTING -p ${p} --dport ${listen} -j DNAT --to-destination "$_h:$_p" $TAG || NP_FAIL=1`)
+      .join('\n');
+    const checks = protos
+      .map((p) => `iptables -t nat -C PREROUTING -p ${p} --dport ${listen} -j DNAT --to-destination "$_h:$_p" $TAG 2>/dev/null || _need=1`)
       .join('\n');
     return `
 # ---- iptables 规则 ${id} ----
@@ -1595,25 +1608,32 @@ if [ -z "$PICK" ]; then
   NP_FAIL=1
 fi
 _h=\${PICK%:*}; _p=\${PICK##*:}
-# 先删本规则旧标签再写：目标可能已切换，不删会留下指向旧目标的 DNAT
+# 期望规则已经在位就跳过重建：iptables 计数器挂在规则上，每轮重删会让流量统计永远归零
+_need=0
+iptables -t nat -C POSTROUTING -d "$_h" -j MASQUERADE $TAG 2>/dev/null || _need=1
+${checks}
 del_tag() {
   iptables -t nat -S "$1" 2>/dev/null | grep -F "np-relay:${id}" | sed "s/^-A $1 //" | while IFS= read -r _r; do
     [ -n "$_r" ] || continue
     iptables -t nat -D "$1" $_r 2>/dev/null || true
   done
 }
-if [ "$HAS_COMMENT" = '1' ]; then
-  del_tag PREROUTING
-  del_tag POSTROUTING
-else
-  iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- "--dport ${listen}( |$)" | sed 's/^-A PREROUTING //' | while IFS= read -r _r; do
-    [ -n "$_r" ] || continue
-    iptables -t nat -D PREROUTING $_r 2>/dev/null || true
-  done
-fi
-add_rule POSTROUTING -d "$_h" -j MASQUERADE $TAG || NP_FAIL=1
+if [ "$_need" = '1' ]; then
+  if [ "$HAS_COMMENT" = '1' ]; then
+    del_tag PREROUTING
+    del_tag POSTROUTING
+  else
+    iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- "--dport ${listen}( |$)" | sed 's/^-A PREROUTING //' | while IFS= read -r _r; do
+      [ -n "$_r" ] || continue
+      iptables -t nat -D PREROUTING $_r 2>/dev/null || true
+    done
+  fi
+  add_rule POSTROUTING -d "$_h" -j MASQUERADE $TAG || NP_FAIL=1
 ${dnat}
-echo "· iptables 规则 ${id} 使用目标 $_h:$_p（候选 ${targets.length} 个）"
+  echo "· iptables 规则 ${id} 已更新（使用目标 $_h:$_p，候选 ${targets.length} 个）"
+else
+  echo "· iptables 规则 ${id} 未变化（使用目标 $_h:$_p），保留计数器"
+fi
 `;
   };
 
@@ -1645,20 +1665,32 @@ if [ -d /etc/systemd/system ]; then
   done
 fi
 
-# 2) 清理面板已经删除的 iptables 规则（按 np-relay: 标签）
+# 2) 清理面板已经删除的规则（DNAT 标签 np-relay:<id> / gost 计数标签 np-relay-count:<id>）
 if command -v iptables >/dev/null 2>&1; then
-  for _chain in PREROUTING POSTROUTING; do
-    iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay:' | while IFS= read -r _line; do
-      _id=$(printf '%s' "$_line" | sed -n 's/.*np-relay:\\([A-Za-z0-9]*\\).*/\\1/p')
+  for _chain in PREROUTING POSTROUTING NP_RELAY_COUNT; do
+    iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay' | while IFS= read -r _line; do
+      _id=$(printf '%s' "$_line" | sed -n 's/.*np-relay-count:\\([A-Za-z0-9]*\\).*/\\1/p')
+      _want="$NP_IPT_IDS"
+      if [ -n "$_id" ]; then
+        _want="$NP_GOST_IDS"
+      else
+        _id=$(printf '%s' "$_line" | sed -n 's/.*np-relay:\\([A-Za-z0-9]*\\).*/\\1/p')
+      fi
       [ -n "$_id" ] || continue
-      case "$NP_IPT_IDS" in
+      case "$_want" in
         *" $_id "*) continue ;;
       esac
       _rule=\${_line#-A $_chain }
       iptables -t nat -D "$_chain" $_rule 2>/dev/null || true
-      echo "· 已移除过期 iptables 规则 $_id"
+      echo "· 已移除过期规则 $_id（$_chain）"
     done
   done
+fi
+
+# comment 模块探测：gost 计数规则与 iptables 标签都依赖它，缺失时降级
+HAS_COMMENT=0
+if command -v iptables >/dev/null 2>&1; then
+  iptables -m comment -h >/dev/null 2>&1 && HAS_COMMENT=1
 fi
 
 # 3) gost 二进制：只在真有 gost 规则且本机缺它时下载
@@ -1693,8 +1725,7 @@ if [ "$NP_IPT_N" -gt 0 ]; then
     echo "! 未检测到 iptables：iptables 规则不会生效（apt install -y iptables）"
     NP_FAIL=1
   else
-    HAS_COMMENT=0
-    iptables -m comment -h >/dev/null 2>&1 && HAS_COMMENT=1
+
     [ "$HAS_COMMENT" = '1' ] || echo "! iptables 缺少 comment 模块：规则不带标签，面板删规则后需手动清理"
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null; then

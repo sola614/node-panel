@@ -21,6 +21,15 @@ const RELAY_STATE = {
 const RELAY_TOOL_BADGE = { gost: 'badge-purple', iptables: 'badge-dim' };
 
 function relayStateOf(r) {
+  // agent 在线时的 planned 不是「没部署」，而是「等着下一轮同步」——文案要区分开，
+  // 否则会被误认为 agent 不会自动部署规则
+  if (r.status === 'planned' && r.serverOnline) {
+    return {
+      label: '等待同步',
+      cls: 'badge-warn',
+      tip: '入口机 agent 在线：下一轮同步（最多 60 秒）会自动部署。想立刻生效可在机器上执行 sh /opt/nodepanel/agent.sh --once',
+    };
+  }
   return RELAY_STATE[r.status] || RELAY_STATE.planned;
 }
 
@@ -57,6 +66,18 @@ RENDERERS.relays = async () => {
           const node = r.nodeName
             ? esc(r.nodeName)
             : '<span style="color:var(--muted)">未关联</span>';
+          const used = Number(r.trafficBytes) || 0;
+          const usedCell = !r.trafficAt
+            ? '<span style="color:var(--muted)" title="需要在中转机部署 agent 才能采集入口流量">未采集</span>'
+            : used > 0
+              ? `<span class="mono">${fmtBytes(used)}</span><div class="cell-sub">${
+                  r.lastUsedAt ? esc(fmtAgo(r.lastUsedAt)) + '用过' : '—'
+                }</div>`
+              : '<span style="color:var(--muted)">未使用</span>';
+          // agent 在线时规则会自动同步，「脚本」只作为手动重跑 / 排查入口，不该抢主按钮的位置
+          const scriptBtn = r.serverOnline
+            ? `<button class="btn btn-sm btn-ghost" data-act="relay-script" data-id="${r.id}" title="agent 在线时自动同步；这里用于手动重跑或排查">手动脚本</button>`
+            : `<button class="btn btn-sm btn-primary" data-act="relay-script" data-id="${r.id}">脚本</button>`;
           return `<tr>
         <td>
           <div class="cell-name">${esc(r.name)}</div>
@@ -68,12 +89,13 @@ RENDERERS.relays = async () => {
         <td class="mono" style="white-space:nowrap">${relayTargetText(r)}</td>
         <td>${esc(r.proto)}</td>
         <td>${node}${r.usedByEntries ? '<div class="cell-sub">已被节点入口引用</div>' : ''}</td>
+        <td>${usedCell}</td>
         <td><span class="badge ${st.cls}" title="${esc(st.tip)}">${st.label}</span>${
             r.appliedAt ? `<div class="cell-sub">${esc(fmtAgo(r.appliedAt))}回执</div>` : ''
           }</td>
         <td>
           <div class="row-actions">
-            <button class="btn btn-sm btn-primary" data-act="relay-script" data-id="${r.id}">脚本</button>
+            ${scriptBtn}
             <button class="btn btn-sm btn-ghost" data-act="relay-diag" data-id="${r.id}">诊断</button>
             <button class="btn btn-sm btn-ghost" data-act="relay-edit" data-id="${r.id}">编辑</button>
             <button class="btn btn-sm btn-danger" data-act="relay-del" data-id="${r.id}">删</button>
@@ -82,7 +104,7 @@ RENDERERS.relays = async () => {
       </tr>`;
         })
         .join('')
-    : `<tr><td colspan="7" class="empty"><b>还没有中转规则</b>
+    : `<tr><td colspan="8" class="empty"><b>还没有中转规则</b>
         先到「服务器」页的「中转服务器」tab 添加一台入口机，再回来为它添加端口转发规则。
         装了 agent 的中转机会自动同步规则；未装 agent 时可生成脚本复制到机器上以 root 执行。
         节点编辑里的「中转入口」可以直接下拉选择这里的规则。</td></tr>`;
@@ -91,7 +113,7 @@ RENDERERS.relays = async () => {
     <div class="card">
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>规则</th><th>工具</th><th>转发方向</th><th>协议</th><th>关联节点</th><th>状态</th>
+          <th>规则</th><th>工具</th><th>转发方向</th><th>协议</th><th>关联节点</th><th>使用</th><th>状态</th>
           <th style="text-align:right">操作</th>
         </tr></thead>
         <tbody>${rows}</tbody>
@@ -102,8 +124,10 @@ RENDERERS.relays = async () => {
       不改内核转发，适配 NAT / 受限环境。iptables：内核态 DNAT，零常驻进程，
       规则带 <span class="mono">np-relay:&lt;id&gt;</span> 标签，卸载按标签精确删除。
       <br>同一台中转服务器的同一监听端口只允许一条规则（gost 与 iptables 混用也冲突）。
-      <b>装了 agent 的中转机</b>每 60 秒自动收敛一次，规则状态以 agent 回执为准；
-      手动脚本仍保留，用于未装 agent 或临时排查的场景。
+      <b>装了 agent 的中转机</b>每 60 秒自动收敛一次，规则状态由 agent 回执推进（无需每次点脚本）；
+      未装 agent 时才需要「脚本」手动执行。「等待同步」表示 agent 在线、下一轮就会部署。
+      <br>「使用」列由中转机 agent 读取 iptables 计数器上报（只统计客户端 → 入口机方向），
+      用来判断这条入口有没有人用；用户额度仍以落地机的真实转发为计费口径，不会重复计费。
     </p>`;
 };
 
@@ -237,7 +261,13 @@ async function relayNewFlow() {
       const err = validateRelayForm(payload);
       if (err) throw new Error(err);
       await api('/api/relays', { method: 'POST', body: JSON.stringify(payload) });
-      toast('规则已创建，接着生成脚本到中转服务器执行', 'ok');
+      const srv = (d.servers || []).find((s) => s.id === payload.serverId);
+      toast(
+        srv && srv.online
+          ? '规则已创建，入口机 agent 在线：最多 60 秒自动同步'
+          : '规则已创建；入口机 agent 不在线，部署 agent 后会自动同步，也可生成脚本手动执行',
+        'ok',
+      );
       closeModal();
       await render();
     },
@@ -258,7 +288,13 @@ async function relayEditFlow(id) {
       const err = validateRelayForm(payload);
       if (err) throw new Error(err);
       await api('/api/relays/' + id, { method: 'PUT', body: JSON.stringify(payload) });
-      toast('已保存', 'ok');
+      const srv = (d.servers || []).find((s) => s.id === payload.serverId);
+      toast(
+        srv && srv.online
+          ? '已保存，入口机 agent 在线：最多 60 秒自动同步'
+          : '已保存；入口机 agent 不在线，部署 agent 后会自动同步，也可重新生成安装脚本',
+        'ok',
+      );
       closeModal();
       await render();
     },
