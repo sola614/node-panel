@@ -451,6 +451,10 @@ function nodeForm(node, servers) {
   );
   const r = n.reality || {};
   const h = n.hy2 || {};
+  // 导入分享节点的部署方式是既成事实：它没有 agent 可切，改成「跟随服务器」会把它
+  // 变回一台需要发证、发 UUID 的自建节点，分享来的凭证就此失效。编辑里不给这个开关。
+  // 复制/新建时 id 是空的（nodeCopyFlow 会把 id 清掉），所以仍然可选。
+  const lockMode = !isNew && n.mode === 'imported';
   const opt = (list, cur) => list.map((x) => `<option value="${x}" ${x === cur ? 'selected' : ''}>${x}</option>`).join('');
   const serverOpts = servers
     .map((s) => `<option value="${s.id}" ${s.id === n.serverId ? 'selected' : ''}>${esc(s.name)} · ${esc(s.host)}</option>`)
@@ -458,7 +462,7 @@ function nodeForm(node, servers) {
 
   return `
     <div class="section-title">基础</div>
-    <div class="field">
+    <div class="field ${lockMode ? 'hidden' : ''}" id="wrap-mode">
       <label>部署方式</label>
       <div class="seg" id="n-mode">
         <button type="button" data-mode="server" class="${n.mode === 'server' ? 'on' : ''}">跟随服务器</button>
@@ -467,12 +471,21 @@ function nodeForm(node, servers) {
       </div>
       <div class="hint" id="n-mode-hint"></div>
     </div>
+    ${
+      // 锁住时留一句可见的说明：整个「部署方式」区块被藏了，不说一句会让人以为少了什么
+      lockMode
+        ? `<div class="hint" style="margin:-4px 0 12px">
+            部署方式：<b>导入分享</b>。协议 / 端口 / 传输 / 证书等全部来自分享链接，
+            编辑里不展示也不改动；要换成别的节点，在下面把链接替换掉即可。
+           </div>`
+        : ''
+    }
 
     <div id="import-box" class="hidden">
       <div class="field">
-        <label>分享链接（每行一条）</label>
+        <label>分享链接${lockMode ? '' : '（每行一条）'}</label>
         <textarea id="n-links" rows="7" placeholder="vless://... （也支持 vmess:// / trojan:// / ss:// / hysteria2://）
-每行一条，支持一次粘贴多条批量导入">${esc(n.importLink || '')}</textarea>
+${lockMode ? '只填一条：保存后会覆盖本节点的地址、端口与凭证' : '每行一条，支持一次粘贴多条批量导入'}">${esc(n.importLink || '')}</textarea>
         <div class="hint" id="n-links-hint"></div>
       </div>
     </div>
@@ -910,9 +923,11 @@ function bindNodeForm(mask) {
     // 导入分享：自建节点的整套配置（协议 / 端口 / 传输 / 安全 / 证书 / 出站）不适用，
     // 字段全部来自链接解析，表单只留链接、名称、套餐、中转入口与启停 / 显隐
     $('#import-box', mask).classList.toggle('hidden', !isImported);
-    $('#n-links-hint', mask).textContent = isImported
-      ? '节点名称留空时使用链接里的名字；凭证与 Reality / TLS 参数都从链接解析。导入后想换节点，在编辑里重新粘贴链接即可'
-      : '';
+    $('#n-links-hint', mask).textContent = !isImported
+      ? ''
+      : $('#wrap-mode', mask).classList.contains('hidden')
+        ? '链接留原样就只改名字，协议 / 端口 / 证书一概不动；换成另一条链接会覆盖本节点的地址、端口与凭证'
+        : '节点名称留空时使用链接里的名字；凭证与 Reality / TLS 参数都从链接解析。导入后想换节点，在编辑里重新粘贴链接即可';
     $('#wrap-proto', mask).classList.toggle('hidden', isImported);
     $('#xray-box', mask).classList.toggle('hidden', isImported || isHy2);
     $('#hy2-box', mask).classList.toggle('hidden', isImported || !isHy2);
@@ -932,8 +947,9 @@ function bindNodeForm(mask) {
     $('#ve-box', mask).classList.toggle('hidden', !veOn);
     $('#ve-hint', mask).classList.toggle('hidden', !veOn);
 
-    // 证书：TLS 或 Hysteria2 都需要
-    const needCert = isHy2 || security === 'tls';
+    // 证书：TLS 或 Hysteria2 都需要。导入分享节点除外 —— 证书来自链接（含自签指纹 /
+    // allowInsecure），面板既不下发也不签发，展示出来只会让人以为在这儿能改
+    const needCert = !isImported && (isHy2 || security === 'tls');
     $('#cert-box', mask).classList.toggle('hidden', !needCert);
 
     // Hysteria2 没有「不加密」这个选项，而 path 模式留空等于没证书（服务直接起不来）。

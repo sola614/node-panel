@@ -1340,6 +1340,21 @@ function totpCodeOf(secret) {
   ok('订阅输出分享节点且用分享 UUID', !!impLink && impLink.uri.startsWith('vless://share-uuid-abc@import.example.com:443?'));
   ok('分享节点的 Reality 参数保留', !!impLink && impLink.uri.includes('pbk=imp-pbk') && impLink.uri.includes('sid=12345678'));
 
+  // 同一条链接再导一次：名称自动加序号。随后「改名 + 回传原链接」（编辑表单的链接框
+  // 预填的就是 importLink，用户只改名字也就是这个请求体）不得把名字改回链接里的
+  // 「合租香港」—— 那会撞上第一个节点，报「已存在同名节点，换个名字」
+  const imp2 = await call('/api/nodes/import', { method: 'POST', body: json({ links: IMPORT_LINK }) });
+  const impNode2 = imp2.data.items && imp2.data.items[0];
+  if (impNode2) cleanup.push(['/api/nodes/' + impNode2.id]);
+  ok('同链接二次导入自动加序号', !!impNode2 && impNode2.name === '合租香港 2', impNode2 && impNode2.name);
+  const imp2Edit = await call('/api/nodes/' + impNode2.id, {
+    method: 'PUT',
+    body: json({ name: 'SMOKE-IMPORT-2', links: IMPORT_LINK }),
+  });
+  ok('改名并回传原链接不报同名、名称以表单为准',
+    imp2Edit.status === 200 && imp2Edit.data.item.name === 'SMOKE-IMPORT-2',
+    `status=${imp2Edit.status}${imp2Edit.data.error ? ' · ' + imp2Edit.data.error : ''}`);
+
   // 分享节点改名（部分更新）：不得丢 credential / importLink
   const impRename = await call('/api/nodes/' + impNode.id, { method: 'PUT', body: json({ name: 'SMOKE-IMPORT' }) });
   ok('导入节点改名后凭证保留',

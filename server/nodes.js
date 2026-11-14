@@ -482,11 +482,31 @@ function updateNode(req, res, params, body) {
   const node = store.db().nodes.find((n) => n.id === params.id);
   if (!node) return sendJson(res, 404, { error: '节点不存在' });
   // 分享节点编辑时重新粘贴了链接：先解析，再把解析字段（协议/地址/端口/凭证/Reality…）
-  // 合并进 body。名称不来自链接 —— 以表单里的名字为准
-  if (node.mode === 'imported' && String(body.links || '').trim()) {
-    const parsed = parse.parseShareLink(String(body.links).trim());
+  // 合并进 body。名称不来自链接 —— 以表单里的名字为准。
+  //
+  // 链接与库里那条一致就整段跳过：编辑表单的文本框预填的就是 importLink，
+  // 不改链接时重解析一遍没有任何意义，却会把名字改回链接 fragment 里的原名
+  // （导入时重名被加上「 2」的那种节点，一保存就撞上原来那个同名节点，报
+  // 「已存在同名节点，换个名字」—— 用户只改了个名字却存不下去，就是这个原因）。
+  const linkLines = String(body.links || '')
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (node.mode === 'imported' && linkLines.length > 1) {
+    // 一个节点只能对应一条链接：多行时默默只取第一条，剩下几条会被当成「已保存」而丢掉
+    return sendJson(res, 400, {
+      error: `编辑只能换成一条链接（当前 ${linkLines.length} 行）；要批量导入新节点请用「新增节点 → 导入分享」`,
+    });
+  }
+  const links = linkLines[0] || '';
+  if (node.mode === 'imported' && links && links !== String(node.importLink || '').trim()) {
+    const parsed = parse.parseShareLink(links);
     if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
-    Object.assign(body, parsed.node, { importLink: String(body.links).trim() });
+    // 表单里的名字优先：parsed.node.name 是链接 fragment 里的名字，
+    // 与导入时最终落库的名字（可能被 uniqueName 加过序号）不一定相同
+    const formName = String(body.name ?? '').trim();
+    Object.assign(body, parsed.node, { importLink: links });
+    if (formName) body.name = formName;
   }
   const next = normalizeNode({ ...body }, node);
   if (nameTaken(store.db().nodes, next.name, node.id)) {
