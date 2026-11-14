@@ -264,9 +264,15 @@ async function serverDeployFlow(id) {
       </div>
 
       <div class="code" style="white-space:pre-wrap"># 部署完成后可用命令
-journalctl -u nodepanel-agent -f              # 查看 agent 日志（systemd）
-tail -f /var/log/nodepanel/agent.log          # 查看 agent 日志（Alpine / cron）
+# —— systemd（Debian / Ubuntu / CentOS / Rocky …）——
+journalctl -u nodepanel-agent -f              # 查看 agent 日志
 systemctl restart nodepanel-agent             # 手动重载
+# —— Alpine / OpenRC ——
+tail -f /var/log/nodepanel/agent.log          # 查看 agent 日志
+rc-service nodepanel-agent status             # 查看运行状态
+rc-service nodepanel-agent restart            # 手动重载
+rc-update show default | grep nodepanel       # 确认已加入开机自启
+# —— 两种系统通用 ——
 sh /opt/nodepanel/agent.sh --once             # 手动跑一轮
 cat /usr/local/etc/xray/config.json           # 查看 Xray 配置
 ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</div>

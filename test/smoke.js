@@ -2319,6 +2319,13 @@ function totpCodeOf(secret) {
   ok('下发三种远端类型', Array.isArray(bs.data.remoteTypes) && bs.data.remoteTypes.join(',') === 'webdav,s3,scp',
     (bs.data.remoteTypes || []).join(','));
   ok('备份列表里带 auto 状态', bkList.data.auto && bkList.data.auto.at === '03:30');
+  // 前端要拿它显示「备份时刻按哪个时区的 03:30 生效」，缺了就退回浏览器时区
+  const clock = bs.data.clock || {};
+  ok('下发服务器时区与当前时分',
+    Number.isFinite(clock.offset) && Math.abs(clock.offset) <= 14 * 60 &&
+    typeof clock.tz === 'string' && clock.tz.length > 0 && clock.tz !== '服务器本地时区' &&
+    /^\d{2}:\d{2}$/.test(clock.now || '') && /^UTC[+-]\d{2}:\d{2}$/.test(clock.offsetLabel || ''),
+    JSON.stringify(clock));
 
   ok('时刻写错被拒',
     (await call('/api/backups/settings', { method: 'PUT', body: json({ at: '25:00' }) })).status === 400);

@@ -1039,9 +1039,13 @@ agent 的端口自检只覆盖「本机有没有监听」；云厂商安全组�
 
   ```bash
   ssh-keygen -t ed25519 -f ~/.ssh/nodepanel -N ''     # -N '' = 不要密码短语，面板用不了带短语的私钥
-  ssh-copy-id -i ~/.ssh/nodepanel.pub 用户@主机
+  ssh-copy-id -i ~/.ssh/nodepanel.pub 用户@主机        # 对端不是 22 端口：加 -p 端口
   cat ~/.ssh/nodepanel                                # 把这一整段（没有 .pub 的那个）粘到面板里
   ```
+
+  界面上这条命令会跟着表单里的主机 / 端口 / 用户名实时变，端口填多少就带多少 `-p`。
+  `ssh-copy-id` 默认只连 22，端口对不上时报的是 `Network is unreachable` 或 `Connection refused`，
+  很容易误判成网络不通。
 
   私钥会写进 0600 的临时文件、用完立刻删；主机指纹记在数据目录的 `.ssh_known_hosts`。
 - **密码**：走 `sshpass -e`，密码经 `SSHPASS` 环境变量传给子进程 —— **不进命令行参数**，

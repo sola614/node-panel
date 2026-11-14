@@ -612,7 +612,11 @@ function showLogin() {
   $('#app').classList.add('hidden');
   $('#force-pw').classList.add('hidden');
   $('#login').classList.remove('hidden');
+  // 密码框一律清空再切屏：浏览器在「提交 + 跳转」时抓到的值才是它提示保存的依据，
+  // 离开这一屏时把值抹掉，能少一次「要保存密码吗」的弹窗
   $('#login-pass').value = '';
+  $('#fp-new').value = '';
+  $('#fp-confirm').value = '';
   setTimeout(() => $('#login-pass').focus(), 60);
 }
 

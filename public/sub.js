@@ -406,10 +406,10 @@ function renderLogin(msg = '', isError = true) {
         <b style="font-size:14px">该订阅已开启登录保护</b>
         <p class="hint" style="margin:6px 0 0">请输入管理员为你设置的登录密码</p>
       </div>
-      <form id="sub-login-form">
+      <form id="sub-login-form" autocomplete="off">
         <div class="field">
           <label>登录密码</label>
-          <input type="password" id="sub-login-pass" placeholder="登录密码" autocomplete="current-password" autofocus>
+          <input type="password" id="sub-login-pass" placeholder="登录密码" autocomplete="new-password" autofocus>
         </div>
         ${msg ? `<p class="hint" style="color:${isError ? 'var(--bad)' : 'var(--muted)'};margin:0 0 10px">${esc(msg)}</p>` : ''}
         <button class="btn btn-primary btn-block" type="submit" id="sub-login-btn" style="padding:11px">登 录</button>

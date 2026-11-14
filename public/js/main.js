@@ -270,11 +270,11 @@ RENDERERS.settings = async () => {
           </div>
           <div class="field">
             <label>原密码</label>
-            <input type="password" id="pw-old" placeholder="••••••••">
+            <input type="password" id="pw-old" placeholder="••••••••" autocomplete="new-password">
           </div>
           <div class="field">
             <label>新密码</label>
-            <input type="password" id="pw-new" placeholder="至少 8 位">
+            <input type="password" id="pw-new" placeholder="至少 8 位" autocomplete="new-password">
           </div>
           <button class="btn" data-act="change-pw">修改密码</button>
           <p class="hint">修改后所有会话失效，需要重新登录。</p>
@@ -697,6 +697,54 @@ function fmtStamp(iso) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** 设置页那口「服务器时钟」的定时器，重渲染时换一个，别叠着跑 */
+let bkClockTimer = null;
+
+/**
+ * 时区文案：`Asia/Shanghai · UTC+08:00`。
+ * tz 为空说明后端没下发（老接口），此时 offset 取的是浏览器时区，如实标注出来。
+ */
+function clockText(tz, offset) {
+  const abs = Math.abs(offset);
+  const p = (n) => String(n).padStart(2, '0');
+  const label = `UTC${offset >= 0 ? '+' : '-'}${p(Math.floor(abs / 60))}:${p(abs % 60)}`;
+  return tz ? `${tz} · ${label}` : `浏览器时区 · ${label}`;
+}
+
+/**
+ * 「备份时刻」下面那行时钟。
+ *
+ * 时刻本身是**服务器时区**的固定钟点，而浏览器的 `getHours()` 是浏览器时区 ——
+ * 面板跑在 UTC 容器里、人在东八区打开时，两者能差 8 小时，界面必须把服务器
+ * 眼中的「现在」直接摆出来，否则用户没法判断自己填的 03:30 到底是几点。
+ * 用后端下发的 offset 推算，不碰浏览器时区。
+ */
+function syncServerClock() {
+  if (bkClockTimer) {
+    clearInterval(bkClockTimer);
+    bkClockTimer = null;
+  }
+  const tzEl = $('#bk-at-tz');
+  const nowEl = $('#bk-at-now');
+  if (!tzEl || !nowEl) return;
+  const off = Number(tzEl.dataset.off) || 0;
+  const tick = () => {
+    const d = new Date(Date.now() + off * 60000);
+    const p = (n) => String(n).padStart(2, '0');
+    nowEl.textContent = `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+  };
+  tick();
+  // 半分钟一跳就够了；页面被换掉后自己停，不留下没人认领的定时器
+  bkClockTimer = setInterval(() => {
+    if (!document.contains(nowEl)) {
+      clearInterval(bkClockTimer);
+      bkClockTimer = null;
+      return;
+    }
+    tick();
+  }, 30000);
+}
+
 function backupAutoStatusText(a) {
   if (!a) return '';
   const parts = [];
@@ -722,6 +770,10 @@ function backupAutoCardHtml(a) {
     .map((t) => `<option value="${esc(t)}" ${type === t ? 'selected' : ''}>${esc(labels[t] || t)}</option>`)
     .join('');
   const pwHint = a.hasPassword ? '已设置；留空表示不修改' : '至少 8 位；留空则不加密上传';
+  // 服务器时钟：接口没给（老后端）就退回浏览器偏移，至少别显示成 --:--
+  const ck = a.clock || {};
+  const ckOff = ck.offset != null ? Number(ck.offset) : -new Date().getTimezoneOffset();
+  const ckTz = ck.tz || '';
   // SCP 的认证方式：老配置（0.1.41 及更早）只有 privateKey，按私钥显示
   const scpAuth = r && r.type === 'scp'
     ? (r.auth || (r.privateKey ? 'key' : r.password ? 'password' : 'key'))
@@ -757,6 +809,10 @@ function backupAutoCardHtml(a) {
           </div>
         </div>
         <div class="hint" style="margin:-6px 0 14px">
+          备份时刻按<b>服务器时区</b>生效（<code id="bk-at-tz"
+            data-off="${esc(ckOff)}"
+            data-tz="${esc(ckTz)}">${esc(clockText(ckTz, ckOff))}</code>，
+          服务器当前 <b id="bk-at-now">${esc(ck.now || '--:--')}</b>）。<br>
           保留份数只作用于<b>定时备份</b>（<code>panel-auto-*</code>）。手动备份、恢复前兜底、
           升级前的快照都不会被自动清理。
         </div>
@@ -886,7 +942,7 @@ function backupAutoCardHtml(a) {
             <div class="hint" style="margin:-6px 0 12px">
               没有密钥就在<b>任意一台能连上这台机器的 Linux</b> 上跑（不要设密码短语，否则面板用不了）：
               <pre class="code" style="white-space:pre-wrap;margin:6px 0">ssh-keygen -t ed25519 -f ~/.ssh/nodepanel -N ''
-ssh-copy-id -i ~/.ssh/nodepanel.pub 用户@主机</pre>
+<span id="bk-scp-copyid">ssh-copy-id -i ~/.ssh/nodepanel.pub 用户@主机</span></pre>
               然后把 <code>~/.ssh/nodepanel</code>（<b>没有 .pub 后缀的那个</b>）整段粘到上面。
               私钥只写进 0600 临时文件、用完立刻删；主机指纹记在数据目录的
               <code>.ssh_known_hosts</code> 里，换机器时会提示指纹不匹配。
@@ -951,6 +1007,24 @@ function syncScpAuth() {
   if (passBox) passBox.classList.toggle('hidden', useKey);
 }
 
+/**
+ * 私钥提示里的 ssh-copy-id 命令要跟着上面填的主机 / 端口 / 用户名走。
+ * ssh-copy-id 默认只连 22，对端改了端口就必须带 -p，否则就是「Network is unreachable」。
+ */
+function syncScpCopyIdHint() {
+  const out = $('#bk-scp-copyid');
+  if (!out) return;
+  const val = (id) => {
+    const el = $('#' + id);
+    return el ? String(el.value || '').trim() : '';
+  };
+  const host = val('bk-scp-host') || '主机';
+  const user = val('bk-scp-user') || '用户';
+  const port = val('bk-scp-port');
+  const pFlag = port && port !== '22' ? ` -p ${port}` : '';
+  out.textContent = `ssh-copy-id -i ~/.ssh/nodepanel.pub${pFlag} ${user}@${host}`;
+}
+
 /** 设置页渲染完调一次：类型 / 认证方式切换要立刻生效，不能等保存 */
 function bindBackupAutoForm() {
   const sel = $('#bk-remote-type');
@@ -960,6 +1034,13 @@ function bindBackupAutoForm() {
   const auth = $('#bk-scp-auth');
   if (auth) auth.addEventListener('change', syncScpAuth);
   syncScpAuth();
+  for (const id of ['bk-scp-host', 'bk-scp-port', 'bk-scp-user']) {
+    const el = $('#' + id);
+    if (el) el.addEventListener('input', syncScpCopyIdHint);
+  }
+  syncScpCopyIdHint();
+  // 时钟每分钟也得走，不然页面开着半天，「服务器当前」还停在加载那一刻
+  syncServerClock();
 }
 
 /** 收集表单。密钥字段留空表示「不修改」，所以空值直接不放进对象 */
@@ -2071,7 +2152,7 @@ async function runAction(act, btn, id) {
           </div>
           <div class="field">
             <label>登录密码（确认是本人在操作）</label>
-            <input type="password" id="totp-pass" autocomplete="current-password" placeholder="••••••••">
+            <input type="password" id="totp-pass" autocomplete="new-password" placeholder="••••••••">
             <div class="hint">防止会话被劫持时，别人把他自己的认证器绑上来把你锁在门外</div>
           </div>`,
         okText: '确认并开启',

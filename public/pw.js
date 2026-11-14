@@ -36,8 +36,43 @@
     btn.setAttribute('aria-pressed', revealed ? 'true' : 'false');
   }
 
+  /* --------------------------------------------------------------------------
+   * 别让浏览器/密码管理器接管这些框
+   *
+   * 面板里的密码框绝大多数是**一次性密钥**（WebDAV 密码、S3 Secret、SCP 密码、
+   * 备份加密密码、通知渠道密码…），跟登录账号毫无关系。但浏览器看到
+   * input[type=password] 就当成登录密码：打开设置页时把存过的管理员密码自动填进去，
+   * 保存后再弹「要保存密码吗」。填错一次就要排查半天，还容易把真实密码提交给远端。
+   *
+   * 统一声明 new-password：Chrome / Edge / Firefox 都不会再拿它当「已有登录密码」，
+   * 也就不会自动填充、不会在提交后提示保存。再给几个常见密码管理器打上忽略标记，
+   * 免得它们的小图标也冒出来。
+   *
+   * 集中在这里而不是逐个模板改：密码框散在十几个模板字符串里，新加一个就可能漏；
+   * 这个文件本来就在扫全部 input[type=password]（含动态渲染的弹窗），一次全覆盖。
+   * ------------------------------------------------------------------------ */
+  var NO_AUTOFILL = {
+    autocomplete: 'new-password',
+    autocapitalize: 'off',
+    autocorrect: 'off',
+    spellcheck: 'false',
+    'data-lpignore': 'true',      // LastPass
+    'data-1p-ignore': 'true',     // 1Password
+    'data-bwignore': 'true',      // Bitwarden
+    'data-form-type': 'other',    // Dashlane
+  };
+
+  function harden(input) {
+    for (var k in NO_AUTOFILL) {
+      if (input.getAttribute(k) !== NO_AUTOFILL[k]) input.setAttribute(k, NO_AUTOFILL[k]);
+    }
+  }
+
   function decorate(input) {
-    if (!input || input.dataset.pwEye === '1') return;
+    if (!input) return;
+    // 先加固再谈装饰：即使后面因为还没进文档而提前 return，属性也已经落上
+    harden(input);
+    if (input.dataset.pwEye === '1') return;
     var parent = input.parentNode;
     if (!parent) return; // 还没进文档（极端情况：模板片段），下一轮扫描会再遇到
     input.dataset.pwEye = '1';

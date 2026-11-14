@@ -32,14 +32,14 @@
         <span>Control Plane</span>
       </div>
     </div>
-    <form id="login-form">
+    <form id="login-form" autocomplete="off">
       <div class="field">
         <label>管理员账号</label>
         <input type="text" id="login-user" value="admin" autocomplete="username" placeholder="admin">
       </div>
       <div class="field">
         <label>密码</label>
-        <input type="password" id="login-pass" autocomplete="current-password" placeholder="••••••••">
+        <input type="password" id="login-pass" autocomplete="new-password" placeholder="••••••••">
       </div>
       <div class="field" id="login-totp-field" hidden>
         <label>动态码 / 恢复码</label>
@@ -70,7 +70,7 @@
     <p class="hint" style="margin:0 0 14px">
       当前账号还在使用出厂默认密码。这个面板可能暴露在公网，请先改掉再继续。
     </p>
-    <form id="force-pw-form">
+    <form id="force-pw-form" autocomplete="off">
       <div class="field">
         <label>新密码</label>
         <input type="password" id="fp-new" autocomplete="new-password" placeholder="至少 8 位，别用 admin888">

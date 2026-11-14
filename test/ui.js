@@ -1497,6 +1497,15 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   ok('有开关 / 时刻 / 保留份数',
     !!d9.querySelector('#bk-auto') && !!d9.querySelector('#bk-at') &&
     !!d9.querySelector('#bk-keep-local') && !!d9.querySelector('#bk-keep-remote'));
+  // 「03:30」是按服务器时区算的，页面上必须把时区和服务器当前时分摆出来
+  const tzEl = d9.querySelector('#bk-at-tz');
+  const tzNow = d9.querySelector('#bk-at-now');
+  ok('时刻旁标注服务器时区与当前时分',
+    !!tzEl && /UTC[+-]\d{2}:\d{2}/.test(tzEl.textContent) &&
+    !!tzNow && /^\d{2}:\d{2}$/.test(tzNow.textContent),
+    `${tzEl && tzEl.textContent} · 当前 ${tzNow && tzNow.textContent}`);
+  ok('时区偏移动态下发（前端据此推算，不依赖浏览器时区）',
+    tzEl && tzEl.dataset.off !== '' && Number.isFinite(Number(tzEl.dataset.off)), tzEl && tzEl.dataset.off);
   const bkTypes = [...d9.querySelectorAll('#bk-remote-type option')].map((o) => o.value).join(',');
   ok('远端可选「不推送 + 三种类型」', bkTypes === ',webdav,s3,scp', bkTypes);
   // 字段块的可见性要用**两个维度**判断：0.1.40 这里出过 bug —— 渲染时写的是
@@ -1533,6 +1542,21 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     d9.querySelector('#bk-scp-auth').value === 'key' &&
     bkShown('bk-scp-key-box') && !bkShown('bk-scp-pass-box') &&
     /ssh-keygen/.test(d9.querySelector('#bk-remote-scp').textContent));
+  // 对端不是 22 端口时，照着提示抄的命令必须带 -p，否则会连 22 报 Network is unreachable
+  const hintHost = d9.querySelector('#bk-scp-host');
+  const hintUser = d9.querySelector('#bk-scp-user');
+  const hintPort = d9.querySelector('#bk-scp-port');
+  hintHost.value = 'backup.example.com';
+  hintUser.value = 'root';
+  hintPort.value = '22022';
+  for (const el of [hintHost, hintUser, hintPort]) el.dispatchEvent(new w9.Event('input', { bubbles: true }));
+  const copyIdCmd = d9.querySelector('#bk-scp-copyid').textContent;
+  ok('端口不是 22 时 ssh-copy-id 提示自动带 -p 和实际主机名',
+    copyIdCmd.includes('-p 22022') && copyIdCmd.includes('root@backup.example.com'), copyIdCmd);
+  hintPort.value = '22';
+  hintPort.dispatchEvent(new w9.Event('input', { bubbles: true }));
+  const copyIdCmd22 = d9.querySelector('#bk-scp-copyid').textContent;
+  ok('端口是 22 时提示不加 -p', !copyIdCmd22.includes('-p '), copyIdCmd22);
   const scpAuthSel = d9.querySelector('#bk-scp-auth');
   scpAuthSel.value = 'password';
   scpAuthSel.dispatchEvent(new w9.Event('change', { bubbles: true }));
@@ -1845,6 +1869,20 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
     await sleep(150);
     const dyn = d13.querySelector('#dyn-pass');
     ok('动态插入的密码框也会自动挂眼睛', !!dyn && !!dyn.parentElement.querySelector('.pw-eye'));
+
+    // 浏览器/密码管理器不许接管这些框：面板里的密码多是一次性密钥，
+    // 被自动填成管理员密码或弹「要保存密码吗」都是事故
+    const allPass = [...d13.querySelectorAll('input[type=password]')];
+    ok('密码框一律声明 new-password', allPass.length > 0 && allPass.every((el) => el.getAttribute('autocomplete') === 'new-password'),
+      `${allPass.length} 个`);
+    ok('密码框带密码管理器忽略标记',
+      allPass.every((el) => el.getAttribute('data-lpignore') === 'true' &&
+        el.getAttribute('data-1p-ignore') === 'true' && el.getAttribute('data-bwignore') === 'true'));
+    ok('登录密码框不再是 current-password', pass.getAttribute('autocomplete') === 'new-password',
+      pass.getAttribute('autocomplete'));
+    ok('登录表单整体关掉自动填充', d13.querySelector('#login-form').getAttribute('autocomplete') === 'off');
+    ok('动态插入的密码框同样禁止保存',
+      !!dyn && dyn.getAttribute('autocomplete') === 'new-password' && dyn.getAttribute('data-lpignore') === 'true');
   }
   dom13.window.close();
 
