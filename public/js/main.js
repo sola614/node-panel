@@ -1925,6 +1925,15 @@ async function runAction(act, btn, id) {
     case 'relay-edit':
       await relayEditFlow(id);
       break;
+    case 'relay-copy':
+      await relayCopyFlow(id);
+      break;
+    case 'relay-toggle':
+      await relayToggleFlow(id);
+      break;
+    case 'relay-refresh':
+      await render();
+      break;
     case 'relay-del':
       relayDelFlow(id);
       break;

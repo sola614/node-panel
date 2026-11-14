@@ -21,6 +21,13 @@ const RELAY_STATE = {
 const RELAY_TOOL_BADGE = { gost: 'badge-purple', iptables: 'badge-dim' };
 
 function relayStateOf(r) {
+  if (r.enabled === false) {
+    return {
+      label: '已停用',
+      cls: 'badge-dim',
+      tip: '已停用：不再下发到入口机（机器上的转发会被清理），关联的节点入口已从订阅移除；点「启用」恢复',
+    };
+  }
   // agent 在线时的 planned 不是「没部署」，而是「等着下一轮同步」——文案要区分开，
   // 否则会被误认为 agent 不会自动部署规则
   if (r.status === 'planned' && r.serverOnline) {
@@ -66,7 +73,9 @@ RENDERERS.relays = async () => {
   state.data.relayNodes = d.nodes;
 
   // 中转机统一在「服务器」页（中转服务器 tab）新增 / 编辑，这里只维护规则
-  $('#page-actions').innerHTML = '<button class="btn btn-primary btn-sm" data-act="relay-new">+ 添加规则</button>';
+  $('#page-actions').innerHTML =
+    '<button class="btn btn-sm btn-ghost" data-act="relay-refresh" title="重新拉取规则与流量">刷新</button>' +
+    '<button class="btn btn-primary btn-sm" data-act="relay-new">+ 添加规则</button>';
 
   const rows = d.items.length
     ? d.items
@@ -76,13 +85,16 @@ RENDERERS.relays = async () => {
             ? esc(r.nodeName)
             : '<span style="color:var(--muted)">未关联</span>';
           const used = Number(r.trafficBytes) || 0;
-          const usedCell = !r.trafficAt
-            ? '<span style="color:var(--muted)" title="需要在中转机部署 agent 才能采集入口流量">未采集</span>'
-            : used > 0
-              ? `<span class="mono">${fmtBytes(used)}</span><div class="cell-sub">${
-                  r.lastUsedAt ? esc(fmtAgo(r.lastUsedAt)) + '用过' : '—'
-                }</div>`
-              : '<span style="color:var(--muted)">未使用</span>';
+          const usedCell =
+            r.enabled === false
+              ? '<span style="color:var(--muted)">—</span>'
+              : !r.trafficAt
+                ? '<span style="color:var(--muted)" title="需要在中转机部署 agent 才能采集入口流量">未采集</span>'
+                : used > 0
+                  ? `<span class="mono">↓ ${fmtBytes(used)}</span><div class="cell-sub">${
+                      r.lastUsedAt ? esc(fmtAgo(r.lastUsedAt)) + '用过' : '—'
+                    }</div>`
+                  : '<span style="color:var(--muted)">未使用</span>';
           // agent 在线时规则会自动同步，「脚本」只作为手动重跑 / 排查入口，不该抢主按钮的位置
           const scriptBtn = r.serverOnline
             ? `<button class="btn btn-sm btn-ghost" data-act="relay-script" data-id="${r.id}" title="agent 在线时自动同步；这里用于手动重跑或排查">手动脚本</button>`
@@ -97,7 +109,7 @@ RENDERERS.relays = async () => {
         <td><span class="badge ${RELAY_TOOL_BADGE[r.tool] || 'badge-dim'}">${esc(r.tool)}</span></td>
         <td class="mono" style="white-space:nowrap">${relayTargetText(r)}</td>
         <td>${esc(r.proto)}</td>
-        <td>${node}${r.usedByEntries ? '<div class="cell-sub">已被节点入口引用</div>' : ''}</td>
+        <td>${node}${r.usedEntryCount ? `<div class="cell-sub">${r.usedEntryCount} 个入口引用</div>` : ''}</td>
         <td>${usedCell}</td>
         <td><span class="badge ${st.cls}" title="${esc(st.tip)}">${st.label}</span>${
             r.appliedAt ? `<div class="cell-sub">${esc(fmtAgo(r.appliedAt))}回执</div>` : ''
@@ -106,6 +118,8 @@ RENDERERS.relays = async () => {
           <div class="row-actions">
             ${scriptBtn}
             <button class="btn btn-sm btn-ghost" data-act="relay-diag" data-id="${r.id}">诊断</button>
+            <button class="btn btn-sm btn-ghost" data-act="relay-toggle" data-id="${r.id}">${r.enabled === false ? '启用' : '停用'}</button>
+            <button class="btn btn-sm btn-ghost" data-act="relay-copy" data-id="${r.id}">复制</button>
             <button class="btn btn-sm btn-ghost" data-act="relay-edit" data-id="${r.id}">编辑</button>
             <button class="btn btn-sm btn-danger" data-act="relay-del" data-id="${r.id}">删</button>
           </div>
@@ -199,6 +213,27 @@ function relayFormBody(r, d) {
         gost / iptables 都由 agent 每轮同步（约 60s）探测重选。
         <br>iptables 模式下域名会在入口机上解析成 IPv4 再写 DNAT（DNS 好查不到时回执会明确报错）。
       </div>
+      ${
+        nodes.length
+          ? `<div style="margin-top:10px">
+              <div class="hint" style="margin:0 0 6px">从节点选择（可多选，自动填入「地址:端口」；取消勾选会移除对应行）</div>
+              <div style="max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px 10px">
+                ${nodes
+                  .map((n) => {
+                    const host = n.host || n.address || '';
+                    const key = host ? `${host}:${n.port}` : '';
+                    const picked = !!(key && r && relayTargetsText(r).split('\n').some((line) => line.trim() === key));
+                    return `<label style="display:flex;gap:8px;align-items:center;padding:3px 0;font-size:12.5px;${host ? '' : 'opacity:.55'}">
+                      <input type="checkbox" class="rl-node-pick" data-target="${esc(key)}" ${host ? '' : 'disabled'} ${picked ? 'checked' : ''}>
+                      <span>${esc(n.name)}</span>
+                      <span class="mono" style="margin-left:auto;color:var(--muted)">${host ? esc(key) : '地址未上报'}</span>
+                    </label>`;
+                  })
+                  .join('')}
+              </div>
+            </div>`
+          : ''
+      }
     </div>
     <div class="field">
       <label>关联节点（可选，仅台账展示）</label>
@@ -216,6 +251,46 @@ function relayFormBody(r, d) {
       <label>备注（选填）</label>
       <input type="text" id="rl-note" value="${esc((r && r.note) || '')}">
     </div>`;
+}
+
+/**
+ * 节点多选 → 目标文本框：
+ * 勾选追加 `地址:端口`；取消勾选移除对应行（只删完全匹配的那行，不动手填内容）。
+ * 手动编辑 textarea 时同步勾选状态，避免「框里有了但复选框没亮」。
+ */
+function bindRelayNodePicker(mask) {
+  const ta = $('#rl-targets', mask);
+  if (!ta) return;
+  const boxes = $$('.rl-node-pick', mask);
+  const sync = () => {
+    const lines = new Set(
+      ta.value
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+    boxes.forEach((b) => {
+      b.checked = !!b.dataset.target && lines.has(b.dataset.target);
+    });
+  };
+  boxes.forEach((box) => {
+    box.addEventListener('change', () => {
+      const target = box.dataset.target || '';
+      if (!target) return;
+      let lines = ta.value
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (box.checked) {
+        if (!lines.includes(target)) lines.push(target);
+      } else {
+        lines = lines.filter((l) => l !== target);
+      }
+      ta.value = lines.join('\n');
+    });
+  });
+  ta.addEventListener('input', sync);
+  sync();
 }
 
 function readRelayForm(mask) {
@@ -262,7 +337,7 @@ async function relayNewFlow() {
     if (nav) nav.click();
     return;
   }
-  openModal({
+  const mask = openModal({
     title: '添加中转规则',
     wide: true,
     body: relayFormBody(null, d),
@@ -283,13 +358,14 @@ async function relayNewFlow() {
       await render();
     },
   });
+  bindRelayNodePicker(mask);
 }
 
 async function relayEditFlow(id) {
   const r = (state.data.relayItems || []).find((x) => x.id === id);
   if (!r) return;
   const d = await api('/api/relays');
-  openModal({
+  const mask = openModal({
     title: '编辑中转规则 · ' + r.name,
     wide: true,
     body: relayFormBody(r, d),
@@ -310,6 +386,68 @@ async function relayEditFlow(id) {
       await render();
     },
   });
+  bindRelayNodePicker(mask);
+}
+
+async function relayCopyFlow(id) {
+  const r = (state.data.relayItems || []).find((x) => x.id === id);
+  if (!r) return;
+  const d = await api('/api/relays');
+  if (!(d.servers || []).length) {
+    toast('还没有中转服务器，请先到「服务器」页的「中转服务器」tab 添加', 'err');
+    return;
+  }
+  // 端口留空：复制出来的规则要落到同一入口机的另一个端口，让用户明确填
+  const copy = {
+    ...r,
+    name: copyName(r.name, (d.items || []).map((x) => x.name)),
+    listenPort: '',
+  };
+  const mask = openModal({
+    title: '复制中转规则 · ' + r.name,
+    wide: true,
+    body: relayFormBody(copy, d),
+    okText: '复制',
+    onOk: async (m) => {
+      const payload = readRelayForm(m);
+      const err = validateRelayForm(payload);
+      if (err) throw new Error(err);
+      await api('/api/relays', { method: 'POST', body: JSON.stringify(payload) });
+      toast('规则已复制，填好新的监听端口后 agent 会自动同步', 'ok');
+      closeModal();
+      await render();
+    },
+  });
+  bindRelayNodePicker(mask);
+}
+
+/** 停用 / 启用：停用后入口机清理转发，关联的节点入口一并停用 */
+async function relayToggleFlow(id) {
+  const r = (state.data.relayItems || []).find((x) => x.id === id);
+  if (!r) return;
+  const enable = r.enabled === false;
+  const count = Number(r.usedEntryCount) || 0;
+  confirmDialog(
+    enable ? '启用中转规则' : '停用中转规则',
+    enable
+      ? `启用「${r.name}」后，入口机会在下一轮同步时重新下发转发规则${
+          count ? `，关联的 ${count} 个节点入口也会恢复发布` : ''
+        }。`
+      : `停用「${r.name}」后：\n· 入口机会在下一轮同步（≤60s）删除这条转发\n· ${
+          count ? `节点上关联的 ${count} 个中转入口会一并停用，订阅里不再发布` : '当前没有关联的节点入口'
+        }\n\n随时可以重新启用。`,
+    async () => {
+      const d = await api('/api/relays/' + id + '/toggle', {
+        method: 'POST',
+        body: JSON.stringify({ enabled: enable }),
+      });
+      toast(
+        `${enable ? '已启用' : '已停用'}${d.entries ? `，${d.entries} 个节点入口已${enable ? '恢复' : '停用'}` : ''}`,
+        'ok',
+      );
+      await render();
+    },
+  );
 }
 
 function relayDelFlow(id) {

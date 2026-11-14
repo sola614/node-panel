@@ -1931,6 +1931,29 @@ function totpCodeOf(secret) {
     && afterEntry.host === '198.51.100.10'
     && Number(afterEntry.port) === 9443);
 
+  // 停用 / 启用（0.1.48）：停用后规则不再下发，关联的节点入口 disabled（订阅过滤）
+  await call('/api/nodes/' + nodeRelayId, {
+    method: 'PUT',
+    body: json({ entries: [{ name: '入口1', relayId: rlId, host: 'x', port: 9 }] }),
+  });
+  const findEntry = (list, id) => (((list.data.items.find((n) => n.id === id) || {}).entries) || [])[0] || {};
+  const toggleOff = await call('/api/relays/' + rlId + '/toggle', {
+    method: 'POST',
+    body: json({ enabled: false }),
+  });
+  ok('停用规则：关联入口一并停用',
+    toggleOff.status === 200 && toggleOff.data.item.enabled === false && toggleOff.data.entries === 1);
+  ok('停用后节点入口 disabled', findEntry(await call('/api/nodes'), nodeRelayId).disabled === true);
+  const relayCfgOff = await call('/api/agent/config?token=' + rsToken);
+  ok('停用后规则不再下发', (relayCfgOff.data.relay.rules || []).every((r) => r.id !== rlId));
+  const toggleOn = await call('/api/relays/' + rlId + '/toggle', {
+    method: 'POST',
+    body: json({ enabled: true }),
+  });
+  ok('启用后入口恢复', toggleOn.status === 200 && findEntry(await call('/api/nodes'), nodeRelayId).disabled === false);
+  const relayCfgOn = await call('/api/agent/config?token=' + rsToken);
+  ok('启用后规则恢复下发', (relayCfgOn.data.relay.rules || []).some((r) => r.id === rlId));
+
   // 三态脚本下发：生成即轮换凭证；token 只出现在脚本正文里，列表不回显
   const relayList = await call('/api/relays');
   ok('列表不回显 deployToken', relayList.data.items.every((r) => r.deployToken === undefined));

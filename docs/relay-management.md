@@ -35,7 +35,7 @@
 - **转发工具按规则选择**：`tool: gost | iptables`。gost 为用户态转发（systemd 托管进程，无需改内核转发，适配 NAT/受限环境）；iptables 为内核态 DNAT（零进程、性能最优）。字段预留扩展位（后续可加 realm / socat 等，生成器按 tool 分发）。
 - **节点联动**：`node.entries` 元素新增可选 `relayId`。选中中转规则后 host/port 自动以规则为准；手填模式保留（兼容旧数据）。
 
-## 3. 数据模型（lib/store.js TABLE_SPECS，schema 14 → 15，只加法迁移）
+## 3. 数据模型（lib/store.js TABLE_SPECS，schema 14 → 17，只加法迁移）
 
 ```js
 // servers：统一机器台账（0.1.44）
@@ -68,6 +68,7 @@
   // 入口机视角诊断（0.1.47）
   diagRequestedAt: null, // 面板点「从入口机检测」后写入；agent 下一轮带探针下来
   agentProbe: null,      // agent 回传的探测结果 JSON：{ at, targets:[{host,port,ok,ms,error}] }
+  enabled: true,         // 0.1.48：停用后不下发（agent 清理），关联节点入口一并 disabled
 }
 ```
 
@@ -94,6 +95,7 @@
 | `GET /api/relays/:id/script?mode=install\|uninstall\|check` | 按 tool 分发生成三态脚本，并 rotate deployToken（手动通道） |
 | `POST /api/relays/:id/diag` | 默认 `source=panel`：从面板逐个 TCP 握手所有目标，返回 `{ ok, ms, error }` 与「按顺序第一个可达」的 `active`；`source=agent`（0.1.47）改为**请求入口机探测**，返回 `{ pending, requestedAt }` |
 | `GET /api/relays/:id/probe` | 读取入口机视角诊断结果：`{ diagRequestedAt, agentProbe }`，前端轮询用 |
+| `POST /api/relays/:id/toggle` | 停用 / 启用（0.1.48）：停用后规则不下发，关联的节点入口 `disabled=true`（订阅过滤）；启用恢复 |
 | `POST /api/relay/ack` | **免登录回执**：relayId + deployToken（恒时比较）→ status=applied/unknown + appliedAt。沿袭免登录 POST 1.5MB 限额与限流（http-util.js readBody 机制） |
 | `POST /api/agent/receipt`（relay token） | 除同步状态外，额外接受 `traffic: { ruleId: 计数器原值 }`（0.1.47，按差值累计）与 `probe: { ruleId: { at, targets } }`（入口机诊断结果） |
 | `GET /api/servers/:id/install`（relay 型） | relayOnly 安装脚本：只部署 agent，不安装 Xray / Hysteria2 |
@@ -105,8 +107,11 @@
 
 ### 5.1 iptables（升级现有 buildRelayScript）
 
-- install：sysctl ip_forward → **依赖检查 / 自动安装**（缺 iptables 时按 apk / apt / dnf / yum / pacman / zypper 自动装；`-m comment` 缺失降级为无标签并提示）→ **目标探测**（按顺序 nc / /dev/tcp，取第一个可达）→ 幂等插入**带标签** `np-relay:<id>` 的 DNAT + MASQUERADE → 持久化（netfilter-persistent / OpenRC `iptables save` / iptables-save）→ 末尾 curl 回执（失败不影响规则生效）
-- uninstall：按标签 `iptables -t nat -S PREROUTING | grep "np-relay:<id>"` 逐条 `-D`（不依赖行号）→ 无标签时按监听端口删 → 回执
+- install：sysctl ip_forward → **依赖检查 / 自动安装**（缺 iptables 时按 apk / apt / dnf / yum / pacman / zypper 自动装；`-m comment` 缺失降级为无标签并提示）→ **目标探测**（按顺序 nc / /dev/tcp，取第一个可达）→ 幂等插入**带标签** `np-relay:<id>` 的 DNAT + MASQUERADE + **FORWARD ACCEPT** → 持久化（netfilter-persistent / OpenRC `iptables save` / iptables-save）→ 末尾 curl 回执（失败不影响规则生效）
+  > DNAT 只改目标地址，包还要经过 FORWARD。云主机 / Docker 环境常把 FORWARD 默认设为 DROP，
+  > 规则写对了也会静默丢包；所以每条规则同时放行 `FORWARD -d <目标IP> --dport <落地端口>`，
+  > 卸载时一起清理。
+- uninstall：按标签 `iptables -t nat -S PREROUTING | grep "np-relay:<id>"` 逐条 `-D`（不依赖行号）→ 无标签时按监听端口删 → **FORWARD 放行同样按标签清掉** → 回执
 - check：只读列出本机全部 `np-relay:*` 规则 + 本规则存活状态 → 回执
 - 多目标：静态规则只能指向一个目标，安装时探测选优；已装 agent 的中转机每轮收敛重选，纯手动模式需重跑 install
 - **目标地址**：iptables DNAT 的 `--to-destination` 只接受 IPv4，域名会由 agent 在**入口机**上
@@ -168,6 +173,8 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 - 「服务器」视图按 **tab 分组**：节点服务器 / 中转服务器（互斥展示，新增按钮跟着当前 tab）
   - 新建弹窗先选类型：节点服务器（跑 Xray / Hysteria2）或中转服务器（入口机）
   - 中转卡片显示「转发规则」数而不是节点 / 用户数；部署 / 卸载弹窗文案按类型分叉
+  - 卡片布局（0.1.48）：勾选框独立居左，名称 / 地址各占一行（超长省略），
+    同步徽章、在线状态与最后心跳单独一行；节点 / 用户统计再一行，避免挤在标题栏
 - 「设置 → 站点信息」新增 **GitHub 反代加速**：只影响中转机下载 gost；留空直连。
   中转机检测到中国大陆 IP 时自动拼接，格式 `反代前缀 + GitHub 地址`
 - 「中转」视图只管规则：改为添加规则时若还没有中转机，提示并跳到服务器页的中转 tab
@@ -177,7 +184,19 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
   - 目标地址改为**大文本框**（一行一个 `host:port`，最多 8 个），列表转发方向显示首个目标 + `+N`
   - 每行新增「诊断」按钮：弹窗分两块 —— **面板视角（即时）** 与 **入口机视角（agent 上报）**。
   入口机视角点「从入口机检测」后写入请求，弹窗轮询结果（最多 90 秒；agent 下一轮同步回传）
-  - 规则表新增「使用」列（0.1.47）：累计入口字节 + 最近使用时间；从未采集时显式提示「需要 agent」
+  - 规则表新增「使用」列（0.1.47）：`↓ 累计入站字节` + 最近使用时间；从未采集时显式提示
+    「需要 agent」，停用规则显示 `—`。流量来自入口机 iptables 计数器，按回执差值累计，
+    只统计客户端 → 入口机方向，不参与用户额度计费
+  - 每行新增「复制」：预填原规则的目标 / 工具 / 协议 / 关联节点，**监听端口留空**
+    （复制到同一入口机的另一个端口），名称自动去重；保存时仍走端口冲突校验
+  - 目标地址支持**从节点列表多选**：勾选节点自动追加 `地址:端口`，取消勾选移除对应行；
+    地址未上报的节点置灰不可选
+  - 每行新增「停用 / 启用」（0.1.48）：停用后规则不再下发，入口机下一轮清理转发；
+    关联的节点入口一并 `disabled`，订阅不再发布；启用后恢复
+  - 列表右上角新增「刷新」，重新拉取规则状态与流量
+- 「节点 → 新增/编辑」弹窗的中转入口支持**拖拽排序**：拖动每行左侧 `⋮⋮` 调整顺序，
+  顺序与订阅里的入口顺序一致；拖拽只重排数据后重新渲染，行索引与输入事件始终对齐；
+  另提供 `↑ / ↓` 按钮作为移动端兜底
 - 部署到中转机后，规则由 agent 自动同步；每行仍保留三态脚本按钮（未装 agent / 排查用）
 
 ## 7. 安全考量

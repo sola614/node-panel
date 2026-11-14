@@ -256,6 +256,9 @@ if (!hasBash) {
   ok('中转收敛包持久化兼容 OpenRC', sync.includes('rc-service iptables save'));
   ok('iptables 脚本解析域名目标',
     iptInstall.includes('resolve_ipv4') && iptInstall.includes('nslookup') && sync.includes('resolve_ipv4'));
+  ok('iptables 规则放行 FORWARD 转发',
+    iptInstall.includes('add_fwd FORWARD') && sync.includes('add_fwd FORWARD'));
+
   ok('gost 收敛包按顺序探测目标',
     sync.includes("NP_TARGETS='5.6.7.8:443 5.6.7.9:443'") && sync.includes('nc -z -w 2'));
   ok('gost 下载支持 GitHub 反代 + 大陆检测',
@@ -411,6 +414,7 @@ ok('iptables install 有端口占用预检', ipInst.includes('已被其它 DNAT 
 const ipUni = relayRuleScript('uninstall', 'iptables');
 ok('iptables uninstall 按标签删除（-S 转 -D，不依赖行号）', ipUni.includes('grep -F "np-relay:$RELAY_ID"'));
 ok('iptables uninstall 有无标签兜底（按监听端口匹配）', ipUni.includes('--dport $LISTEN_PORT'));
+ok('iptables uninstall 清理 FORWARD 放行', ipUni.includes('iptables -D FORWARD'));
 const ipChk = relayRuleScript('check', 'iptables');
 ok('iptables check 只读盘点全部面板规则', ipChk.includes("grep -F 'np-relay:'"));
 

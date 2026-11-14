@@ -845,6 +845,7 @@ ${lockMode ? '只填一条：保存后会覆盖本节点的地址、端口与凭
         客户端连接入口地址，流量经 L4 转发落到本节点所在机器，<b>一个入口发布为订阅里的一条节点</b>，
         方便客户端自动选路与故障转移。不填任何入口 = 直连。入口机器上执行「节点 → 部署 → 中转脚本」即可。
         <br>· 与「端口跳跃」<b>互斥</b>：填了跳跃范围就不能再用中转入口（客户端连的是入口机，落地机的转发表看不到这批流量）。
+        <br>· 多个入口时，拖动每行左侧的 <b>⋮⋮</b> 调整顺序，订阅里的入口顺序与之相同。
       </p>
     </div>
 
@@ -1175,6 +1176,10 @@ function bindNodeForm(mask) {
         const locked = !!e.relayId;
         return `<div class="entry-row" data-i="${i}" style="border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:9px">
         <div style="display:flex;gap:8px;align-items:center">
+          <span class="drag-handle" draggable="true" title="拖动调整入口顺序（影响订阅里的入口顺序）" style="cursor:grab;color:var(--muted);user-select:none;padding:0 2px;flex-shrink:0">⋮⋮</span>
+          <button type="button" class="btn btn-sm btn-ghost e-up" title="上移" ${i === 0 ? 'disabled' : ''} style="padding:2px 6px;flex-shrink:0">↑</button>
+          <button type="button" class="btn btn-sm btn-ghost e-down" title="下移" ${i === entries.length - 1 ? 'disabled' : ''} style="padding:2px 6px;flex-shrink:0">↓</button>
+          ${e.disabled ? '<span class="badge badge-dim" style="flex-shrink:0" title="关联的中转规则已停用，或手动停用了这个入口">已停用</span>' : ''}
           <input type="text" class="e-name" value="${esc(e.name)}" placeholder="名称，如：广州中转" style="flex:0 0 130px">
           <select class="e-relay" style="flex:0 0 190px;min-width:0">
             <option value="">手填地址</option>
@@ -1319,6 +1324,71 @@ function bindNodeForm(mask) {
     else if (t.classList.contains('e-port')) entries[i].port = t.value.trim();
     else if (t.classList.contains('e-hidden')) entries[i].hidden = t.checked;
   });
+
+  // 入口顺序 = 订阅里的入口顺序。拖拽只改数组顺序后重新渲染，
+  // data-i 与输入事件索引始终一致，避免拖完 DOM 与 entries 错位。
+  const entriesBox = $('#entries-list', mask);
+  if (entriesBox) {
+    let dragFrom = -1;
+    const clearOutline = () => $$('.entry-row', mask).forEach((r) => (r.style.outline = ''));
+    entriesBox.addEventListener('dragstart', (e) => {
+      const handle = e.target.closest('.drag-handle');
+      if (!handle) {
+        e.preventDefault();
+        return;
+      }
+      const row = handle.closest('.entry-row');
+      dragFrom = Number(row.dataset.i);
+      e.dataTransfer.effectAllowed = 'move';
+      try {
+        e.dataTransfer.setData('text/plain', String(dragFrom));
+      } catch {
+        /* 某些浏览器/iframe 里不允许 setData，dragstart 本身已够用 */
+      }
+    });
+    entriesBox.addEventListener('dragover', (e) => {
+      const row = e.target.closest('.entry-row');
+      if (!row || dragFrom < 0) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      clearOutline();
+      row.style.outline = '1px dashed var(--accent)';
+    });
+    entriesBox.addEventListener('dragleave', (e) => {
+      const row = e.target.closest('.entry-row');
+      if (row) row.style.outline = '';
+    });
+    entriesBox.addEventListener('drop', (e) => {
+      const row = e.target.closest('.entry-row');
+      if (!row || dragFrom < 0) return;
+      e.preventDefault();
+      const to = Number(row.dataset.i);
+      if (Number.isFinite(to) && to !== dragFrom) {
+        const [moved] = entries.splice(dragFrom, 1);
+        entries.splice(to, 0, moved);
+        renderEntries();
+      }
+      dragFrom = -1;
+      clearOutline();
+    });
+    entriesBox.addEventListener('dragend', () => {
+      dragFrom = -1;
+      clearOutline();
+    });
+    // 移动端兜底：↑ / ↓ 按钮同样重排 entries，重渲染后行索引一致
+    entriesBox.addEventListener('click', (e) => {
+      const up = e.target.closest('.e-up');
+      const down = e.target.closest('.e-down');
+      if (!up && !down) return;
+      const row = (up || down).closest('.entry-row');
+      if (!row) return;
+      const i = Number(row.dataset.i);
+      const j = up ? i - 1 : i + 1;
+      if (j < 0 || j >= entries.length) return;
+      [entries[i], entries[j]] = [entries[j], entries[i]];
+      renderEntries();
+    });
+  }
 
   renderEntries();
   state.entryDraft = entries;

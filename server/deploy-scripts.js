@@ -844,9 +844,14 @@ if [ "$RELAY_ONLY" = "1" ]; then
         iptables -t nat -D "$_chain" $_r 2>/dev/null || true
       done
     done
+    # filter 表的 FORWARD 放行（DNAT 之后还要过 FORWARD）
+    iptables -S FORWARD 2>/dev/null | grep -F 'np-relay' | sed 's/^-A FORWARD //' | while IFS= read -r _r; do
+      [ -n "$_r" ] || continue
+      iptables -D FORWARD $_r 2>/dev/null || true
+    done
     iptables -t nat -D PREROUTING -j NP_RELAY_COUNT 2>/dev/null || true
     iptables -t nat -X NP_RELAY_COUNT 2>/dev/null || true
-    echo "  ✓ 已清理带 np-relay 标签的 NAT 规则"
+    echo "  ✓ 已清理带 np-relay 标签的 NAT / FORWARD 规则"
   fi
   echo "  · 已跳过 Hysteria2 / Xray 清理（中转机不安装这两样）"
 else
@@ -1162,6 +1167,10 @@ function buildIptablesRelayScript({ rule, mode, panelUrl }) {
   const targetPort = targets[0] ? targets[0].port : 443;
   const targetsBash = targets.map((t) => `'${t.host}:${t.port}'`).join(' ');
   const protocols = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto === 'udp' ? 'udp' : 'tcp'];
+  // DNAT 之后还要过 FORWARD；默认 DROP 的机器会静默丢包
+  const fwdLines = protocols
+    .map((p) => `add_fwd FORWARD -p ${p} -d "$TARGET_HOST" --dport "$TARGET_PORT" -j ACCEPT $TAG`)
+    .join('\n');
 
   if (mode === 'install') {
     const dnatLines = protocols
@@ -1225,6 +1234,10 @@ fi
 # 幂等写入 NAT 规则（已存在则跳过）
 add_rule() {
   iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"
+}
+# filter 表的 FORWARD 放行（DNAT 之后还要过 FORWARD）
+add_fwd() {
+  iptables -C "$@" 2>/dev/null || iptables -A "$@"
 }
 
 # 目标探测：按顺序取第一个能建立 TCP 连接的。iptables 规则是静态的，
@@ -1304,6 +1317,7 @@ echo "  使用目标：$TARGET_HOST:$TARGET_PORT"
 
 add_rule POSTROUTING -d "$TARGET_HOST" -j MASQUERADE $TAG
 ${dnatLines}
+${fwdLines}
 
 echo ""
 echo "✓ 中转规则已生效"
@@ -1385,6 +1399,19 @@ else
   del_target PREROUTING
   echo "  MASQUERADE 未删（无标签无法精确定位，可能被同目标规则共用）："
   iptables -t nat -S POSTROUTING | grep -F -- "-d $TARGET_HOST" || echo "  （没有该目标的 MASQUERADE）"
+fi
+
+# filter 表 FORWARD 放行也要清（有标签按标签，无标签按 dport）
+if iptables -m comment -h >/dev/null 2>&1; then
+  iptables -S FORWARD | grep -F "np-relay:\$RELAY_ID" | sed 's/^-A FORWARD //' | while IFS= read -r r; do
+    echo "→ 删除 FORWARD：$r"
+    iptables -D FORWARD $r || true
+  done
+else
+  iptables -S FORWARD | grep -E -- "--dport $LISTEN_PORT( |$)" | sed 's/^-A FORWARD //' | while IFS= read -r r; do
+    echo "→ 删除 FORWARD：$r"
+    iptables -D FORWARD $r || true
+  done
 fi
 
 # 标签与目标两种途径都过一遍（幂等：删过了就静默跳过），防止历史遗留混装
@@ -1873,6 +1900,14 @@ fi
     const checks = protos
       .map((p) => `iptables -t nat -C PREROUTING -p ${p} --dport ${listen} -j DNAT --to-destination "$_h:$_p" $TAG 2>/dev/null || _need=1`)
       .join('\n');
+    // DNAT 只改目标地址，包还要经过 FORWARD 转发。云主机 / Docker 环境里 FORWARD
+    // 常常是 DROP，规则写对了也会静默丢包 —— 这是「nat 规则在、端口却不通」的常见原因
+    const fwdChecks = protos
+      .map((p) => `iptables -C FORWARD -p ${p} -d "$_h" --dport $_p -j ACCEPT $TAG 2>/dev/null || _need=1`)
+      .join('\n');
+    const fwdRules = protos
+      .map((p) => `add_fwd FORWARD -p ${p} -d "$_h" --dport $_p -j ACCEPT $TAG || NP_FAIL=1`)
+      .join('\n');
     return `
 # ---- iptables 规则 ${id} ----
 TAG=''
@@ -1901,16 +1936,24 @@ if [ -n "$PICK" ]; then
 _need=0
 iptables -t nat -C POSTROUTING -d "$_h" -j MASQUERADE $TAG 2>/dev/null || _need=1
 ${checks}
+${fwdChecks}
 del_tag() {
   iptables -t nat -S "$1" 2>/dev/null | grep -F "np-relay:${id}" | sed "s/^-A $1 //" | while IFS= read -r _r; do
     [ -n "$_r" ] || continue
     iptables -t nat -D "$1" $_r 2>/dev/null || true
   done
 }
+del_fwd() {
+  iptables -S FORWARD 2>/dev/null | grep -F "np-relay:${id}" | sed 's/^-A FORWARD //' | while IFS= read -r _r; do
+    [ -n "$_r" ] || continue
+    iptables -D FORWARD $_r 2>/dev/null || true
+  done
+}
 if [ "$_need" = '1' ]; then
   if [ "$HAS_COMMENT" = '1' ]; then
     del_tag PREROUTING
     del_tag POSTROUTING
+    del_fwd
   else
     iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- "--dport ${listen}( |$)" | sed 's/^-A PREROUTING //' | while IFS= read -r _r; do
       [ -n "$_r" ] || continue
@@ -1919,6 +1962,7 @@ if [ "$_need" = '1' ]; then
   fi
   add_rule POSTROUTING -d "$_h" -j MASQUERADE $TAG || NP_FAIL=1
 ${dnat}
+${fwdRules}
   if [ "$NP_FAIL" = '0' ]; then
     echo "· iptables 规则 ${id} 已更新（使用目标 $_h:$_p，候选 ${targets.length} 个）"
   else
@@ -2020,6 +2064,20 @@ if command -v iptables >/dev/null 2>&1; then
   done
 fi
 
+# FORWARD 链（filter 表）也要清过期规则：DNAT 之后还要过 FORWARD
+if command -v iptables >/dev/null 2>&1; then
+  iptables -S FORWARD 2>/dev/null | grep -F 'np-relay' | while IFS= read -r _line; do
+    _id=$(printf '%s' "$_line" | sed -n 's/.*np-relay:\\([A-Za-z0-9]*\\).*/\\1/p')
+    [ -n "$_id" ] || continue
+    case "$NP_IPT_IDS" in
+      *" $_id "*) continue ;;
+    esac
+    _rule=\${_line#-A FORWARD }
+    iptables -D FORWARD $_rule 2>/dev/null || true
+    echo "· 已移除过期 FORWARD 规则 $_id"
+  done
+fi
+
 # comment 模块探测：gost 计数规则与 iptables 标签都依赖它，缺失时降级
 HAS_COMMENT=0
 if command -v iptables >/dev/null 2>&1; then
@@ -2107,6 +2165,8 @@ if [ "$NP_IPT_N" -gt 0 ]; then
       echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf 2>/dev/null || true
     fi
     add_rule() { iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"; }
+    # filter 表的 FORWARD 放行：DNAT 之后还要过 FORWARD，默认 DROP 的机器会静默丢包
+    add_fwd() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
 ${iptRules.map(iptBlock).join('')}
     # 持久化：Debian 系用 netfilter-persistent；Alpine 用 OpenRC 的 iptables 服务
     if command -v netfilter-persistent >/dev/null 2>&1; then

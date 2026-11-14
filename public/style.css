@@ -1078,13 +1078,35 @@ tr.tree-child .cell-name { font-weight: 450; }
 
 /* ------------------------------- 服务器卡 ------------------------------ */
 
-.server-card { padding: 17px 18px; }
+.server-card { padding: 16px 18px; }
 
-.server-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.server-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 7px; }
-.server-host { font-size: 12px; color: var(--muted); margin-top: 5px; font-family: ui-monospace, monospace; }
+/* 勾选框独立一列居中，信息/状态各占一行，避免名称、徽章、复选框挤在一行 */
+.server-layout {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.server-layout .s-pick { width: auto; margin: 3px 0 0; }
+.server-body { min-width: 0; }
 
-.server-meta { display: flex; gap: 18px; margin: 15px 0 14px; }
+.server-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 7px; min-width: 0; }
+.server-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-host {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 5px;
+  font-family: ui-monospace, monospace;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.server-host-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.server-status-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+
+.server-meta { display: flex; gap: 18px; margin: 12px 0 10px; }
 .server-meta div span { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
 .server-meta div b { font-size: 14px; font-weight: 600; }
 

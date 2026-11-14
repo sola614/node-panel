@@ -285,7 +285,7 @@ function buildAgentPayload(scope) {
  * 不依赖 APP_VERSION —— 一次脚本修复不需要单独发版本号，也能让 agent 立刻拉新包；
  * 否则 hash 不变，agent 永远按旧 bundle 跑（「改完了但线上没生效」）。
  */
-const RELAY_BUNDLE_REV = 8;
+const RELAY_BUNDLE_REV = 9;
 
 /**
  * 中转机配置包（relay scope）：只产规则清单，不读 nodes / users / certs。
@@ -296,7 +296,7 @@ const RELAY_BUNDLE_REV = 8;
 function buildRelayPayload(scope) {
   const db = store.db();
   const rules = db.relays
-    .filter((r) => r.serverId === scope.id)
+    .filter((r) => r.serverId === scope.id && r.enabled !== false)
     .slice()
     .sort((a, b) => Number(a.listenPort) - Number(b.listenPort) || String(a.id).localeCompare(String(b.id)))
     .map((r) => {

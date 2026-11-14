@@ -20,48 +20,47 @@ const serverTypeOf = (s) => (s && s.type === 'relay' ? 'relay' : 'node');
 
 function serverCardHtml(s) {
   const relay = serverTypeOf(s) === 'relay';
+  const addr = s.address || s.host || '尚未获取地址';
+  const src = s.addressSource === '上报' ? '自动上报' : s.addressSource === '待上报' ? '待上报' : '手动';
   return `<div class="card server-card">
-    <div class="server-top">
-      <div>
+    <div class="server-layout">
+      <input type="checkbox" class="s-pick" data-id="${s.id}" title="勾选后可批量删除">
+      <div class="server-body">
         <div class="server-name">
-          <i class="dot" style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}"></i>${esc(s.name)}
-          ${relay ? '<span class="chip" style="margin-left:6px">中转机</span>' : ''}
+          <i class="dot" style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}"></i>
+          <span class="server-name-text">${esc(s.name)}</span>
+          ${relay ? '<span class="chip">中转机</span>' : ''}
         </div>
         <div class="server-host">
-          ${esc(s.address || s.host || '尚未获取地址')}
+          <span class="server-host-text" title="${esc(addr)}">${esc(addr)}</span>
+          ${relay ? '' : `<span class="chip">${src}</span>`}
+        </div>
+        <div class="server-status-row">
+          ${syncBadge(s.sync, s.name)}
+          <span class="badge ${s.online ? 'badge-ok' : 'badge-dim'}">${s.online ? '在线' : '离线'}</span>
+          <span class="hint" style="margin:0">最后心跳 ${fmtAgo(s.lastSeen)}</span>
+        </div>
+        <div class="server-meta">
           ${relay
-            ? ''
-            : `<span class="chip" style="margin-left:6px">${
-                s.addressSource === '上报' ? '自动上报' : s.addressSource === '待上报' ? '待上报' : '手动'
-              }</span>`}
+            ? `<div><span>转发规则</span><b>${s.ruleCount || 0}</b></div>`
+            : `<div><span>节点</span><b>${s.nodeCount}</b></div>
+               <div><span>可用用户</span><b>${s.userCount}</b></div>`}
+        </div>
+        ${s.note ? `<div style="font-size:12px;color:var(--muted);margin-bottom:10px">${esc(s.note)}</div>` : ''}
+        ${relay
+          ? '<div class="hint" style="margin-bottom:10px">中转机只装 agent，转发规则在「中转」页维护，agent 每 60s 自动收敛（gost / iptables）</div>'
+          : s.hasHysteria
+            ? '<div class="hint" style="margin-bottom:10px">含 Hysteria2 节点，部署脚本会一并安装 hysteria</div>'
+            : ''}
+        <div style="display:flex;gap:7px;flex-wrap:wrap">
+          <button class="btn btn-sm btn-primary" data-act="server-deploy" data-id="${s.id}">部署命令</button>
+          <button class="btn btn-sm btn-ghost" data-act="server-uninstall" data-id="${s.id}">卸载命令</button>
+          <button class="btn btn-sm btn-ghost" data-act="server-edit" data-id="${s.id}">编辑</button>
+          <button class="btn btn-sm btn-ghost" data-act="server-copy" data-id="${s.id}">复制</button>
+          <button class="btn btn-sm btn-ghost" data-act="server-rotate" data-id="${s.id}">重置 token</button>
+          <button class="btn btn-sm btn-danger" data-act="server-del" data-id="${s.id}">删除</button>
         </div>
       </div>
-      <div style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" class="s-pick" data-id="${s.id}" title="勾选后可批量删除" style="width:auto">
-        ${syncBadge(s.sync, s.name)}
-        <span class="badge ${s.online ? 'badge-ok' : 'badge-dim'}">${s.online ? '在线' : '离线'}</span>
-      </div>
-    </div>
-    <div class="server-meta">
-      ${relay
-        ? `<div><span>转发规则</span><b>${s.ruleCount || 0}</b></div>`
-        : `<div><span>节点</span><b>${s.nodeCount}</b></div>
-           <div><span>可用用户</span><b>${s.userCount}</b></div>`}
-      <div><span>最后心跳</span><b style="font-size:12.5px">${fmtAgo(s.lastSeen)}</b></div>
-    </div>
-    ${s.note ? `<div style="font-size:12px;color:var(--muted);margin-bottom:12px">${esc(s.note)}</div>` : ''}
-    ${relay
-      ? '<div class="hint" style="margin-bottom:10px">中转机只装 agent，转发规则在「中转」页维护，agent 每 60s 自动收敛（gost / iptables）</div>'
-      : s.hasHysteria
-        ? '<div class="hint" style="margin-bottom:10px">含 Hysteria2 节点，部署脚本会一并安装 hysteria</div>'
-        : ''}
-    <div style="display:flex;gap:7px;flex-wrap:wrap">
-      <button class="btn btn-sm btn-primary" data-act="server-deploy" data-id="${s.id}">部署命令</button>
-      <button class="btn btn-sm btn-ghost" data-act="server-uninstall" data-id="${s.id}">卸载命令</button>
-      <button class="btn btn-sm btn-ghost" data-act="server-edit" data-id="${s.id}">编辑</button>
-      <button class="btn btn-sm btn-ghost" data-act="server-copy" data-id="${s.id}">复制</button>
-      <button class="btn btn-sm btn-ghost" data-act="server-rotate" data-id="${s.id}">重置 token</button>
-      <button class="btn btn-sm btn-danger" data-act="server-del" data-id="${s.id}">删除</button>
     </div>
   </div>`;
 }

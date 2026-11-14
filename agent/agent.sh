@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.47'
+VERSION='0.1.48'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -2076,7 +2076,6 @@ tick() {
   if apply_bundle; then
     apply_services changed
     if [ "$RELAY_ONLY" = '1' ]; then
-      collect_relay_traffic
       log "面板在线 · ${NP_SCOPE:-未知} · ${NP_RELAY_RULES:-0} 条转发规则"
     else
       log "面板在线 · ${NP_SCOPE:-未知} · ${NP_NODES:-0} 个节点 / ${NP_USERS:-0} 位可用用户"
@@ -2084,6 +2083,12 @@ tick() {
   else
     # 配置没变也要跑：把意外挂掉的 Hysteria2 拉起来
     apply_services same
+  fi
+
+  # 中转机每轮都采流量：配置未变化时 apply_bundle 返回 1（#UNCHANGED），
+  # 以前只在「配置变化」那一轮采集，结果 iptables 计数器一直在涨、面板永远显示「未使用」
+  if [ "$RELAY_ONLY" = '1' ]; then
+    collect_relay_traffic
   fi
 
   # 只有和面板通上话才回执：离线时上报必然失败，没必要每分钟重试一次
@@ -2160,9 +2165,14 @@ np_uninstall() {
           iptables -t nat -D "$_chain" $_r 2>/dev/null || true
         done
       done
+      # filter 表的 FORWARD 放行（DNAT 之后还要过 FORWARD）
+      iptables -S FORWARD 2>/dev/null | grep -F 'np-relay' | sed 's/^-A FORWARD //' | while IFS= read -r _r; do
+        [ -n "$_r" ] || continue
+        iptables -D FORWARD $_r 2>/dev/null || true
+      done
       iptables -t nat -D PREROUTING -j NP_RELAY_COUNT 2>/dev/null || true
       iptables -t nat -X NP_RELAY_COUNT 2>/dev/null || true
-      echo "  ✓ 已清理带 np-relay 标签的 NAT 规则"
+      echo "  ✓ 已清理带 np-relay 标签的 NAT / FORWARD 规则"
     fi
   fi
 

@@ -182,6 +182,8 @@ function normalizeNode(body, prev = {}) {
             port: e.port === '' || e.port === null || e.port === undefined ? null : Number(e.port),
             planIds: Array.isArray(e.planIds) ? e.planIds.filter((p) => store.db().plans.some((x) => x.id === p)) : [],
             hidden: !!e.hidden,
+            // 入口停用：手填入口保留用户设置；关联规则时由规则 enabled 决定（订阅按此过滤）
+            disabled: !!e.disabled,
           };
           const relayId = String(e.relayId || '').trim();
           const relay = relayId ? store.db().relays.find((r) => r.id === relayId) : null;
@@ -190,6 +192,7 @@ function normalizeNode(body, prev = {}) {
             entry.relayId = relay.id;
             if (server) entry.host = server.host;
             entry.port = relay.listenPort;
+            entry.disabled = relay.enabled === false;
           } else {
             entry.relayId = '';
           }

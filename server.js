@@ -68,6 +68,7 @@ const {
   listRelays, createRelay, updateRelay, deleteRelay,
   relayDiag,
   relayProbe,
+  relayToggle,
   relayRuleScript, relayAck,
 } = require('./server/relays');
 const {
@@ -198,6 +199,8 @@ const ROUTES = [
   ['POST', '/api/relays/:id/diag', relayDiag, true],
   // 入口机诊断结果轮询（0.1.47）
   ['GET', '/api/relays/:id/probe', relayProbe, true],
+  // 停用 / 启用（0.1.48）：停用后不再下发，关联的节点入口一并停用
+  ['POST', '/api/relays/:id/toggle', relayToggle, true],
   ['GET', '/api/relays/:id/script', relayRuleScript, true],
   ['POST', '/api/relay/ack', relayAck, false],
 

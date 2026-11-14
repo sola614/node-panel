@@ -199,6 +199,10 @@ function listRelays(req, res) {
         serverSync: server ? server.sync || null : null,
         nodeName: node ? node.name : '',
         usedByEntries: db.nodes.some((n) => (n.entries || []).some((e) => e.relayId === r.id)),
+        usedEntryCount: db.nodes.reduce(
+          (sum, n) => sum + (n.entries || []).filter((e) => e.relayId === r.id).length,
+          0,
+        ),
       };
     }),
     servers: servers.map((s) => {
@@ -229,6 +233,7 @@ function createRelay(req, res, params, body) {
     targetPort: parsed.targets[0].port,
     targets: parsed.targets,
     nodeId: String(body.nodeId || ''),
+    enabled: true,
     status: 'planned',
     deployToken: store.rnd(16),
     appliedAt: null,
@@ -388,6 +393,37 @@ function relayProbe(req, res, params) {
   });
 }
 
+/**
+ * 停用 / 启用（0.1.48）：
+ *   停用 → 规则不下发（agent 清理入口机上的转发），关联的节点入口一并 disabled（订阅不再发布）
+ *   启用 → 恢复下发，关联入口恢复
+ * 单独用 POST，避免和规则字段编辑混在一起。
+ */
+function relayToggle(req, res, params, body) {
+  const db = store.db();
+  const rule = db.relays.find((x) => x.id === params.id);
+  if (!rule) return sendJson(res, 404, { error: '中转规则不存在' });
+  const enable = body && body.enabled !== undefined ? !!body.enabled : rule.enabled === false;
+  rule.enabled = enable;
+  rule.status = 'planned';
+  rule.appliedAt = null;
+  let entries = 0;
+  for (const n of db.nodes) {
+    for (const e of n.entries || []) {
+      if (e.relayId !== rule.id) continue;
+      e.disabled = !enable;
+      entries++;
+    }
+  }
+  store.save();
+  auditAction(
+    'relay.toggle',
+    rule.name,
+    `${enable ? '启用' : '停用'}${entries ? `（关联入口 ${entries} 个已${enable ? '恢复' : '停用'}）` : ''}`,
+  );
+  sendJson(res, 200, { ok: true, item: rule, entries });
+}
+
 /* ------------------------------ 脚本下发 / 回执 ------------------------------ */
 
 /**
@@ -444,5 +480,6 @@ module.exports = {
   listRelays, createRelay, updateRelay, deleteRelay,
   relayDiag,
   relayProbe,
+  relayToggle,
   relayRuleScript, relayAck,
 };
