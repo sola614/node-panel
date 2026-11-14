@@ -109,6 +109,9 @@
 - uninstall：按标签 `iptables -t nat -S PREROUTING | grep "np-relay:<id>"` 逐条 `-D`（不依赖行号）→ 无标签时按监听端口删 → 回执
 - check：只读列出本机全部 `np-relay:*` 规则 + 本规则存活状态 → 回执
 - 多目标：静态规则只能指向一个目标，安装时探测选优；已装 agent 的中转机每轮收敛重选，纯手动模式需重跑 install
+- **目标地址**：iptables DNAT 的 `--to-destination` 只接受 IPv4，域名会由 agent 在**入口机**上
+  解析成 IPv4 后写入 DNAT（每轮重新解析，DDNS 换 IP 会跟着更新）；解析失败时回执明确报
+  「目标无法解析为 IPv4」，不会只留一句 `iptables -h`。gost 直接使用域名。
 
 ### 5.2 gost（新增 buildGostScript，基于 gost v3 / go-gost）
 

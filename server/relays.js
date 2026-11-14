@@ -153,6 +153,11 @@ function ruleFieldError(body, db) {
   return '';
 }
 
+/**
+ * iptables DNAT 的 --to-destination 只接受 IP，域名会在入口机上被解析成 IPv4 后写入规则
+ * （见 deploy-scripts 的 resolve_ipv4）。面板侧不拦域名：用户用 DDNS 是常见场景。
+ */
+
 /** 同机同端口的跨工具冲突（iptables DNAT 与 gost 监听抢同一端口会互相劫持） */
 function portConflict(db, rule, selfId) {
   return db.relays.some(
@@ -208,6 +213,7 @@ function createRelay(req, res, params, body) {
   const db = store.db();
   const parsed = parseTargets(body);
   if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+
   const err = ruleFieldError(body, db);
   if (err) return sendJson(res, 400, { error: err });
 
@@ -252,6 +258,7 @@ function updateRelay(req, res, params, body) {
   const merged = { ...rule, ...body, __selfId: rule.id };
   const parsed = parseTargets(merged);
   if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+
   const err = ruleFieldError(merged, db);
   if (err) return sendJson(res, 400, { error: err });
   merged.listenPort = portOk(merged.listenPort);

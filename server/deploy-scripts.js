@@ -1254,14 +1254,39 @@ echo "  使用目标：$TARGET_HOST:$TARGET_PORT"
 
 # 目标探测：按顺序取第一个能建立 TCP 连接的。iptables 规则是静态的，
 # 切换只发生在「安装 / 重跑脚本」时；agent 托管的中转机由每轮收敛重新选目标。
+# 域名先在入口机解析成 IPv4 —— DNAT 的 --to-destination 只接受 IP
+resolve_ipv4() {
+  case "$1" in
+    *[!0-9.]*) ;;
+    *) echo "$1"; return 0 ;;
+  esac
+  local ip=''
+  if command -v getent >/dev/null 2>&1; then
+    ip=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}')
+  fi
+  if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
+    ip=$(nslookup "$1" 2>/dev/null | awk '/^Name:/{seen=1;next} seen && /^Address/{for(i=2;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; exit}}')
+  fi
+  if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
+    ip=$(host "$1" 2>/dev/null | awk '/has address/{print $4; exit}')
+  fi
+  [ -n "$ip" ] || return 1
+  echo "$ip"
+}
+
 pick_target() {
-  local t h p
+  local t h p ip
   for t in "\${TARGETS[@]}"; do
     h="\${t%:*}"; p="\${t##*:}"
+    ip=$(resolve_ipv4 "$h" || true)
+    if [ -z "$ip" ]; then
+      echo "! 目标 $h 无法解析为 IPv4（检查入口机 DNS，或直接填 IP）" >&2
+      continue
+    fi
     if command -v nc >/dev/null 2>&1; then
-      nc -z -w 2 "$h" "$p" >/dev/null 2>&1 && { echo "$t"; return 0; }
+      nc -z -w 2 "$ip" "$p" >/dev/null 2>&1 && { echo "$ip:$p"; return 0; }
     else
-      (exec 3<>"/dev/tcp/$h/$p") 2>/dev/null && { echo "$t"; return 0; }
+      (exec 3<>"/dev/tcp/$ip/$p") 2>/dev/null && { echo "$ip:$p"; return 0; }
     fi
   done
   return 1
@@ -1270,8 +1295,8 @@ pick_target() {
 echo "→ 探测目标（按顺序第一个可达）"
 PICK=$(pick_target || true)
 if [ -z "$PICK" ]; then
-  echo "! 所有目标都不可达，先按第一个写入：\${TARGETS[0]}（恢复后重跑本脚本即可重选）"
-  PICK="\${TARGETS[0]}"
+  echo "✗ 没有可用目标：域名解析失败或全部不可达，请检查入口机 DNS / 目标地址"
+  exit 1
 fi
 TARGET_HOST="\${PICK%:*}"
 TARGET_PORT="\${PICK##*:}"
@@ -1857,14 +1882,21 @@ NP_TARGETS='${targetList}'
 PICK=''
 for _t in $NP_TARGETS; do
   _h=\${_t%:*}; _p=\${_t##*:}
-  if command -v nc >/dev/null 2>&1 && nc -z -w 2 "$_h" "$_p" >/dev/null 2>&1; then PICK=$_t; break; fi
+  # DNAT 只接受 IP：域名先在入口机解析成 IPv4，解析不到就跳过并报明确原因
+  _ip=$(resolve_ipv4 "$_h" || true)
+  if [ -z "$_ip" ]; then
+    echo "! iptables 规则 ${id}：目标 $_h 无法解析为 IPv4（检查入口机 DNS，或直接填 IP）"
+    NP_FAIL=1
+    continue
+  fi
+  if command -v nc >/dev/null 2>&1 && nc -z -w 2 "$_ip" "$_p" >/dev/null 2>&1; then PICK="$_ip:$_p"; break; fi
 done
 if [ -z "$PICK" ]; then
-  for _t in $NP_TARGETS; do PICK=$_t; break; done
-  echo "! iptables 规则 ${id}：目标都不可达，暂用 $PICK"
+  echo "! iptables 规则 ${id}：没有可用目标，本规则跳过"
   NP_FAIL=1
 fi
 _h=\${PICK%:*}; _p=\${PICK##*:}
+if [ -n "$PICK" ]; then
 # 期望规则已经在位就跳过重建：iptables 计数器挂在规则上，每轮重删会让流量统计永远归零
 _need=0
 iptables -t nat -C POSTROUTING -d "$_h" -j MASQUERADE $TAG 2>/dev/null || _need=1
@@ -1887,9 +1919,14 @@ if [ "$_need" = '1' ]; then
   fi
   add_rule POSTROUTING -d "$_h" -j MASQUERADE $TAG || NP_FAIL=1
 ${dnat}
-  echo "· iptables 规则 ${id} 已更新（使用目标 $_h:$_p，候选 ${targets.length} 个）"
+  if [ "$NP_FAIL" = '0' ]; then
+    echo "· iptables 规则 ${id} 已更新（使用目标 $_h:$_p，候选 ${targets.length} 个）"
+  else
+    echo "! iptables 规则 ${id} 写入失败（目标 $_h:$_p 无法转发）"
+  fi
 else
   echo "· iptables 规则 ${id} 未变化（使用目标 $_h:$_p），保留计数器"
+fi
 fi
 `;
   };
@@ -1906,6 +1943,31 @@ NP_GOST_IDS=${idList(gostRules)}
 NP_IPT_IDS=${idList(iptRules)}
 # GitHub 反代前缀（面板设置项）；空 = 直连
 GOST_PROXY="${proxy}"
+
+# 域名 → IPv4：iptables DNAT 的 --to-destination 只接受 IP。
+# 在入口机上解析才有意义（实际转发链路用的是这台机器的 DNS）。
+resolve_ipv4() {
+  case "$1" in
+    *[!0-9.]*) ;;
+    *) echo "$1"; return 0 ;;
+  esac
+  _ip=''
+  if command -v getent >/dev/null 2>&1; then
+    _ip=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}')
+  fi
+  if [ -z "$_ip" ] && command -v nslookup >/dev/null 2>&1; then
+    _ip=$(nslookup "$1" 2>/dev/null | awk '
+      /^Name:/ { seen = 1; next }
+      seen && /^Address/ {
+        for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print $i; exit }
+      }')
+  fi
+  if [ -z "$_ip" ] && command -v host >/dev/null 2>&1; then
+    _ip=$(host "$1" 2>/dev/null | awk '/has address/ { print $4; exit }')
+  fi
+  [ -n "$_ip" ] || return 1
+  echo "$_ip"
+}
 
 # 1) 清理面板已经删除的 gost 规则（systemd unit / OpenRC init 都是锚点）
 for _f in /etc/systemd/system/gost-relay-*.service; do
@@ -2062,7 +2124,11 @@ ${iptRules.map(iptBlock).join('')}
   fi
 fi
 
-echo "✓ 中转规则已收敛（gost ${gostRules.length} 条 / iptables ${iptRules.length} 条）"
+if [ "$NP_FAIL" = '0' ]; then
+  echo "✓ 中转规则已收敛（gost ${gostRules.length} 条 / iptables ${iptRules.length} 条）"
+else
+  echo "✗ 中转规则收敛失败（gost ${gostRules.length} 条 / iptables ${iptRules.length} 条）"
+fi
 ${probeBlock(probe)}
 [ "$NP_FAIL" = '0' ] || exit 1
 `;

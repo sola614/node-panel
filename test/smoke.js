@@ -1786,6 +1786,17 @@ function totpCodeOf(secret) {
     }),
   })).status === 400);
 
+  // iptables DNAT 只接受 IP：域名在入口机上解析成 IPv4，面板侧允许保存
+  const domainRule = await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId, name: 'SMOKE-域名目标', tool: 'iptables', proto: 'tcp',
+      listenPort: 9446, targets: 'example.com:443',
+    }),
+  });
+  ok('iptables 规则允许域名目标（入口机解析）', domainRule.status === 200);
+  if (domainRule.status === 200) cleanup.push(['/api/relays/' + domainRule.data.item.id]);
+
   // 入口机视角诊断（0.1.47）：面板先写请求，agent 下一轮回执带回结果
   const agentDiag = await call('/api/relays/' + diagId + '/diag', {
     method: 'POST',

@@ -196,7 +196,8 @@ function relayFormBody(r, d) {
       <textarea class="code-area" id="rl-targets" style="min-height:104px" placeholder="203.0.113.9:443&#10;203.0.113.10:443">${r ? esc(relayTargetsText(r)) : ''}</textarea>
       <div class="hint">
         每行一个目标，写成 <b>host:port</b>（省略端口默认 443），最多 8 个。第一个不通时自动切到下一个；
-        gost 由进程内即时切换，iptables 由 agent 每轮同步时重选（未装 agent 则重跑 install 脚本）。
+        gost / iptables 都由 agent 每轮同步（约 60s）探测重选。
+        <br>iptables 模式下域名会在入口机上解析成 IPv4 再写 DNAT（DNS 好查不到时回执会明确报错）。
       </div>
     </div>
     <div class="field">
@@ -247,6 +248,7 @@ function validateRelayForm(p) {
     const host = m ? m[1] : line;
     const port = m ? Number(m[2]) : 443;
     if (host.includes(':')) return `第 ${i + 1} 行暂不支持 IPv6`;
+
     if (!Number.isInteger(port) || port < 1 || port > 65535) return `第 ${i + 1} 行端口不合法`;
   }
   return '';

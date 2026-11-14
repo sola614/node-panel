@@ -254,6 +254,8 @@ if (!hasBash) {
   ok('iptables 持久化兼容 OpenRC', iptInstall.includes('rc-service iptables save'));
   ok('中转收敛包自动安装 iptables', sync.includes('apk add --no-cache iptables'));
   ok('中转收敛包持久化兼容 OpenRC', sync.includes('rc-service iptables save'));
+  ok('iptables 脚本解析域名目标',
+    iptInstall.includes('resolve_ipv4') && iptInstall.includes('nslookup') && sync.includes('resolve_ipv4'));
   ok('gost 收敛包按顺序探测目标',
     sync.includes("NP_TARGETS='5.6.7.8:443 5.6.7.9:443'") && sync.includes('nc -z -w 2'));
   ok('gost 下载支持 GitHub 反代 + 大陆检测',
