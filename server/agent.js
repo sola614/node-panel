@@ -18,6 +18,8 @@ const hysteria = require('../lib/hysteria');
 const cert = require('../lib/cert');
 const alerts = require('../lib/alerts');
 const agentBundle = require('../lib/agentBundle');
+// 只取伪装部署的目录名：配置包要把 state.env / changed.env 写进同一处
+const { STEALTH_NAME } = require('./deploy-scripts');
 const logger = require('../lib/log');
 const { sendJson, sendText } = require('./http-util');
 const { auditAction, clientIp, desiredHashCache } = require('./context');
@@ -143,6 +145,9 @@ function resolveScope(token, ip) {
       type: relay ? 'relay' : 'server',
       id: server.id,
       name: server.name,
+      // 伪装部署：配置包要写进同一个状态目录（/opt/logsync），否则 changed.env
+      // 落回 /opt/nodepanel，agent 认不出「Xray 变了」就不会重载，节点直接不通
+      stealth: !!server.stealth,
       // 中转机不承载节点：配置包里只有转发规则
       nodes: relay ? [] : db.nodes.filter((n) => n.serverId === server.id && n.enabled),
     };
@@ -157,6 +162,7 @@ function resolveScope(token, ip) {
       type: 'node',
       id: node.id,
       name: node.name,
+      stealth: !!node.stealth,
       nodes: node.enabled ? [node] : [],
     };
     applyReportedIp(scope, ip);
@@ -906,6 +912,9 @@ function agentBundleHandler(req, res, params, body, session, ctx) {
   const script = agentBundle.buildBundle(payload, {
     panelUrl: baseUrl(ctx.req),
     siteName: store.db().settings.siteName,
+    // 伪装部署的机器装在 /opt/logsync：配置包要写同一份状态目录，否则
+    // changed.env 落回 /opt/nodepanel，agent 认不出服务变更就不会重载
+    stateDir: scope.stealth ? `/opt/${STEALTH_NAME}` : '/opt/nodepanel',
     // 中转机下载 gost 用的反代前缀（设置页可配；空 = 直连）
     githubProxy: store.db().settings.githubProxy || '',
   });

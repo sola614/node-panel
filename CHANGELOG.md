@@ -3,6 +3,24 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.53] - 2026-11-15
+
+### 修复
+
+- **伪装部署的机器只装了 agent、服务全没起来**：配置包（`lib/agentBundle.js`）把
+  状态目录写死成 `/opt/nodepanel`，伪装部署装在 `/opt/logsync` 的机器上，配置包会把
+  `state.env` / `changed.env` 写到一个没人读的目录 —— 后果是 agent 读不到
+  `NP_XRAY_NODES`（判断成「本机没有 Xray 节点」直接跳过 `xray_ensure`）、也读不到
+  `NP_CHANGED_XRAY`（不重载），**配置已经落盘但 Xray 一次都没启动，节点直接不通**；
+  同时 `/opt/nodepanel` 这个目录会被重新创建出来，伪装等于白做。
+  现在配置包改用 `"${STATE_DIR:-<面板按部署名算好的目录>}"`，agent 侧也 `export STATE_DIR`；
+  旧 agent 不 export 时，面板下发的兜底值照样正确。
+- **agent 在 Alpine 上会静默猝死**：`apply_bundle` 里 `. "$STATE_DIR/state.env"` 没有先判
+  存在，而 `.` 是 POSIX 特殊内建 —— 源一个不存在的文件会让 dash / busybox ash 的
+  非交互 shell **整个退出**（`2>/dev/null` 只吞掉报错，不阻止退出）。表现出来就是
+  `rc-service` 显示 `crashed`、日志停在「配置包已应用」后一行不写、面板显示离线。
+  两处都改成 `[ -f … ] && . …`。
+
 ## [0.1.52] - 2026-11-14
 
 ### 新增

@@ -2330,4 +2330,6 @@ module.exports = {
   relayTarget,
   GOST_VER_RE,
   shellSafe,
+  // 配置包（lib/agentBundle.js）要按同一个伪装目录写状态文件
+  STEALTH_NAME,
 };

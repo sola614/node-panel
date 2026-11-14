@@ -778,6 +778,26 @@ ok('伪装后内嵌 agent 的卸载单元也换了', hidden.includes('/etc/init.
 ok('伪装卸载脚本里搜不到 nodepanel', !/nodepanel/i.test(hiddenUninstall));
 ok('不勾选时输出里没有 logsync', !/logsync/i.test(plain) && !/logsync/i.test(buildUninstallScript({ label: '隐藏 01' })));
 
+// 配置包（bundle）也要跟着换状态目录：写死 /opt/nodepanel 会有两个后果 ——
+// 机器上凭空多一个旧目录（藏名字白藏）、changed.env 落错地方导致 Xray 不重载
+// （配置写进去了但服务没重启，节点直接不通）
+const { buildBundle } = require('../lib/agentBundle');
+const bundlePayload = {
+  ok: true,
+  hash: 'abc123',
+  scope: { type: 'server', id: 's1', name: '隐藏 01' },
+  agentVersion: '0.0.0',
+  nodes: [{ id: 'n1', name: 'n1', protocol: 'vless', port: 443 }],
+  userCount: 1,
+  xray: { log: {}, inbounds: [{ port: 443, protocol: 'vless', settings: { clients: [] }, streamSettings: {} }] },
+  hysteria: [],
+  certs: [],
+};
+const bundleHidden = buildBundle(bundlePayload, { panelUrl: 'https://p.example.com', siteName: 'x', stateDir: '/opt/logsync' });
+const bundlePlain = buildBundle(bundlePayload, { panelUrl: 'https://p.example.com', siteName: 'x' });
+ok('配置包按伪装目录写状态文件', bundleHidden.includes('"${STATE_DIR:-/opt/logsync}"') && !bundleHidden.includes('/opt/nodepanel'));
+ok('配置包默认仍写 /opt/nodepanel', bundlePlain.includes('"${STATE_DIR:-/opt/nodepanel}"'));
+
 /* ------------------------------ 收尾 ------------------------------ */
 // 先关库再删目录：Windows 上 SQLite 句柄没释放时 unlink 会 EBUSY
 try {

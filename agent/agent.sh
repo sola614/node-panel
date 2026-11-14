@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.52'
+VERSION='0.1.53'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -120,6 +120,10 @@ HOP_AUTO_INSTALL=${HOP_AUTO_INSTALL:-1}
 STATE_DIR=${STATE_DIR:-/opt/nodepanel}
 RUN_DIR=${RUN_DIR:-/run/nodepanel}
 LOG_DIR=${LOG_DIR:-/var/log/nodepanel}
+# 配置包（bundle）按 $STATE_DIR 写 state.env / changed.env —— 伪装部署时目录不是
+# /opt/nodepanel，不 export 的话 bundle 只能退回面板算好的兜底值（这里同步给它是
+# 为了让「机器自己说了算」这条原则在两侧一致）
+export STATE_DIR
 HTTP_TIMEOUT=${HTTP_TIMEOUT:-15}
 LOG_MAX=${LOG_MAX:-5242880}
 # 关掉公网 IP 上报：面板在反代后面、或者只想手动填地址时用
@@ -1538,8 +1542,11 @@ apply_bundle() {
     cat "$_blog" >> "$LOG_DIR/agent.log" 2>/dev/null
     rm -f "$_tmp" "$_blog"
     # state.env 给下一轮用；changed.env 记录这一轮哪些文件真的变了，决定要不要重载服务
-    . "$STATE_DIR/state.env" 2>/dev/null
-    . "$STATE_DIR/changed.env" 2>/dev/null
+    # 必须先判存在：`.` 是 POSIX 特殊内建，源一个不存在的文件在 dash / busybox ash
+    # 里会让**整个非交互 shell 直接退出**（2>/dev/null 只吞掉了报错）。配置包把
+    # 状态文件写到别的目录时，agent 就是在这里静默猝死的，OpenRC 只会显示 crashed
+    [ -f "$STATE_DIR/state.env" ] && . "$STATE_DIR/state.env" 2>/dev/null
+    [ -f "$STATE_DIR/changed.env" ] && . "$STATE_DIR/changed.env" 2>/dev/null
     # 变更项写进日志：事后对时间线时，「这轮到底改了什么」比「更新了」有用得多
     _what=''
     [ "${NP_CHANGED_XRAY:-0}" = '1' ] && _what='Xray'
