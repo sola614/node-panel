@@ -1,6 +1,6 @@
 # 中转管理方案（relay management）
 
-> 2026-11-14 · v6（0.1.47 增量：入口机视角诊断 + iptables 自动安装）· 状态：已实施
+> 2026-11-14 · v7（0.1.48–0.1.51 增量：停用/复制/分组、双向流量、默认并行诊断、gost 模式自动装 iptables）· 状态：已实施
 >
 > 需求：① 新增「中转服务器」管理，可往中转机上用主流工具（gost / iptables）添加端口转发实现节点中转；② 节点新增/编辑时中转入口可下拉选择中转管理中已有的规则；③ **中转机与落地机统一在「服务器」页管理（tab 分组），装 agent 后规则自动同步**；④ **一个入口支持多个目标地址，按顺序故障切换；规则列表可一键诊断目标连通性与延迟**。
 
@@ -60,7 +60,8 @@
   status: 'planned',     // planned | applied | unknown
   deployToken: '',       // 手动脚本回执鉴权，rotate 能力
   appliedAt: null, note: '',
-  // 入口流量（0.1.47）：agent 读 iptables 计数器上报原值，面板按差值累计
+  // 入口流量（0.1.47 单向；0.1.49 起双向）：agent 读 iptables 计数器上报原值，面板按差值累计
+  // 注意：gost 模式同样依赖这套 iptables 计数链（缺 iptables 时 0.1.51 起自动安装）
   trafficBytes: 0,       // 累计入站字节（客户端 → 入口机方向）
   trafficDown: 0,        // 累计回程字节（入口机 → 客户端方向，0.1.49 起）
   trafficRaw: 0,         // 上次读到的入站计数器原值
@@ -74,7 +75,8 @@
 }
 ```
 
-- **迁移（入口流量）**：旧规则没有流量列，加载时补 0 / null；非数字一律归零，避免 NaN 污染累计
+- **迁移（入口流量）**：旧规则没有流量列，加载时补 0 / null；非数字一律归零，避免 NaN 污染累计。
+  0.1.49 新增 `traffic_down` / `traffic_raw_down`，同样按默认 0 补齐（升级后回程从 0 开始累计）
 
 - **迁移（旧 `relay_servers` → `servers`）**：每条旧台账转成 `type='relay'` 的 servers 行，
   补设备级 `token`、`ipMode='manual'` 与心跳字段；id 与既有 servers 冲突时重新分配并同步
@@ -100,7 +102,7 @@
 | `GET /api/relays/:id/probe` | 读取入口机视角诊断结果：`{ diagRequestedAt, agentProbe }`，前端轮询用 |
 | `POST /api/relays/:id/toggle` | 停用 / 启用（0.1.48）：停用后规则不下发，关联的节点入口 `disabled=true`（订阅过滤）；启用恢复 |
 | `POST /api/relay/ack` | **免登录回执**：relayId + deployToken（恒时比较）→ status=applied/unknown + appliedAt。沿袭免登录 POST 1.5MB 限额与限流（http-util.js readBody 机制） |
-| `POST /api/agent/receipt`（relay token） | 除同步状态外，额外接受 `traffic: { ruleId: 计数器原值 }`（0.1.47，按差值累计）与 `probe: { ruleId: { at, targets } }`（入口机诊断结果） |
+| `POST /api/agent/receipt`（relay token） | 除同步状态外，额外接受 `traffic: { ruleId: { up, down } }`（0.1.47 单向、0.1.49 起双向，按差值累计）与 `probe: { ruleId: { at, targets } }`（入口机诊断结果） |
 | `GET /api/servers/:id/install`（relay 型） | relayOnly 安装脚本：只部署 agent，不安装 Xray / Hysteria2 |
 | `GET /api/agent/bundle`（relay token） | relay 配置包：只含规则收敛脚本，不读 nodes / users / certs |
 
@@ -143,6 +145,10 @@
 - 小磁盘兼容：下载改为**流式解压**（`curl | tar -xzO gost`），峰值只占最终二进制一份；
   可用空间 < 60MB 时直接报错并建议改用 iptables。旧逻辑「压缩包 + 解压 + install 复制」
   峰值是 3 份，90MB 根分区必爆（`No space left on device`）
+- 流量统计（0.1.51）：gost 转发本身不需要 iptables，但**入口 / 回程计数依赖 iptables 计数链**
+  （`NP_RELAY_COUNT` / `NP_RELAY_BACK`）。精简系统（Alpine 默认）没装 iptables 时收敛包自动安装
+  （apk / apt / dnf / yum / pacman / zypper），装完再探测 `-m comment`；仍缺 comment 时明确提示
+  「规则会正常转发但没有流量数据」。此前这种情况会静默上报空 traffic，面板一直显示「未使用」
 
 ### 5.3 端口占用预检
 
@@ -155,10 +161,13 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 1. 枚举 `gost-relay-*.service` 与带 `np-relay:` / `np-relay-count:` 标签的 NAT 规则，**删除面板已不存在的**（删规则 / 改端口 / 换 tool 自动生效）
 2. 期望规则逐条写入：gost 按顺序探测目标、写单目标 env + 服务（systemd unit 或 OpenRC init）并启动；iptables 每轮按顺序探测目标，**期望规则已在位时跳过重建**（否则计数器每秒归零），目标变化才删旧标签重写
 3. 清理段同时识别 `gost-relay-*.service` 与 `/etc/init.d/gost-relay-*`，卸载时把 OpenRC 服务、pidfile、计数链一起清掉
-4. gost 没有 DNAT 规则可挂计数器，收敛时在固定计数链 `NP_RELAY_COUNT` 里插一条 `RETURN` 规则（标签 `np-relay-count:<id>`），只建一次、不重建
-5. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
-6. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入，只统计 gost 规则），失败通过 receipt 暴露
-7. **入口机诊断**（0.1.47）：bundle 里只有面板点了「从入口机检测」的规则才生成探测段。
+4. gost 没有 DNAT 规则可挂计数器，收敛时在固定计数链 `NP_RELAY_COUNT` 里插一条 `RETURN` 规则（标签 `np-relay-count:<id>`），只建一次、不重建；回程在 `mangle OUTPUT` 按「源端口 = 监听端口」计数，统一写入 `NP_RELAY_BACK` 链（`-j RETURN` 只计数不改转发）。0.1.51 起缺 iptables 先自动安装，缺 `-m comment` 时降级为无标签并明确提示
+5. 流量采集由 `agent.sh` 的 `collect_relay_traffic` **每轮都跑**（不能只在配置变化时跑），
+   结果写 `/run/nodepanel/relay-traffic.txt`（`id up down` 三列）随回执上报；缺 iptables 只提示一次，
+   装好后哨兵文件自动清除并恢复采集
+6. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
+7. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入，只统计 gost 规则），失败通过 receipt 暴露
+8. **入口机诊断**（0.1.47）：bundle 里只有面板点了「从入口机检测」的规则才生成探测段。
    在入口机上用 `curl --connect-timeout 3 -w '%{time_connect}'` 逐个目标测 TCP 握手，
    结果写 `/opt/nodepanel/relay-probe.json`，agent 随下一次回执带回后删除文件；
    请求时间参与 payload hash，所以 agent 一定会为此拉新包
@@ -191,9 +200,9 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
   - 目标地址改为**大文本框**（一行一个 `host:port`，最多 8 个），列表转发方向显示首个目标 + `+N`
   - 每行新增「诊断」按钮：弹窗分两块 —— **面板视角（即时）** 与 **入口机视角（agent 上报）**。
   入口机视角点「从入口机检测」后写入请求，弹窗轮询结果（最多 90 秒；agent 下一轮同步回传）
-  - 规则表新增「使用」列（0.1.47）：`↓ 累计入站字节` + 最近使用时间；从未采集时显式提示
-    「需要 agent」，停用规则显示 `—`。流量来自入口机 iptables 计数器，按回执差值累计，
-    只统计客户端 → 入口机方向，不参与用户额度计费
+  - 规则表新增「使用」列（0.1.47 单向，0.1.49 起双向）：`↑ 入站 / ↓ 回程` + 最近使用时间；
+    从未采集时显式提示「需要 agent」，停用规则显示 `—`。流量来自入口机 iptables 计数器
+    （gost 模式亦然，0.1.51 起缺 iptables 自动安装），按回执差值累计，不参与用户额度计费
   - 每行新增「复制」：预填原规则的目标 / 工具 / 协议 / 关联节点，**监听端口留空**
     （复制到同一入口机的另一个端口），名称自动去重；保存时仍走端口冲突校验
   - 目标地址支持**从节点列表多选**：勾选节点自动追加 `地址:端口`，取消勾选移除对应行；
@@ -225,8 +234,9 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 
 - `test/generators.js`：gost / iptables 三态脚本 + relayOnly 安装/卸载 + relay 收敛包 `bash -n` 真解析；
   标签、GOST_VER 白名单、shellSafe 转义、中转机不装 Xray/Hysteria 断言
-- `test/relay.js`：schema 12→15 迁移（id 冲突重映射、relays.serverId 跟随、旧表删除、
-  旧规则自动补 targets / 流量默认值）、落地机 payload 字段集合不变、中转机 payload 带 targets
+- `test/relay.js`：schema 12→19 迁移（id 冲突重映射、relays.serverId 跟随、旧表删除、
+  旧规则自动补 targets / 双向流量默认值、enabled 三种历史状态自愈）、落地机 payload 字段集合不变、
+  中转机 payload 带 targets
 - `test/smoke.js`：servers(type=relay) CRUD、多目标规则创建与解析、目标诊断（可达/不可达/延迟/
   当前首选）、IPv6 目标拦截、入口流量回执（累计 / 差值 / 计数器归零）、同机端口冲突 400（跨工具）、
   ack 鉴权（错 token / 重放）、status 流转、节点入口联动（选 relay → host/port 覆盖；
@@ -237,12 +247,12 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 
 | 维度 | 影响 |
 |------|------|
-| 数据 | schema 12→15：`servers` 增 `type`、`relays` 增 `targets` 与流量字段；旧 `relay_servers` 行迁入并 DROP 旧表；自动备份后迁移 |
+| 数据 | schema 12→19：`servers` 增 `type`（13）；`relays` 增 `targets`（14）、`traffic_bytes`（15）、`diag_requested_at` / `agent_probe`（16）、`enabled`（17）、`traffic_down` / `traffic_raw_down`（19）；`relay_daily` 建表（18）并补 `down_bytes`（19）；旧 `relay_servers` 行迁入并 DROP 旧表；自动备份后迁移 |
 | 兼容 | `node.entries` 仅增可选 `relayId`；旧规则单目标自动补 `targets`；`targetHost/targetPort` 保留为第一项镜像；`GET /api/relay-servers` 保留只读一个版本；写入端点已移除 |
 | 落地机 agent | **零影响**：payload 字段集合与 hash 输入不变，不触发重下发（test/relay.js 锁死） |
 | 中转机侧 | 装 agent 后新增 `gost-relay-<id>.service` / `np-relay:<id>` 的 60s 自动收敛；多目标切换：gost / iptables 都每轮探测重选（gost 单目标下发；iptables 未变化不重建、保留计数器）；入口流量随回执上报 |
 | 安全面 | 中转机获得设备级 token（可被下发 root shell），relay bundle 只由固定模板生成，不接受自由字段；流量数字仅作展示 |
-| 风险点 | 入口流量只统计单向（客户端 → 入口机），且依赖 `iptables` + `comment`；计数器在目标切换 / 规则重建时归零，面板按「原值下降视为重置」处理；无 `nc` 时目标探测退化为取第一个；gost 下载依赖 GitHub 连通性（反代 / `GOST_DL_BASE` 兜底）；同机双角色（既入口又落地）不支持 |
+| 风险点 | 入口流量（0.1.49 起双向）仍依赖 `iptables` + `comment`，gost 模式亦然（0.1.51 起缺 iptables 自动安装，缺 comment 只有转发没有数据）；计数器在目标切换 / 规则重建时归零，面板按「原值下降视为重置」处理；无 `nc` 时目标探测退化为取第一个；gost 下载依赖 GitHub 连通性（反代 / `GOST_DL_BASE` 兜底）；同机双角色（既入口又落地）不支持 |
 | bundle 版本 | relay payload hash 额外包含 `RELAY_BUNDLE_REV`：生成逻辑有行为修复时 +1，agent 下一轮就会拉新包，不必为此单独发版本号 |
 
 ## 10. 分期
@@ -251,6 +261,10 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 - **二期（0.1.44，已完成）**：中转机并入 servers 台账（type=relay）+ relay-only agent（规则 60s 自动收敛）+ 服务器页 tab 分组 + 手动脚本保留为兜底
 - **三期（0.1.46，已完成）**：单入口多目标（最多 8 个，按顺序故障切换）+ 目标诊断（TCP 延迟 / 当前首选）
 - **四期（0.1.47，已完成）**：入口流量统计（判断入口是否有人使用）+ 前端错误提示与静态资源版本化修正
+- **五期（0.1.48，已完成）**：规则停用/启用、复制、列表刷新、按服务器分组、目标从节点多选、入口拖拽排序、FORWARD 放行
+- **六期（0.1.49，已完成）**：双向流量（↑ 入站 / ↓ 回程）、流量统计页中转入口区块、`enabled` bool 解码修复（旧规则不再被误停用）
+- **七期（0.1.50，已完成）**：诊断弹窗默认并行检测面板机 + 入口机、agent 退出原因日志、节点入口下拉按服务器分组
+- **八期（0.1.51，已完成）**：gost 模式缺 iptables 自动安装，修复入口流量长期显示「未使用」
 - **后续（评估）**：同一台机器同时承担入口与落地（需要 capabilities 多角色模型）；tool 扩展（realm / socat）；入口机侧诊断回执
 
 ## 11. 0.1.47 附带修复的两个前端问题
