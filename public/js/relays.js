@@ -546,6 +546,62 @@ function agentProbeHtml(probe, requestedAt) {
     </table></div>`;
 }
 
+/** 面板机探测结果表 */
+function relayPanelProbeHtml(d) {
+  if (d && d.error) {
+    return `<div class="alert alert-danger" style="margin:0">${esc(d.error.message || d.error)}</div>`;
+  }
+  if (!d || !Array.isArray(d.targets)) {
+    return '<div class="hint" style="margin:0">面板探测没有返回数据</div>';
+  }
+  return `
+    <div class="table-wrap"><table>
+      <thead><tr><th>#</th><th>目标</th><th>结果</th><th>延迟</th><th>说明</th></tr></thead>
+      <tbody>
+        ${d.targets
+          .map(
+            (t, i) => `<tr>
+              <td>${i + 1}${i === d.active ? ' <span class="badge badge-ok">当前首选</span>' : ''}</td>
+              <td class="mono">${esc(t.host)}:${esc(t.port)}</td>
+              <td><span class="badge ${t.ok ? 'badge-ok' : 'badge-bad'}">${t.ok ? '可达' : '不可达'}</span></td>
+              <td class="mono">${t.ok ? t.ms + ' ms' : '—'}</td>
+              <td class="cell-sub">${t.error ? esc(t.error) : '—'}</td>
+            </tr>`,
+          )
+          .join('')}
+      </tbody>
+    </table></div>
+    <p class="hint" style="margin-top:8px">
+      ${
+        d.active < 0
+          ? '所有目标都探测失败：这条规则当前没有可用落地地址。'
+          : `按顺序第一个可达的是 <b>#${d.active + 1}</b>：${esc(d.targets[d.active].host)}:${esc(d.targets[d.active].port)}。`
+      }
+      探测从<b>面板所在机器</b>发起。
+    </p>`;
+}
+
+/** 入口机探测结果：覆盖离线 / 超时 / 报错三种状态 */
+function relayAgentProbeHtml(state) {
+  if (!state) return agentProbeHtml(null, null);
+  if (state.offline) {
+    return `<div class="alert alert-warn" style="margin:0 0 10px">入口机当前离线（或没装 agent），无法从入口机探测。</div>${
+      state.probe ? agentProbeHtml(state.probe, null) : ''
+    }`;
+  }
+  if (state.timeout) {
+    return `<div class="alert alert-warn" style="margin:0 0 10px">入口机未在 90 秒内回传，下面是最近一次结果。</div>${
+      state.probe ? agentProbeHtml(state.probe, null) : agentProbeHtml(null, null)
+    }`;
+  }
+  if (state.error) {
+    return `<div class="alert alert-danger" style="margin:0 0 10px">${esc(state.error.message || state.error)}</div>${
+      state.probe ? agentProbeHtml(state.probe, null) : ''
+    }`;
+  }
+  return agentProbeHtml(state.probe, null);
+}
+
 async function relayDiagFlow(id) {
   const r = (state.data.relayItems || []).find((x) => x.id === id);
   if (!r) return;
@@ -554,121 +610,100 @@ async function relayDiagFlow(id) {
     wide: true,
     footer: false,
     body: `
-      <div class="section-title">面板视角（即时）</div>
-      <div id="rd-body"><div class="hint" style="margin:0">正在从面板探测目标…</div></div>
-      <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
-        <button class="btn btn-sm btn-primary" type="button" id="rd-again">重新测试</button>
-        <span class="hint" style="margin:0">探测超时 3 秒；目标按表单顺序作为故障切换顺序</span>
+      <div id="rd-loading" class="empty" style="padding:30px 0">
+        <i class="spinner" style="margin-right:7px"></i>正在检测：面板机 + 入口机…
+        <div class="hint" style="margin-top:8px">入口机由 agent 拉取式回传，最多约 60 秒；离线时会直接跳过</div>
       </div>
-
-      <div class="section-title" style="margin-top:18px">入口机视角（agent 上报）</div>
-      <div id="rd-agent">${agentProbeHtml(parseAgentProbe(r.agentProbe), r.diagRequestedAt)}</div>
-      <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
-        <button class="btn btn-sm btn-primary" type="button" id="rd-agent-run">从入口机检测</button>
-        <span class="hint" style="margin:0">agent 是拉取式：点击后最多 60 秒回传；入口机离线时无效</span>
+      <div id="rd-content" class="hidden">
+        <div class="section-title">面板视角</div>
+        <div id="rd-panel"></div>
+        <div class="section-title" style="margin-top:18px">入口机视角</div>
+        <div id="rd-agent"></div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+          <button class="btn btn-sm btn-primary" type="button" id="rd-again">重新测试（面板 + 入口机）</button>
+          <button class="btn btn-sm btn-ghost" type="button" id="rd-agent-run">只重测入口机</button>
+          <span class="hint" style="margin:0">延迟为 TCP 握手耗时</span>
+        </div>
       </div>`,
   });
 
-  const run = async () => {
-    const box = $('#rd-body', mask);
-    box.innerHTML = '<div class="hint" style="margin:0">正在从面板探测目标…</div>';
+  const showLoading = (text) => {
+    const loading = $('#rd-loading', mask);
+    if (loading) {
+      loading.innerHTML = `<i class="spinner" style="margin-right:7px"></i>${esc(
+        text || '正在检测：面板机 + 入口机…',
+      )}<div class="hint" style="margin-top:8px">入口机由 agent 拉取式回传，最多约 60 秒；离线时会直接跳过</div>`;
+      loading.classList.remove('hidden');
+    }
+    $('#rd-content', mask).classList.add('hidden');
+  };
+
+  const render = (panel, agent) => {
+    $('#rd-panel', mask).innerHTML = relayPanelProbeHtml(panel);
+    $('#rd-agent', mask).innerHTML = relayAgentProbeHtml(agent);
+    $('#rd-loading', mask).classList.add('hidden');
+    $('#rd-content', mask).classList.remove('hidden');
+  };
+
+  const loadPanel = async () => {
     try {
-      const d = await api('/api/relays/' + id + '/diag', { method: 'POST' });
-      box.innerHTML = `
-        <div class="alert alert-warn" style="margin:0 0 12px;font-size:12px;line-height:1.7">
-          探测从 <b>面板所在机器</b> 发起：面板到目标可达，不代表入口机到目标也可达。
-          入口机视角请用下方的「从入口机检测」。
-        </div>
-        <div class="table-wrap"><table>
-          <thead><tr><th>#</th><th>目标</th><th>结果</th><th>延迟</th><th>说明</th></tr></thead>
-          <tbody>
-            ${d.targets
-              .map(
-                (t, i) => `<tr>
-                  <td>${i + 1}${i === d.active ? ' <span class="badge badge-ok">当前首选</span>' : ''}</td>
-                  <td class="mono">${esc(t.host)}:${esc(t.port)}</td>
-                  <td><span class="badge ${t.ok ? 'badge-ok' : 'badge-bad'}">${t.ok ? '可达' : '不可达'}</span></td>
-                  <td class="mono">${t.ok ? t.ms + ' ms' : '—'}</td>
-                  <td class="cell-sub">${t.error ? esc(t.error) : '—'}</td>
-                </tr>`,
-              )
-              .join('')}
-          </tbody>
-        </table></div>
-        <p class="hint" style="margin-top:10px">
-          ${
-            d.active < 0
-              ? '所有目标都探测失败：这条规则当前没有可用落地地址（gost 连接会失败；iptables 会保留但流量不通）。'
-              : `按顺序第一个可达的是 <b>#${d.active + 1}</b>：${esc(d.targets[d.active].host)}:${esc(d.targets[d.active].port)}。`
-          }
-          ${r.tool === 'iptables'
-            ? 'iptables 是静态规则：已装 agent 的中转机每轮同步（约 60s）重选；纯手动模式需要重跑 install 脚本。'
-            : 'gost 同样由每轮同步（约 60s）按顺序探测并重选目标。'}
-        </p>`;
+      return await api('/api/relays/' + id + '/diag', { method: 'POST' });
     } catch (err) {
-      box.innerHTML = `<div class="alert alert-danger" style="margin:0">${esc(err.message)}</div>`;
+      return { error: err };
     }
   };
 
-  const runAgent = async () => {
-    const btn = $('#rd-agent-run', mask);
-    const box = $('#rd-agent', mask);
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '等待入口机…';
+  const waitAgent = async (force) => {
+    let cached = parseAgentProbe(r.agentProbe);
+    const at = cached && cached.at ? Date.parse(cached.at) : NaN;
+    // 5 分钟内的结果直接复用：每次打开都强制等 60 秒体验太差
+    if (!force && Number.isFinite(at) && Date.now() - at < 5 * 60 * 1000) {
+      return { probe: cached };
     }
+    if (!r.serverOnline) return { offline: true, probe: cached };
     try {
       const req = await api('/api/relays/' + id + '/diag', {
         method: 'POST',
         body: JSON.stringify({ source: 'agent' }),
       });
-      if (box) box.innerHTML = agentProbeHtml(null, req.requestedAt);
-      let tries = 0;
-      const timer = setInterval(async () => {
-        tries++;
+      const want = Date.parse(req.requestedAt);
+      for (let i = 0; i < 30; i++) {
+        if (!document.body.contains(mask)) return { probe: cached };
+        await new Promise((resolve) => setTimeout(resolve, 3000));
         let d = null;
         try {
           d = await api('/api/relays/' + id + '/probe');
         } catch {
           d = null;
         }
-        const at = d && d.agentProbe ? Date.parse(d.agentProbe.at) : NaN;
-        const want = req.requestedAt ? Date.parse(req.requestedAt) : NaN;
-        const fresh = !req.requestedAt || !Number.isFinite(at) || !Number.isFinite(want) || at >= want;
-        if (d && d.agentProbe && fresh) {
-          clearInterval(timer);
-          if (box) box.innerHTML = agentProbeHtml(d.agentProbe, null);
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = '重新检测（入口机）';
-          }
-          return;
+        if (d && d.agentProbe) cached = d.agentProbe;
+        const got = d && d.agentProbe ? Date.parse(d.agentProbe.at) : NaN;
+        if (d && d.agentProbe && (!Number.isFinite(want) || !Number.isFinite(got) || got >= want)) {
+          return { probe: d.agentProbe };
         }
-        if (tries >= 18) {
-          clearInterval(timer);
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = '重新检测（入口机）';
-          }
-          if (box) {
-            box.innerHTML =
-              agentProbeHtml(null, null) +
-              '<div class="hint">超时：agent 未在 90 秒内回传，确认入口机在线且同步正常</div>';
-          }
-        }
-      }, 5000);
-    } catch (err) {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = '从入口机检测';
       }
-      if (box) box.innerHTML = `<div class="alert alert-danger" style="margin:0">${esc(err.message)}</div>`;
+      return { timeout: true, probe: cached };
+    } catch (err) {
+      return { error: err, probe: cached };
     }
   };
 
-  $('#rd-again', mask).addEventListener('click', run);
-  $('#rd-agent-run', mask).addEventListener('click', runAgent);
-  run();
+  const loadAll = async (force = false) => {
+    showLoading(force ? '正在重新检测：面板机 + 入口机…' : undefined);
+    const [panel, agent] = await Promise.all([loadPanel(), waitAgent(force)]);
+    render(panel, agent);
+  };
+
+  $('#rd-again', mask).addEventListener('click', () => loadAll(true));
+  $('#rd-agent-run', mask).addEventListener('click', async () => {
+    showLoading('正在重新检测入口机…');
+    const agent = await waitAgent(true);
+    $('#rd-agent', mask).innerHTML = relayAgentProbeHtml(agent);
+    $('#rd-loading', mask).classList.add('hidden');
+    $('#rd-content', mask).classList.remove('hidden');
+  });
+
+  loadAll(false);
 }
 
 /* ------------------------------- 脚本下发 ------------------------------- */

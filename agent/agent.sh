@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.49'
+VERSION='0.1.50'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -141,6 +141,8 @@ case "${1:-}" in
     exit 0
     ;;
   --uninstall)
+    CURRENT_ACTION=uninstall
+    log "开始卸载：主动停止 agent（原因：执行了 --uninstall）"
     # 卸载会删掉脚本自己所在的目录：先把自己拷到 /tmp 再 exec，
     # 免得某些 shell 边读边执行时读到已经被 unlink 的文件。
     # 真正的清理逻辑在 np_uninstall（文件末尾），这里只负责换个安全的位置执行它
@@ -1488,6 +1490,7 @@ orphan_clear() {
 
 # 返回 0 = 应用了配置，1 = 没变化或失败
 apply_bundle() {
+  CURRENT_ACTION=apply
   _body="$RUN_DIR/bundle.body.$$"
   NP_HTTP_CODE=$(fetch_bundle "$_body")
   _out=$(cat "$_body" 2>/dev/null)
@@ -1542,6 +1545,7 @@ apply_bundle() {
     [ "${NP_CHANGED_XRAY:-0}" = '1' ] && _what='Xray'
     [ -n "${NP_CHANGED_HY:-}" ] && _what="${_what}${_what:+、}Hysteria2${NP_CHANGED_HY}"
     log "✓ 配置已更新（hash ${NP_HASH:-?}，变更：${_what:-无}）"
+    CURRENT_ACTION=tick
     return 0
   fi
 
@@ -1554,6 +1558,7 @@ apply_bundle() {
   LAST_FETCH_OK=1
   RC_OK=0
   RC_ERR="配置包执行失败：${_why:-详见 $LOG_DIR/agent.log}"
+  CURRENT_ACTION=tick
   return 1
 }
 
@@ -1998,6 +2003,7 @@ agent_update_fail() {
 }
 
 agent_self_update() {
+  CURRENT_ACTION=update
   _want=${NP_AGENT_VERSION:-}
   [ -n "$_want" ] || return 0
   [ "$_want" = "$VERSION" ] && return 0
@@ -2053,6 +2059,7 @@ agent_self_update() {
 
   rm -f "$STATE_DIR/.agent-update" 2>/dev/null
   log "✓ agent 已更新到 $_want，重启进程"
+  log "自更新重启：旧进程退出原因=升级到 $_want（exec 替换进程，不是收到退出信号）"
   # exec 在同一个 PID 上换成新脚本：systemd 看来服务没有中断，
   # 也不会出现「旧进程还在跑、又被拉起一个新进程」的双跑
   exec sh "$SELF_PATH" $RUN_ARGS
@@ -2061,6 +2068,7 @@ agent_self_update() {
 # --------------------------------- 主循环 -----------------------------------
 
 tick() {
+  CURRENT_ACTION=tick
   # 每轮都重新读一次状态，--once 模式下也能拿到上一轮的结果
   [ -f "$STATE_DIR/state.env" ] && . "$STATE_DIR/state.env"
   [ -f "$STATE_DIR/changed.env" ] && . "$STATE_DIR/changed.env"
@@ -2107,6 +2115,7 @@ tick() {
 
   # 自更新放最后：这一轮的配置与流量都已经处理完，重启不会丢数据
   agent_self_update
+  CURRENT_ACTION=idle
 }
 
 # --------------------------------- 卸载 -------------------------------------
@@ -2370,7 +2379,21 @@ if [ "${1:-}" = '--once' ]; then
   exit 0
 fi
 
-trap 'log "收到退出信号，agent 停止"; exit 0' TERM INT
+CURRENT_ACTION=idle
+
+# 退出原因：信号名 + 父进程 + init + 当前动作
+# systemd/OpenRC stop、容器销毁会发 TERM；Ctrl-C 是 INT；SIGKILL/OOM 无法捕获
+agent_exit_reason() {
+  _sig="$1"
+  _ppid="${PPID:-?}"
+  _pcomm=$(cat "/proc/$_ppid/comm" 2>/dev/null || ps -o comm= -p "$_ppid" 2>/dev/null || echo '?')
+  _init=$(cat /proc/1/comm 2>/dev/null || echo '?')
+  log "收到退出信号 $_sig，agent 停止：来源 pid=$_ppid comm=$_pcomm；init=$_init；当前动作=${CURRENT_ACTION:-idle}"
+  log "  · systemd/OpenRC stop、容器销毁或手动 Ctrl-C 属预期；当前动作=update 表示自更新重启；SIGKILL/OOM 不会留下这条日志"
+  exit 0
+}
+trap 'agent_exit_reason TERM' TERM
+trap 'agent_exit_reason INT' INT
 while :; do
   tick
   # 面板已经不认这台机器时转低频：日志不刷屏、请求不空转，
