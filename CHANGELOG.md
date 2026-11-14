@@ -3,6 +3,39 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.45] - 2026-11-14
+
+> 中转机不再是独立台账：`servers` 增 `type`，服务器页用 tab 分成「节点服务器 / 中转服务器」，
+> 中转机装同一套 agent 后规则每 60 秒自动收敛（gost / iptables）；没装 agent 的机器继续用
+> 手动三态脚本兜底。
+
+### 新增
+
+- **中转机 agent 自动同步（relay-only bundle）**：中转机与落地机共用 `/api/agent/bundle`
+  与同一份 `agent.sh`，按 token 解析出的 scope 分流。中转机拿到的是只含转发规则的收敛包：
+  先删面板已不存在的 `gost-relay-*` / `np-relay:*` 规则，再写入期望规则，因此删规则、改端口、
+  换 tool 都会在下一轮自动生效。agent 的 `RELAY_ONLY=1` 会跳过证书、Xray、Hysteria2、
+  端口跳跃与流量采集，只保留回执与端口自检。
+- **服务器页 tab 分组**：节点服务器 / 中转服务器两栏（带数量），新增按钮跟随当前 tab；
+  新建弹窗先选类型，编辑时类型只读。中转卡片显示「转发规则 N 条」而不是节点 / 用户数；
+  部署、卸载弹窗文案按类型分叉。
+- **中转机安装/卸载脚本分叉**：relay 型安装脚本只部署 agent（`NEED_XRAY=0` /
+  `NEED_HYSTERIA=0` / `RELAY_ONLY=1`），不安装也不改动同机已有的 Xray / Hysteria2；
+  卸载脚本只清 gost unit、`/etc/gost/relay-*.env` 与 `np-relay:` 标签规则。
+
+### 变更
+
+- **schema 12 → 13**：`servers` 增 `type`（`node` / `relay`，创建后不可改）。旧
+  `relay_servers` 台账迁入 `servers`：补设备级 token、地址改为手动模式、写入心跳字段；
+  id 与既有服务器冲突时重新分配并同步 `relays.serverId`，迁移完成后删除旧表（不再双台账并存）。
+- 中转机台账的增删改统一走 `POST/PUT/DELETE /api/servers`；`GET /api/relay-servers`
+  保留只读一个版本（不回显 token），写入端点移除。
+- 中转视图去掉「中转服务器」入口，只保留规则；还没有中转机时引导到服务器页的中转 tab。
+- 中转机地址强制 `ipMode=manual` + `relayTarget` 白名单（IPv4 / 域名），不允许 agent 自动上报 —
+  入口地址会进订阅，漂移即断连。有转发规则的中转机不允许删除（单个与批量删除都拦）。
+- **落地机零影响**：relay 字段不进入落地机 payload 与 hash 输入，升级不会触发全量重下发；
+  `node.entries.relayId` 行为不变。
+
 ## [0.1.44] - 2026-11-14
 
 > 导入分享的节点编辑起来干净了：只留「名称」和「链接」，协议 / 端口 / 传输 / 证书这些

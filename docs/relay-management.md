@@ -1,42 +1,51 @@
 # 中转管理方案（relay management）
 
-> 2026-11-13 · v2（按澄清需求重写）· 状态：已实施（0.1.43）
+> 2026-11-13 · v3（0.1.44 增量：中转机并入服务器台账 + agent 自动同步）· 状态：已实施
 >
-> 需求：① 新增「中转服务器」管理，可往中转机上用主流工具（gost / iptables）添加端口转发实现节点中转；② 节点新增/编辑时中转入口可下拉选择中转管理中已有的规则。
+> 需求：① 新增「中转服务器」管理，可往中转机上用主流工具（gost / iptables）添加端口转发实现节点中转；② 节点新增/编辑时中转入口可下拉选择中转管理中已有的规则；③ **中转机与落地机统一在「服务器」页管理（tab 分组），装 agent 后规则自动同步**。
 
-## 1. 现状与差距
+## 1. 现状与差距（v3 已关闭）
 
-- 现有中转只有 `node.entries`（订阅发布端点，手填 host/port）+ `GET /api/relay/script` 一次性 iptables 脚本（server/servers.js:256-280 → deploy-scripts.js:924-1000）
-- 没有「中转服务器」概念：入口机信息散落在各节点 entries 里，无法按机管理
-- 只支持 iptables 一种工具；无卸载脚本、无状态回执、无端口冲突校验
-- agent 只管落地机，入口机不在管控范围
+- v2 的中转机是独立台账 `relay_servers`，与落地机 `servers` 两套记录、两套 UI，同一个地址要维护两次
+- v2 只支持手动脚本（生成 → 复制执行 → curl 回执），规则变更必须重新生成并执行
+- v3 起：中转机 = `servers.type='relay'`，与落地机共用 token / 心跳 / 安装脚本框架；
+  规则由 agent 每 60s 拉取并幂等收敛，手动三态脚本保留作为未装 agent 时的兜底
 
 ## 2. 总体设计
 
-纯面板侧改动（一期不要求入口机装 agent），沿用「生成脚本 → 手动执行 → curl 回执」模式：
+机器统一在「服务器」页（tab 分组），规则在「中转」页；中转机装了 agent 就自动同步，
+没装则沿用「生成脚本 → 手动执行 → curl 回执」：
 
 ```
-中转管理（新视图）                      节点编辑（联动）
-┌────────────────────────┐            ┌─────────────────────────┐
-│ 中转服务器 A（1.2.3.4） │            │ 中转入口：[下拉选择规则 ▾] │
-│  ├ 规则 R1 gost  :8443→N1:443       │  香港入口 → 日本节点       │
-│  ├ 规则 R2 iptables:443→N2:443      │  （选中后 host/port 自动带出│
-│  └ [添加规则] [脚本] [状态]          │    并记录 relayId）        │
-└────────────────────────┘            └─────────────────────────┘
+服务器页（tab：节点服务器 / 中转服务器）        中转页（规则）
+┌──────────────────────────────┐     ┌──────────────────────────┐
+│ 中转服务器 A（198.51.100.10）│ ←── │ 规则 R1 gost  :8443→N1:443 │
+│  [部署命令] [卸载命令] [在线] │     │ 规则 R2 iptables:443→N2:443│
+│  （与落地机同一套 agent 通道）│     │ [添加规则] [三态脚本]      │
+└──────────────────────────────┘     └──────────────────────────┘
 ```
+
+- **下发分流**：落地机拿到的是 Xray / Hysteria2 / 证书配置包；中转机拿到的是
+  relay-only 配置包（只有规则收敛脚本）。两者共用 `/api/agent/bundle` 与同一份
+  `agent.sh`，靠 token 解析出的 `scope.type` 分流，中转机 bundle 额外带 `RELAY_ONLY=1`。
+- **落地机零影响**：relay 字段不进入落地机 payload 与 hash 输入，升级后不会触发全量重下发。
 
 - **转发工具按规则选择**：`tool: gost | iptables`。gost 为用户态转发（systemd 托管进程，无需改内核转发，适配 NAT/受限环境）；iptables 为内核态 DNAT（零进程、性能最优）。字段预留扩展位（后续可加 realm / socat 等，生成器按 tool 分发）。
 - **节点联动**：`node.entries` 元素新增可选 `relayId`。选中中转规则后 host/port 自动以规则为准；手填模式保留（兼容旧数据）。
 
-## 3. 数据模型（lib/store.js TABLE_SPECS，schema 11 → 13，只加法迁移）
+## 3. 数据模型（lib/store.js TABLE_SPECS，schema 12 → 13，只加法迁移）
 
 ```js
-// relayServers：中转服务器台账（一期纯信息，二期可直接挂 agent token）
-{ id, name, host, note, createdAt }
-
-// relays：端口转发规则
+// servers：统一机器台账（0.1.44）
 {
-  id, serverId,          // → relayServers
+  id, type,             // 'node' = 落地机 | 'relay' = 中转机（创建后不可改）
+  name, host, token, note, ipMode, reportedIp,
+  createdAt, lastSeen, agentVersion, sync,
+}
+
+// relays：端口转发规则（serverId → servers.id，要求该 server 的 type='relay'）
+{
+  id, serverId,
   name,                  // 如「香港入口 → 日本节点」
   tool: 'gost',          // gost | iptables
   proto: 'both',         // tcp | udp | both
@@ -45,22 +54,31 @@
   targetPort: 443,       // 落地端口（= 节点监听端口）
   nodeId: '',            // 可选：关联落地节点（仅台账展示用）
   status: 'planned',     // planned | applied | unknown
-  deployToken: '',       // 回执鉴权，rotate 能力
+  deployToken: '',       // 手动脚本回执鉴权，rotate 能力
   appliedAt: null, note: '',
 }
 ```
 
-- **冲突校验（保存规则时）**：同一 serverId 下 listenPort 重复 → 400（跨工具也查：iptables DNAT 与 gost 监听同端口会互相劫持）。同 listenPort 不同 server 合法。
-- `node.entries`：元素增加可选 `relayId`；带 relayId 时保存节点自动以 relay 的 host/listenPort 覆盖 entry.host/port（防手改不一致）；relay 已删除则保留手填值并清 relayId。订阅发布链路（lib/sub.js endpointsOf）**零改动**。hopError 互斥校验不变（下拉选择后 entryHosts 依旧非空，天然保持互斥）。
+- **迁移（旧 `relay_servers` → `servers`）**：每条旧台账转成 `type='relay'` 的 servers 行，
+  补设备级 `token`、`ipMode='manual'` 与心跳字段；id 与既有 servers 冲突时重新分配并同步
+  `relays.serverId`；迁移后 `DROP TABLE relay_servers`（不允许两份台账并存）
+- **中转机地址约束**：必须是 IPv4 / 域名（过 `relayTarget`），`ipMode` 强制 `manual` ——
+  入口地址会进订阅，自动上报会让客户端连接地址漂移
+- **冲突校验（保存规则时）**：同一 serverId 下 listenPort 重复 → 400（跨工具也查）
+- `node.entries` 元素保留可选 `relayId`；带 relayId 时保存节点自动以 relay 的
+  `listenPort` + 所属中转机 host 覆盖 entry.host/port
 
 ## 4. API（沿路由表 + Bearer + 审计模式，server.js:97-211）
 
 | 路由 | 说明 |
 |------|------|
-| `GET/POST/PUT/DELETE /api/relay-servers` | 中转服务器 CRUD；删除时若有规则 → 400 提示先清规则 |
+| `GET/POST/PUT/DELETE /api/servers`（`type=relay`） | 中转机台账统一走服务器接口；删除时若有规则 → 400 提示先清规则；批量删除会跳过有规则的机器 |
+| `GET /api/relay-servers` | **兼容只读端点**（一个版本）：列出 type=relay 的服务器，不回显 token；写入端点已移除 |
 | `GET/POST/PUT/DELETE /api/relays` | 规则 CRUD（校验见 §3）；关键字段变更后 status 重置 planned；DELETE 时若 status=applied 响应带 `needsUninstall: true` |
-| `GET /api/relays/:id/script?mode=install\|uninstall\|check` | 按 tool 分发生成三态脚本，并 rotate deployToken |
+| `GET /api/relays/:id/script?mode=install\|uninstall\|check` | 按 tool 分发生成三态脚本，并 rotate deployToken（手动通道） |
 | `POST /api/relay/ack` | **免登录回执**：relayId + deployToken（恒时比较）→ status=applied/unknown + appliedAt。沿袭免登录 POST 1.5MB 限额与限流（http-util.js readBody 机制） |
+| `GET /api/servers/:id/install`（relay 型） | relayOnly 安装脚本：只部署 agent，不安装 Xray / Hysteria2 |
+| `GET /api/agent/bundle`（relay token） | relay 配置包：只含规则收敛脚本，不读 nodes / users / certs |
 
 旧 `GET /api/relay/script` 保留（兼容既有工作流）。
 
@@ -87,14 +105,25 @@
 
 install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）：iptables 模式查 DNAT 重复；gost 模式查监听冲突，被非本面板进程占用 → 明确报错退出，避免静默不通。
 
+### 5.4 relay 收敛包（agent 通道，0.1.44）
+
+`buildRelaySyncScript({ rules })` 生成 POSIX sh 收敛脚本，由 relay bundle 每轮执行：
+
+1. 枚举 `gost-relay-*.service` 与带 `np-relay:` 标签的 NAT 规则，**删除面板已不存在的**（删规则 / 改端口 / 换 tool 自动生效）
+2. 期望规则逐条写入：gost 写 env + systemd unit 并 `enable --now`；iptables 写 DNAT + MASQUERADE（--comment 标签，缺 comment 模块降级）
+3. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
+4. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入），失败通过 receipt 暴露
+
+与手动三态脚本共用同一套命名的好处：两条通道可以互相接手，不留第二套规则。
+
 ## 6. 前端
 
-- 新「中转」视图（public/index.html 菜单 + public/js/relays.js，沿视图拆分惯例）：
-  - 顶部中转服务器切换/管理（CRUD 弹窗）
-  - 规则表格：名称、tool 徽标、proto、`listen:port → target:port`、关联节点、状态徽标（planned/applied/unknown + appliedAt）
-  - 新建/编辑弹窗：tool 下拉（gost/iptables，proto 选项联动）、serverId 下拉、nodeId 下拉（可选）
-  - 每行三态脚本生成（install/uninstall/check，一键复制）
-- 节点视图（public/js/nodes.js:787-834 入口编辑区）：入口行改为「下拉选择中转规则（显示 `名称 host:port [tool]`）+ 未选择时手填」；旧数据无 relayId 自动落手填模式
+- 「服务器」视图按 **tab 分组**：节点服务器 / 中转服务器（互斥展示，新增按钮跟着当前 tab）
+  - 新建弹窗先选类型：节点服务器（跑 Xray / Hysteria2）或中转服务器（入口机）
+  - 中转卡片显示「转发规则」数而不是节点 / 用户数；部署 / 卸载弹窗文案按类型分叉
+- 「中转」视图只管规则：改为添加规则时若还没有中转机，提示并跳到服务器页的中转 tab
+  - 规则表在机器名旁提示「入口机离线」；服务器 CRUD 入口已移除（统一在服务器页）
+- 部署到中转机后，规则由 agent 自动同步；每行仍保留三态脚本按钮（未装 agent / 排查用）
 
 ## 7. 安全考量
 
@@ -105,22 +134,28 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 
 ## 8. 测试
 
-- `test/generators.js`：gost / iptables 三态脚本 `bash -n` 真解析；标签、GOST_VER 白名单、shellSafe 转义断言
-- `test/smoke.js`：relayServers / relays CRUD、同机端口冲突 400（跨工具）、ack 鉴权（错 token / 重放）、status 流转、节点入口联动（选 relay → host/port 覆盖；relay 删除 → entry 保留手填值）
-- 回归：既有中转入口用例（smoke.js:1506-1622）必须全绿；agent 侧零改动
+- `test/generators.js`：gost / iptables 三态脚本 + relayOnly 安装/卸载 + relay 收敛包 `bash -n` 真解析；
+  标签、GOST_VER 白名单、shellSafe 转义、中转机不装 Xray/Hysteria 断言
+- `test/relay.js`：schema 12→13 迁移（id 冲突重映射、relays.serverId 跟随、旧表删除）、
+  落地机 payload 字段集合不变、中转机 payload 只含规则
+- `test/smoke.js`：servers(type=relay) CRUD、同机端口冲突 400（跨工具）、ack 鉴权（错 token / 重放）、
+  status 流转、节点入口联动（选 relay → host/port 覆盖；relay 删除 → entry 保留手填值）、
+  中转机安装/卸载脚本分叉、兼容只读端点
+- 回归：`npm test`（含 smoke 全量）与 `npm run test:ui`
 
 ## 9. 影响分析
 
 | 维度 | 影响 |
 |------|------|
-| 数据 | schema 11→13 新增 relayServers / relays 两表，自动备份后迁移，无存量数据改写 |
-| 兼容 | `node.entries` 仅增可选 `relayId` 字段；无 relayId 的旧数据 = 手填模式，行为不变；订阅链路零改动 |
-| 安全面 | 新增 1 个免登录接口（ack），token + 限额 + 限流收敛 |
-| 入口机侧 | gost 模式新增 systemd 常驻进程（`gost-relay-<id>.service`，每规则一个）与 `/etc/gost/`、`/usr/local/bin/gost`；iptables 模式仅多一条 comment 标签 |
-| 回归范围 | `npm run test:generators` + `npm test`（smoke 全量） |
-| 风险点 | 极精简系统无 `comment` match → iptables 降级无标签（卸载精度略降）；gost 下载依赖 GitHub 连通性（版本变量可指向自托管 URL 的扩展位） |
+| 数据 | schema 12→13：`servers` 增 `type`；旧 `relay_servers` 行迁入并 DROP 旧表；自动备份后迁移 |
+| 兼容 | `node.entries` 仅增可选 `relayId`；`GET /api/relay-servers` 保留只读一个版本；写入端点已移除 |
+| 落地机 agent | **零影响**：payload 字段集合与 hash 输入不变，不触发重下发（test/relay.js 锁死） |
+| 中转机侧 | 装 agent 后新增 `gost-relay-<id>.service` / `np-relay:<id>` 的 60s 自动收敛；未装 agent 仍可手动执行脚本 |
+| 安全面 | 中转机获得设备级 token（可被下发 root shell），relay bundle 只由固定模板生成，不接受自由字段 |
+| 风险点 | 极精简系统无 `comment` match → iptables 降级无标签（过期规则无法自动清理）；gost 下载依赖 GitHub 连通性（`GOST_DL_BASE` 可指镜像）；同机双角色（既入口又落地）不支持，需后续 capabilities 模型 |
 
 ## 10. 分期
 
-- **一期（本方案）**：两新表 + API + gost/iptables 三态脚本 + 中转视图 + 节点下拉联动 + 测试
-- **二期（评估）**：中转服务器 agent 化（relay-only bundle：只应用转发规则 + 回执/心跳，复用现有下发链路），实现 60s 自动同步；tool 扩展（realm / socat）
+- **一期（0.1.43，已完成）**：中转台账 + API + gost/iptables 三态脚本 + 中转视图 + 节点下拉联动 + 测试
+- **二期（0.1.44，已完成）**：中转机并入 servers 台账（type=relay）+ relay-only agent（规则 60s 自动收敛）+ 服务器页 tab 分组 + 手动脚本保留为兜底
+- **后续（评估）**：同一台机器同时承担入口与落地（需要 capabilities 多角色模型）；tool 扩展（realm / socat）

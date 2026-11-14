@@ -1,14 +1,14 @@
 'use strict';
 /**
- * 中转管理域：中转服务器台账 + 端口转发规则 + 三态脚本下发 + 执行回执
+ * 中转管理域：端口转发规则 + 三态脚本下发 + 执行回执
  *
- * 「中转服务器」是端口转发的宿主机（入口机），一期不装 agent：规则通过生成
- * 三态脚本（install / uninstall / check）由管理员手动执行，脚本末尾 curl 回执
- * 本模块的 /api/relay/ack（免登录，deployToken 恒时比较），面板据此推进 status。
+ * 「中转服务器」就是 servers 表里 type='relay' 的机器（0.1.44 起与落地机共用一份台账）：
+ *   · 机器的新增 / 编辑 / 删除在「服务器」页完成，本模块只读它们
+ *   · 装了 agent 的中转机由 agent 每轮拉取规则并幂等收敛（relay bundle）
+ *   · 没装 agent 的机器仍可用三态脚本（install / uninstall / check）手动执行，
+ *     脚本末尾 curl 回执 /api/relay/ack（免登录，deployToken 恒时比较）
  *
- * 与落地机（servers 表 + agent 回执链路）刻意分开：入口机上没有 agent，
- * status 永远是「最近一次回执」的快照，面板不主动探测入口机。
- * 脚本模板在 server/deploy-scripts.js（buildRelayRuleScript，按 tool 分发）。
+ * 脚本模板在 server/deploy-scripts.js（buildRelayRuleScript / buildRelaySyncScript）。
  */
 
 const store = require('../lib/store');
@@ -16,6 +16,7 @@ const { sendJson, sendText } = require('./http-util');
 const { auditAction, clientIp } = require('./context');
 const { tokenEq } = require('./tokens');
 const { baseUrl, nameTaken } = require('./util');
+const { relayServers } = require('./servers');
 const { buildRelayRuleScript, relayTarget } = require('./deploy-scripts');
 
 const TOOLS = ['gost', 'iptables'];
@@ -52,75 +53,22 @@ function ackLimited(ip) {
 
 /* ------------------------------ 中转服务器 ------------------------------ */
 
+/**
+ * 兼容旧前端 / 旧调用方的只读端点：中转机的增删改已统一收归 /api/servers。
+ * token 不回显（旧台账本来没有 token；前端拼安装命令走的是服务器列表）。
+ */
 function listRelayServers(req, res) {
   const db = store.db();
   sendJson(res, 200, {
-    items: db.relay_servers.map((s) => ({
-      ...s,
-      ruleCount: db.relays.filter((r) => r.serverId === s.id).length,
-    })),
+    items: relayServers(db).map((s) => {
+      const { token, ...safe } = s;
+      return {
+        ...safe,
+        online: store.serverOnline(s),
+        ruleCount: db.relays.filter((r) => r.serverId === s.id).length,
+      };
+    }),
   });
-}
-
-function createRelayServer(req, res, params, body) {
-  const name = String(body.name || '').trim();
-  const host = String(body.host || '').trim();
-  if (!name) return sendJson(res, 400, { error: '请填写中转服务器名称' });
-  if (nameTaken(store.db().relay_servers, name)) {
-    return sendJson(res, 409, { error: '已存在同名中转服务器，换个名字' });
-  }
-  // host 会被拼进 iptables 规则与节点入口（entry.host），只认裸 IPv4 / 域名
-  if (!relayTarget(host)) {
-    return sendJson(res, 400, { error: '服务器地址只能是 IPv4 或域名（不带 http://、端口、路径；IPv6 暂不支持）' });
-  }
-  const s = { id: store.uid(), name, host, note: String(body.note || ''), createdAt: store.iso() };
-  store.db().relay_servers.push(s);
-  store.save();
-  auditAction('relay-server.create', name, host);
-  sendJson(res, 200, { ok: true, item: s });
-}
-
-function updateRelayServer(req, res, params, body) {
-  const s = store.db().relay_servers.find((x) => x.id === params.id);
-  if (!s) return sendJson(res, 404, { error: '中转服务器不存在' });
-  if (body.name !== undefined) {
-    const next = String(body.name).trim() || s.name;
-    if (nameTaken(store.db().relay_servers, next, s.id)) {
-      return sendJson(res, 409, { error: '已存在同名中转服务器，换个名字' });
-    }
-    s.name = next;
-  }
-  if (body.host !== undefined) {
-    const host = String(body.host).trim();
-    // 地址变了，这台机上的规则全部回到「未部署」—— 旧脚本还指向旧机器
-    if (host && host !== s.host) {
-      for (const r of store.db().relays) {
-        if (r.serverId === s.id && r.status === 'applied') r.status = 'planned';
-      }
-    }
-    if (host && !relayTarget(host)) {
-      return sendJson(res, 400, { error: '服务器地址只能是 IPv4 或域名（不带 http://、端口、路径；IPv6 暂不支持）' });
-    }
-    s.host = host;
-  }
-  if (body.note !== undefined) s.note = String(body.note);
-  store.save();
-  auditAction('relay-server.update', s.name, s.host);
-  sendJson(res, 200, { ok: true, item: s });
-}
-
-function deleteRelayServer(req, res, params) {
-  const db = store.db();
-  const i = db.relay_servers.findIndex((x) => x.id === params.id);
-  if (i < 0) return sendJson(res, 404, { error: '中转服务器不存在' });
-  const rules = db.relays.filter((r) => r.serverId === params.id).length;
-  if (rules) {
-    return sendJson(res, 400, { error: `该服务器上还有 ${rules} 条中转规则，先删除规则再删服务器` });
-  }
-  const [gone] = db.relay_servers.splice(i, 1);
-  store.save();
-  auditAction('relay-server.delete', gone.name, gone.host);
-  sendJson(res, 200, { ok: true });
 }
 
 /* ------------------------------- 中转规则 ------------------------------- */
@@ -130,8 +78,8 @@ function deleteRelayServer(req, res, params) {
  * targetHost 会拼进 iptables --to-destination 与 gost 的转发 URL，必须过白名单。
  */
 function ruleFieldError(body, db) {
-  const server = db.relay_servers.find((x) => x.id === String(body.serverId || ''));
-  if (!server) return '请选择中转服务器';
+  const server = relayServers(db).find((x) => x.id === String(body.serverId || ''));
+  if (!server) return '请选择中转服务器（先到「服务器」页新增一台中转机）';
   const name = String(body.name || '').trim();
   if (!name) return '请填写规则名称';
   if (nameTaken(db.relays, name, body.__selfId)) return '已存在同名规则，换个名字';
@@ -154,7 +102,7 @@ function portConflict(db, rule, selfId) {
 
 /** 节点入口（手填 host:port）与新建规则撞端口：会抢同一端口的流量 */
 function entryConflict(db, rule, selfId) {
-  const server = db.relay_servers.find((x) => x.id === rule.serverId);
+  const server = relayServers(db).find((x) => x.id === rule.serverId);
   if (!server) return null;
   for (const n of db.nodes) {
     for (const e of n.entries || []) {
@@ -169,9 +117,10 @@ function entryConflict(db, rule, selfId) {
 
 function listRelays(req, res) {
   const db = store.db();
+  const servers = relayServers(db);
   sendJson(res, 200, {
     items: db.relays.map((r) => {
-      const server = db.relay_servers.find((x) => x.id === r.serverId);
+      const server = servers.find((x) => x.id === r.serverId);
       const node = r.nodeId ? db.nodes.find((x) => x.id === r.nodeId) : null;
       // deployToken 不回显：它只应该出现在生成好的脚本正文里（与 certs 的
       // 「凭据只写不读」同一原则）。列表/详情回显会让 token 无谓地暴露一层
@@ -180,11 +129,15 @@ function listRelays(req, res) {
         ...safe,
         serverName: server ? server.name : '（已删除）',
         serverHost: server ? server.host : '',
+        serverOnline: server ? store.serverOnline(server) : false,
         nodeName: node ? node.name : '',
         usedByEntries: db.nodes.some((n) => (n.entries || []).some((e) => e.relayId === r.id)),
       };
     }),
-    servers: db.relay_servers,
+    servers: servers.map((s) => {
+      const { token, ...safe } = s;
+      return { ...safe, online: store.serverOnline(s), ruleCount: db.relays.filter((r) => r.serverId === s.id).length };
+    }),
     nodes: db.nodes.map((n) => ({ id: n.id, name: n.name, port: n.port, host: n.host || n.address })),
   });
 }
@@ -323,7 +276,7 @@ function relayAck(req, res, params, body, session, ctx) {
 }
 
 module.exports = {
-  listRelayServers, createRelayServer, updateRelayServer, deleteRelayServer,
+  listRelayServers,
   listRelays, createRelay, updateRelay, deleteRelay,
   relayRuleScript, relayAck,
 };

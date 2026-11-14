@@ -30,6 +30,7 @@ const {
   buildUninstallScript,
   buildRelayScript,
   buildRelayRuleScript,
+  buildRelaySyncScript,
   relayTarget,
   GOST_VER_RE,
   readAgentSource,
@@ -97,6 +98,25 @@ const SHELL_CASES = [
     proto: 'tcp',
     label: '',
   })],
+  // 中转机 agent 部署 / 卸载（0.1.44）：不安装 Xray / Hysteria2
+  ['中转机部署脚本', () => buildInstallScript({
+    panelUrl: 'https://panel.example.com',
+    token: 'd'.repeat(48),
+    label: '香港中转 (198.51.100.10)',
+    needHysteria: true,
+    needXray: true,
+    relayOnly: true,
+    agentSrc: AGENT_SRC,
+  })],
+  ['中转机卸载脚本', () => buildUninstallScript({ label: '香港中转', relayOnly: true })],
+  // 中转机 agent 收敛包：空规则（清场）/ gost + iptables 混合
+  ['中转收敛包（无规则）', () => buildRelaySyncScript({ rules: [] })],
+  ['中转收敛包（混合规则）', () => buildRelaySyncScript({
+    rules: [
+      { id: 'ab12cd34', name: '香港 → 日本', tool: 'gost', proto: 'both', listenPort: 8443, targetHost: '5.6.7.8', targetPort: 443 },
+      { id: 'ef56ab78', name: '香港 → 新加坡', tool: 'iptables', proto: 'tcp', listenPort: 9443, targetHost: '9.9.9.9', targetPort: 8443 },
+    ],
+  })],
   // 中转规则三态脚本（0.1.43）：gost / iptables × install / uninstall / check
   ...['gost', 'iptables'].flatMap((tool) =>
     ['install', 'uninstall', 'check'].map((mode) => [
@@ -147,6 +167,38 @@ if (!hasBash) {
       .filter(([, err]) => err !== null);
     ok(`${name}：三份脚本仍合法`, bad.length === 0, bad.length ? JSON.stringify(bad) : '');
   }
+}
+
+/* --------------------- 中转机脚本：不碰节点域 --------------------- */
+
+{
+  // 即便调用方传了 needXray/needHysteria，relayOnly 也必须把它们压成 0
+  const relayInstall = buildInstallScript({
+    panelUrl: 'https://panel.example.com',
+    token: 'e'.repeat(48),
+    label: '香港中转',
+    needHysteria: true,
+    needXray: true,
+    relayOnly: true,
+    agentSrc: AGENT_SRC,
+  });
+  ok('中转机部署脚本带 RELAY_ONLY=1', relayInstall.includes('RELAY_ONLY="1"'));
+  ok('中转机部署脚本把 Xray/Hysteria 依赖压成 0',
+    relayInstall.includes('NEED_XRAY="0"') && relayInstall.includes('NEED_HYSTERIA="0"'));
+
+  const relayUninstall = buildUninstallScript({ label: '香港中转', relayOnly: true });
+  ok('中转机卸载脚本清理 gost unit', relayUninstall.includes('gost-relay-'));
+  ok('中转机卸载脚本清理 np-relay 规则', relayUninstall.includes('np-relay:'));
+
+  const sync = buildRelaySyncScript({
+    rules: [
+      { id: 'ab12cd34', tool: 'gost', proto: 'both', listenPort: 8443, targetHost: '5.6.7.8', targetPort: 443 },
+      { id: 'ef56ab78', tool: 'iptables', proto: 'tcp', listenPort: 9443, targetHost: '9.9.9.9', targetPort: 8443 },
+    ],
+  });
+  ok('中转收敛包含 gost unit', sync.includes('gost-relay-ab12cd34.service'));
+  ok('中转收敛包含 iptables 标签', sync.includes('np-relay:ef56ab78'));
+  ok('中转收敛包含过期规则清理', sync.includes('已移除过期'));
 }
 
 /* --------------------- 二、注入串不得成为可执行语句 --------------------- */

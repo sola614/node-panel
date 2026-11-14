@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.44'
+VERSION='0.1.45'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -92,7 +92,7 @@ env_read() {
 if [ -f "$ENV_FILE" ]; then
   for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
                   HYSTERIA_BIN HYSTERIA_AUTO_INSTALL HOP_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR \
-                  HTTP_TIMEOUT LOG_MAX \
+                  HTTP_TIMEOUT LOG_MAX RELAY_ONLY \
                   ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD ORPHAN_GRACE ORPHAN_INTERVAL; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
@@ -103,6 +103,8 @@ fi
 
 PANEL_URL=${PANEL_URL:-}
 AGENT_TOKEN=${AGENT_TOKEN:-}
+# 中转机：只同步端口转发规则，完全不碰 Xray / Hysteria2 / 证书 / 端口跳跃
+RELAY_ONLY=${RELAY_ONLY:-0}
 INTERVAL=${INTERVAL:-60}
 XRAY_ALIAS=${XRAY_ALIAS:-xray}
 XRAY_CONFIG=${XRAY_CONFIG:-/usr/local/etc/xray/config.json}
@@ -1572,6 +1574,14 @@ apply_cert_list() {
 }
 
 apply_services() {
+  # 中转机没有节点域资源：证书 / Xray / Hysteria2 / hop 全部跳过，
+  # 只做端口自检（转发规则由 bundle 里的收敛脚本在 apply_bundle 阶段执行）
+  if [ "$RELAY_ONLY" = '1' ]; then
+    [ "$NP_JUST_RESTARTED" = '1' ] && sleep 1 2>/dev/null
+    probe_ports
+    return 0
+  fi
+
   # 证书先就位，否则 Xray 起来会因为找不到证书而失败
   apply_cert_list ensure_self_cert <<NP_SELF_CERTS_EOF
 ${NP_SELF_CERTS:-}
@@ -2010,7 +2020,11 @@ tick() {
 
   if apply_bundle; then
     apply_services changed
-    log "面板在线 · ${NP_SCOPE:-未知} · ${NP_NODES:-0} 个节点 / ${NP_USERS:-0} 位可用用户"
+    if [ "$RELAY_ONLY" = '1' ]; then
+      log "面板在线 · ${NP_SCOPE:-未知} · ${NP_RELAY_RULES:-0} 条转发规则"
+    else
+      log "面板在线 · ${NP_SCOPE:-未知} · ${NP_NODES:-0} 个节点 / ${NP_USERS:-0} 位可用用户"
+    fi
   else
     # 配置没变也要跑：把意外挂掉的 Hysteria2 拉起来
     apply_services same
@@ -2019,8 +2033,11 @@ tick() {
   # 只有和面板通上话才回执：离线时上报必然失败，没必要每分钟重试一次
   [ "$LAST_FETCH_OK" = '1' ] && send_receipt
 
-  collect_stats
-  report
+  # 中转机没有用户流量可采：collect_stats/report 会只发空数据，直接跳过
+  if [ "$RELAY_ONLY" != '1' ]; then
+    collect_stats
+    report
+  fi
 
   # 自更新放最后：这一轮的配置与流量都已经处理完，重启不会丢数据
   agent_self_update
@@ -2058,6 +2075,30 @@ np_uninstall() {
 
   _bak="$XRAY_CONFIG.nodepanel.bak"
 
+  # 中转机：只清转发规则，不碰 Xray / Hysteria2（那两样本来就没装，
+  # 同机可能存在管理员自己的服务，误删代价太高）
+  if [ "$RELAY_ONLY" = '1' ]; then
+    echo "→ 清理中转转发（gost / iptables）"
+    for _u in /etc/systemd/system/gost-relay-*.service; do
+      [ -f "$_u" ] || continue
+      _name=$(basename "$_u")
+      systemctl disable --now "$_name" >/dev/null 2>&1 || true
+      rm -f "$_u"
+      echo "  ✓ 已移除 $_name"
+    done
+    rm -f /etc/gost/relay-*.env 2>/dev/null
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if command -v iptables >/dev/null 2>&1; then
+      for _chain in PREROUTING POSTROUTING; do
+        iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay:' | sed "s/^-A $_chain //" | while IFS= read -r _r; do
+          [ -n "$_r" ] || continue
+          iptables -t nat -D "$_chain" $_r 2>/dev/null || true
+        done
+      done
+      echo "  ✓ 已清理带 np-relay: 标签的 NAT 规则"
+    fi
+  fi
+
   echo "→ 停止并注销 nodepanel-agent"
 
   if [ -f /etc/systemd/system/nodepanel-agent.service ]; then
@@ -2091,6 +2132,7 @@ np_uninstall() {
     fi
   fi
 
+  if [ "$RELAY_ONLY" != '1' ]; then
   echo "→ 停止由 agent 托管的 Hysteria2 实例"
   for _pidfile in "$RUN_DIR"/*.pid; do
     [ -f "$_pidfile" ] || continue
@@ -2121,6 +2163,7 @@ np_uninstall() {
       echo "  ✓ 已结束残留的 Hysteria2 实例"
     fi
   fi
+fi  # RELAY_ONLY=1 时跳过 Hysteria2 清理
 
   echo "→ 删除 agent 文件与运行时目录"
   rm -rf "$STATE_DIR" "$RUN_DIR"
@@ -2131,6 +2174,7 @@ np_uninstall() {
     echo "  ✓ 已删除自签证书目录 /etc/nodepanel"
   fi
 
+  if [ "$RELAY_ONLY" != '1' ]; then
   echo "→ 停掉 Xray 并清理面板生成的配置"
   # 服务名不一定是 xray：伪装名 / xray-core / x-ui 都见过
   _unit=''
@@ -2176,6 +2220,7 @@ np_uninstall() {
       fi
     fi
   fi
+fi  # RELAY_ONLY=1 时跳过 Xray 清理
 
   if [ "$_purge" = '1' ]; then
     echo "→ 深度清理（--purge）"
@@ -2195,7 +2240,11 @@ np_uninstall() {
   fi
 
   echo ""
-  echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
+  if [ "$RELAY_ONLY" = '1' ]; then
+    echo "✓ 卸载完成：中转机 agent 已注销，转发规则已清理"
+  else
+    echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
+  fi
   echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即可恢复接入。"
   return 0
 }
@@ -2212,8 +2261,12 @@ fi
 
 log "Node Panel Agent $VERSION 启动"
 log "面板：$PANEL_URL"
-log "HTTP：${HTTP:-未找到 curl/wget}"
-log "Xray：$XRAY_CONFIG · Hysteria2：$HYSTERIA_DIR"
+if [ "$RELAY_ONLY" = '1' ]; then
+  log "角色：中转机（只同步端口转发规则，不管理 Xray / Hysteria2）"
+else
+  log "HTTP：${HTTP:-未找到 curl/wget}"
+  log "Xray：$XRAY_CONFIG · Hysteria2：$HYSTERIA_DIR"
+fi
 # 重载命令是「配置没生效」类问题的第一嫌疑，启动时先把它亮出来
 _detect_cmd=$(detect_reload_cmd)
 if [ -n "${RELOAD_CMD:-}" ]; then

@@ -1856,13 +1856,24 @@ async function runAction(act, btn, id) {
         render();
       });
       break;
-    case 'server-del':
-      confirmDialog('删除服务器', '该服务器下的所有节点也会一并删除，此操作不可撤销。', async () => {
-        await api('/api/servers/' + id, { method: 'DELETE' });
-        toast('服务器已删除', 'ok');
-        render();
-      });
+    case 'server-del': {
+      const s = (state.data.servers || []).find((x) => x.id === id);
+      const relay = s && s.type === 'relay';
+      confirmDialog(
+        relay ? '删除中转服务器' : '删除服务器',
+        relay
+          ? `确定删除中转服务器「${s.name}」？${
+              s.ruleCount ? `它下面还有 ${s.ruleCount} 条转发规则，需要先在「中转」页删光规则。` : '删除后不可恢复。'
+            }`
+          : '该服务器下的所有节点也会一并删除，此操作不可撤销。',
+        async () => {
+          await api('/api/servers/' + id, { method: 'DELETE' });
+          toast('服务器已删除', 'ok');
+          render();
+        },
+      );
       break;
+    }
     case 'cert-new':
       await certNewFlow();
       break;
@@ -1897,19 +1908,8 @@ async function runAction(act, btn, id) {
     }
 
     /* ------------------------------ 中转管理 ------------------------------ */
+    // 中转机台账在「服务器」页统一管理（中转服务器 tab），这里只处理规则
 
-    case 'relay-servers':
-      await relayServersManageFlow();
-      break;
-    case 'relay-server-new':
-      await relayServerNewFlow(btn.dataset.then || '');
-      break;
-    case 'relay-server-edit':
-      await relayServerEditFlow(id);
-      break;
-    case 'relay-server-del':
-      relayServerDelFlow(id);
-      break;
     case 'relay-new':
       await relayNewFlow();
       break;

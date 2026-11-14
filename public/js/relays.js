@@ -34,9 +34,8 @@ RENDERERS.relays = async () => {
   state.data.relayServers = d.servers;
   state.data.relayNodes = d.nodes;
 
-  $('#page-actions').innerHTML =
-    '<button class="btn btn-sm btn-ghost" data-act="relay-servers">中转服务器</button>' +
-    '<button class="btn btn-primary btn-sm" data-act="relay-new">+ 添加规则</button>';
+  // 中转机统一在「服务器」页（中转服务器 tab）新增 / 编辑，这里只维护规则
+  $('#page-actions').innerHTML = '<button class="btn btn-primary btn-sm" data-act="relay-new">+ 添加规则</button>';
 
   const rows = d.items.length
     ? d.items
@@ -48,7 +47,9 @@ RENDERERS.relays = async () => {
           return `<tr>
         <td>
           <div class="cell-name">${esc(r.name)}</div>
-          ${r.note ? `<div class="cell-sub">${esc(r.note)}</div>` : ''}
+          <div class="cell-sub">${esc(r.serverName)}${r.serverOnline ? '' : ' · 入口机离线'}${
+            r.note ? ' · ' + esc(r.note) : ''
+          }</div>
         </td>
         <td><span class="badge ${RELAY_TOOL_BADGE[r.tool] || 'badge-dim'}">${esc(r.tool)}</span></td>
         <td class="mono" style="white-space:nowrap">${relayTargetText(r)}</td>
@@ -68,7 +69,8 @@ RENDERERS.relays = async () => {
         })
         .join('')
     : `<tr><td colspan="7" class="empty"><b>还没有中转规则</b>
-        先添加一台中转服务器，再为它添加端口转发规则；生成的脚本复制到中转服务器上以 root 执行即可。
+        先到「服务器」页的「中转服务器」tab 添加一台入口机，再回来为它添加端口转发规则。
+        装了 agent 的中转机会自动同步规则；未装 agent 时可生成脚本复制到机器上以 root 执行。
         节点编辑里的「中转入口」可以直接下拉选择这里的规则。</td></tr>`;
 
   $('#view').innerHTML = `
@@ -86,7 +88,8 @@ RENDERERS.relays = async () => {
       不改内核转发，适配 NAT / 受限环境。iptables：内核态 DNAT，零常驻进程，
       规则带 <span class="mono">np-relay:&lt;id&gt;</span> 标签，卸载按标签精确删除。
       <br>同一台中转服务器的同一监听端口只允许一条规则（gost 与 iptables 混用也冲突）。
-      脚本执行后回执面板更新状态；如果 check 报「规则不在」，多半是机器重启丢了规则或被防火墙工具清掉了。
+      <b>装了 agent 的中转机</b>每 60 秒自动收敛一次，规则状态以 agent 回执为准；
+      手动脚本仍保留，用于未装 agent 或临时排查的场景。
     </p>`;
 };
 
@@ -112,7 +115,7 @@ function relayFormBody(r, d) {
             )
             .join('')}
         </select>
-        ${servers.length ? '' : '<div class="hint">还没有中转服务器，先点右上角「中转服务器」添加</div>'}
+        ${servers.length ? '' : '<div class="hint">还没有中转服务器，先到「服务器」页的「中转服务器」tab 添加</div>'}
       </div>
     </div>
     <div class="form-row">
@@ -199,7 +202,10 @@ function validateRelayForm(p) {
 async function relayNewFlow() {
   const d = await api('/api/relays');
   if (!(d.servers || []).length) {
-    return relayServersManageFlow(true);
+    toast('还没有中转服务器，请先到「服务器」页的「中转服务器」tab 添加', 'err');
+    const nav = document.querySelector('.nav-item[data-view="servers"]');
+    if (nav) nav.click();
+    return;
   }
   openModal({
     title: '添加中转规则',
@@ -246,7 +252,11 @@ function relayDelFlow(id) {
     '删除中转规则',
     `确定删除「${r.name}」（${r.serverHost}:${r.listenPort} → ${r.targetHost}:${r.targetPort}）？\n\n` +
       (r.status === 'applied'
-        ? '这条规则已在中转服务器上生效，删除记录<b>不会</b>自动移除机器上的转发——记得先（或事后）在中转服务器上执行 uninstall 脚本。'
+        ? `这条规则已在入口机上生效。${
+            r.serverOnline
+              ? '该中转机有 agent 在线，删除后下一轮同步会自动移除机器上的规则。'
+              : '入口机没有 agent，删除记录<b>不会</b>自动移除机器上的转发——记得先（或事后）在入口机上执行 uninstall 脚本。'
+          }`
         : '删除后不可恢复。'),
     async () => {
       await api('/api/relays/' + id, { method: 'DELETE' });
@@ -334,120 +344,5 @@ function relayScriptFlow(id, mode = 'install') {
   show(mode);
 }
 
-/* ------------------------------ 中转服务器管理 ------------------------------ */
-
-function relayServerRowHtml(s) {
-  return `<tr>
-    <td>${esc(s.name)}</td>
-    <td class="mono">${esc(s.host)}</td>
-    <td>${s.ruleCount ? `${s.ruleCount} 条规则` : '<span style="color:var(--muted)">无规则</span>'}</td>
-    <td>
-      <div class="row-actions">
-        <button class="btn btn-sm btn-ghost" data-act="relay-server-edit" data-id="${s.id}">编辑</button>
-        <button class="btn btn-sm btn-danger" data-act="relay-server-del" data-id="${s.id}">删</button>
-      </div>
-    </td>
-  </tr>`;
-}
-
-async function relayServersManageFlow(thenNewRule = false) {
-  const d = await api('/api/relay-servers');
-  state.data.relayServerItems = d.items;
-  const rows = d.items.length
-    ? d.items.map(relayServerRowHtml).join('')
-    : '<tr><td colspan="4" class="empty" style="padding:18px">还没有中转服务器，点下方「添加服务器」</td></tr>';
-
-  openModal({
-    title: '中转服务器',
-    footer: false,
-    body: `
-      <div class="table-wrap"><table>
-        <thead><tr><th>名称</th><th>地址</th><th>规则</th><th></th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table></div>
-      <p class="hint" style="margin:10px 0 0">
-        中转服务器是端口转发的宿主机（客户端连它）。一期<b>不装 agent</b>：
-        规则脚本由管理员复制到机器上执行，执行结果通过回执更新状态。
-      </p>
-      <div style="margin-top:12px">
-        <button class="btn btn-primary btn-sm" data-act="relay-server-new" data-then="${thenNewRule ? '1' : ''}">+ 添加服务器</button>
-      </div>`,
-  });
-}
-
-function relayServerFormBody(s) {
-  return `
-    <div class="field">
-      <label>名称</label>
-      <input type="text" id="rs-name" value="${esc((s && s.name) || '')}" placeholder="如：香港中转">
-    </div>
-    <div class="field">
-      <label>服务器地址</label>
-      <input type="text" id="rs-host" value="${esc((s && s.host) || '')}" placeholder="IPv4 或域名">
-      <div class="hint">会同时作为节点入口的默认地址（IPv4 / 域名，IPv6 暂不支持）。</div>
-    </div>
-    <div class="field">
-      <label>备注（选填）</label>
-      <input type="text" id="rs-note" value="${esc((s && s.note) || '')}">
-    </div>`;
-}
-
-async function relayServerNewFlow(after = '') {
-  openModal({
-    title: '添加中转服务器',
-    body: relayServerFormBody(null),
-    okText: '创建',
-    onOk: async (m) => {
-      const payload = {
-        name: $('#rs-name', m).value.trim(),
-        host: $('#rs-host', m).value.trim(),
-        note: $('#rs-note', m).value.trim(),
-      };
-      if (!payload.name) throw new Error('请填写名称');
-      if (!payload.host) throw new Error('请填写服务器地址');
-      await api('/api/relay-servers', { method: 'POST', body: JSON.stringify(payload) });
-      toast('中转服务器已添加', 'ok');
-      closeModal();
-      if (after === 'rule') return relayNewFlow();
-      await render();
-    },
-  });
-}
-
-async function relayServerEditFlow(id) {
-  const s = (state.data.relayServerItems || (await api('/api/relay-servers')).items).find((x) => x.id === id);
-  if (!s) return;
-  openModal({
-    title: '编辑中转服务器 · ' + s.name,
-    body: relayServerFormBody(s),
-    okText: '保存',
-    onOk: async (m) => {
-      const payload = {
-        name: $('#rs-name', m).value.trim(),
-        host: $('#rs-host', m).value.trim(),
-        note: $('#rs-note', m).value.trim(),
-      };
-      if (!payload.name) throw new Error('请填写名称');
-      if (!payload.host) throw new Error('请填写服务器地址');
-      await api('/api/relay-servers/' + id, { method: 'PUT', body: JSON.stringify(payload) });
-      toast('已保存。若地址变了，这台机器上的规则需要重新执行 install', 'ok');
-      closeModal();
-      await render();
-    },
-  });
-}
-
-function relayServerDelFlow(id) {
-  const s = (state.data.relayServerItems || []).find((x) => x.id === id);
-  if (!s) return;
-  confirmDialog(
-    '删除中转服务器',
-    `确定删除「${s.name}」（${s.host}）？${s.ruleCount ? `它下面还有 ${s.ruleCount} 条规则，要先删光规则才能删服务器。` : ''}`,
-    async () => {
-      await api('/api/relay-servers/' + id, { method: 'DELETE' });
-      toast('中转服务器已删除', 'ok');
-      closeModal();
-      await render();
-    },
-  );
-}
+/* 中转服务器统一在「服务器」页的「中转服务器」tab 新增 / 编辑 / 删除：
+   本视图不再提供机器台账入口，避免两份 UI 维护同一批数据。 */

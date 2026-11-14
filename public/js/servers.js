@@ -8,6 +8,63 @@
 
 /* 勾选状态只服务本页，切页即重置 */
 let SERVER_SELECTED = new Set();
+/* 服务器列表按类型分组：node = 落地机；relay = 中转机（入口机） */
+let SERVER_TAB = 'node';
+
+const SERVER_TABS = [
+  { key: 'node', label: '节点服务器' },
+  { key: 'relay', label: '中转服务器' },
+];
+
+const serverTypeOf = (s) => (s && s.type === 'relay' ? 'relay' : 'node');
+
+function serverCardHtml(s) {
+  const relay = serverTypeOf(s) === 'relay';
+  return `<div class="card server-card">
+    <div class="server-top">
+      <div>
+        <div class="server-name">
+          <i class="dot" style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}"></i>${esc(s.name)}
+          ${relay ? '<span class="chip" style="margin-left:6px">中转机</span>' : ''}
+        </div>
+        <div class="server-host">
+          ${esc(s.address || s.host || '尚未获取地址')}
+          ${relay
+            ? ''
+            : `<span class="chip" style="margin-left:6px">${
+                s.addressSource === '上报' ? '自动上报' : s.addressSource === '待上报' ? '待上报' : '手动'
+              }</span>`}
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" class="s-pick" data-id="${s.id}" title="勾选后可批量删除" style="width:auto">
+        ${syncBadge(s.sync, s.name)}
+        <span class="badge ${s.online ? 'badge-ok' : 'badge-dim'}">${s.online ? '在线' : '离线'}</span>
+      </div>
+    </div>
+    <div class="server-meta">
+      ${relay
+        ? `<div><span>转发规则</span><b>${s.ruleCount || 0}</b></div>`
+        : `<div><span>节点</span><b>${s.nodeCount}</b></div>
+           <div><span>可用用户</span><b>${s.userCount}</b></div>`}
+      <div><span>最后心跳</span><b style="font-size:12.5px">${fmtAgo(s.lastSeen)}</b></div>
+    </div>
+    ${s.note ? `<div style="font-size:12px;color:var(--muted);margin-bottom:12px">${esc(s.note)}</div>` : ''}
+    ${relay
+      ? '<div class="hint" style="margin-bottom:10px">中转机只装 agent，转发规则在「中转」页维护，agent 每 60s 自动收敛（gost / iptables）</div>'
+      : s.hasHysteria
+        ? '<div class="hint" style="margin-bottom:10px">含 Hysteria2 节点，部署脚本会一并安装 hysteria</div>'
+        : ''}
+    <div style="display:flex;gap:7px;flex-wrap:wrap">
+      <button class="btn btn-sm btn-primary" data-act="server-deploy" data-id="${s.id}">部署命令</button>
+      <button class="btn btn-sm btn-ghost" data-act="server-uninstall" data-id="${s.id}">卸载命令</button>
+      <button class="btn btn-sm btn-ghost" data-act="server-edit" data-id="${s.id}">编辑</button>
+      <button class="btn btn-sm btn-ghost" data-act="server-copy" data-id="${s.id}">复制</button>
+      <button class="btn btn-sm btn-ghost" data-act="server-rotate" data-id="${s.id}">重置 token</button>
+      <button class="btn btn-sm btn-danger" data-act="server-del" data-id="${s.id}">删除</button>
+    </div>
+  </div>`;
+}
 
 RENDERERS.servers = async () => {
   const [d, nd] = await Promise.all([api('/api/servers'), api('/api/nodes')]);
@@ -15,58 +72,43 @@ RENDERERS.servers = async () => {
   state.data.nodes = nd.items;
   SERVER_SELECTED = new Set();
 
-  $('#page-actions').insertAdjacentHTML('beforeend', '<button class="btn btn-primary btn-sm" data-act="server-new">+ 新增服务器</button>');
+  const all = d.items || [];
+  const ofTab = all.filter((s) => serverTypeOf(s) === SERVER_TAB);
+  const counts = {
+    node: all.filter((s) => serverTypeOf(s) === 'node').length,
+    relay: all.filter((s) => serverTypeOf(s) === 'relay').length,
+  };
 
-  const cards = d.items.length
-    ? d.items
-        .map(
-          (s) => `<div class="card server-card">
-        <div class="server-top">
-          <div>
-            <div class="server-name">
-              <i class="dot" style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}"></i>${esc(s.name)}
-            </div>
-            <div class="server-host">
-              ${esc(s.address || '尚未获取地址')}
-              <span class="chip" style="margin-left:6px">${s.addressSource === '上报' ? '自动上报' : s.addressSource === '待上报' ? '待上报' : '手动'}</span>
-            </div>
-          </div>
-          <div style="display:flex;gap:6px;align-items:center">
-            <input type="checkbox" class="s-pick" data-id="${s.id}" title="勾选后可批量删除" style="width:auto">
-            ${syncBadge(s.sync, s.name)}
-            <span class="badge ${s.online ? 'badge-ok' : 'badge-dim'}">${s.online ? '在线' : '离线'}</span>
-          </div>
-        </div>
-        <div class="server-meta">
-          <div><span>节点</span><b>${s.nodeCount}</b></div>
-          <div><span>可用用户</span><b>${s.userCount}</b></div>
-          <div><span>最后心跳</span><b style="font-size:12.5px">${fmtAgo(s.lastSeen)}</b></div>
-        </div>
-        ${s.note ? `<div style="font-size:12px;color:var(--muted);margin-bottom:12px">${esc(s.note)}</div>` : ''}
-        ${s.hasHysteria ? '<div class="hint" style="margin-bottom:10px">含 Hysteria2 节点，部署脚本会一并安装 hysteria</div>' : ''}
-        <div style="display:flex;gap:7px;flex-wrap:wrap">
-          <button class="btn btn-sm btn-primary" data-act="server-deploy" data-id="${s.id}">部署命令</button>
-          <button class="btn btn-sm btn-ghost" data-act="server-uninstall" data-id="${s.id}">卸载命令</button>
-          <button class="btn btn-sm btn-ghost" data-act="server-edit" data-id="${s.id}">编辑</button>
-          <button class="btn btn-sm btn-ghost" data-act="server-copy" data-id="${s.id}">复制</button>
-          <button class="btn btn-sm btn-ghost" data-act="server-rotate" data-id="${s.id}">重置 token</button>
-          <button class="btn btn-sm btn-danger" data-act="server-del" data-id="${s.id}">删除</button>
-        </div>
-      </div>`,
-        )
-        .join('')
-    : `<div class="card"><div class="empty"><b>还没有服务器</b>添加服务器后，把部署命令贴到机器上执行，agent 就会自动接管</div></div>`;
+  $('#page-actions').insertAdjacentHTML(
+    'beforeend',
+    `<button class="btn btn-primary btn-sm" data-act="server-new">+ 新增${SERVER_TAB === 'relay' ? '中转服务器' : '节点服务器'}</button>`,
+  );
 
-  $('#view').innerHTML = `
-    <div class="card hidden" id="s-bulkcard" style="padding:0;margin-bottom:16px">
-      <div class="bulk-bar">
-        <b style="font-size:12.5px">已选 <span id="s-selcount">0</span> 台</b>
-        <button class="btn btn-sm btn-danger" data-act="server-bulk-del">删除</button>
-        <button class="btn btn-sm btn-ghost" data-act="server-bulk-clear" style="margin-left:auto">取消选择</button>
-      </div>
-    </div>
-    <div class="grid-3" id="s-grid">${cards}</div>
-    <div class="card" style="margin-top:16px">
+  const tabs = `<div class="seg" id="s-tabs" style="margin-bottom:14px;display:inline-flex">
+    ${SERVER_TABS.map(
+      (t) =>
+        `<button type="button" data-tab="${t.key}" class="${SERVER_TAB === t.key ? 'on' : ''}">${t.label}<span class="chip" style="margin-left:6px">${counts[t.key]}</span></button>`,
+    ).join('')}
+  </div>`;
+
+  const cards = ofTab.length
+    ? ofTab.map(serverCardHtml).join('')
+    : `<div class="card"><div class="empty"><b>还没有${SERVER_TAB === 'relay' ? '中转服务器' : '节点服务器'}</b>${
+        SERVER_TAB === 'relay'
+          ? '中转机是客户端连接的入口（端口转发宿主），添加后到「中转」页为它添加转发规则'
+          : '添加服务器后，把部署命令贴到机器上执行，agent 就会自动接管'
+      }</div></div>`;
+
+  const help = SERVER_TAB === 'relay'
+    ? `<div class="card" style="margin-top:16px">
+        <div class="card-head"><h3>中转服务器如何工作</h3></div>
+        <div class="card-body" style="font-size:12.5px;color:var(--text-dim);line-height:1.8">
+          中转机只负责把客户端流量转发到落地机，本身不跑节点。部署 agent 后，
+          「中转」页里的规则会每 60 秒自动同步（gost 用户态转发或 iptables 内核 DNAT），
+          不需要再手工执行脚本；未装 agent 时仍可在规则上生成三态脚本手动执行。
+        </div>
+      </div>`
+    : `<div class="card" style="margin-top:16px">
       <div class="card-head"><h3>两种部署方式</h3></div>
       <div class="card-body">
         <div class="grid-2" style="gap:22px">
@@ -88,12 +130,33 @@ RENDERERS.servers = async () => {
       </div>
     </div>`;
 
+  $('#view').innerHTML = `
+    ${tabs}
+    <div class="card hidden" id="s-bulkcard" style="padding:0;margin-bottom:16px">
+      <div class="bulk-bar">
+        <b style="font-size:12.5px">已选 <span id="s-selcount">0</span> 台</b>
+        <button class="btn btn-sm btn-danger" data-act="server-bulk-del">删除</button>
+        <button class="btn btn-sm btn-ghost" data-act="server-bulk-clear" style="margin-left:auto">取消选择</button>
+      </div>
+    </div>
+    <div class="grid-3" id="s-grid">${cards}</div>
+    ${help}`;
+
   bindServerList();
 };
 
 /* --------------------------- 勾选 / 批量删 / 复制 --------------------------- */
 
 function bindServerList() {
+  const tabs = $('#s-tabs');
+  if (tabs) {
+    tabs.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-tab]');
+      if (!btn || btn.dataset.tab === SERVER_TAB) return;
+      SERVER_TAB = btn.dataset.tab;
+      render();
+    });
+  }
   const grid = $('#s-grid');
   if (!grid) return;
   grid.addEventListener('change', (e) => {
@@ -118,6 +181,7 @@ function serverCopyFlow(id) {
   if (!s) return;
   serverNewFlow({
     copyFrom: s.name,
+    type: serverTypeOf(s),
     name: copyName(s.name, (state.data.servers || []).map((x) => x.name)),
     host: s.host || '',
     ipMode: s.ipMode || 'manual',
@@ -128,30 +192,58 @@ function serverCopyFlow(id) {
 function serverBulkDelete() {
   if (!SERVER_SELECTED.size) return toast('先勾选服务器', 'err');
   const n = SERVER_SELECTED.size;
+  const relay = SERVER_TAB === 'relay';
   const nodes = (state.data.nodes || []).filter((x) => SERVER_SELECTED.has(x.serverId)).length;
+  const rules = (state.data.servers || [])
+    .filter((x) => SERVER_SELECTED.has(x.id))
+    .reduce((sum, x) => sum + (x.ruleCount || 0), 0);
+  const warn = relay
+    ? `确定删除选中的 ${n} 台中转服务器？${rules ? `其中 ${rules} 条转发规则会阻止删除，需要先在「中转」页删规则。` : '删除后不可恢复。'}`
+    : `确定删除选中的 ${n} 台服务器？其下 ${nodes} 个节点会一并删除，相关订阅链接立即失效。`;
   confirmDialog(
-    '批量删除服务器',
-    `确定删除选中的 ${n} 台服务器？其下 ${nodes} 个节点会一并删除，相关订阅链接立即失效。`,
+    relay ? '批量删除中转服务器' : '批量删除服务器',
+    warn,
     async () => {
       const r = await api('/api/servers/batch-delete', {
         method: 'POST',
         body: JSON.stringify({ ids: [...SERVER_SELECTED] }),
       });
-      toast(`已删除 ${r.done} 台服务器${r.nodes ? `、${r.nodes} 个节点` : ''}`, 'ok');
+      toast(
+        `已删除 ${r.done} 台服务器${r.nodes ? `、${r.nodes} 个节点` : ''}${
+          r.blocked && r.blocked.length ? `；${r.blocked.length} 台有规则被跳过` : ''
+        }`,
+        'ok',
+      );
       render();
     },
   );
 }
 
-function serverForm(s) {
+function serverForm(s, opts = {}) {
   const v = s || {};
+  const lockType = !!opts.lockType;
   const auto = (v.ipMode || 'manual') === 'auto';
+  const type = v.type === 'relay' ? 'relay' : v.type === 'node' ? 'node' : SERVER_TAB;
+  const relay = type === 'relay';
   return `
     <div class="field">
-      <label>服务器名称</label>
-      <input type="text" id="s-name" value="${esc(v.name || '')}" placeholder="如：香港-01">
+      <label>服务器类型</label>
+      ${
+        lockType
+          ? `<div><span class="chip">${relay ? '中转服务器' : '节点服务器'}</span>
+               <span class="hint" style="display:inline;margin-left:8px">类型创建后不可修改</span></div>`
+          : `<div class="seg" id="s-type">
+              <button type="button" data-type="node" class="${relay ? '' : 'on'}">节点服务器</button>
+              <button type="button" data-type="relay" class="${relay ? 'on' : ''}">中转服务器</button>
+            </div>`
+      }
+      <div class="hint">节点服务器跑 Xray / Hysteria2；中转服务器只做端口转发（入口机），安装脚本与下发内容不同</div>
     </div>
     <div class="field">
+      <label>服务器名称</label>
+      <input type="text" id="s-name" value="${esc(v.name || '')}" placeholder="${relay ? '如：香港中转' : '如：香港-01'}">
+    </div>
+    <div class="field" id="s-ipmode-field" ${relay ? 'hidden' : ''}>
       <label>地址来源</label>
       <div class="seg" id="s-ipmode">
         <button type="button" data-ipmode="manual" class="${!auto ? 'on' : ''}">手动填写</button>
@@ -160,8 +252,8 @@ function serverForm(s) {
       <div class="hint">选「由服务器上报」后，agent 会自行探测公网 IP 并同步过来，机器换 IP 也不用改面板</div>
     </div>
     <div class="field">
-      <label>公网地址</label>
-      <input type="text" id="s-host" value="${esc(v.host || '')}" placeholder="1.2.3.4 或 hk1.example.com">
+      <label>${relay ? '入口地址' : '公网地址'}</label>
+      <input type="text" id="s-host" value="${esc(v.host || '')}" placeholder="${relay ? '客户端连接中转机的 IPv4 / 域名' : '1.2.3.4 或 hk1.example.com'}">
       <div class="hint" id="s-host-hint"></div>
     </div>
     <div class="field">
@@ -171,52 +263,87 @@ function serverForm(s) {
     <span id="s-reported" hidden>${esc(v.reportedIp || '')}</span>`;
 }
 
-function bindServerForm(mask) {
+function bindServerForm(mask, lockType = false) {
   const sync = () => {
-    const auto = $('#s-ipmode button.on', mask).dataset.ipmode === 'auto';
+    const typeBtn = $('#s-type button.on', mask);
+    const type = typeBtn ? typeBtn.dataset.type : mask.dataset.serverType || 'node';
+    const relay = type === 'relay';
+    const ipField = $('#s-ipmode-field', mask);
+    if (ipField) ipField.hidden = relay;
     const hint = $('#s-host-hint', mask);
-    if (auto) {
+    if (!hint) return;
+    if (relay) {
+      hint.textContent = '会写进节点入口与订阅，必须是 IPv4 或域名（不带端口 / 路径，IPv6 暂不支持）';
+    } else if ($('#s-ipmode button.on', mask) && $('#s-ipmode button.on', mask).dataset.ipmode === 'auto') {
       hint.innerHTML = '部署 agent 后自动上报；这里可填一个兜底地址（选填）。当前上报：<b>' +
         esc(($('#s-reported', mask) || {}).textContent || '未知') + '</b>';
     } else {
       hint.textContent = '用于生成客户端节点地址，必须是客户端能访问到的地址';
     }
   };
-  $('#s-ipmode', mask).addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-ipmode]');
-    if (!btn) return;
-    $$('#s-ipmode button', mask).forEach((b) => b.classList.toggle('on', b === btn));
-    sync();
-  });
+  const typeBox = $('#s-type', mask);
+  if (typeBox) {
+    typeBox.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-type]');
+      if (!btn) return;
+      $$('#s-type button', mask).forEach((b) => b.classList.toggle('on', b === btn));
+      sync();
+    });
+  }
+  const ipBox = $('#s-ipmode', mask);
+  if (ipBox) {
+    ipBox.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-ipmode]');
+      if (!btn) return;
+      $$('#s-ipmode button', mask).forEach((b) => b.classList.toggle('on', b === btn));
+      sync();
+    });
+  }
+  mask.dataset.serverType = mask.dataset.serverType || (lockType ? 'node' : '');
   sync();
 }
 
 function readServerForm(mask) {
+  const typeBtn = $('#s-type button.on', mask);
+  const type = typeBtn ? typeBtn.dataset.type : mask.dataset.serverType || 'node';
+  const ipBtn = $('#s-ipmode button.on', mask);
   return {
+    type,
     name: $('#s-name', mask).value.trim(),
     host: $('#s-host', mask).value.trim(),
-    ipMode: $('#s-ipmode button.on', mask).dataset.ipmode,
+    ipMode: type === 'relay' ? 'manual' : ipBtn ? ipBtn.dataset.ipmode : 'manual',
     note: $('#s-note', mask).value.trim(),
   };
 }
 
 async function serverNewFlow(template) {
   const copy = !!template;
+  const type = template && template.type ? template.type : SERVER_TAB;
   const mask = openModal({
-    title: copy ? '复制服务器 · ' + (template.copyFrom || template.name) : '新增服务器',
-    body: serverForm(template || null),
+    title: copy ? '复制服务器 · ' + (template.copyFrom || template.name) : `新增${type === 'relay' ? '中转服务器' : '节点服务器'}`,
+    body: serverForm(Object.assign({ type }, template || {})),
     okText: copy ? '复制' : '创建',
     onOk: async (m) => {
       const payload = readServerForm(m);
       if (!payload.name) throw new Error('请填写名称');
-      if (payload.ipMode === 'manual' && !payload.host) {
+      if (payload.type === 'relay' && !payload.host) throw new Error('请填写中转服务器入口地址');
+      if (payload.type !== 'relay' && payload.ipMode === 'manual' && !payload.host) {
         throw new Error('手动模式下请填写服务器地址');
       }
       await api('/api/servers', { method: 'POST', body: JSON.stringify(payload) });
-      toast(copy ? '服务器已复制，记得在新机器上执行部署命令' : '服务器已添加，下一步去「节点」页添加节点', 'ok');
+      if (!copy) SERVER_TAB = payload.type;
+      toast(
+        copy
+          ? '服务器已复制，记得在新机器上执行部署命令'
+          : payload.type === 'relay'
+            ? '中转服务器已添加，去「中转」页添加转发规则'
+            : '服务器已添加，下一步去「节点」页添加节点',
+        'ok',
+      );
       render();
     },
   });
+  mask.dataset.serverType = type;
   bindServerForm(mask);
 }
 
@@ -225,45 +352,65 @@ async function serverEditFlow(id) {
   if (!s) return;
   const mask = openModal({
     title: '编辑服务器',
-    body: serverForm(s),
+    body: serverForm(s, { lockType: true }),
     onOk: async (m) => {
       const payload = readServerForm(m);
       if (!payload.name) throw new Error('请填写名称');
-      if (payload.ipMode === 'manual' && !payload.host) {
+      if (payload.type === 'relay' && !payload.host) throw new Error('请填写中转服务器入口地址');
+      if (payload.type !== 'relay' && payload.ipMode === 'manual' && !payload.host) {
         throw new Error('手动模式下请填写服务器地址');
       }
+      delete payload.type; // 类型不可改，不提交以免误触发 400
       await api('/api/servers/' + id, { method: 'PUT', body: JSON.stringify(payload) });
       toast('已保存', 'ok');
       render();
     },
   });
-  bindServerForm(mask);
+  mask.dataset.serverType = serverTypeOf(s);
+  bindServerForm(mask, true);
 }
 
 async function serverDeployFlow(id) {
   const s = state.data.servers.find((x) => x.id === id);
   if (!s) return;
+  const relay = serverTypeOf(s) === 'relay';
   const cmd = rootShCmd(`${location.origin}/api/servers/${s.id}/install?token=${s.token}`, '', 'np-server-setup.sh');
   const nodes = (state.data.nodes || []).filter((n) => n.serverId === s.id && n.mode === 'server');
 
-  openModal({
-    title: '部署到 ' + s.name,
-    wide: true,
-    footer: false,
-    body: `
-      <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
-      <div class="code-wrap">
-        <pre class="code">${esc(cmd)}</pre>
-        <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(cmd)}">复制</button>
-      </div>
-
-      <div style="display:flex;gap:18px;margin:18px 0 14px">
+  const stats = relay
+    ? `<div style="display:flex;gap:18px;margin:18px 0 14px">
+        <div><div class="hint" style="margin:0 0 3px">转发规则</div><b>${s.ruleCount || 0} 条</b></div>
+        <div><div class="hint" style="margin:0 0 3px">机器角色</div><b>中转机</b></div>
+        <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}">${s.online ? '在线' : '离线'}</b></div>
+      </div>`
+    : `<div style="display:flex;gap:18px;margin:18px 0 14px">
         <div><div class="hint" style="margin:0 0 3px">本机节点</div><b>${nodes.length} 个</b></div>
         <div><div class="hint" style="margin:0 0 3px">可用用户</div><b>${s.userCount}</b></div>
         <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}">${s.online ? '在线' : '离线'}</b></div>
-      </div>
+      </div>`;
 
-      <div class="code" style="white-space:pre-wrap"># 部署完成后可用命令
+  const tips = relay
+    ? `<div class="code" style="white-space:pre-wrap"># 部署完成后可用命令
+# —— systemd（Debian / Ubuntu / CentOS / Rocky …）——
+journalctl -u nodepanel-agent -f              # 查看 agent 日志
+systemctl restart nodepanel-agent             # 手动重载
+# —— Alpine / OpenRC ——
+tail -f /var/log/nodepanel/agent.log          # 查看 agent 日志
+rc-service nodepanel-agent status             # 查看运行状态
+# —— 两种系统通用 ——
+sh /opt/nodepanel/agent.sh --once             # 手动跑一轮
+systemctl list-units 'gost-relay-*'           # 查看 gost 转发实例
+iptables -t nat -S PREROUTING | grep np-relay # 查看 iptables 转发规则</div>
+
+      <p class="hint" style="margin-top:14px">
+        中转机只部署 agent：<b>不会安装 Xray / Hysteria2，也不会改动本机已有的服务</b>。
+        「中转」页里的规则由 agent 每 60 秒自动收敛（gost 用户态 / iptables 内核态），
+        装好 agent 后不需要再手工执行规则脚本。
+      </p>
+      <p class="hint">
+        agent 未上线前，仍可在「中转」页对单条规则生成 install / uninstall / check 脚本手动执行。
+      </p>`
+    : `<div class="code" style="white-space:pre-wrap"># 部署完成后可用命令
 # —— systemd（Debian / Ubuntu / CentOS / Rocky …）——
 journalctl -u nodepanel-agent -f              # 查看 agent 日志
 systemctl restart nodepanel-agent             # 手动重载
@@ -286,7 +433,21 @@ ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</d
       </p>
       <p class="hint">
         要让这台机器彻底退出纳管，用同张卡片上的「卸载命令」，别手动删目录 —— 服务注册和 Hysteria2 实例会残留。
-      </p>`,
+      </p>`;
+
+  openModal({
+    title: '部署到 ' + s.name,
+    wide: true,
+    footer: false,
+    body: `
+      <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
+      <div class="code-wrap">
+        <pre class="code">${esc(cmd)}</pre>
+        <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(cmd)}">复制</button>
+      </div>
+
+      ${stats}
+      ${tips}`,
   });
 }
 
@@ -300,11 +461,32 @@ function uninstallFlow(kind, id) {
   const isServer = kind === 'server';
   const item = (isServer ? state.data.servers : state.data.nodes).find((x) => x.id === id);
   if (!item) return;
+  const relay = isServer && serverTypeOf(item) === 'relay';
 
   const url = `${location.origin}/api/${isServer ? 'servers' : 'nodes'}/${id}/uninstall?token=${item.token}`;
   const plain = rootShCmd(url, '', 'np-uninstall.sh');
   const purge = rootShCmd(url, '--purge', 'np-uninstall.sh');
   const where = isServer ? item.address || item.host || '该机器' : item.host || '该机器';
+
+  const clean = relay
+    ? `<li>停止并注销 <b>nodepanel-agent</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
+        <li>停掉并删除 <b>gost-relay-*.service</b> 与 <span class="mono">/etc/gost/relay-*.env</span></li>
+        <li>按 <span class="mono">np-relay:</span> 标签清理本机全部的 iptables DNAT / MASQUERADE 规则</li>
+        <li>删除 <span class="mono">/opt/nodepanel</span>（agent 脚本、token、状态文件）与 <span class="mono">/run/nodepanel</span></li>`
+    : `<li>停止并注销 <b>nodepanel-agent</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
+        <li>停掉 agent 托管的 Hysteria2 实例，删除 <span class="mono">/etc/hysteria/node-*.yaml</span></li>
+        <li>删除 <span class="mono">/opt/nodepanel</span>（agent 脚本、token、状态文件）、<span class="mono">/run/nodepanel</span>
+          与 <span class="mono">/etc/nodepanel</span>（agent 生成的自签证书）</li>
+        <li><b>停掉 Xray 并取消开机自启</b>，删除面板生成的 <span class="mono">config.json</span>（先备份）
+          —— 卸完这台机器上的节点端口不再监听</li>`;
+
+  const keep = relay
+    ? `<li><span class="mono">/var/log/nodepanel</span> —— 排查用日志</li>
+        <li><span class="mono">/usr/local/bin/gost</span> —— 可能是你自己装的，脚本不动（<span class="mono">--purge</span> 且本机没有其它中转规则时才删）</li>
+        <li>本机的 Xray / Hysteria2 / 证书 —— 中转机不管理这些，一律不碰</li>`
+    : `<li><span class="mono">config.json.nodepanel.bak</span> —— 面板覆盖前的配置备份，需要回滚时用</li>
+        <li><span class="mono">/var/log/nodepanel</span> —— 排查用日志</li>
+        <li><span class="mono">/usr/local/bin/xray</span> 与 geo 数据 —— 可能是你自己装的，脚本不动</li>`;
 
   openModal({
     title: '卸载 agent · ' + item.name,
@@ -319,19 +501,12 @@ function uninstallFlow(kind, id) {
 
       <div class="section-title" style="margin-top:16px">会清理</div>
       <ul class="hint" style="margin:6px 0 0;padding-left:18px;line-height:1.9">
-        <li>停止并注销 <b>nodepanel-agent</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
-        <li>停掉 agent 托管的 Hysteria2 实例，删除 <span class="mono">/etc/hysteria/node-*.yaml</span></li>
-        <li>删除 <span class="mono">/opt/nodepanel</span>（agent 脚本、token、状态文件）、<span class="mono">/run/nodepanel</span>
-          与 <span class="mono">/etc/nodepanel</span>（agent 生成的自签证书）</li>
-        <li><b>停掉 Xray 并取消开机自启</b>，删除面板生成的 <span class="mono">config.json</span>（先备份）
-          —— 卸完这台机器上的节点端口不再监听</li>
+        ${clean}
       </ul>
 
       <div class="section-title" style="margin-top:16px">默认保留</div>
       <ul class="hint" style="margin:6px 0 0;padding-left:18px;line-height:1.9">
-        <li><span class="mono">config.json.nodepanel.bak</span> —— 面板覆盖前的配置备份，需要回滚时用</li>
-        <li><span class="mono">/var/log/nodepanel</span> —— 排查用日志</li>
-        <li><span class="mono">/usr/local/bin/xray</span> 与 geo 数据 —— 可能是你自己装的，脚本不动</li>
+        ${keep}
       </ul>
 
       <div class="section-title" style="margin-top:16px">连日志和备份一起清掉</div>
@@ -345,7 +520,8 @@ function uninstallFlow(kind, id) {
       </p>
       <p class="hint">
         面板里的<span style="color:var(--text)">服务器 / 节点记录不会自动消失</span>：卸载后状态变离线，
-        想彻底移除就在服务器列表里「删除」（其下节点会一并删掉）；只是想恢复接入，重新执行一次部署命令即可。
+        想彻底移除就在服务器列表里「删除」${relay ? '（有转发规则的机器要先在「中转」页删规则）' : '（其下节点会一并删掉）'}；
+        只是想恢复接入，重新执行一次部署命令即可。
       </p>`,
   });
 }

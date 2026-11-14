@@ -229,10 +229,10 @@ function totpCodeOf(secret) {
     };
     await stale('/api/users');
     await stale('/api/nodes');
+    // 中转管理（0.1.44）：先删规则，再删服务器（有规则的机器删除会被拦）
+    await stale('/api/relays');
     await stale('/api/servers');
     await stale('/api/plans');
-    // 中转管理（0.1.43）：先删规则再删服务器 —— 有规则的服务器删除会被拦
-    await stale('/api/relays');
     await stale('/api/relay-servers');
     // 外部订阅：残留的同名订阅会让「新增外部订阅」撞 URL
     await stale('/api/extsubs');
@@ -1677,22 +1677,55 @@ function totpCodeOf(secret) {
 
   /* ---------- 11.7 中转管理：服务器台账 / 转发规则 / 回执（0.1.43） ---------- */
 
-  const rsNew = await call('/api/relay-servers', {
+  const rsNew = await call('/api/servers', {
     method: 'POST',
-    body: json({ name: 'SMOKE-中转A', host: '198.51.100.10' }),
+    body: json({ type: 'relay', name: 'SMOKE-中转A', host: '198.51.100.10' }),
   });
-  ok('新增中转服务器', rsNew.status === 200 && rsNew.data.item.host === '198.51.100.10');
+  ok('新增中转服务器（servers.type=relay）',
+    rsNew.status === 200
+    && rsNew.data.item.type === 'relay'
+    && rsNew.data.item.host === '198.51.100.10'
+    && rsNew.data.item.ipMode === 'manual'
+    && !!rsNew.data.item.token);
   const rsId = rsNew.data.item.id;
-  cleanup.push(['/api/relay-servers/' + rsId]);
+  cleanup.push(['/api/servers/' + rsId]);
+  const rsToken = rsNew.data.item.token;
 
-  ok('中转服务器名重复被拦', (await call('/api/relay-servers', {
+  ok('中转服务器名重复被拦', (await call('/api/servers', {
     method: 'POST',
-    body: json({ name: 'SMOKE-中转A', host: '198.51.100.11' }),
+    body: json({ type: 'relay', name: 'SMOKE-中转A', host: '198.51.100.11' }),
   })).status === 409);
-  ok('非法地址被拦（带端口）', (await call('/api/relay-servers', {
+  ok('非法地址被拦（带端口）', (await call('/api/servers', {
     method: 'POST',
-    body: json({ name: 'SMOKE-中转B', host: '198.51.100.1:443' }),
+    body: json({ type: 'relay', name: 'SMOKE-中转B', host: '198.51.100.1:443' }),
   })).status === 400);
+  ok('中转机不允许自动上报地址', (await call('/api/servers/' + rsId, {
+    method: 'PUT',
+    body: json({ ipMode: 'auto' }),
+  })).status === 400);
+
+  // 安装脚本走 relayOnly 分支：不下载 Xray，agent.env 带 RELAY_ONLY=1
+  const relayInstall = await fetch(`${BASE}/api/servers/${rsId}/install?token=${rsToken}`);
+  const relayInstallText = await relayInstall.text();
+  ok('中转机安装脚本走 relayOnly（不装 Xray）',
+    relayInstall.status === 200
+    && relayInstallText.includes('RELAY_ONLY="1"')
+    && relayInstallText.includes('NEED_XRAY="0"')
+    && relayInstallText.includes('NEED_HYSTERIA="0"'),
+    `(${relayInstall.status})`);
+  const relayUninstall = await fetch(`${BASE}/api/servers/${rsId}/uninstall?token=${rsToken}`);
+  const relayUninstallText = await relayUninstall.text();
+  ok('中转机卸载脚本只清转发规则',
+    relayUninstall.status === 200
+    && relayUninstallText.includes('RELAY_ONLY="1"')
+    && relayUninstallText.includes('gost-relay-'),
+    `(${relayUninstall.status})`);
+
+  // 兼容读端点仍能列出中转机，但不回显 token
+  const relayServersList = await call('/api/relay-servers');
+  const relayRow = relayServersList.data.items.find((s) => s.id === rsId) || {};
+  ok('兼容端点列出中转机且不回显 token',
+    relayServersList.status === 200 && relayRow.name === 'SMOKE-中转A' && relayRow.token === undefined);
 
   const rlNew = await call('/api/relays', {
     method: 'POST',
@@ -1714,12 +1747,12 @@ function totpCodeOf(secret) {
     }),
   })).status === 409);
 
-  const rsNew2 = await call('/api/relay-servers', {
+  const rsNew2 = await call('/api/servers', {
     method: 'POST',
-    body: json({ name: 'SMOKE-中转C', host: '198.51.100.12' }),
+    body: json({ type: 'relay', name: 'SMOKE-中转C', host: '198.51.100.12' }),
   });
   const rsId2 = rsNew2.data.item.id;
-  cleanup.push(['/api/relay-servers/' + rsId2]);
+  cleanup.push(['/api/servers/' + rsId2]);
   const rlIp = await call('/api/relays', {
     method: 'POST',
     body: json({
@@ -1732,7 +1765,7 @@ function totpCodeOf(secret) {
   cleanup.push(['/api/relays/' + rlIpId]);
 
   // 有规则的服务器不能删（防「删了台账，入口机上的规则彻底失控」）
-  ok('有规则的中转服务器不能删', (await call('/api/relay-servers/' + rsId2, { method: 'DELETE' })).status === 400);
+  ok('有规则的中转服务器不能删', (await call('/api/servers/' + rsId2, { method: 'DELETE' })).status === 400);
 
   // 节点入口下拉联动：选了规则，host/port 以规则为准（手填值被覆盖）
   const nodeRelay = await call('/api/nodes', {

@@ -186,7 +186,7 @@ function normalizeNode(body, prev = {}) {
           const relayId = String(e.relayId || '').trim();
           const relay = relayId ? store.db().relays.find((r) => r.id === relayId) : null;
           if (relay) {
-            const server = store.db().relay_servers.find((s) => s.id === relay.serverId);
+            const server = store.db().servers.find((s) => s.id === relay.serverId && s.type === 'relay');
             entry.relayId = relay.id;
             if (server) entry.host = server.host;
             entry.port = relay.listenPort;

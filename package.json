@@ -1,6 +1,6 @@
 {
   "name": "node-panel",
-  "version": "0.1.44",
+  "version": "0.1.45",
   "private": false,
   "description": "轻量节点管理面板：用户 / 节点 / 服务器 + 订阅与流量配额",
   "keywords": [
@@ -15,7 +15,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test/version.js && node test/dockerfile.js && node test/generators.js && node test/parse-link.js && node test/extsubs.js && node test/tx.js && node test/update.js && node test/backup.js && node test/acme.js && node test/smoke.js",
+    "test": "node test/version.js && node test/dockerfile.js && node test/generators.js && node test/parse-link.js && node test/extsubs.js && node test/tx.js && node test/relay.js && node test/update.js && node test/backup.js && node test/acme.js && node test/smoke.js",
     "test:version": "node test/version.js",
     "version:check": "node scripts/version.js",
     "version:set": "node scripts/version.js",

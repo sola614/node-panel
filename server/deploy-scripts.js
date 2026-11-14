@@ -57,25 +57,31 @@ function relayTarget(raw) {
   return isValidHost(v, v) ? v : '';
 }
 
-function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc }) {
+function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc, relayOnly = false }) {
   // 面板地址来自请求头，插进 shell 之前先去掉能掀起风浪的字符
   const safeUrl = urlSafe(panelUrl);
   // 名称会进双引号变量：换行撕开语句，引号/反引号/$ 能跑命令
   const safeLabel = shellSafe(label);
+  // 中转机只跑 agent 的转发同步：不下载 Xray / hysteria，也不碰机器上已有的同类服务
+  const wantHy = relayOnly ? false : !!needHysteria;
+  const wantXray = relayOnly ? false : !!needXray;
   return `#!/bin/sh
-# ${shellSafe(store.db().settings.siteName)} · 节点部署脚本
+# ${shellSafe(store.db().settings.siteName)} · ${relayOnly ? '中转机部署脚本' : '节点部署脚本'}
 # 目标：${safeLabel}
 # 生成时间：${new Date().toISOString()}
 #
 # 幂等：重复执行只覆盖 agent 与配置，不重复堆积东西。
-# 已有 Xray 安装（xray / xray-core / x-ui）不会被覆盖；SKIP_XRAY=1 可跳过 Xray 安装。
+${relayOnly
+    ? '# 中转机：只部署 agent，转发规则由面板按「中转」页的规则自动同步（gost / iptables）。\n# 不会安装 Xray / Hysteria2，也不会改动本机已有的服务。'
+    : '# 已有 Xray 安装（xray / xray-core / x-ui）不会被覆盖；SKIP_XRAY=1 可跳过 Xray 安装。'}
 set -u
 
 PANEL_URL="${safeUrl}"
 AGENT_TOKEN="${token}"
 TARGET_LABEL="${safeLabel}"
-NEED_HYSTERIA="${needHysteria ? '1' : '0'}"
-NEED_XRAY="${needXray ? '1' : '0'}"
+NEED_HYSTERIA="${wantHy ? '1' : '0'}"
+NEED_XRAY="${wantXray ? '1' : '0'}"
+RELAY_ONLY="${relayOnly ? '1' : '0'}"
 INTERVAL=60
 
 # ------------------------------ 输出辅助 ------------------------------------
@@ -500,6 +506,7 @@ cat > /opt/nodepanel/agent.env <<EOF
 PANEL_URL="$PANEL_URL"
 AGENT_TOKEN="$AGENT_TOKEN"
 INTERVAL="$INTERVAL"
+RELAY_ONLY="$RELAY_ONLY"
 XRAY_ALIAS="$XRAY_ALIAS"
 XRAY_CONFIG="$XRAY_ETC/config.json"
 RELOAD_CMD="$RELOAD_CMD"
@@ -660,10 +667,15 @@ fi
 printf '\\n✓ 部署完成 · 耗时 %ss\\n\\n' "$ELAPSED"
 # 标签是手写对齐的：printf 的 %-10s 按字节补位，中文会被算成 3 字节/字，排不齐
 printf '  agent      %s\\n' "v\${AGENT_VER:-未知} · $STARTED · 每 \${INTERVAL}s 一轮"
-printf '  xray       %s\\n' "$XRAY_LINE"
-printf '  hysteria2  %s\\n' "$HY_LINE"
-printf '  配置       %s\\n' "$XRAY_ETC/config.json"
-printf '  状态       %s\\n' '/opt/nodepanel/state.env'
+if [ "$RELAY_ONLY" = "1" ]; then
+  printf '  中转       %s\\n' '按面板规则自动同步 gost / iptables 转发'
+  printf '  状态       %s\\n' '/opt/nodepanel/state.env'
+else
+  printf '  xray       %s\\n' "$XRAY_LINE"
+  printf '  hysteria2  %s\\n' "$HY_LINE"
+  printf '  配置       %s\\n' "$XRAY_ETC/config.json"
+  printf '  状态       %s\\n' '/opt/nodepanel/state.env'
+fi
 printf '\\n'
 case "$STARTED" in
   systemd)
@@ -699,11 +711,11 @@ function readAgentSource() {
  * 不碰 Xray 配置和日志 —— 那两样可能是人家自己的资产，想连根拔起要显式 --purge。
  * 幂等：没有对应文件时各分支直接跳过，重复执行不报错。
  */
-function buildUninstallScript({ label }) {
+function buildUninstallScript({ label, relayOnly = false }) {
   // 同上：名称里的换行会把注释行撕开
   const safeLabel = shellSafe(label);
   return `#!/bin/sh
-# ${shellSafe(store.db().settings.siteName)} · 节点卸载脚本
+# ${shellSafe(store.db().settings.siteName)} · ${relayOnly ? '中转机卸载脚本' : '节点卸载脚本'}
 # 目标：${safeLabel}
 # 生成时间：${new Date().toISOString()}
 #
@@ -717,6 +729,7 @@ function buildUninstallScript({ label }) {
 # 不会动面板里的服务器 / 节点记录；想恢复接入，重新执行一遍部署命令即可。
 set -u
 
+RELAY_ONLY="${relayOnly ? '1' : '0'}"
 PURGE=0
 for _arg in "$@"; do
   case "$_arg" in
@@ -804,6 +817,28 @@ if command -v pkill >/dev/null 2>&1; then
 fi
 
 echo "→ 停止由 agent 托管的 Hysteria2 实例"
+if [ "$RELAY_ONLY" = "1" ]; then
+  echo "→ 清理中转转发（gost / iptables）"
+  for _u in /etc/systemd/system/gost-relay-*.service; do
+    [ -f "$_u" ] || continue
+    _name=$(basename "$_u")
+    systemctl disable --now "$_name" >/dev/null 2>&1 || true
+    rm -f "$_u"
+    echo "  ✓ 已移除 $_name"
+  done
+  rm -f /etc/gost/relay-*.env 2>/dev/null
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if command -v iptables >/dev/null 2>&1; then
+    for _chain in PREROUTING POSTROUTING; do
+      iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay:' | sed "s/^-A $_chain //" | while IFS= read -r _r; do
+        [ -n "$_r" ] || continue
+        iptables -t nat -D "$_chain" $_r 2>/dev/null || true
+      done
+    done
+    echo "  ✓ 已清理带 np-relay: 标签的 NAT 规则"
+  fi
+  echo "  · 已跳过 Hysteria2 / Xray 清理（中转机不安装这两样）"
+else
 for _pidfile in "$RUN_DIR"/*.pid; do
   [ -f "$_pidfile" ] || continue
   _pid=$(cat "$_pidfile" 2>/dev/null)
@@ -834,6 +869,7 @@ if command -v pkill >/dev/null 2>&1; then
     echo "  ✓ 已结束残留的 Hysteria2 实例"
   fi
 fi
+fi  # RELAY_ONLY=1 时跳过 Hysteria2 清理
 
 echo "→ 删除 agent 文件与运行时目录"
 rm -rf "$AGENT_DIR" "$RUN_DIR"
@@ -845,6 +881,7 @@ if [ -d "$CERTS_DIR" ]; then
   echo "  ✓ 已删除自签证书目录 $CERTS_DIR"
 fi
 
+if [ "$RELAY_ONLY" != "1" ]; then
 echo "→ 停掉 Xray 并清理面板生成的配置"
 # 服务名不一定是 xray：伪装名 / xray-core / x-ui 都见过
 XRAY_UNIT=''
@@ -890,6 +927,7 @@ else
     fi
   fi
 fi
+fi  # RELAY_ONLY=1 时跳过 Xray 清理
 
 if [ "$PURGE" = "1" ]; then
   echo "→ 深度清理（--purge）"
@@ -909,7 +947,11 @@ if [ -x "/usr/local/bin/$XRAY_ALIAS" ] || [ -x /usr/local/bin/xray ]; then
 fi
 
 echo ""
-echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
+if [ "$RELAY_ONLY" = "1" ]; then
+  echo "✓ 卸载完成：中转机 agent 已注销，转发规则已清理"
+else
+  echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
+fi
 echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即可恢复接入。"
 `;
 }
@@ -1391,6 +1433,180 @@ ${relayAck()}
 `;
 }
 
+/**
+ * 中转机 agent 用的「收敛脚本」：把本机规则同步成面板当前期望的那一组。
+ *
+ * 和 buildRelayRuleScript（手动三态脚本）的区别：
+ *   · 没有 ack / 回执凭证：状态由 agent 的 receipt 统一上报，不再走 /api/relay/ack
+ *   · 幂等收敛而不是安装/卸载二选一：先删「本机有、面板已不要」的规则，再写期望规则，
+ *     所以面板删规则、改端口、换 tool 都能在下一轮自动生效
+ *   · POSIX sh：bundle 是 `sh` 执行的，不能用 bash 数组 / pipefail
+ *
+ * 命名与手动脚本完全一致（gost-relay-<id>.service / np-relay:<id>），两条通道可以互相接手。
+ */
+function buildRelaySyncScript({ rules = [] } = {}) {
+  const gostRules = rules.filter((r) => r.tool === 'gost');
+  const iptRules = rules.filter((r) => r.tool === 'iptables');
+  const idList = (list) => `' ${list.map((r) => shellSafe(r.id)).join(' ')} '`;
+
+  const gostBlock = (r) => {
+    const id = shellSafe(r.id);
+    const listen = Number(r.listenPort) || 443;
+    const target = shellSafe(r.targetHost);
+    const targetPort = Number(r.targetPort) || 443;
+    const forwards = r.proto === 'both' ? ['tcp', 'udp'] : [r.proto === 'udp' ? 'udp' : 'tcp'];
+    const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}/\${NP_TARGET}`).join(' ');
+    return `
+# ---- gost 规则 ${id} ----
+mkdir -p /etc/gost
+cat > "/etc/gost/relay-${id}.env" <<'NP_ENV_EOF'
+NP_LISTEN=${listen}
+NP_TARGET=${target}:${targetPort}
+NP_ENV_EOF
+cat > "/etc/systemd/system/gost-relay-${id}.service" <<'NP_UNIT_EOF'
+[Unit]
+Description=nodepanel relay ${id}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/gost/relay-${id}.env
+ExecStart=/usr/local/bin/gost ${execArgs}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+NP_UNIT_EOF
+systemctl daemon-reload >/dev/null 2>&1 || true
+if systemctl enable --now "gost-relay-${id}.service" >/dev/null 2>&1; then
+  echo "✓ gost 规则就位 ${id}（:${listen} → ${target}:${targetPort}）"
+else
+  echo "! gost 规则启动失败 ${id}：journalctl -u gost-relay-${id} -n 20"
+  NP_FAIL=1
+fi
+`;
+  };
+
+  const iptBlock = (r) => {
+    const id = shellSafe(r.id);
+    const listen = Number(r.listenPort) || 443;
+    const target = shellSafe(r.targetHost);
+    const targetPort = Number(r.targetPort) || 443;
+    const protos = r.proto === 'both' ? ['tcp', 'udp'] : [r.proto === 'udp' ? 'udp' : 'tcp'];
+    const dnat = protos
+      .map((p) => `add_rule PREROUTING -p ${p} --dport ${listen} -j DNAT --to-destination "${target}:${targetPort}" $TAG || NP_FAIL=1`)
+      .join('\n');
+    return `
+# ---- iptables 规则 ${id} ----
+TAG=''
+[ "$HAS_COMMENT" = '1' ] && TAG='-m comment --comment np-relay:${id}'
+add_rule POSTROUTING -d "${target}" -j MASQUERADE $TAG || NP_FAIL=1
+${dnat}
+`;
+  };
+
+  return `#!/bin/sh
+# 中转转发收敛包（由面板生成，agent 每轮幂等执行）
+# gost ${gostRules.length} 条 / iptables ${iptRules.length} 条
+set -u
+
+NP_FAIL=0
+NP_GOST_N=${gostRules.length}
+NP_IPT_N=${iptRules.length}
+NP_GOST_IDS=${idList(gostRules)}
+NP_IPT_IDS=${idList(iptRules)}
+
+# 1) 清理面板已经删除的 gost 规则（unit 名就是锚点）
+if [ -d /etc/systemd/system ]; then
+  for _f in /etc/systemd/system/gost-relay-*.service; do
+    [ -f "$_f" ] || continue
+    _id=$(basename "$_f" .service)
+    _id=\${_id#gost-relay-}
+    case "$NP_GOST_IDS" in
+      *" $_id "*) ;;
+      *)
+        systemctl disable --now "gost-relay-$_id.service" >/dev/null 2>&1 || true
+        rm -f "$_f" "/etc/gost/relay-$_id.env"
+        echo "· 已移除过期 gost 规则 $_id"
+        ;;
+    esac
+  done
+fi
+
+# 2) 清理面板已经删除的 iptables 规则（按 np-relay: 标签）
+if command -v iptables >/dev/null 2>&1; then
+  for _chain in PREROUTING POSTROUTING; do
+    iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay:' | while IFS= read -r _line; do
+      _id=$(printf '%s' "$_line" | sed -n 's/.*np-relay:\\([A-Za-z0-9]*\\).*/\\1/p')
+      [ -n "$_id" ] || continue
+      case "$NP_IPT_IDS" in
+        *" $_id "*) continue ;;
+      esac
+      _rule=\${_line#-A $_chain }
+      iptables -t nat -D "$_chain" $_rule 2>/dev/null || true
+      echo "· 已移除过期 iptables 规则 $_id"
+    done
+  done
+fi
+
+# 3) gost 二进制：只在真有 gost 规则且本机缺它时下载
+if [ "$NP_GOST_N" -gt 0 ] && [ ! -x /usr/local/bin/gost ]; then
+  case "$(uname -m)" in
+    x86_64)          ARCH=amd64 ;;
+    aarch64|arm64)   ARCH=arm64 ;;
+    *) ARCH='' ;;
+  esac
+  if [ -z "$ARCH" ]; then
+    echo "! 不支持的架构 $(uname -m)：gost 只发 amd64 / arm64，相关规则不会生效"
+    NP_FAIL=1
+  else
+    _TMP=$(mktemp -d)
+    if curl -fsSL "\${GOST_DL_BASE:-https://github.com/go-gost/gost/releases/download}/v${DEFAULT_GOST_VER}/gost_${DEFAULT_GOST_VER}_linux_\${ARCH}.tar.gz" -o "$_TMP/gost.tgz" \\
+       && tar -xzf "$_TMP/gost.tgz" -C "$_TMP" \\
+       && install -m 755 "$_TMP/gost" /usr/local/bin/gost; then
+      echo "✓ gost v${DEFAULT_GOST_VER} 已安装"
+    else
+      echo "! gost 下载/安装失败（GitHub 连通性？可用 GOST_DL_BASE 指向镜像后重跑）"
+      NP_FAIL=1
+    fi
+    rm -rf "$_TMP"
+  fi
+fi
+
+# 4) 应用 gost 规则（unit 覆盖写 + enable --now，幂等）
+${gostRules.map(gostBlock).join('')}
+# 5) 应用 iptables 规则（内核态 DNAT）
+if [ "$NP_IPT_N" -gt 0 ]; then
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "! 未检测到 iptables：iptables 规则不会生效（apt install -y iptables）"
+    NP_FAIL=1
+  else
+    HAS_COMMENT=0
+    iptables -m comment -h >/dev/null 2>&1 && HAS_COMMENT=1
+    [ "$HAS_COMMENT" = '1' ] || echo "! iptables 缺少 comment 模块：规则不带标签，面板删规则后需手动清理"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null; then
+      sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf 2>/dev/null || true
+    else
+      echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf 2>/dev/null || true
+    fi
+    add_rule() { iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"; }
+${iptRules.map(iptBlock).join('')}
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    elif command -v iptables-save >/dev/null 2>&1; then
+      mkdir -p /etc/iptables 2>/dev/null || true
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+  fi
+fi
+
+echo "✓ 中转规则已收敛（gost ${gostRules.length} 条 / iptables ${iptRules.length} 条）"
+[ "$NP_FAIL" = '0' ] || exit 1
+`;
+}
+
 /** 按 tool 分发：gost / iptables 各自的三态生成器 */
 function buildRelayRuleScript({ rule, mode = 'install', panelUrl = '' }) {
   const gen = rule.tool === 'iptables' ? buildIptablesRelayScript : buildGostRelayScript;
@@ -1403,6 +1619,7 @@ module.exports = {
   buildUninstallScript,
   buildRelayScript,
   buildRelayRuleScript,
+  buildRelaySyncScript,
   relayTarget,
   GOST_VER_RE,
   shellSafe,

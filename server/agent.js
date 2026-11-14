@@ -119,7 +119,7 @@ function applyReportedIp(scope, ip) {
   badIpHint.delete(scope.id);
   const db = store.db();
   const target =
-    scope.type === 'server'
+    scope.type === 'server' || scope.type === 'relay'
       ? db.servers.find((s) => s.id === scope.id)
       : db.nodes.find((n) => n.id === scope.id);
   if (!target) return;
@@ -138,11 +138,13 @@ function resolveScope(token, ip) {
   const server = db.servers.find((s) => tokenEq(s.token, token));
   if (server) {
     server.lastSeen = store.iso();
+    const relay = server.type === 'relay';
     const scope = {
-      type: 'server',
+      type: relay ? 'relay' : 'server',
       id: server.id,
       name: server.name,
-      nodes: db.nodes.filter((n) => n.serverId === server.id && n.enabled),
+      // 中转机不承载节点：配置包里只有转发规则
+      nodes: relay ? [] : db.nodes.filter((n) => n.serverId === server.id && n.enabled),
     };
     applyReportedIp(scope, ip);
     return scope;
@@ -165,6 +167,10 @@ function resolveScope(token, ip) {
 }
 
 function buildAgentPayload(scope) {
+  // 中转机走独立配置包：只同步转发规则，绝不触碰 xray / hysteria / certs，
+  // 也保证落地机（server/node scope）的 payload 形状与 hash 与本改动前完全一致
+  if (scope.type === 'relay') return buildRelayPayload(scope);
+
   sweepRenewals();
   const db = store.db();
   const active = store.activeUsers();
@@ -274,12 +280,46 @@ function buildAgentPayload(scope) {
   };
 }
 
+/**
+ * 中转机配置包（relay scope）：只产规则清单，不读 nodes / users / certs。
+ *
+ * hash 只覆盖「规则 + 面板版本」：规则改了 hash 就变，agent 下一轮拉新包；
+ * 面板升级（agentVersion 变）也会触发一轮，保证 agent 自更新信号不会因为
+ * 中转机没有节点而丢失。
+ */
+function buildRelayPayload(scope) {
+  const db = store.db();
+  const rules = db.relays
+    .filter((r) => r.serverId === scope.id)
+    .slice()
+    .sort((a, b) => Number(a.listenPort) - Number(b.listenPort) || String(a.id).localeCompare(String(b.id)))
+    .map((r) => ({
+      id: r.id,
+      name: r.name,
+      tool: r.tool,
+      proto: r.proto,
+      listenPort: Number(r.listenPort) || 443,
+      targetHost: r.targetHost,
+      targetPort: Number(r.targetPort) || 443,
+    }));
+
+  return {
+    ok: true,
+    hash: sha256(JSON.stringify({ relay: rules, agent: APP_VERSION })).slice(0, 16),
+    scope: { type: 'relay', id: scope.id, name: scope.name },
+    agentVersion: APP_VERSION,
+    nodes: [],
+    userCount: 0,
+    relay: { rules },
+  };
+}
+
 function agentConfig(req, res, params, body, session, ctx) {
   const scope = resolveScope(agentTokenOf(req, ctx), ctx.query.get('ip'));
   if (!scope) return sendJson(res, 401, { error: 'invalid token' });
 
   if (ctx.query.get('v')) {
-    if (scope.type === 'server') {
+    if (scope.type === 'server' || scope.type === 'relay') {
       const s = store.db().servers.find((x) => x.id === scope.id);
       if (s) s.agentVersion = ctx.query.get('v');
     } else {
@@ -299,6 +339,13 @@ function agentReport(req, res, params, body, session, ctx) {
     // token 对不上是最常见的一类「节点一直离线」，记 ip 与版本便于定位是哪台机器
     logAgent.warn('上报被拒绝：token 无效', { rid: ctx.rid, ip: clientIp(req), agentVersion: ctx.query.get('v') });
     return sendJson(res, 401, { error: 'invalid token' });
+  }
+
+  // 中转机没有用户流量可采（agent 的 tick 也会跳过采集）；这里直接吸收掉，
+  // 避免误报把 sweepRenewals / 流量水位这些与中转机无关的状态推进一遍
+  if (scope.type === 'relay') {
+    saveSoon();
+    return sendJson(res, 200, { ok: true, applied: 0, bytes: 0 });
   }
 
   // agent 每 60 秒上报一次，借这个心跳顺手处理到期续期，面板没人打开也不会掉线
@@ -550,11 +597,12 @@ function parseTextReport(text) {
  * agent 每轮应用完配置后把结果报回来，落在这条记录的 sync 字段上。
  */
 function scopeOfServer(s) {
+  const relay = s.type === 'relay';
   return {
-    type: 'server',
+    type: relay ? 'relay' : 'server',
     id: s.id,
     name: s.name,
-    nodes: store.db().nodes.filter((n) => n.serverId === s.id && n.enabled),
+    nodes: relay ? [] : store.db().nodes.filter((n) => n.serverId === s.id && n.enabled),
   };
 }
 
@@ -595,9 +643,10 @@ const SYNC_LABEL = {
 function syncView(item, scope) {
   const sync = item.sync || null;
   const desired = desiredHashOf(scope);
-  const online = scope.type === 'server'
-    ? store.serverOnline(item)
-    : store.nodeOnline(item);
+  const online = scope.type === 'node' ? store.nodeOnline(item) : store.serverOnline(item);
+  const relayRules = scope.type === 'relay'
+    ? store.db().relays.filter((r) => r.serverId === scope.id).length
+    : 0;
 
   let state;
   if (!online) state = sync ? 'offline' : 'unknown';
@@ -622,6 +671,7 @@ function syncView(item, scope) {
     unbound: sync ? sync.unbound || '' : '',
     nodes: sync ? Number(sync.nodes) || 0 : 0,
     users: sync ? Number(sync.users) || 0 : 0,
+    relay: relayRules,
     agentVersion: sync ? sync.agentVersion || '' : '',
   };
 }
@@ -635,7 +685,7 @@ function agentReceipt(req, res, params, body, session, ctx) {
   }
 
   const db = store.db();
-  const item = scope.type === 'server'
+  const item = scope.type === 'server' || scope.type === 'relay'
     ? db.servers.find((x) => x.id === scope.id)
     : db.nodes.find((x) => x.id === scope.id);
   if (!item) return sendJson(res, 404, { error: 'not found' });
@@ -802,6 +852,7 @@ module.exports = {
   resolveScope,
   applyReportedIp,
   buildAgentPayload,
+  buildRelayPayload,
   desiredHashOf,
   syncView,
   scopeOfServer,
