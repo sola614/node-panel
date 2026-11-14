@@ -83,7 +83,8 @@
   新规则始终以 `targets` 为准，`targetHost/targetPort` 作为第一项镜像同步写回
 - **中转机地址约束**：必须是 IPv4 / 域名（过 `relayTarget`），`ipMode` 强制 `manual` ——
   入口地址会进订阅，自动上报会让客户端连接地址漂移
-- **冲突校验（保存规则时）**：同一 serverId 下 listenPort 重复 → 400（跨工具也查）
+- **冲突校验（保存规则时）**：同一 serverId 下 listenPort 重复 → 400（跨工具也查）；
+  规则名只在同一 serverId 内唯一，不同服务器允许同名（如每台入口机都有一条「香港入口 → 日本节点」）
 - `node.entries` 元素保留可选 `relayId`；带 relayId 时保存节点自动以 relay 的
   `listenPort` + 所属中转机 host 覆盖 entry.host/port
 

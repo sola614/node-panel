@@ -46,7 +46,9 @@ raw.exec(`
     id TEXT PRIMARY KEY, server_id TEXT, name TEXT, tool TEXT DEFAULT 'gost',
     proto TEXT DEFAULT 'both', listen_port INTEGER DEFAULT 443, target_host TEXT,
     target_port INTEGER DEFAULT 443, node_id TEXT DEFAULT '', status TEXT DEFAULT 'planned',
-    deploy_token TEXT, applied_at TEXT, note TEXT
+    deploy_token TEXT, applied_at TEXT, note TEXT,
+    -- 历史 bug：enabled 列存在但没标 bool，布尔被写成 TEXT 'true'/'false'
+    enabled TEXT
   );
 `);
 raw.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('version', '12');
@@ -61,16 +63,15 @@ raw
 raw
   .prepare('INSERT INTO relay_servers (id, name, host, note, created_at) VALUES (?, ?, ?, ?, ?)')
   .run('srv-0001', '东京中转', '198.51.100.11', '', '2026-11-03T00:00:00.000Z');
-raw
-  .prepare(
-    'INSERT INTO relays (id, server_id, name, tool, proto, listen_port, target_host, target_port, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  )
-  .run('rule-0001', 'rly-0001', '规则1', 'gost', 'both', 8443, '203.0.113.9', 443, 'applied');
-raw
-  .prepare(
-    'INSERT INTO relays (id, server_id, name, tool, proto, listen_port, target_host, target_port, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  )
-  .run('rule-0002', 'srv-0001', '规则2', 'iptables', 'tcp', 9443, '203.0.113.9', 443, 'planned');
+const insertRule = raw.prepare(
+  'INSERT INTO relays (id, server_id, name, tool, proto, listen_port, target_host, target_port, status, enabled, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+);
+// 'true' 字符串：老库正常启用
+insertRule.run('rule-0001', 'rly-0001', '规则1', 'gost', 'both', 8443, '203.0.113.9', 443, 'applied', 'true', '2026-11-10T00:00:00.000Z');
+// 'false' + appliedAt：0.1.48 bug 误停用，迁移后应恢复启用
+insertRule.run('rule-0002', 'srv-0001', '规则2', 'iptables', 'tcp', 9443, '203.0.113.9', 443, 'planned', 'false', '2026-11-10T00:00:00.000Z');
+// 'false' + 无 appliedAt：用户主动停用，迁移后保持停用
+insertRule.run('rule-0003', 'rly-0001', '规则3', 'gost', 'tcp', 8444, '203.0.113.9', 443, 'planned', 'false', null);
 raw.close();
 
 /* ------------------------------ 2. 触发迁移 ------------------------------ */
@@ -104,6 +105,11 @@ ok(
     && r1.targets[0].host === '203.0.113.9'
     && r1.targets[0].port === 443,
 );
+ok('旧库 enabled 字符串 true 归一为启用', r1.enabled === true);
+ok('bug 误停用（有 appliedAt）的规则恢复启用', r2.enabled === true);
+const r3 = db.relays.find((r) => r.id === 'rule-0003') || {};
+
+ok('用户主动停用（无 appliedAt）保持停用', r3.enabled === false);
 
 console.log('\n下发隔离');
 const nodePayload = agent.buildAgentPayload(agent.scopeOfServer(db.servers.find((s) => s.id === 'srv-0001')));

@@ -1908,6 +1908,24 @@ function totpCodeOf(secret) {
   const rlIpId = rlIp.data.item.id;
   cleanup.push(['/api/relays/' + rlIpId]);
 
+  // 规则名只要求同一台中转服务器内唯一：不同入口机可以同名
+  const sameNameOther = await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId2, name: 'SMOKE-规则1', tool: 'iptables', proto: 'tcp',
+      listenPort: 9448, targetHost: '203.0.113.9', targetPort: 443,
+    }),
+  });
+  ok('不同中转服务器允许同名规则', sameNameOther.status === 200);
+  if (sameNameOther.status === 200) cleanup.push(['/api/relays/' + sameNameOther.data.item.id]);
+  ok('同一中转服务器内同名规则仍被拦', (await call('/api/relays', {
+    method: 'POST',
+    body: json({
+      serverId: rsId2, name: 'SMOKE-规则1', tool: 'iptables', proto: 'tcp',
+      listenPort: 9449, targetHost: '203.0.113.9', targetPort: 443,
+    }),
+  })).status === 400);
+
   // 有规则的服务器不能删（防「删了台账，入口机上的规则彻底失控」）
   ok('有规则的中转服务器不能删', (await call('/api/servers/' + rsId2, { method: 'DELETE' })).status === 400);
 

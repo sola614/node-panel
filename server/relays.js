@@ -146,7 +146,11 @@ function ruleFieldError(body, db) {
   if (!server) return '请选择中转服务器（先到「服务器」页新增一台中转机）';
   const name = String(body.name || '').trim();
   if (!name) return '请填写规则名称';
-  if (nameTaken(db.relays, name, body.__selfId)) return '已存在同名规则，换个名字';
+  // 规则名只要求在「同一台中转服务器」内唯一：不同入口机同名是正常场景
+  // （比如每台入口机都有一条「香港入口 → 日本节点」），按 serverId 过滤后再查重
+  if (nameTaken(db.relays.filter((r) => String(r.serverId) === String(body.serverId || '')), name, body.__selfId)) {
+    return '该中转服务器下已存在同名规则，换个名字';
+  }
   if (!TOOLS.includes(body.tool)) return '转发工具只能是 gost 或 iptables';
   if (!PROTOS.includes(body.proto)) return '协议只能是 tcp / udp / both';
   if (portOk(body.listenPort) === null) return '监听端口只能是 1–65535';
