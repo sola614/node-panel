@@ -40,6 +40,47 @@ function urlSafe(v) {
 }
 
 /**
+ * 伪装部署用的中性标识。
+ *
+ * 默认脚本把 agent 装在 /opt/nodepanel、注册成 nodepanel-agent —— 名字本身就把用途
+ * 写在脸上了：`ps` 一眼、`grep panel` 一搜就能认出来。勾选「伪装」后，目录、日志目录、
+ * 运行时目录、systemd/OpenRC 单元名、nft 表名、配置备份后缀全部换成这个中性名字。
+ *
+ * 实现上刻意走「对生成好的文本整体替换」而不是在模板里插变量，两个原因：
+ *   1. 默认路径一个字节都不变 —— 已经部署的机器升级面板，脚本不会因为插值改动而漂移；
+ *   2. 内嵌的 agent.sh 源码也会一起被换掉（它自己也有 /opt/nodepanel 默认值、
+ *      和写死的 nodepanel-agent 单元名），否则 agent 的 --uninstall 会去找旧名字，卸不干净。
+ *
+ * 替换顺序有依赖：先把 nodepanel-agent 换成新名（/run/nodepanel-agent.pid 会一起变成
+ * /run/<name>.pid），再换各目录前缀，最后收尾裸写的 'nodepanel/agent.sh' 匹配串。
+ */
+const STEALTH_NAME = 'logsync';
+
+function disguiseAgent(text, stealth) {
+  if (!stealth) return text;
+  const n = STEALTH_NAME;
+  return String(text)
+    .replace(/NODEPANEL_AGENT_EOF/g, 'LOGSYNC_AGENT_EOF')
+    .replace(/NODEPANEL_UNINSTALL_EOF/g, 'LOGSYNC_UNINSTALL_EOF')
+    .replace(/nodepanel-agent/g, n)
+    .replace(/nodepanel\/agent\.sh/g, `${n}/agent.sh`)
+    .replace(/\/opt\/nodepanel/g, `/opt/${n}`)
+    .replace(/\/var\/log\/nodepanel/g, `/var/log/${n}`)
+    .replace(/\/run\/nodepanel/g, `/run/${n}`)
+    .replace(/\/etc\/nodepanel/g, `/etc/${n}`)
+    .replace(/nodepanel_hyhop/g, `${n}_hyhop`)
+    // 同一条 nft 链在脚本里还有大写写法，`nft list ruleset` 里能直接看到它
+    .replace(/NODEPANEL_HYHOP/g, `${n.toUpperCase()}_HYHOP`)
+    .replace(/\.nodepanel\.bak/g, `.${n}.bak`)
+    .replace(/\/tmp\/nodepanel-xray/g, `/tmp/${n}-xray`)
+    .replace(/\.nodepanel-uninstall\./g, `.${n}-uninstall.`)
+    // 连脚本文件名一起换：`ps` 里是 `sh /opt/logsync/agent.sh`，把 agent 也留着了，
+    // 而干净的部署（如 xboard-node）在进程名里既没有 panel 也没有 agent
+    .replace(/agent\.sh/g, `${n}.sh`)
+    .replace(/Node Panel Agent/g, 'Log Sync');
+}
+
+/**
  * 中转落地地址：只接受裸 IPv4 或域名。
  *
  * 它会被拼进 `iptables -t nat -j DNAT --to-destination`，这个位置必须是一个纯
@@ -57,7 +98,7 @@ function relayTarget(raw) {
   return isValidHost(v, v) ? v : '';
 }
 
-function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc, relayOnly = false }) {
+function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc, relayOnly = false, stealth = false }) {
   // 面板地址来自请求头，插进 shell 之前先去掉能掀起风浪的字符
   const safeUrl = urlSafe(panelUrl);
   // 名称会进双引号变量：换行撕开语句，引号/反引号/$ 能跑命令
@@ -65,7 +106,7 @@ function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, ag
   // 中转机只跑 agent 的转发同步：不下载 Xray / hysteria，也不碰机器上已有的同类服务
   const wantHy = relayOnly ? false : !!needHysteria;
   const wantXray = relayOnly ? false : !!needXray;
-  return `#!/bin/sh
+  return disguiseAgent(`#!/bin/sh
 # ${shellSafe(store.db().settings.siteName)} · ${relayOnly ? '中转机部署脚本' : '节点部署脚本'}
 # 目标：${safeLabel}
 # 生成时间：${new Date().toISOString()}
@@ -693,7 +734,7 @@ esac
 printf '  手动一轮   %s\\n' 'sh /opt/nodepanel/agent.sh --once'
 printf '  卸载       %s\\n' 'sh /opt/nodepanel/uninstall.sh'
 printf '\\n'
-`;
+`, stealth);
 }
 
 function readAgentSource() {
@@ -711,10 +752,10 @@ function readAgentSource() {
  * 不碰 Xray 配置和日志 —— 那两样可能是人家自己的资产，想连根拔起要显式 --purge。
  * 幂等：没有对应文件时各分支直接跳过，重复执行不报错。
  */
-function buildUninstallScript({ label, relayOnly = false }) {
+function buildUninstallScript({ label, relayOnly = false, stealth = false }) {
   // 同上：名称里的换行会把注释行撕开
   const safeLabel = shellSafe(label);
-  return `#!/bin/sh
+  return disguiseAgent(`#!/bin/sh
 # ${shellSafe(store.db().settings.siteName)} · ${relayOnly ? '中转机卸载脚本' : '节点卸载脚本'}
 # 目标：${safeLabel}
 # 生成时间：${new Date().toISOString()}
@@ -969,7 +1010,7 @@ else
   echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
 fi
 echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即可恢复接入。"
-`;
+`, stealth);
 }
 
 /** 服务器 / 独立节点共用的卸载脚本鉴权 */

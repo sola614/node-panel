@@ -388,18 +388,28 @@ async function serverDeployFlow(id) {
         <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}">${s.online ? '在线' : '离线'}</b></div>
       </div>`;
 
+  // 伪装部署时，面板生成的脚本把 agent 装到 /opt/logsync、注册成 logsync，
+  // 这里必须跟着同一个名字显示命令 —— 否则用户照着 nodepanel-agent 去查只会得到
+  // 「service does not exist」，反过来误判成机器没装
+  const alias = s.stealth ? 'logsync' : 'nodepanel';
+  const unit = s.stealth ? 'logsync' : 'nodepanel-agent';
+  // 命令与注释对齐到同一列：名字一变（nodepanel → logsync）原地对齐会错位
+  const pad = (c) => c + ' '.repeat(Math.max(1, 45 - c.length));
+
   const tips = relay
     ? `<div class="code" style="white-space:pre-wrap"># 部署完成后可用命令
 # —— systemd（Debian / Ubuntu / CentOS / Rocky …）——
-journalctl -u nodepanel-agent -f              # 查看 agent 日志
-systemctl restart nodepanel-agent             # 手动重载
+${pad(`journalctl -u ${unit} -f`)}# 查看 agent 日志
+${pad(`systemctl restart ${unit}`)}# 手动重载
 # —— Alpine / OpenRC ——
-tail -f /var/log/nodepanel/agent.log          # 查看 agent 日志
-rc-service nodepanel-agent status             # 查看运行状态
+${pad(`tail -f /var/log/${alias}/agent.log`)}# 查看 agent 日志
+${pad(`rc-service ${unit} status`)}# 查看运行状态
+${pad(`rc-service ${unit} restart`)}# 手动重载
+${pad(`rc-update show default | grep ${alias}`)}# 确认已加入开机自启
 # —— 两种系统通用 ——
-sh /opt/nodepanel/agent.sh --once             # 手动跑一轮
-systemctl list-units 'gost-relay-*'           # 查看 gost 转发实例
-iptables -t nat -S PREROUTING | grep np-relay # 查看 iptables 转发规则</div>
+${pad(`sh /opt/${alias}/agent.sh --once`)}# 手动跑一轮
+${pad("systemctl list-units 'gost-relay-*'")}# 查看 gost 转发实例
+${pad('iptables -t nat -S PREROUTING | grep np-relay')}# 查看 iptables 转发规则</div>
 
       <p class="hint" style="margin-top:14px">
         中转机只部署 agent：<b>不会安装 Xray / Hysteria2，也不会改动本机已有的服务</b>。
@@ -411,15 +421,15 @@ iptables -t nat -S PREROUTING | grep np-relay # 查看 iptables 转发规则</di
       </p>`
     : `<div class="code" style="white-space:pre-wrap"># 部署完成后可用命令
 # —— systemd（Debian / Ubuntu / CentOS / Rocky …）——
-journalctl -u nodepanel-agent -f              # 查看 agent 日志
-systemctl restart nodepanel-agent             # 手动重载
+${pad(`journalctl -u ${unit} -f`)}# 查看 agent 日志
+${pad(`systemctl restart ${unit}`)}# 手动重载
 # —— Alpine / OpenRC ——
-tail -f /var/log/nodepanel/agent.log          # 查看 agent 日志
-rc-service nodepanel-agent status             # 查看运行状态
-rc-service nodepanel-agent restart            # 手动重载
-rc-update show default | grep nodepanel       # 确认已加入开机自启
+${pad(`tail -f /var/log/${alias}/agent.log`)}# 查看 agent 日志
+${pad(`rc-service ${unit} status`)}# 查看运行状态
+${pad(`rc-service ${unit} restart`)}# 手动重载
+${pad(`rc-update show default | grep ${alias}`)}# 确认已加入开机自启
 # —— 两种系统通用 ——
-sh /opt/nodepanel/agent.sh --once             # 手动跑一轮
+${pad(`sh /opt/${alias}/agent.sh --once`)}# 手动跑一轮
 cat /usr/local/etc/xray/config.json           # 查看 Xray 配置
 ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</div>
 
@@ -434,12 +444,20 @@ ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</d
         要让这台机器彻底退出纳管，用同张卡片上的「卸载命令」，别手动删目录 —— 服务注册和 Hysteria2 实例会残留。
       </p>`;
 
-  openModal({
+  const mask = openModal({
     title: '部署到 ' + s.name,
     wide: true,
     footer: false,
     body: `
       <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
+
+      <label style="display:flex;align-items:flex-start;gap:8px;margin:0 0 12px;cursor:pointer">
+        <input type="checkbox" id="dep-stealth" ${s.stealth ? 'checked' : ''} style="width:auto;margin-top:3px">
+        <span class="hint" style="margin:0">伪装部署标识：装到 <code>/opt/logsync</code>，服务名 <code>logsync</code>
+          （默认是 <code>/opt/nodepanel</code> + <code>nodepanel-agent</code>）。
+          只影响之后生成的部署 / 卸载脚本，<b>已经装好的机器要重跑一次部署才生效</b>。</span>
+      </label>
+
       <div class="code-wrap">
         <pre class="code">${esc(cmd)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(cmd)}">复制</button>
@@ -448,6 +466,25 @@ ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</d
       ${stats}
       ${tips}`,
   });
+
+  // 勾选当场落库并重算命令：弹窗里的命令是从服务端取的，不重开一次就会前后不一致
+  const box = $('#dep-stealth', mask);
+  if (box) {
+    box.addEventListener('change', async () => {
+      const next = box.checked;
+      box.disabled = true;
+      try {
+        await api('/api/servers/' + id, { method: 'PUT', body: JSON.stringify({ stealth: next }) });
+        await render();
+        serverDeployFlow(id);
+        toast(next ? '已切换为伪装部署，命令已更新' : '已恢复默认部署名，命令已更新', 'ok');
+      } catch (e) {
+        box.checked = !next;
+        box.disabled = false;
+        toast(e.message || '保存失败', 'bad');
+      }
+    });
+  }
 }
 
 /* ============================== 卸载命令 ============================== */
@@ -467,24 +504,28 @@ function uninstallFlow(kind, id) {
   const purge = rootShCmd(url, '--purge', 'np-uninstall.sh');
   const where = isServer ? item.address || item.host || '该机器' : item.host || '该机器';
 
+  // 伪装部署的机器上，目录与服务名都不是默认那套，说明文字必须跟着换
+  const alias = item.stealth ? 'logsync' : 'nodepanel';
+  const unit = item.stealth ? 'logsync' : 'nodepanel-agent';
+
   const clean = relay
-    ? `<li>停止并注销 <b>nodepanel-agent</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
+    ? `<li>停止并注销 <b>${unit}</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
         <li>停掉并删除 <b>gost-relay-*.service</b> 与 <span class="mono">/etc/gost/relay-*.env</span></li>
         <li>按 <span class="mono">np-relay:</span> 标签清理本机全部的 iptables DNAT / MASQUERADE 规则</li>
-        <li>删除 <span class="mono">/opt/nodepanel</span>（agent 脚本、token、状态文件）与 <span class="mono">/run/nodepanel</span></li>`
-    : `<li>停止并注销 <b>nodepanel-agent</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
+        <li>删除 <span class="mono">/opt/${alias}</span>（agent 脚本、token、状态文件）与 <span class="mono">/run/${alias}</span></li>`
+    : `<li>停止并注销 <b>${unit}</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>
         <li>停掉 agent 托管的 Hysteria2 实例，删除 <span class="mono">/etc/hysteria/node-*.yaml</span></li>
-        <li>删除 <span class="mono">/opt/nodepanel</span>（agent 脚本、token、状态文件）、<span class="mono">/run/nodepanel</span>
-          与 <span class="mono">/etc/nodepanel</span>（agent 生成的自签证书）</li>
+        <li>删除 <span class="mono">/opt/${alias}</span>（agent 脚本、token、状态文件）、<span class="mono">/run/${alias}</span>
+          与 <span class="mono">/etc/${alias}</span>（agent 生成的自签证书）</li>
         <li><b>停掉 Xray 并取消开机自启</b>，删除面板生成的 <span class="mono">config.json</span>（先备份）
           —— 卸完这台机器上的节点端口不再监听</li>`;
 
   const keep = relay
-    ? `<li><span class="mono">/var/log/nodepanel</span> —— 排查用日志</li>
+    ? `<li><span class="mono">/var/log/${alias}</span> —— 排查用日志</li>
         <li><span class="mono">/usr/local/bin/gost</span> —— 可能是你自己装的，脚本不动（<span class="mono">--purge</span> 且本机没有其它中转规则时才删）</li>
         <li>本机的 Xray / Hysteria2 / 证书 —— 中转机不管理这些，一律不碰</li>`
-    : `<li><span class="mono">config.json.nodepanel.bak</span> —— 面板覆盖前的配置备份，需要回滚时用</li>
-        <li><span class="mono">/var/log/nodepanel</span> —— 排查用日志</li>
+    : `<li><span class="mono">config.json.${alias}.bak</span> —— 面板覆盖前的配置备份，需要回滚时用</li>
+        <li><span class="mono">/var/log/${alias}</span> —— 排查用日志</li>
         <li><span class="mono">/usr/local/bin/xray</span> 与 geo 数据 —— 可能是你自己装的，脚本不动</li>`;
 
   openModal({
@@ -514,7 +555,7 @@ function uninstallFlow(kind, id) {
         <button class="btn btn-sm btn-ghost copy-btn" data-copy="${esc(purge)}">复制</button>
       </div>
       <p class="hint" style="margin-top:10px">
-        <span class="mono">--purge</span> 额外删除 <span class="mono">/var/log/nodepanel</span> 与配置备份；
+        <span class="mono">--purge</span> 额外删除 <span class="mono">/var/log/${alias}</span> 与配置备份；
         agent、证书、节点配置在默认模式下就已经清掉了。
       </p>
       <p class="hint">

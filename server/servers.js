@@ -79,6 +79,8 @@ function createServer(req, res, params, body) {
     note: String(body.note || ''),
     ipMode,
     reportedIp: '',
+    // 伪装部署：决定这台机器的部署脚本把 agent 装到哪个目录、注册成什么服务名
+    stealth: body.stealth ? 1 : 0,
     createdAt: store.iso(),
     lastSeen: null,
     agentVersion: null,
@@ -126,6 +128,8 @@ function updateServer(req, res, params, body) {
     s.ipMode = body.ipMode === 'auto' ? 'auto' : 'manual';
   }
   if (body.note !== undefined) s.note = String(body.note);
+  // 伪装部署只影响「下次生成的部署/卸载脚本」，已经装好的机器要重跑部署才会生效
+  if (body.stealth !== undefined) s.stealth = body.stealth ? 1 : 0;
   store.save();
   auditAction('server.update', s.name, s.host || '地址由服务器上报');
   sendJson(res, 200, { ok: true, item: s });
@@ -208,14 +212,14 @@ function resetServerToken(req, res, params) {
 // 模板在 server/deploy-scripts.js（buildInstallScript / readAgentSource /
 //  buildUninstallScript / buildRelayScript）；这里只剩「拼参数 + 写响应」的 handler。
 
-function sendUninstallScript(res, { item, label, tokenInUrl, session, filename, relayOnly = false }) {
+function sendUninstallScript(res, { item, label, tokenInUrl, session, filename, relayOnly = false, stealth = false }) {
   if (!item) return sendJson(res, 404, { error: '目标不存在' });
   // session 由调用方用 getSession() 现场解析：这两个端点是免登录路由（要给 curl 用），
   // 路由层不会注入会话，不主动取的话「管理员已登录」这条通道永远是死代码。
   if (!session && !tokenEq(tokenInUrl, item.token)) {
     return sendJson(res, 401, { error: '无权获取卸载脚本' });
   }
-  const script = buildUninstallScript({ label, relayOnly });
+  const script = buildUninstallScript({ label, relayOnly, stealth });
   // HTTP 头只能是 ASCII：中文名放进 filename*（RFC 5987），filename 里退回纯 ASCII
   const ascii = `uninstall-${item.id}.sh`;
   sendText(res, 200, script, 'text/x-shellscript; charset=utf-8', {
@@ -254,6 +258,7 @@ function installScript(req, res, params, body, session, ctx) {
     needHysteria,
     needXray,
     relayOnly,
+    stealth: !!s.stealth,
     agentSrc,
   });
 
@@ -273,6 +278,7 @@ function uninstallScript(req, res, params, body, session, ctx) {
     session: getSession(ctx.req),
     filename: `uninstall-${s.name}.sh`,
     relayOnly: s.type === 'relay',
+    stealth: !!s.stealth,
   });
 }
 
@@ -305,6 +311,7 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
     label: `${node.name}（独立部署 · ${node.address}）`,
     needHysteria: node.protocol === 'hysteria2',
     needXray: node.protocol !== 'hysteria2',
+    stealth: !!node.stealth,
     agentSrc,
   });
 
@@ -326,6 +333,7 @@ function nodeUninstallScript(req, res, params, body, session, ctx) {
     tokenInUrl: ctx.query.get('token'),
     session: getSession(ctx.req),
     filename: `uninstall-${node.name}.sh`,
+    stealth: !!node.stealth,
   });
 }
 

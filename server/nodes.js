@@ -524,6 +524,8 @@ function updateNode(req, res, params, body) {
   const badHop = hopError(next, node.id);
   if (badHop) return sendJson(res, 400, { error: badHop });
   Object.assign(node, next);
+  // 伪装部署：只影响之后生成的部署 / 卸载脚本，已装好的机器要重跑部署
+  if (body.stealth !== undefined) node.stealth = body.stealth ? 1 : 0;
   store.save();
   auditAction('node.update', node.name, `${node.protocol} · 端口 ${node.port}${node.enabled ? '' : ' · 已停用'}`);
   sendJson(res, 200, { ok: true, item: node, warnings: portWarnings(node) });

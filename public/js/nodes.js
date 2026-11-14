@@ -1663,12 +1663,29 @@ async function nodeDeployFlow(id) {
   if (!n) return;
   const cmd = rootShCmd(`${location.origin}/api/nodes/${n.id}/install?token=${n.token}`, '', 'np-node-setup.sh');
 
-  openModal({
+  // 伪装部署（独立节点）与服务器同一个机制：目录 / 服务名整体换成中性名
+  const alias = n.stealth ? 'logsync' : 'nodepanel';
+  const unit = n.stealth ? 'logsync' : 'nodepanel-agent';
+  const pad = (c) => c + ' '.repeat(Math.max(1, 38 - c.length));
+  const lastTip =
+    n.protocol === 'hysteria2'
+      ? pad(`ls /run/${alias}/`) + '# Hysteria2 实例 pid'
+      : pad('systemctl status xray') + '# Xray 服务状态';
+
+  const mask = openModal({
     title: '独立部署 · ' + n.name,
     wide: true,
     footer: false,
     body: `
       <p class="hint" style="margin:0 0 10px">在 <b>${esc(n.host || '待上报地址')}</b> 的终端执行（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）：</p>
+
+      <label style="display:flex;align-items:flex-start;gap:8px;margin:0 0 12px;cursor:pointer">
+        <input type="checkbox" id="nd-stealth" ${n.stealth ? 'checked' : ''} style="width:auto;margin-top:3px">
+        <span class="hint" style="margin:0">伪装部署标识：装到 <code>/opt/logsync</code>，服务名 <code>logsync</code>
+          （默认是 <code>/opt/nodepanel</code> + <code>nodepanel-agent</code>）。
+          只影响之后生成的部署 / 卸载脚本，<b>已经装好的机器要重跑一次部署才生效</b>。</span>
+      </label>
+
       <div class="code-wrap">
         <pre class="code">${esc(cmd)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(cmd)}">复制</button>
@@ -1679,14 +1696,33 @@ async function nodeDeployFlow(id) {
         <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${n.online ? 'var(--ok)' : 'var(--muted)'}">${n.online ? '在线' : '离线'}</b></div>
       </div>
       <div class="code" style="white-space:pre-wrap"># 部署完成后
-journalctl -u nodepanel-agent -f      # 查看日志（systemd）
-tail -f /var/log/nodepanel/agent.log  # 查看日志（Alpine / cron）
-${n.protocol === 'hysteria2' ? 'ls /run/nodepanel/                  # Hysteria2 实例 pid' : 'systemctl status xray               # Xray 服务状态'}</div>
+${pad(`journalctl -u ${unit} -f`)}# 查看日志（systemd）
+${pad(`tail -f /var/log/${alias}/agent.log`)}# 查看日志（Alpine / cron）
+${lastTip}</div>
       <p class="hint" style="margin-top:14px">
         独立节点使用自己的 token 拉取配置，与服务器 agent 互不影响。修改节点后同样 60 秒内自动生效。
       </p>
       <div id="relay-box"></div>`,
   });
+
+  // 勾选当场落库并重算命令：命令来自服务端，不重开弹窗就会前后不一致
+  const stealthBox = $('#nd-stealth', mask);
+  if (stealthBox) {
+    stealthBox.addEventListener('change', async () => {
+      const next = stealthBox.checked;
+      stealthBox.disabled = true;
+      try {
+        await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify({ stealth: next }) });
+        await render();
+        nodeDeployFlow(id);
+        toast(next ? '已切换为伪装部署，命令已更新' : '已恢复默认部署名，命令已更新', 'ok');
+      } catch (e) {
+        stealthBox.checked = !next;
+        stealthBox.disabled = false;
+        toast(e.message || '保存失败', 'bad');
+      }
+    });
+  }
 
   /* 中转入口：为每个入口生成 L4 转发脚本 */
   const entries = (n.entries || []).filter((e) => e.host);

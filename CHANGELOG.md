@@ -3,6 +3,32 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.52] - 2026-11-14
+
+### 新增
+
+- **部署可伪装 agent 标识**（服务器与独立节点都支持）：部署弹窗新增「伪装部署标识」复选框。
+  勾选后生成（以及之后重新生成）的部署 / 卸载脚本会把 agent 装到 `/opt/logsync/logsync.sh`，注册成 `logsync` ——
+  systemd 单元、OpenRC 脚本、pid / 日志 / 状态目录、nft 链名、配置备份后缀、脚本文件名一起换，
+  `ps`、`rc-service`、`nft list ruleset` 里既没有 `panel` 也没有 `agent`。
+  独立节点虽然不承载服务器上的其它节点，但跑的是同一个 agent、同样 60 秒心跳，
+  从机器上看与服务器部署没有区别，所以两处都给了开关。
+  默认不勾选，默认输出与旧版逐字节一致；开关只影响之后生成的脚本，**已部署的机器要重跑一次部署**。
+  实现是「对生成好的脚本文本整体替换」，因此内嵌的 `agent.sh` 源码也一起换名，
+  agent 的 `--uninstall` 才不会去找旧的服务单元。
+  未覆盖：面板签发证书的目录 `/etc/nodepanel/certs`（`lib/cert.js` 的 `CERTS_ROOT`）仍是原名，
+  只有用到面板证书的机器才会落这个目录。
+
+### 修复
+
+- **离线通知的排查命令只认 systemd**：Alpine / OpenRC 机器收到的告警里写着
+  `systemctl status nodepanel-agent`，那条命令在机器上根本不存在，容易误判成「服务挂了」。
+  现在两种都列，并补一句「报 `service does not exist` 说明机器上没有 agent（被重置或重装）」。
+- **部署弹窗的「可用命令」补齐 Alpine**：加上 `rc-service status / restart`、
+  `rc-update show default | grep …`，并按 systemd / OpenRC / 通用三段分组；
+  伪装部署时这些命令里的目录与服务名会跟着换（之前固定写 `nodepanel-agent`，
+  照着查会得到 `service does not exist`）。
+
 ## [0.1.51] - 2026-11-14
 
 > gost 模式缺 iptables 时自动安装，流量统计不再静默为 0。

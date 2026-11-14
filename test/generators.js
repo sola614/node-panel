@@ -109,6 +109,17 @@ const SHELL_CASES = [
     agentSrc: AGENT_SRC,
   })],
   ['中转机卸载脚本', () => buildUninstallScript({ label: '香港中转', relayOnly: true })],
+  // 伪装部署：目录 / 服务名 / nft 链名整体换名，但仍是能被 sh 解析的同一份脚本
+  ['伪装部署脚本', () => buildInstallScript({
+    panelUrl: 'https://panel.example.com',
+    token: 'e'.repeat(48),
+    label: '香港 02',
+    needHysteria: true,
+    needXray: true,
+    stealth: true,
+    agentSrc: AGENT_SRC,
+  })],
+  ['伪装卸载脚本', () => buildUninstallScript({ label: '香港 02', stealth: true })],
   // 中转机 agent 收敛包：空规则（清场）/ gost + iptables 混合
   ['中转收敛包（无规则）', () => buildRelaySyncScript({ rules: [] })],
   ['中转收敛包（混合规则）', () => buildRelaySyncScript({
@@ -733,6 +744,39 @@ for (const [label, line] of [
   const out = String(r.stdout || '');
   ok(`hy_ensure 能从${label}的 yaml 里还原出证书路径`, out === probeCert, JSON.stringify(out));
 }
+
+/* ---------------------------- 四、伪装部署 ---------------------------- */
+// 勾选「伪装部署」后，脚本里的目录 / 服务名 / nft 链名整体换成中性名。
+// 锁三件事：① 伪装后一个 nodepanel 都不剩 ② 内嵌的 agent.sh 源码也跟着换
+// （否则 agent --uninstall 会去删旧单元，卸不干净）③ 不勾选时行为一个字节都不变
+const hidden = buildInstallScript({
+  panelUrl: 'https://panel.example.com',
+  token: 'f'.repeat(48),
+  label: '隐藏 01',
+  needHysteria: true,
+  needXray: true,
+  stealth: true,
+  agentSrc: AGENT_SRC,
+});
+const hiddenUninstall = buildUninstallScript({ label: '隐藏 01', stealth: true });
+const plain = buildInstallScript({
+  panelUrl: 'https://panel.example.com',
+  token: 'f'.repeat(48),
+  label: '隐藏 01',
+  needHysteria: true,
+  needXray: true,
+  agentSrc: AGENT_SRC,
+});
+
+ok('伪装部署脚本里搜不到 nodepanel', !/nodepanel/i.test(hidden));
+ok('伪装部署脚本装到 /opt/logsync', hidden.includes('/opt/logsync/logsync.sh') && hidden.includes('mkdir -p /opt/logsync /var/log/logsync /run/logsync'));
+ok('伪装后脚本文件名也不叫 agent.sh（ps 里看不到 agent）', !/agent\.sh/.test(hidden) && hidden.includes('ExecStart=/bin/sh /opt/logsync/logsync.sh'));
+ok('伪装后 systemd / OpenRC 单元都叫 logsync', hidden.includes('systemctl enable logsync') && hidden.includes('rc-update add logsync default'));
+ok('伪装后 nft 链名一起换', !/NODEPANEL_HYHOP/.test(hidden) && hidden.includes('LOGSYNC_HYHOP'));
+ok('伪装后内嵌 agent 的默认目录也换了', hidden.includes('STATE_DIR=${STATE_DIR:-/opt/logsync}'));
+ok('伪装后内嵌 agent 的卸载单元也换了', hidden.includes('/etc/init.d/logsync') && !hidden.includes('/etc/init.d/nodepanel-agent'));
+ok('伪装卸载脚本里搜不到 nodepanel', !/nodepanel/i.test(hiddenUninstall));
+ok('不勾选时输出里没有 logsync', !/logsync/i.test(plain) && !/logsync/i.test(buildUninstallScript({ label: '隐藏 01' })));
 
 /* ------------------------------ 收尾 ------------------------------ */
 // 先关库再删目录：Windows 上 SQLite 句柄没释放时 unlink 会 EBUSY
