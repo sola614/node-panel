@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.46'
+VERSION='0.1.47'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -1530,8 +1530,10 @@ apply_bundle() {
 
   _tmp="$RUN_DIR/bundle.$$.sh"
   printf '%s\n' "$_out" > "$_tmp" || return 1
-  if sh "$_tmp" >> "$LOG_DIR/agent.log" 2>&1; then
-    rm -f "$_tmp"
+  _blog="$RUN_DIR/bundle.$$.log"
+  if sh "$_tmp" > "$_blog" 2>&1; then
+    cat "$_blog" >> "$LOG_DIR/agent.log" 2>/dev/null
+    rm -f "$_tmp" "$_blog"
     # state.env 给下一轮用；changed.env 记录这一轮哪些文件真的变了，决定要不要重载服务
     . "$STATE_DIR/state.env" 2>/dev/null
     . "$STATE_DIR/changed.env" 2>/dev/null
@@ -1543,11 +1545,15 @@ apply_bundle() {
     return 0
   fi
 
-  log "✗ 配置包执行失败，详见 $LOG_DIR/agent.log"
-  rm -f "$_tmp"
+  # 失败原因不能只写「详见 agent.log」：面板上看到的必须是「iptables 没装 / gost 起不来」
+  # 这种能直接行动的信息，否则规则会永远停在「等待同步」
+  _why=$(tail -n 3 "$_blog" 2>/dev/null | tr '\n' ' ' | cut -c1-300)
+  cat "$_blog" >> "$LOG_DIR/agent.log" 2>/dev/null
+  log "✗ 配置包执行失败：${_why:-详见 $LOG_DIR/agent.log}"
+  rm -f "$_tmp" "$_blog"
   LAST_FETCH_OK=1
   RC_OK=0
-  RC_ERR="配置包执行失败，详见 $LOG_DIR/agent.log"
+  RC_ERR="配置包执行失败：${_why:-详见 $LOG_DIR/agent.log}"
   return 1
 }
 
@@ -1911,8 +1917,10 @@ send_receipt() {
   # 签名要写进 state 文件的第二行：先把换行压掉，否则永远读不回原值、每轮都重发。
   # 指纹清单也进签名：证书重签 → 指纹变化 → 回执立即重发，面板订阅里的 pcs 才不会拿着旧指纹
   # 流量总量也进签名：有流量就刷新回执，没流量则不重复发
+  # 入口机诊断结果同样进签名：结果一到就优先回执，不等 10 分钟
   _traffic_sum=$(awk '{ s += $2 } END { print s + 0 }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
-  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${RC_HOP:-}|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")|${_traffic_sum:-0}"
+  _probe_sig=$(tr '\n' ' ' 2>/dev/null < "$STATE_DIR/relay-probe.json")
+  _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${RC_HOP:-}|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")|${_traffic_sum:-0}|$(printf '%s' "$_probe_sig" | cut -c1-200)"
   _last=''
   _ts=0
   if [ -f "$STATE_DIR/.receipt" ]; then
@@ -1939,12 +1947,20 @@ send_receipt() {
   if [ -s "$RUN_DIR/relay-traffic.txt" ]; then
     _traffic=$(awk '{ printf "%s\"%s\":%s", sep, $1, $2; sep="," }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
   fi
-  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","hop":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s","traffic":{%s}}\n' \
+  # 入口机诊断结果：bundle 写好的 JSON 原样带上；没有就用空对象占位
+  _probe=''
+  if [ -s "$STATE_DIR/relay-probe.json" ]; then
+    _probe=$(cat "$STATE_DIR/relay-probe.json" 2>/dev/null)
+  fi
+  [ -n "$_probe" ] || _probe='{}'
+  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","hop":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s","traffic":{%s},"probe":%s}\n' \
     "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${RC_HOP:-}" "${BAD_PORTS:-}" \
-    "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" "$_traffic" > "$_f" 2>/dev/null
+    "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" "$_traffic" "$_probe" > "$_f" 2>/dev/null
 
   if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
     printf '%s\n%s\n' "$_now" "$_sig" > "$STATE_DIR/.receipt" 2>/dev/null
+    # 诊断结果只上报一次：面板收到后会清掉请求标记，下一轮不再重发
+    rm -f "$STATE_DIR/relay-probe.json" 2>/dev/null
     if [ "$_ok" = 'true' ]; then
       log "✓ 已回执：配置 ${NP_HASH:-（空）} 已生效"
     else

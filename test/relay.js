@@ -135,6 +135,19 @@ ok('中转机 hash 随目标变化', (() => {
   return before !== after.hash && after.relay.rules[0].targets.length === 2;
 })());
 
+// 入口机诊断请求（0.1.47）：请求时间必须进 payload 和 hash，否则 agent 不会拉新包
+ok('入口机诊断请求进入 payload', (() => {
+  const rule = db.relays.find((r) => r.id === 'rule-0002');
+  const before = agent.buildAgentPayload(agent.scopeOfServer(tokyo)).hash;
+  rule.diagRequestedAt = '2026-11-14T00:00:00.000Z';
+  const withProbe = agent.buildAgentPayload(agent.scopeOfServer(tokyo));
+  rule.diagRequestedAt = null;
+  return withProbe.probe.length === 1
+    && withProbe.probe[0].id === 'rule-0002'
+    && withProbe.probe[0].targets.length === 2
+    && withProbe.hash !== before;
+})());
+
 const bundle = require('../lib/agentBundle');
 const iptBundle = bundle.buildBundle(relayPayload, { siteName: '测试站' });
 ok('iptables 规则不进入端口自检（NAT 无监听 socket）', iptBundle.includes("NP_LISTEN_PORTS=''"));

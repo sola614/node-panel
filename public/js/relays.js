@@ -24,6 +24,15 @@ function relayStateOf(r) {
   // agent 在线时的 planned 不是「没部署」，而是「等着下一轮同步」——文案要区分开，
   // 否则会被误认为 agent 不会自动部署规则
   if (r.status === 'planned' && r.serverOnline) {
+    // 回执明确失败（bundle 执行失败：iptables 没装 / gost 起不来…）时不能再显示「等待同步」，
+    // 否则规则会永远停在这里，用户不知道要去机器上看什么
+    if (r.serverSync && r.serverSync.ok === false) {
+      return {
+        label: '同步失败',
+        cls: 'badge-bad',
+        tip: `${r.serverSync.error || 'agent 回报配置包执行失败'}（详见入口机 /var/log/nodepanel/agent.log）`,
+      };
+    }
     return {
       label: '等待同步',
       cls: 'badge-warn',
@@ -327,8 +336,42 @@ function relayDelFlow(id) {
 
 /**
  * 从面板侧逐个 TCP 握手目标，返回延迟与可用性。
- * 说明清楚「来源是面板」：入口机到目标的链路可能不同，面板可达 ≠ 入口机可达。
+ * 说明清楚两种视角：面板探测是即时的，入口机探测由 agent 下一轮同步回传。
  */
+function parseAgentProbe(raw) {
+  try {
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function agentProbeHtml(probe, requestedAt) {
+  if (!probe) {
+    return `<div class="hint" style="margin:0">${
+      requestedAt
+        ? '已请求入口机探测，等待下一轮同步（最多 60 秒）…'
+        : '还没有入口机诊断数据，点下方按钮触发一次。'
+    }</div>`;
+  }
+  const rows = (probe.targets || [])
+    .map(
+      (t, i) => `<tr>
+        <td>${i + 1}</td>
+        <td class="mono">${esc(t.host)}:${esc(t.port)}</td>
+        <td><span class="badge ${t.ok ? 'badge-ok' : 'badge-bad'}">${t.ok ? '可达' : '不可达'}</span></td>
+        <td class="mono">${t.ok ? t.ms + ' ms' : '—'}</td>
+        <td class="cell-sub">${t.error ? esc(t.error) : '—'}</td>
+      </tr>`,
+    )
+    .join('');
+  return `<div class="hint" style="margin:0 0 8px">采集于 ${esc(fmtAgo(probe.at))} · 入口机 → 目标（TCP 握手耗时）</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>#</th><th>目标</th><th>结果</th><th>延迟</th><th>说明</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
 async function relayDiagFlow(id) {
   const r = (state.data.relayItems || []).find((x) => x.id === id);
   if (!r) return;
@@ -337,10 +380,18 @@ async function relayDiagFlow(id) {
     wide: true,
     footer: false,
     body: `
+      <div class="section-title">面板视角（即时）</div>
       <div id="rd-body"><div class="hint" style="margin:0">正在从面板探测目标…</div></div>
-      <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+      <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
         <button class="btn btn-sm btn-primary" type="button" id="rd-again">重新测试</button>
         <span class="hint" style="margin:0">探测超时 3 秒；目标按表单顺序作为故障切换顺序</span>
+      </div>
+
+      <div class="section-title" style="margin-top:18px">入口机视角（agent 上报）</div>
+      <div id="rd-agent">${agentProbeHtml(parseAgentProbe(r.agentProbe), r.diagRequestedAt)}</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+        <button class="btn btn-sm btn-primary" type="button" id="rd-agent-run">从入口机检测</button>
+        <span class="hint" style="margin:0">agent 是拉取式：点击后最多 60 秒回传；入口机离线时无效</span>
       </div>`,
   });
 
@@ -351,8 +402,8 @@ async function relayDiagFlow(id) {
       const d = await api('/api/relays/' + id + '/diag', { method: 'POST' });
       box.innerHTML = `
         <div class="alert alert-warn" style="margin:0 0 12px;font-size:12px;line-height:1.7">
-          探测从 <b>面板所在机器</b> 发起（不是从入口机发起）：面板到目标可达，不代表入口机到目标也可达。
-          需要入口机视角时，可在入口机上执行检查脚本，或用 <span class="mono">nc -z -w 2 host port</span> 手工验证。
+          探测从 <b>面板所在机器</b> 发起：面板到目标可达，不代表入口机到目标也可达。
+          入口机视角请用下方的「从入口机检测」。
         </div>
         <div class="table-wrap"><table>
           <thead><tr><th>#</th><th>目标</th><th>结果</th><th>延迟</th><th>说明</th></tr></thead>
@@ -376,18 +427,73 @@ async function relayDiagFlow(id) {
               ? '所有目标都探测失败：这条规则当前没有可用落地地址（gost 连接会失败；iptables 会保留但流量不通）。'
               : `按顺序第一个可达的是 <b>#${d.active + 1}</b>：${esc(d.targets[d.active].host)}:${esc(d.targets[d.active].port)}。`
           }
-          ${
-            r.tool === 'iptables'
-              ? 'iptables 是静态规则：已装 agent 的中转机每轮同步（约 60s）重选；纯手动模式需要重跑 install 脚本。'
-              : 'gost 在进程内按 fifo 顺序自动切换，无需人工介入。'
-          }
+          ${r.tool === 'iptables'
+            ? 'iptables 是静态规则：已装 agent 的中转机每轮同步（约 60s）重选；纯手动模式需要重跑 install 脚本。'
+            : 'gost 同样由每轮同步（约 60s）按顺序探测并重选目标。'}
         </p>`;
     } catch (err) {
       box.innerHTML = `<div class="alert alert-danger" style="margin:0">${esc(err.message)}</div>`;
     }
   };
 
+  const runAgent = async () => {
+    const btn = $('#rd-agent-run', mask);
+    const box = $('#rd-agent', mask);
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '等待入口机…';
+    }
+    try {
+      const req = await api('/api/relays/' + id + '/diag', {
+        method: 'POST',
+        body: JSON.stringify({ source: 'agent' }),
+      });
+      if (box) box.innerHTML = agentProbeHtml(null, req.requestedAt);
+      let tries = 0;
+      const timer = setInterval(async () => {
+        tries++;
+        let d = null;
+        try {
+          d = await api('/api/relays/' + id + '/probe');
+        } catch {
+          d = null;
+        }
+        const at = d && d.agentProbe ? Date.parse(d.agentProbe.at) : NaN;
+        const want = req.requestedAt ? Date.parse(req.requestedAt) : NaN;
+        const fresh = !req.requestedAt || !Number.isFinite(at) || !Number.isFinite(want) || at >= want;
+        if (d && d.agentProbe && fresh) {
+          clearInterval(timer);
+          if (box) box.innerHTML = agentProbeHtml(d.agentProbe, null);
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = '重新检测（入口机）';
+          }
+          return;
+        }
+        if (tries >= 18) {
+          clearInterval(timer);
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = '重新检测（入口机）';
+          }
+          if (box) {
+            box.innerHTML =
+              agentProbeHtml(null, null) +
+              '<div class="hint">超时：agent 未在 90 秒内回传，确认入口机在线且同步正常</div>';
+          }
+        }
+      }, 5000);
+    } catch (err) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '从入口机检测';
+      }
+      if (box) box.innerHTML = `<div class="alert alert-danger" style="margin:0">${esc(err.message)}</div>`;
+    }
+  };
+
   $('#rd-again', mask).addEventListener('click', run);
+  $('#rd-agent-run', mask).addEventListener('click', runAgent);
   run();
 }
 

@@ -67,6 +67,7 @@ const {
   listRelayServers,
   listRelays, createRelay, updateRelay, deleteRelay,
   relayDiag,
+  relayProbe,
   relayRuleScript, relayAck,
 } = require('./server/relays');
 const {
@@ -192,8 +193,11 @@ const ROUTES = [
   ['POST', '/api/relays', createRelay, true],
   ['PUT', '/api/relays/:id', updateRelay, true],
   ['DELETE', '/api/relays/:id', deleteRelay, true],
-  // 目标诊断（0.1.46）：面板侧 TCP 握手，返回每个目标的延迟与可用性
+  // 目标诊断（0.1.46）：面板侧 TCP 握手，返回每个目标的延迟与可用性。
+  // 0.1.47 起 source=agent 改为「请求入口机探测」，结果由 agent 回执带回
   ['POST', '/api/relays/:id/diag', relayDiag, true],
+  // 入口机诊断结果轮询（0.1.47）
+  ['GET', '/api/relays/:id/probe', relayProbe, true],
   ['GET', '/api/relays/:id/script', relayRuleScript, true],
   ['POST', '/api/relay/ack', relayAck, false],
 

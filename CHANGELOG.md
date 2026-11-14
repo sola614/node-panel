@@ -3,6 +3,38 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.1.47] - 2026-11-14
+
+> 诊断可以从入口机发起了（不再只看面板视角）；规则同步失败会明确显示原因；
+> 缺少 iptables 时自动安装，Alpine 上也能持久化转发规则。
+
+### 新增
+
+- **入口机视角诊断**：诊断弹窗分「面板视角 / 入口机视角」两块。入口机视角点「从入口机检测」后，
+  面板写入 `diagRequestedAt`（参与 relay payload hash，确保 agent 为此拉新包），agent 下一轮
+  在入口机上用 `curl --connect-timeout 3 -w '%{time_connect}'` 逐目标测 TCP 握手，
+  结果随回执的 `probe` 字段带回并落库（`relays.agentProbe`）；前端轮询
+  `GET /api/relays/:id/probe`，最多等 90 秒（agent 是拉取式，通常 ≤60 秒）。
+  该探测只在点击后执行一次，不影响每轮 60s 收敛。
+- **缺少转发工具时自动安装 iptables**：bundle / 手动 install 脚本检测不到 `iptables` 时，
+  按系统包管理器自动安装（Alpine `apk add --no-cache iptables`、Debian/Ubuntu `apt-get`、
+  RHEL `dnf/yum`、Arch `pacman`、openSUSE `zypper`），并把 `/usr/sbin`、`/sbin` 补进 PATH。
+  Alpine 的持久化改用 OpenRC：`rc-update add iptables default` + `rc-service iptables save`，
+  重启后 DNAT 规则不会丢。
+
+### 变更
+
+- **schema 15 → 16**：`relays` 增 `diagRequestedAt`（面板请求入口机探测的时间）与
+  `agentProbe`（agent 回传的探测结果 JSON）。旧规则默认 null。
+- relay bundle 生成器版本升到 6：入口机诊断段、iptables 自动安装都会触发一次新包下发。
+
+### 修复
+
+- **规则永远停在「等待同步」**：bundle 执行失败（例如 Alpine 没装 iptables、gost 起不来）时，
+  agent 回执只写「详见 agent.log」，前端只看到「等待同步」，根本不知道要去机器上处理什么。
+  现在回执错误带上 bundle 输出的最后几行（如 `! 未检测到 iptables`），规则状态显示
+  「同步失败」并把原因放在徽标提示里，不再让用户无休止等待。
+
 ## [0.1.46] - 2026-11-14
 
 > 一条中转规则可以填多个目标地址，按填写顺序做故障切换；规则列表新增「诊断」，
@@ -12,9 +44,8 @@
 ### 新增
 
 - **单入口多目标（最多 8 个）**：目标地址改为一行一个的大文本框（`host:port`，省略端口默认 443），
-  顺序即故障切换顺序。gost 用进程内 `strategy=fifo`（首选第一个，失败按 max_fails 剔除并切下一个）；
-  iptables 由 agent 每轮收敛时按顺序探测（`nc -z -w 2`）并重写 DNAT；未装 agent 时在 install
-  脚本里探测一次，重跑脚本可重新选择。
+  顺序即故障切换顺序。gost / iptables 都由 agent 每轮收敛时按顺序探测（`nc -z -w 2`）
+  并只下发一个可达目标；未装 agent 时在 install 脚本里探测一次，重跑脚本可重新选择。
 - **目标诊断**：规则行新增「诊断」按钮 → `POST /api/relays/:id/diag`，从面板侧逐个 TCP 握手
   （3s 超时、并发），返回可达性、延迟、错误码与「按顺序第一个可达」的首选目标，弹窗可重新测试。
   探测来源是面板所在机器，界面与文档都明确标注「入口机视角可能不同」。
@@ -69,6 +100,11 @@
 - **GitHub 下载被墙**：设置页新增「GitHub 反代加速」。中转机下载 gost 时检测 IP 归属
   （`cdn-cgi/trace` 的 `loc`），中国大陆或判断失败时自动拼成
   `https://ghproxy.com/https://github.com/...`；`GOST_DL_BASE` 自定义镜像不叠加。
+- **小磁盘装不下 gost**：Alpine 容器常见 90MB 根分区，旧逻辑峰值要同时放
+  「17MB 压缩包 + 50MB 解压文件 + 50MB install 副本」，直接 `No space left on device`。
+  改为流式解压（`curl | tar -xzO gost`）只占最终二进制一份，并在下载前检查可用空间：
+  不足 60MB 时明确提示清理 `/tmp` 或把规则改用 iptables。
+
 
 ## [0.1.45] - 2026-11-14
 

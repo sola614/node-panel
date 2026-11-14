@@ -1015,8 +1015,23 @@ else
   echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
 fi
 
+# 缺 iptables 时自动安装（Alpine 默认不装）
 if ! command -v iptables >/dev/null 2>&1; then
-  echo "✗ 未检测到 iptables，请先安装：apt install -y iptables"
+  echo "→ 未检测到 iptables，尝试自动安装"
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache iptables 2>&1 | tail -n 3 || true
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables 2>&1 | tail -n 3 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y iptables 2>&1 | tail -n 3 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y iptables 2>&1 | tail -n 3 || true
+  fi
+  export PATH="$PATH:/usr/sbin:/sbin"
+fi
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "✗ iptables 仍不可用：请手动安装（Alpine: apk add iptables）"
   exit 1
 fi
 
@@ -1162,7 +1177,25 @@ TAG='-m comment --comment np-relay:${id}'
 
 ${relayRootCheck()}
 if ! command -v iptables >/dev/null 2>&1; then
-  echo "✗ 未检测到 iptables，请先安装：apt install -y iptables"
+  echo "→ 未检测到 iptables，尝试自动安装"
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache iptables 2>&1 | tail -n 3 || true
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables 2>&1 | tail -n 3 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y iptables 2>&1 | tail -n 3 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y iptables 2>&1 | tail -n 3 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm iptables 2>&1 | tail -n 3 || true
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install iptables 2>&1 | tail -n 3 || true
+  fi
+  export PATH="$PATH:/usr/sbin:/sbin"
+fi
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "✗ iptables 仍不可用：请手动安装（Alpine: apk add iptables）"
   exit 1
 fi
 
@@ -1260,6 +1293,13 @@ iptables -t nat -S POSTROUTING | grep -F "np-relay:\$RELAY_ID" || true
 # 持久化（不同发行版命令不同，失败不影响本次生效）
 if command -v netfilter-persistent >/dev/null 2>&1; then
   netfilter-persistent save && echo "✓ 规则已持久化"
+elif [ -f /etc/init.d/iptables ] && command -v rc-service >/dev/null 2>&1; then
+  rc-update add iptables default >/dev/null 2>&1 || true
+  if rc-service iptables save >/dev/null 2>&1; then
+    echo "✓ 规则已持久化（OpenRC iptables 服务）"
+  else
+    mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && echo "✓ 规则已保存到 /etc/iptables/rules.v4"
+  fi
 elif command -v iptables-save >/dev/null 2>&1; then
   mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && echo "✓ 规则已保存到 /etc/iptables/rules.v4"
 else
@@ -1442,16 +1482,27 @@ if [ ! -x "$GOST_BIN" ]; then
     esac
   fi
   echo "→ 下载 gost v\${GOST_VER}（linux/\${ARCH}）：$GOST_URL"
-  TMP=$(mktemp -d)
-  trap 'rm -rf "$TMP"' EXIT
-  if ! curl -fsSL "$GOST_URL" -o "$TMP/gost.tgz"; then
-    echo "✗ 下载失败：$GOST_URL"
-    echo "  · 404 = 版本 / 资产名不存在；连不上 = 在面板设置里配置 GitHub 反代"
+  # 小磁盘机器（Alpine 容器常见 90MB 根分区）：先看可用空间。
+  # 以前「下载 tar.gz → 解压 → install 复制」峰值是 3 份，60MB 可用也会被撑爆
+  _avail=$(df -k "$(dirname "$GOST_BIN")" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [ -n "$_avail" ] && [ "$_avail" -lt 61440 ]; then
+    echo "✗ 磁盘空间不足：$(dirname "$GOST_BIN") 可用 \${_avail}KB，gost 二进制约 50MB"
+    echo "  · 清理 /tmp 后重跑；或把这条规则改用 iptables（不需要 gost 二进制）"
     exit 1
   fi
-  tar -xzf "$TMP/gost.tgz" -C "$TMP"
-  install -m 755 "$TMP/gost" "$GOST_BIN"
-  echo "✓ gost 已安装：$("$GOST_BIN" -V 2>&1 | head -n 1 || echo '(版本信息获取失败，但不影响安装)')"
+  _tmp="$GOST_BIN.np-new.$$"
+  # 流式解压：压缩包不落地，峰值只占最终二进制一份，避免 No space left on device
+  if curl -fsSL "$GOST_URL" | tar -xzO gost > "$_tmp" 2>/dev/null && [ "$(wc -c < "$_tmp")" -gt 20971520 ]; then
+    chmod 755 "$_tmp"
+    mv -f "$_tmp" "$GOST_BIN"
+    echo "✓ gost 已安装：$("$GOST_BIN" -V 2>&1 | head -n 1 || echo '(版本信息获取失败，但不影响安装)')"
+  else
+    rm -f "$_tmp"
+    echo "✗ gost 下载/解压失败：$GOST_URL"
+    echo "  · 404 = 版本 / 资产名不存在；连不上 = 在面板设置里配置 GitHub 反代"
+    echo "  · No space left on device = 磁盘不足（清理 /tmp 或改用 iptables）"
+    exit 1
+  fi
 fi
 
 # 端口预检：先停本规则旧服务（重跑更新配置的场景），再确认端口没被别人占着
@@ -1650,11 +1701,53 @@ ${relayAck()}
  *
  * 命名与手动脚本完全一致（gost-relay-<id>.service / np-relay:<id>），两条通道可以互相接手。
  */
-function buildRelaySyncScript({ rules = [], githubProxy = '' } = {}) {
+function buildRelaySyncScript({ rules = [], githubProxy = '', probe = [] } = {}) {
   const gostRules = rules.filter((r) => r.tool === 'gost');
   const iptRules = rules.filter((r) => r.tool === 'iptables');
   const idList = (list) => `' ${list.map((r) => shellSafe(r.id)).join(' ')} '`;
   const proxy = shellSafe(String(githubProxy || ''));
+
+  /**
+   * 入口机视角诊断（面板点「从入口机检测」后的一次性探测）。
+   * 只在这一轮 bundle 里生成，探测结果写 JSON 文件，agent 随回执带回后删除。
+   * 延迟用 curl 的 time_connect（TCP 握手耗时），目标可能是任意 TCP 端口。
+   */
+  const probeBlock = (list) => {
+    if (!Array.isArray(list) || !list.length) return '';
+    const chunks = [];
+    chunks.push(`
+# ---- 入口机视角诊断（面板触发的一次性探测） ----
+_probe_file="/opt/nodepanel/relay-probe.json"
+mkdir -p /opt/nodepanel
+if command -v curl >/dev/null 2>&1; then
+  {
+    printf '{'
+    _rsep=''`);
+    for (const p of list) {
+      const id = shellSafe(p.id);
+      chunks.push(`    printf '%s"${id}":{"at":"%s","targets":[' "$_rsep" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    _rsep=','
+    _tsep=''`);
+      for (const t of p.targets || []) {
+        const host = shellSafe(t.host);
+        const port = Number(t.port) || 443;
+        chunks.push(`    _tc=$(curl -s -o /dev/null --connect-timeout 3 --max-time 4 -w '%{time_connect}' "http://${host}:${port}/" 2>/dev/null)
+    _ok=false; _ms=0; _err=unreachable
+    case "$_tc" in ''|0|0.000000) ;; *) _ok=true; _err=''; _ms=$(printf '%s' "$_tc" | awk '{printf "%d", $1*1000}') ;; esac
+    printf '%s{"host":"${host}","port":${port},"ok":%s,"ms":%s,"error":"%s"}' "$_tsep" "$_ok" "$_ms" "$_err"
+    _tsep=','`);
+      }
+      chunks.push(`    printf ']}'`);
+    }
+    chunks.push(`    printf '}'
+  } > "$_probe_file" 2>/dev/null
+  echo "· 入口机诊断完成：$_probe_file"
+else
+  echo "! 未找到 curl：无法从入口机执行诊断"
+fi
+`);
+    return chunks.join('\n');
+  };
 
   const gostBlock = (r) => {
     const id = shellSafe(r.id);
@@ -1892,17 +1985,26 @@ if [ "$NP_GOST_N" -gt 0 ] && [ ! -x /usr/local/bin/gost ]; then
       esac
     fi
     echo "→ 下载 gost v${DEFAULT_GOST_VER}：$_GOST_URL"
-    _TMP=$(mktemp -d)
-    if curl -fsSL "$_GOST_URL" -o "$_TMP/gost.tgz" \\
-       && tar -xzf "$_TMP/gost.tgz" -C "$_TMP" \\
-       && install -m 755 "$_TMP/gost" /usr/local/bin/gost; then
-      echo "✓ gost v${DEFAULT_GOST_VER} 已安装"
-    else
-      echo "! gost 下载/安装失败：$_GOST_URL"
-      echo "  · 404 = 版本 / 资产名不存在；连不上 = 在面板设置里配置 GitHub 反代"
+    # 小磁盘机器（Alpine 容器常见 90MB 根分区）：先看可用空间。
+    # 流式解压，压缩包不落地，峰值只占最终二进制一份
+    _avail=$(df -k /usr/local/bin 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$_avail" ] && [ "$_avail" -lt 61440 ]; then
+      echo "! 磁盘空间不足：/usr/local/bin 可用 \${_avail}KB，gost 二进制约 50MB"
+      echo "  · 清理 /tmp；或把这条规则改用 iptables（不需要 gost 二进制）"
       NP_FAIL=1
+    else
+      _tmp="/usr/local/bin/.gost.np-new.$$"
+      if curl -fsSL "$_GOST_URL" | tar -xzO gost > "$_tmp" 2>/dev/null && [ "$(wc -c < "$_tmp")" -gt 20971520 ]; then
+        chmod 755 "$_tmp"
+        mv -f "$_tmp" /usr/local/bin/gost
+        echo "✓ gost v${DEFAULT_GOST_VER} 已安装"
+      else
+        rm -f "$_tmp"
+        echo "! gost 下载/解压失败：$_GOST_URL"
+        echo "  · 404 = 版本 / 资产名不存在；连不上 = 配置 GitHub 反代；No space left = 磁盘不足"
+        NP_FAIL=1
+      fi
     fi
-    rm -rf "$_TMP"
   fi
 fi
 
@@ -1910,8 +2012,28 @@ fi
 ${gostRules.map(gostBlock).join('')}
 # 5) 应用 iptables 规则（内核态 DNAT）
 if [ "$NP_IPT_N" -gt 0 ]; then
+  # 缺 iptables 时自动安装：Alpine 默认不装，用户环境就是这种情况
   if ! command -v iptables >/dev/null 2>&1; then
-    echo "! 未检测到 iptables：iptables 规则不会生效（apt install -y iptables）"
+    echo "→ 未检测到 iptables，尝试自动安装"
+    if command -v apk >/dev/null 2>&1; then
+      apk add --no-cache iptables 2>&1 | tail -n 3
+    elif command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables 2>&1 | tail -n 3
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y iptables 2>&1 | tail -n 3
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y iptables 2>&1 | tail -n 3
+    elif command -v pacman >/dev/null 2>&1; then
+      pacman -Sy --noconfirm iptables 2>&1 | tail -n 3
+    elif command -v zypper >/dev/null 2>&1; then
+      zypper --non-interactive install iptables 2>&1 | tail -n 3
+    fi
+    export PATH="$PATH:/usr/sbin:/sbin"
+    command -v iptables >/dev/null 2>&1 && echo "✓ iptables 已安装"
+  fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "! iptables 自动安装失败：请手动安装（Alpine: apk add iptables）"
     NP_FAIL=1
   else
 
@@ -1924,8 +2046,15 @@ if [ "$NP_IPT_N" -gt 0 ]; then
     fi
     add_rule() { iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"; }
 ${iptRules.map(iptBlock).join('')}
+    # 持久化：Debian 系用 netfilter-persistent；Alpine 用 OpenRC 的 iptables 服务
     if command -v netfilter-persistent >/dev/null 2>&1; then
       netfilter-persistent save >/dev/null 2>&1 || true
+    elif [ -f /etc/init.d/iptables ] && command -v rc-service >/dev/null 2>&1; then
+      rc-update add iptables default >/dev/null 2>&1 || true
+      rc-service iptables save >/dev/null 2>&1 || {
+        mkdir -p /etc/iptables 2>/dev/null || true
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+      }
     elif command -v iptables-save >/dev/null 2>&1; then
       mkdir -p /etc/iptables 2>/dev/null || true
       iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
@@ -1934,6 +2063,7 @@ ${iptRules.map(iptBlock).join('')}
 fi
 
 echo "✓ 中转规则已收敛（gost ${gostRules.length} 条 / iptables ${iptRules.length} 条）"
+${probeBlock(probe)}
 [ "$NP_FAIL" = '0' ] || exit 1
 `;
 }

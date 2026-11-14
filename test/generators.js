@@ -123,6 +123,21 @@ const SHELL_CASES = [
       },
     ],
   })],
+  // 入口机视角诊断（0.1.47）：只在面板触发请求后生成探测段
+  ['中转收敛包（含入口机诊断）', () => buildRelaySyncScript({
+    rules: [
+      {
+        id: 'ab12cd34', tool: 'iptables', proto: 'tcp', listenPort: 8443,
+        targets: [{ host: '9.9.9.9', port: 443 }],
+      },
+    ],
+    probe: [
+      {
+        id: 'ab12cd34', at: '2026-11-14T00:00:00.000Z',
+        targets: [{ host: '9.9.9.9', port: 443 }],
+      },
+    ],
+  })],
   // 中转规则三态脚本（0.1.43）：gost / iptables × install / uninstall / check
   ...['gost', 'iptables'].flatMap((tool) =>
     ['install', 'uninstall', 'check'].map((mode) => [
@@ -234,12 +249,21 @@ if (!hasBash) {
     mode: 'install',
   });
   ok('iptables 安装时探测目标', iptInstall.includes("TARGETS=('9.9.9.9:8443' '9.9.9.10:8443')") && iptInstall.includes('pick_target'));
+  ok('iptables 安装脚本缺工具时自动安装',
+    iptInstall.includes('apk add --no-cache iptables') && iptInstall.includes('apt-get install -y -qq iptables'));
+  ok('iptables 持久化兼容 OpenRC', iptInstall.includes('rc-service iptables save'));
+  ok('中转收敛包自动安装 iptables', sync.includes('apk add --no-cache iptables'));
+  ok('中转收敛包持久化兼容 OpenRC', sync.includes('rc-service iptables save'));
   ok('gost 收敛包按顺序探测目标',
     sync.includes("NP_TARGETS='5.6.7.8:443 5.6.7.9:443'") && sync.includes('nc -z -w 2'));
   ok('gost 下载支持 GitHub 反代 + 大陆检测',
     gostInstall.includes('GOST_PROXY=') && gostInstall.includes('cdn-cgi/trace'));
   ok('gost 服务管理兼容 OpenRC（Alpine）',
     gostInstall.includes('/etc/init.d/') && gostInstall.includes('rc-service'));
+  ok('gost 下载走流式解压（小磁盘机器）',
+    gostInstall.includes('tar -xzO gost') && gostInstall.includes('df -k'));
+  ok('中转收敛包下载走流式解压',
+    sync.includes('tar -xzO gost') && sync.includes('df -k'));
   ok('中转收敛包兼容 OpenRC', sync.includes('rc-service') && sync.includes('/etc/init.d/gost-relay-'));
   ok('gost 规则带流量计数链', sync.includes('NP_RELAY_COUNT') && sync.includes('np-relay-count:ab12cd34'));
   ok('iptables 规则未变化时保留计数器', sync.includes('保留计数器'));

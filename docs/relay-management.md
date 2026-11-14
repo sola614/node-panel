@@ -1,6 +1,6 @@
 # 中转管理方案（relay management）
 
-> 2026-11-14 · v5（0.1.47 增量：中转入口流量统计 + 前端错误提示修正）· 状态：已实施
+> 2026-11-14 · v6（0.1.47 增量：入口机视角诊断 + iptables 自动安装）· 状态：已实施
 >
 > 需求：① 新增「中转服务器」管理，可往中转机上用主流工具（gost / iptables）添加端口转发实现节点中转；② 节点新增/编辑时中转入口可下拉选择中转管理中已有的规则；③ **中转机与落地机统一在「服务器」页管理（tab 分组），装 agent 后规则自动同步**；④ **一个入口支持多个目标地址，按顺序故障切换；规则列表可一键诊断目标连通性与延迟**。
 
@@ -65,6 +65,9 @@
   trafficRaw: 0,         // 上次读到的计数器原值
   trafficAt: null,       // 最近一次采集时间（null = 从未采集，通常是没装 agent）
   lastUsedAt: null,      // 最近一次流量增长时间（判断「有没有人用」）
+  // 入口机视角诊断（0.1.47）
+  diagRequestedAt: null, // 面板点「从入口机检测」后写入；agent 下一轮带探针下来
+  agentProbe: null,      // agent 回传的探测结果 JSON：{ at, targets:[{host,port,ok,ms,error}] }
 }
 ```
 
@@ -89,9 +92,10 @@
 | `GET /api/relay-servers` | **兼容只读端点**（一个版本）：列出 type=relay 的服务器，不回显 token；写入端点已移除 |
 | `GET/POST/PUT/DELETE /api/relays` | 规则 CRUD（校验见 §3）；关键字段变更后 status 重置 planned；DELETE 时若 status=applied 响应带 `needsUninstall: true` |
 | `GET /api/relays/:id/script?mode=install\|uninstall\|check` | 按 tool 分发生成三态脚本，并 rotate deployToken（手动通道） |
-| `POST /api/relays/:id/diag` | **目标诊断**（0.1.46）：从面板逐个 TCP 握手所有目标，返回 `{ ok, ms, error }` 与「按顺序第一个可达」的 `active` 下标；`source=panel` |
+| `POST /api/relays/:id/diag` | 默认 `source=panel`：从面板逐个 TCP 握手所有目标，返回 `{ ok, ms, error }` 与「按顺序第一个可达」的 `active`；`source=agent`（0.1.47）改为**请求入口机探测**，返回 `{ pending, requestedAt }` |
+| `GET /api/relays/:id/probe` | 读取入口机视角诊断结果：`{ diagRequestedAt, agentProbe }`，前端轮询用 |
 | `POST /api/relay/ack` | **免登录回执**：relayId + deployToken（恒时比较）→ status=applied/unknown + appliedAt。沿袭免登录 POST 1.5MB 限额与限流（http-util.js readBody 机制） |
-| `POST /api/agent/receipt`（relay token） | 除同步状态外，额外接受 `traffic: { ruleId: 计数器原值 }`（0.1.47），按差值累计到规则 |
+| `POST /api/agent/receipt`（relay token） | 除同步状态外，额外接受 `traffic: { ruleId: 计数器原值 }`（0.1.47，按差值累计）与 `probe: { ruleId: { at, targets } }`（入口机诊断结果） |
 | `GET /api/servers/:id/install`（relay 型） | relayOnly 安装脚本：只部署 agent，不安装 Xray / Hysteria2 |
 | `GET /api/agent/bundle`（relay token） | relay 配置包：只含规则收敛脚本，不读 nodes / users / certs |
 
@@ -101,7 +105,7 @@
 
 ### 5.1 iptables（升级现有 buildRelayScript）
 
-- install：sysctl ip_forward → 依赖检查（含 `-m comment` 可用性，缺失降级为无标签并提示）→ **目标探测**（按顺序 nc / /dev/tcp，取第一个可达）→ 幂等插入**带标签** `np-relay:<id>` 的 DNAT + MASQUERADE → 持久化（netfilter-persistent / iptables-save）→ 末尾 curl 回执（失败不影响规则生效）
+- install：sysctl ip_forward → **依赖检查 / 自动安装**（缺 iptables 时按 apk / apt / dnf / yum / pacman / zypper 自动装；`-m comment` 缺失降级为无标签并提示）→ **目标探测**（按顺序 nc / /dev/tcp，取第一个可达）→ 幂等插入**带标签** `np-relay:<id>` 的 DNAT + MASQUERADE → 持久化（netfilter-persistent / OpenRC `iptables save` / iptables-save）→ 末尾 curl 回执（失败不影响规则生效）
 - uninstall：按标签 `iptables -t nat -S PREROUTING | grep "np-relay:<id>"` 逐条 `-D`（不依赖行号）→ 无标签时按监听端口删 → 回执
 - check：只读列出本机全部 `np-relay:*` 规则 + 本规则存活状态 → 回执
 - 多目标：静态规则只能指向一个目标，安装时探测选优；已装 agent 的中转机每轮收敛重选，纯手动模式需重跑 install
@@ -125,6 +129,9 @@
 - GitHub 反代：面板设置项 `githubProxy`。中转机下载时先查 `cdn-cgi/trace` 的 `loc`，
   `CN` 或判断不出来 → URL 前缀加上反代（`https://ghproxy.com/https://github.com/...`）；
   `GOST_DL_BASE` 自定义镜像不叠加反代
+- 小磁盘兼容：下载改为**流式解压**（`curl | tar -xzO gost`），峰值只占最终二进制一份；
+  可用空间 < 60MB 时直接报错并建议改用 iptables。旧逻辑「压缩包 + 解压 + install 复制」
+  峰值是 3 份，90MB 根分区必爆（`No space left on device`）
 
 ### 5.3 端口占用预检
 
@@ -137,9 +144,13 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 1. 枚举 `gost-relay-*.service` 与带 `np-relay:` / `np-relay-count:` 标签的 NAT 规则，**删除面板已不存在的**（删规则 / 改端口 / 换 tool 自动生效）
 2. 期望规则逐条写入：gost 按顺序探测目标、写单目标 env + 服务（systemd unit 或 OpenRC init）并启动；iptables 每轮按顺序探测目标，**期望规则已在位时跳过重建**（否则计数器每秒归零），目标变化才删旧标签重写
 3. 清理段同时识别 `gost-relay-*.service` 与 `/etc/init.d/gost-relay-*`，卸载时把 OpenRC 服务、pidfile、计数链一起清掉
-3. gost 没有 DNAT 规则可挂计数器，收敛时在固定计数链 `NP_RELAY_COUNT` 里插一条 `RETURN` 规则（标签 `np-relay-count:<id>`），只建一次、不重建
-4. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
-5. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入，只统计 gost 规则），失败通过 receipt 暴露
+4. gost 没有 DNAT 规则可挂计数器，收敛时在固定计数链 `NP_RELAY_COUNT` 里插一条 `RETURN` 规则（标签 `np-relay-count:<id>`），只建一次、不重建
+5. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
+6. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入，只统计 gost 规则），失败通过 receipt 暴露
+7. **入口机诊断**（0.1.47）：bundle 里只有面板点了「从入口机检测」的规则才生成探测段。
+   在入口机上用 `curl --connect-timeout 3 -w '%{time_connect}'` 逐个目标测 TCP 握手，
+   结果写 `/opt/nodepanel/relay-probe.json`，agent 随下一次回执带回后删除文件；
+   请求时间参与 payload hash，所以 agent 一定会为此拉新包
 
 与手动三态脚本共用同一套命名的好处：两条通道可以互相接手，不留第二套规则。
 
@@ -158,8 +169,11 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
   中转机检测到中国大陆 IP 时自动拼接，格式 `反代前缀 + GitHub 地址`
 - 「中转」视图只管规则：改为添加规则时若还没有中转机，提示并跳到服务器页的中转 tab
   - 规则表在机器名旁提示「入口机离线」；服务器 CRUD 入口已移除（统一在服务器页）
+  - 规则状态区分三种：`等待同步`（agent 在线、等下一轮）、`同步失败`（回执 ok=false，
+    悬停看原因，如 iptables 没装 / gost 起不来）、`已部署`（hash 匹配）
   - 目标地址改为**大文本框**（一行一个 `host:port`，最多 8 个），列表转发方向显示首个目标 + `+N`
-  - 每行新增「诊断」按钮：弹窗展示每个目标的可达性、TCP 延迟与当前首选目标，可重新测试
+  - 每行新增「诊断」按钮：弹窗分两块 —— **面板视角（即时）** 与 **入口机视角（agent 上报）**。
+  入口机视角点「从入口机检测」后写入请求，弹窗轮询结果（最多 90 秒；agent 下一轮同步回传）
   - 规则表新增「使用」列（0.1.47）：累计入口字节 + 最近使用时间；从未采集时显式提示「需要 agent」
 - 部署到中转机后，规则由 agent 自动同步；每行仍保留三态脚本按钮（未装 agent / 排查用）
 

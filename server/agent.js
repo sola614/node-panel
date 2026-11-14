@@ -285,7 +285,7 @@ function buildAgentPayload(scope) {
  * 不依赖 APP_VERSION —— 一次脚本修复不需要单独发版本号，也能让 agent 立刻拉新包；
  * 否则 hash 不变，agent 永远按旧 bundle 跑（「改完了但线上没生效」）。
  */
-const RELAY_BUNDLE_REV = 3;
+const RELAY_BUNDLE_REV = 6;
 
 /**
  * 中转机配置包（relay scope）：只产规则清单，不读 nodes / users / certs。
@@ -318,14 +318,38 @@ function buildRelayPayload(scope) {
       };
     });
 
+  // 入口机视角诊断（0.1.47）：只有面板点了「从入口机检测」的规则才带探针请求。
+  // 请求时间参与 hash —— 否则 agent 不会为了探测再拉一次包。
+  const pendingProbe = db.relays
+    .filter((r) => r.serverId === scope.id && r.diagRequestedAt)
+    .map((r) => ({
+      id: r.id,
+      at: r.diagRequestedAt,
+      targets: (Array.isArray(r.targets) && r.targets.length
+        ? r.targets
+        : r.targetHost
+          ? [{ host: r.targetHost, port: r.targetPort }]
+          : []
+      ).map((t) => ({ host: String(t.host), port: Number(t.port) || 443 })),
+    }))
+    .filter((p) => p.targets.length);
+
   return {
     ok: true,
-    hash: sha256(JSON.stringify({ relay: rules, agent: APP_VERSION, rev: RELAY_BUNDLE_REV })).slice(0, 16),
+    hash: sha256(
+      JSON.stringify({
+        relay: rules,
+        agent: APP_VERSION,
+        rev: RELAY_BUNDLE_REV,
+        probe: pendingProbe.map((p) => `${p.id}@${p.at}`).join(','),
+      }),
+    ).slice(0, 16),
     scope: { type: 'relay', id: scope.id, name: scope.name },
     agentVersion: APP_VERSION,
     nodes: [],
     userCount: 0,
     relay: { rules },
+    probe: pendingProbe,
   };
 }
 
@@ -744,6 +768,31 @@ function agentReceipt(req, res, params, body, session, ctx) {
       applied++;
     }
     if (applied) logAgent.debug('中转入口流量已记录', { rid: ctx.rid, scope: scope.name, rules: applied });
+  }
+
+  // 入口机视角诊断结果（0.1.47）：agent 在入口机上做 TCP 探测后随回执带回。
+  // 收到即清掉 diagRequestedAt，避免下一轮又触发一次探测。
+  if (scope.type === 'relay' && body.probe && typeof body.probe === 'object' && !Array.isArray(body.probe)) {
+    const now = store.iso();
+    let applied = 0;
+    for (const [rid, info] of Object.entries(body.probe)) {
+      const rule = db.relays.find((r) => r.id === rid && r.serverId === scope.id);
+      if (!rule || !info || !Array.isArray(info.targets)) continue;
+      const targets = info.targets
+        .map((t) => ({
+          host: String((t && t.host) || ''),
+          port: Number(t && t.port) || 0,
+          ok: !!(t && t.ok),
+          ms: Math.max(0, Number(t && t.ms) || 0),
+          error: String((t && t.error) || '').slice(0, 40),
+        }))
+        .filter((t) => t.host && t.port >= 1 && t.port <= 65535);
+      if (!targets.length) continue;
+      rule.agentProbe = JSON.stringify({ at: info.at || now, targets });
+      rule.diagRequestedAt = null;
+      applied++;
+    }
+    if (applied) logAgent.info('入口机诊断已回传', { rid: ctx.rid, scope: scope.name, rules: applied });
   }
 
   // agent 自动同步成功后，把该机规则推进到 applied。

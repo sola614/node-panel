@@ -190,6 +190,8 @@ function listRelays(req, res) {
         serverName: server ? server.name : '（已删除）',
         serverHost: server ? server.host : '',
         serverOnline: server ? store.serverOnline(server) : false,
+        // 最近一次回执：前端据此区分「等待同步」和「同步失败」，而不是永远显示等待
+        serverSync: server ? server.sync || null : null,
         nodeName: node ? node.name : '',
         usedByEntries: db.nodes.some((n) => (n.entries || []).some((e) => e.relayId === r.id)),
       };
@@ -327,9 +329,26 @@ function probeTarget(t, timeoutMs = 3000) {
  * 逐个目标做 TCP 握手：返回每个目标的可用性与延迟，并指出「按顺序第一个可达」的目标。
  * 探测从面板所在机器发起 —— 入口机到目标的链路可能不同，结果里明确带 source=panel。
  */
-async function relayDiag(req, res, params) {
+async function relayDiag(req, res, params, body, session, ctx) {
   const rule = store.db().relays.find((x) => x.id === params.id);
   if (!rule) return sendJson(res, 404, { error: '中转规则不存在' });
+  const source = String((body && body.source) || (ctx && ctx.query.get('source')) || 'panel');
+
+  // 入口机视角：agent 是拉取式，写一个请求时间让它下一轮带探针下来。
+  // 请求时间会进 relay payload 的 hash，所以 agent 一定会为此拉一次新包。
+  if (source === 'agent') {
+    rule.diagRequestedAt = store.iso();
+    store.save();
+    auditAction('relay.diag', rule.name, '请求入口机诊断');
+    return sendJson(res, 200, {
+      ok: true,
+      pending: true,
+      source: 'agent',
+      requestedAt: rule.diagRequestedAt,
+      hint: '已请求入口机执行探测，结果会在下一轮同步（最多 60 秒）回传',
+    });
+  }
+
   const targets = targetsOf(rule);
   if (!targets.length) return sendJson(res, 400, { error: '这条规则还没有目标地址' });
   const results = await Promise.all(targets.map((t) => probeTarget(t)));
@@ -340,6 +359,25 @@ async function relayDiag(req, res, params) {
     at: store.iso(),
     active,
     targets: results,
+  });
+}
+
+/** 入口机诊断结果：前端轮询这个接口，拿到 agent 回传的探测数据 */
+function relayProbe(req, res, params) {
+  const rule = store.db().relays.find((x) => x.id === params.id);
+  if (!rule) return sendJson(res, 404, { error: '中转规则不存在' });
+  let agentProbe = null;
+  if (rule.agentProbe) {
+    try {
+      agentProbe = JSON.parse(rule.agentProbe);
+    } catch {
+      agentProbe = null;
+    }
+  }
+  sendJson(res, 200, {
+    ok: true,
+    diagRequestedAt: rule.diagRequestedAt || null,
+    agentProbe,
   });
 }
 
@@ -398,5 +436,6 @@ module.exports = {
   listRelayServers,
   listRelays, createRelay, updateRelay, deleteRelay,
   relayDiag,
+  relayProbe,
   relayRuleScript, relayAck,
 };

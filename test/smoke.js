@@ -1786,6 +1786,35 @@ function totpCodeOf(secret) {
     }),
   })).status === 400);
 
+  // 入口机视角诊断（0.1.47）：面板先写请求，agent 下一轮回执带回结果
+  const agentDiag = await call('/api/relays/' + diagId + '/diag', {
+    method: 'POST',
+    body: json({ source: 'agent' }),
+  });
+  ok('请求入口机诊断', agentDiag.status === 200 && agentDiag.data.pending === true && !!agentDiag.data.requestedAt);
+  const probePending = await call('/api/relays/' + diagId + '/probe');
+  ok('诊断请求已记录、结果尚未回传',
+    !!probePending.data.diagRequestedAt && probePending.data.agentProbe === null);
+  const receiptProbe = await call('/api/agent/receipt?token=' + rsToken, {
+    method: 'POST',
+    body: json({
+      hash: 'diag', ok: true,
+      probe: {
+        [diagId]: {
+          at: '2026-11-14T00:00:00.000Z',
+          targets: [{ host: '127.0.0.1', port: 1, ok: false, ms: 0, error: 'unreachable' }],
+        },
+      },
+    }),
+  });
+  ok('入口机诊断回执被接收', receiptProbe.status === 200);
+  const probeDone = await call('/api/relays/' + diagId + '/probe');
+  ok('入口机诊断结果已落库并清除请求',
+    probeDone.data.diagRequestedAt === null
+    && !!probeDone.data.agentProbe
+    && probeDone.data.agentProbe.targets.length === 1
+    && probeDone.data.agentProbe.targets[0].ok === false);
+
   // 入口流量（0.1.47）：agent 上报计数器原值，面板按差值累计；归零时按当前值重算
   const rc1 = await call('/api/agent/receipt?token=' + rsToken, {
     method: 'POST',
