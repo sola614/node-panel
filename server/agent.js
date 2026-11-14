@@ -281,11 +281,17 @@ function buildAgentPayload(scope) {
 }
 
 /**
+ * relay 配置包的生成器版本：bundle 内容有「行为变化」（不只是规则变化）时 +1。
+ * 不依赖 APP_VERSION —— 一次脚本修复不需要单独发版本号，也能让 agent 立刻拉新包；
+ * 否则 hash 不变，agent 永远按旧 bundle 跑（「改完了但线上没生效」）。
+ */
+const RELAY_BUNDLE_REV = 3;
+
+/**
  * 中转机配置包（relay scope）：只产规则清单，不读 nodes / users / certs。
  *
- * hash 只覆盖「规则 + 面板版本」：规则改了 hash 就变，agent 下一轮拉新包；
- * 面板升级（agentVersion 变）也会触发一轮，保证 agent 自更新信号不会因为
- * 中转机没有节点而丢失。
+ * hash 覆盖「规则 + 面板版本 + bundle 生成器版本」：规则改了、面板升级、或
+ * 生成逻辑本身有修复，都会让 agent 下一轮拉新包。
  */
 function buildRelayPayload(scope) {
   const db = store.db();
@@ -314,7 +320,7 @@ function buildRelayPayload(scope) {
 
   return {
     ok: true,
-    hash: sha256(JSON.stringify({ relay: rules, agent: APP_VERSION })).slice(0, 16),
+    hash: sha256(JSON.stringify({ relay: rules, agent: APP_VERSION, rev: RELAY_BUNDLE_REV })).slice(0, 16),
     scope: { type: 'relay', id: scope.id, name: scope.name },
     agentVersion: APP_VERSION,
     nodes: [],
@@ -839,6 +845,8 @@ function agentBundleHandler(req, res, params, body, session, ctx) {
   const script = agentBundle.buildBundle(payload, {
     panelUrl: baseUrl(ctx.req),
     siteName: store.db().settings.siteName,
+    // 中转机下载 gost 用的反代前缀（设置页可配；空 = 直连）
+    githubProxy: store.db().settings.githubProxy || '',
   });
 
   // 下发频率等于「配置变更频率」，不会刷屏；hash 是否对得上全靠这条

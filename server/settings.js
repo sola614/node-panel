@@ -138,6 +138,17 @@ function updateSettings(req, res, params, body) {
     }
   }
 
+  // GitHub 反代（0.1.46）：只作为 URL 前缀拼给中转机下载 gost。
+  // 必须是 http(s) 前缀且以 / 结尾，否则会拼出 https://ghproxy.comhttps://... 这种坏地址
+  if (body.githubProxy !== undefined) {
+    try {
+      const v = normalizeHttpUrl(body.githubProxy, 'GitHub 反代加速地址');
+      next.githubProxy = v && !v.endsWith('/') ? v + '/' : v;
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+  }
+
   // 在线订阅转换：转换地址与模板地址都只是拼进链接里给用户复制，
   // 面板自己不会去请求它们 —— 所以「填错也能存」是危险的（用户点了打不开），
   // 这里只做到「必须是合法的 http(s) 地址」，可达性留给用户自己点一下验证

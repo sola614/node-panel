@@ -196,7 +196,7 @@ if (!hasBash) {
 
   const relayUninstall = buildUninstallScript({ label: '香港中转', relayOnly: true });
   ok('中转机卸载脚本清理 gost unit', relayUninstall.includes('gost-relay-'));
-  ok('中转机卸载脚本清理 np-relay 规则', relayUninstall.includes('np-relay:'));
+  ok('中转机卸载脚本清理 np-relay 规则', relayUninstall.includes('np-relay'));
 
   const sync = buildRelaySyncScript({
     rules: [
@@ -223,7 +223,8 @@ if (!hasBash) {
     },
     mode: 'install',
   });
-  ok('gost 多目标使用 fifo 故障切换', gostInstall.includes('strategy=fifo') && gostInstall.includes('5.6.7.8:443,5.6.7.9:443'));
+  ok('gost 安装脚本按顺序探测目标',
+    gostInstall.includes('pick_target') && gostInstall.includes("TARGETS=('5.6.7.8:443' '5.6.7.9:443')"));
   const iptInstall = buildRelayRuleScript({
     rule: {
       id: 'ef56ab78', tool: 'iptables', proto: 'tcp', listenPort: 9443,
@@ -233,7 +234,13 @@ if (!hasBash) {
     mode: 'install',
   });
   ok('iptables 安装时探测目标', iptInstall.includes("TARGETS=('9.9.9.9:8443' '9.9.9.10:8443')") && iptInstall.includes('pick_target'));
-  ok('中转收敛包含多目标', sync.includes('NP_TARGETS=5.6.7.8:443,5.6.7.9:443') && sync.includes('nc -z -w 2'));
+  ok('gost 收敛包按顺序探测目标',
+    sync.includes("NP_TARGETS='5.6.7.8:443 5.6.7.9:443'") && sync.includes('nc -z -w 2'));
+  ok('gost 下载支持 GitHub 反代 + 大陆检测',
+    gostInstall.includes('GOST_PROXY=') && gostInstall.includes('cdn-cgi/trace'));
+  ok('gost 服务管理兼容 OpenRC（Alpine）',
+    gostInstall.includes('/etc/init.d/') && gostInstall.includes('rc-service'));
+  ok('中转收敛包兼容 OpenRC', sync.includes('rc-service') && sync.includes('/etc/init.d/gost-relay-'));
   ok('gost 规则带流量计数链', sync.includes('NP_RELAY_COUNT') && sync.includes('np-relay-count:ab12cd34'));
   ok('iptables 规则未变化时保留计数器', sync.includes('保留计数器'));
 }
@@ -385,11 +392,11 @@ ok('iptables check 只读盘点全部面板规则', ipChk.includes("grep -F 'np-
 const gInst = relayRuleScript('install', 'gost');
 ok(
   'gost install 的 ExecStart 保留 systemd 变量字面',
-  gInst.includes('ExecStart=/usr/local/bin/gost -L tcp://:${NP_LISTEN}/${NP_TARGETS} -L udp://:${NP_LISTEN}/${NP_TARGETS}'),
+  gInst.includes('ExecStart=/usr/local/bin/gost -L tcp://:${NP_LISTEN}/${NP_TARGET} -L udp://:${NP_LISTEN}/${NP_TARGET}'),
 );
 ok('gost install 的 EnvironmentFile 是实际路径', gInst.includes('EnvironmentFile=/etc/gost/relay-ab12cd34.env'));
-ok('gost install 的 env 文件带 bash 展开的端口', gInst.includes('NP_LISTEN=${LISTEN_PORT}') && gInst.includes('NP_TARGETS=${TARGETS_ADDR}') && gInst.includes('TARGET_ADDR="5.6.7.8:443"'));
-ok('gost install 的 unit 名含规则 ID', gInst.includes('gost-relay-ab12cd34.service'));
+ok('gost install 的 env 文件带 bash 展开的端口', gInst.includes('NP_LISTEN=${LISTEN_PORT}') && gInst.includes('NP_TARGET=${TARGET_ADDR}'));
+ok('gost install 的服务名含规则 ID', gInst.includes('gost-relay-${RELAY_ID}'));
 ok('gost install 有端口占用预检', gInst.includes('已被其它进程占用'));
 ok('gost install 有端口监听自检', gInst.includes('端口未监听'));
 ok('gost install 官方 release 下载 + 镜像变量', gInst.includes('go-gost/gost/releases/download') && gInst.includes('GOST_DL_BASE'));

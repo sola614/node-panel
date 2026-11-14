@@ -552,6 +552,18 @@ function totpCodeOf(secret) {
   ok('结算日可关闭，后续用例不受影响',
     (await call('/api/settings')).data.settings.billingDay === '0');
 
+  // GitHub 反代（0.1.46）：保存时补尾斜杠，非法协议直接拦
+  const ghSave = await call('/api/settings', {
+    method: 'PUT',
+    body: json({ githubProxy: 'https://ghproxy.com' }),
+  });
+  ok('GitHub 反代保存成功', ghSave.status === 200);
+  ok('GitHub 反代读回时补了尾斜杠',
+    (await call('/api/settings')).data.settings.githubProxy === 'https://ghproxy.com/');
+  ok('GitHub 反代拒绝非 http(s) 地址',
+    (await call('/api/settings', { method: 'PUT', body: json({ githubProxy: 'ftp://x' }) })).status === 400);
+  await call('/api/settings', { method: 'PUT', body: json({ githubProxy: '' }) });
+
   // 老接口传 days 仍然等价于「N 天」
   const legacy = await call('/api/plans/' + planId, { method: 'PUT', body: json({ days: 5 }) });
   ok('老参数 days 仍等价于按天', legacy.data.item.validity.type === 'day' && legacy.data.item.validity.num === 5);

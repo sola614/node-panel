@@ -826,16 +826,27 @@ if [ "$RELAY_ONLY" = "1" ]; then
     rm -f "$_u"
     echo "  ✓ 已移除 $_name"
   done
+  # Alpine / OpenRC：服务脚本在 /etc/init.d，必须单独清
+  for _f in /etc/init.d/gost-relay-*; do
+    [ -f "$_f" ] || continue
+    _name=$(basename "$_f")
+    rc-service "$_name" stop >/dev/null 2>&1 || true
+    rc-update del "$_name" default >/dev/null 2>&1 || true
+    rm -f "$_f" "/run/$_name.pid"
+    echo "  ✓ 已移除 $_name（OpenRC）"
+  done
   rm -f /etc/gost/relay-*.env 2>/dev/null
   systemctl daemon-reload >/dev/null 2>&1 || true
   if command -v iptables >/dev/null 2>&1; then
-    for _chain in PREROUTING POSTROUTING; do
-      iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay:' | sed "s/^-A $_chain //" | while IFS= read -r _r; do
+    for _chain in PREROUTING POSTROUTING NP_RELAY_COUNT; do
+      iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay' | sed "s/^-A $_chain //" | while IFS= read -r _r; do
         [ -n "$_r" ] || continue
         iptables -t nat -D "$_chain" $_r 2>/dev/null || true
       done
     done
-    echo "  ✓ 已清理带 np-relay: 标签的 NAT 规则"
+    iptables -t nat -D PREROUTING -j NP_RELAY_COUNT 2>/dev/null || true
+    iptables -t nat -X NP_RELAY_COUNT 2>/dev/null || true
+    echo "  ✓ 已清理带 np-relay 标签的 NAT 规则"
   fi
   echo "  · 已跳过 Hysteria2 / Xray 清理（中转机不安装这两样）"
 else
@@ -1060,7 +1071,12 @@ echo "  · 删除规则：iptables -t nat -L PREROUTING -n --line-numbers 找到
 
 /** gost 版本白名单：只认 x.y.z 纯数字版本（nightly / rc 一律拒绝，资产名不可预测） */
 const GOST_VER_RE = /^\d+\.\d+\.\d+$/;
-const DEFAULT_GOST_VER = '3.5.1';
+/**
+ * 默认 gost 版本：必须与 GitHub Release 的 tag / 资产名一致。
+ * 3.5.1 并不存在（会 404），当前最新稳定版是 3.3.3；升级前先确认
+ * https://api.github.com/repos/go-gost/gost/releases/latest 的 tag_name 与资产名。
+ */
+const DEFAULT_GOST_VER = '3.3.3';
 
 /**
  * 规则的目标列表（0.1.46）：targets 优先，老数据回落到 targetHost/targetPort。
@@ -1362,30 +1378,38 @@ ${relayAck()}
  * gost 转发（v3，go-gost）：每条规则一个 systemd unit（gost-relay-<id>.service）
  * + 一份环境文件（/etc/gost/relay-<id>.env）。unit 名就是「卸载时找到规则」的锚点。
  */
-function buildGostRelayScript({ rule, mode, panelUrl }) {
+function buildGostRelayScript({ rule, mode, panelUrl, githubProxy = '' }) {
   const site = shellSafe(store.db().settings.siteName);
   const id = shellSafe(rule.id);
   const listenPort = Number(rule.listenPort) || 443;
   const targets = relayTargets(rule);
   const target = targets[0] ? targets[0].host : '';
   const targetPort = targets[0] ? targets[0].port : 443;
-  const targetAddr = targets.map((t) => `${t.host}:${t.port}`).join(',');
+  const targetsBash = targets.map((t) => `'${t.host}:${t.port}'`).join(' ');
+  const proxy = shellSafe(String(githubProxy || ''));
 
   // proto 裁剪成 -L 参数（gost 的 TCP 与 UDP 是两个独立监听，可同端口并存）。
-  // \${NP_LISTEN}/\${NP_TARGETS} 是 systemd 的 EnvironmentFile 变量，必须保留字面。
-  // 多目标用 fifo + max_fails：客户端始终优先走第一个目标，失败后自动切下一个
+  // \${NP_LISTEN}/\${NP_TARGET} 是 systemd 的 EnvironmentFile 变量，必须保留字面。
+  // 不用 gost 的 strategy/max_fails 参数：不同版本对多目标策略参数的兼容性不一致，
+  // 一旦不认识 unit 就起不来。改成「脚本先探测、只下发一个可达目标」，最稳。
   const forwards = rule.proto === 'both' ? ['tcp', 'udp'] : [rule.proto === 'udp' ? 'udp' : 'tcp'];
-  const query = targets.length > 1 ? '?strategy=fifo&max_fails=1&fail_timeout=30s' : '';
-  const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}${query}/\${NP_TARGETS}`).join(' ');
+  const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}/\${NP_TARGET}`).join(' ');
+  // OpenRC 没有 EnvironmentFile 这一层，参数在生成 init 脚本时用实际值写死
+  const openrcArgs = forwards.map((p) => `-L ${p}://:\${LISTEN_PORT}/$TARGET_ADDR`).join(' ');
 
   if (mode === 'install') {
-    return `${relayHeader({ rule, mode, panelUrl, site, comment: `systemd unit：gost-relay-${id}.service（卸载 / 状态检查按 unit 名定位）` })}
+    return `${relayHeader({ rule, mode, panelUrl, site, comment: `gost 服务（systemd unit 或 OpenRC init）：gost-relay-${id}（卸载 / 状态检查按服务名定位）` })}
 LISTEN_PORT=${listenPort}
+# 目标顺序 = 故障切换顺序（0.1.46）；下面探测一次，选第一个可达
+TARGETS=(${targetsBash})
 TARGET_ADDR="${target}:${targetPort}"
-TARGETS_ADDR="${targetAddr}"
 GOST_VER="${DEFAULT_GOST_VER}"
 GOST_BIN=/usr/local/bin/gost
+# GitHub 反代前缀（面板设置项）；空 = 直连
+GOST_PROXY="${proxy}"
 UNIT="gost-relay-\${RELAY_ID}.service"
+SERVICE="gost-relay-\${RELAY_ID}"
+SVC_FILE="/etc/init.d/\${SERVICE}"
 ENV_FILE="/etc/gost/relay-\${RELAY_ID}.env"
 
 ${relayRootCheck()}
@@ -1395,20 +1419,47 @@ case "$(uname -m)" in
   *) echo "✗ 不支持的架构：$(uname -m)（gost 官方只发 amd64 / arm64）"; exit 1 ;;
 esac
 
+# 服务管理器：Alpine 只有 OpenRC，没有 /etc/systemd/system，不能硬写 unit
+if command -v systemctl >/dev/null 2>&1; then
+  SVC_KIND=systemd
+elif command -v rc-service >/dev/null 2>&1; then
+  SVC_KIND=openrc
+else
+  echo "✗ 未找到 systemd / OpenRC：gost 需要服务管理器常驻"
+  exit 1
+fi
+
 # gost 二进制：已存在就复用（不覆盖用户自装的版本），缺了才下载。
-# GitHub 连不上时：GOST_DL_BASE=https://your-mirror/gost-releases sh relay-*.sh 重跑
+# 自定义镜像：GOST_DL_BASE=https://your-mirror/... sh relay-*.sh
 if [ ! -x "$GOST_BIN" ]; then
-  echo "→ 下载 gost v\${GOST_VER}（linux/\${ARCH}）"
+  GOST_URL="\${GOST_DL_BASE:-https://github.com/go-gost/gost/releases/download}/v\${GOST_VER}/gost_\${GOST_VER}_linux_\${ARCH}.tar.gz"
+  # 有反代且机器在中国大陆（或判断不出来）时，把反代拼在 GitHub 地址前；
+  # 自定义镜像已经是替代源，不再叠加反代
+  if [ -n "$GOST_PROXY" ] && [ -z "\${GOST_DL_BASE:-}" ]; then
+    _loc=$(curl -fsS -m 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p')
+    case "$_loc" in
+      CN|'') GOST_URL="\${GOST_PROXY}\${GOST_URL}" ;;
+    esac
+  fi
+  echo "→ 下载 gost v\${GOST_VER}（linux/\${ARCH}）：$GOST_URL"
   TMP=$(mktemp -d)
   trap 'rm -rf "$TMP"' EXIT
-  curl -fsSL "\${GOST_DL_BASE:-https://github.com/go-gost/gost/releases/download}/v\${GOST_VER}/gost_\${GOST_VER}_linux_\${ARCH}.tar.gz" -o "$TMP/gost.tgz"
+  if ! curl -fsSL "$GOST_URL" -o "$TMP/gost.tgz"; then
+    echo "✗ 下载失败：$GOST_URL"
+    echo "  · 404 = 版本 / 资产名不存在；连不上 = 在面板设置里配置 GitHub 反代"
+    exit 1
+  fi
   tar -xzf "$TMP/gost.tgz" -C "$TMP"
   install -m 755 "$TMP/gost" "$GOST_BIN"
   echo "✓ gost 已安装：$("$GOST_BIN" -V 2>&1 | head -n 1 || echo '(版本信息获取失败，但不影响安装)')"
 fi
 
-# 端口预检：先停本规则旧 unit（重跑更新配置的场景），再确认端口没被别人占着
-systemctl stop "$UNIT" >/dev/null 2>&1 || true
+# 端口预检：先停本规则旧服务（重跑更新配置的场景），再确认端口没被别人占着
+if [ "$SVC_KIND" = systemd ]; then
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
+else
+  rc-service "$SERVICE" stop >/dev/null 2>&1 || true
+fi
 if ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
   echo "✗ 端口 \${LISTEN_PORT} 已被其它进程占用："
   ss -lntup 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" || true
@@ -1416,19 +1467,44 @@ if ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
   exit 1
 fi
 
+# 目标探测：按顺序取第一个能建立 TCP 连接的。gost 只下发一个目标，
+# 切换只发生在「安装 / 重跑脚本」时；agent 托管的中转机由每轮收敛重新选目标
+pick_target() {
+  local t h p
+  for t in "\${TARGETS[@]}"; do
+    h="\${t%:*}"; p="\${t##*:}"
+    if command -v nc >/dev/null 2>&1; then
+      nc -z -w 2 "$h" "$p" >/dev/null 2>&1 && { echo "$t"; return 0; }
+    else
+      (exec 3<>"/dev/tcp/$h/$p") 2>/dev/null && { echo "$t"; return 0; }
+    fi
+  done
+  return 1
+}
+
+echo "→ 探测目标（按顺序第一个可达）"
+PICK=$(pick_target || true)
+if [ -z "$PICK" ]; then
+  echo "! 所有目标都不可达，先按第一个写入：\${TARGETS[0]}（恢复后重跑本脚本即可重选）"
+  PICK="\${TARGETS[0]}"
+fi
+TARGET_ADDR="$PICK"
+echo "  使用目标：$TARGET_ADDR"
+
 echo "→ 写入配置 \$ENV_FILE"
 mkdir -p /etc/gost
 cat > "$ENV_FILE" <<EOF
 # nodepanel relay \${RELAY_ID}
 NP_LISTEN=\${LISTEN_PORT}
-# 多目标逗号分隔，顺序即故障切换顺序
-NP_TARGETS=\${TARGETS_ADDR}
+# 单目标：由脚本按 TARGETS 顺序探测后选出
+NP_TARGET=\${TARGET_ADDR}
 EOF
 
-echo "→ 写入 systemd unit \$UNIT"
-# heredoc 用 'EOF' 禁止 bash 展开：unit 里的 \${NP_LISTEN}/\${NP_TARGET}
-# 是给 systemd 的 EnvironmentFile 变量，必须原样落盘；其余值由面板直接拼好
-cat > "/etc/systemd/system/\$UNIT" <<'EOF'
+if [ "$SVC_KIND" = systemd ]; then
+  echo "→ 写入 systemd unit \$UNIT"
+  # heredoc 用 'EOF' 禁止 bash 展开：unit 里的 \${NP_LISTEN}/\${NP_TARGET}
+  # 是给 systemd 的 EnvironmentFile 变量，必须原样落盘；其余值由面板直接拼好
+  cat > "/etc/systemd/system/\$UNIT" <<'EOF'
 [Unit]
 Description=nodepanel relay ${id} (${listenPort} -> ${targets.length > 1 ? `${targets.length} targets` : `${target}:${targetPort}`})
 After=network-online.target
@@ -1443,48 +1519,85 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-
-systemctl daemon-reload
-systemctl enable --now "$UNIT"
+  systemctl daemon-reload
+  systemctl enable --now "$UNIT"
+  _active() { systemctl is-active --quiet "$UNIT" 2>/dev/null; }
+  _logs() { systemctl status "$UNIT" --no-pager -n 20 2>/dev/null || true; }
+else
+  echo "→ 写入 OpenRC 服务 \$SVC_FILE"
+  # OpenRC 没有 EnvironmentFile：监听端口与目标直接写进 init 脚本
+  cat > "$SVC_FILE" <<EOF
+#!/sbin/openrc-run
+name="\$SERVICE"
+description="nodepanel relay \$RELAY_ID"
+command="\$GOST_BIN"
+command_args="${openrcArgs}"
+command_background=true
+pidfile="/run/\$SERVICE.pid"
+EOF
+  chmod +x "$SVC_FILE"
+  rc-update add "$SERVICE" default >/dev/null 2>&1 || true
+  rc-service "$SERVICE" restart >/dev/null 2>&1 || rc-service "$SERVICE" start >/dev/null 2>&1 || true
+  _active() { rc-service "$SERVICE" status >/dev/null 2>&1; }
+  _logs() { rc-service "$SERVICE" status 2>&1 || true; }
+fi
 
 # 端口自检：服务 active 但端口没监听 = applied 也是假的，必须当场戳穿
 sleep 1
 OK=0
-if systemctl is-active --quiet "$UNIT" 2>/dev/null && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
+if _active && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
   OK=1
-  echo "✓ gost 转发已生效：本机 :\${LISTEN_PORT} → \${TARGET_ADDR}"
+  echo "✓ gost 转发已生效（\$SVC_KIND）：本机 :\${LISTEN_PORT} → \${TARGET_ADDR}"
   echo "  目标列表（按顺序故障切换）：${targetListText(targets)}"
 else
-  echo "✗ 服务已提交但端口未监听，排查：journalctl -u \$UNIT -n 20"
+  echo "✗ 服务已提交但端口未监听，排查："
+  _logs
   exit 1
 fi
 ${relayAck()}
 
 echo ""
 echo "提示："
-echo "  · 服务名：\$UNIT（journalctl -u \$UNIT -f 看实时日志）"
+if [ "$SVC_KIND" = systemd ]; then
+  echo "  · 服务名：\$UNIT（journalctl -u \$UNIT -f 看实时日志）"
+else
+  echo "  · 服务名：\$SERVICE（rc-service \$SERVICE status / /var/log/gost-relay-\${RELAY_ID}.log）"
+fi
 echo "  · 记得在中转服务器放行 \${LISTEN_PORT} 端口（安全组 / 防火墙）"
 `;
   }
 
   if (mode === 'uninstall') {
-    return `${relayHeader({ rule, mode, panelUrl, site, comment: `移除 gost-relay-${id}.service 与 /etc/gost/relay-${id}.env` })}
+    return `${relayHeader({ rule, mode, panelUrl, site, comment: `移除 gost-relay-${id} 服务（systemd unit / OpenRC init）与 env` })}
 GOST_BIN=/usr/local/bin/gost
 UNIT="gost-relay-\${RELAY_ID}.service"
+SERVICE="gost-relay-\${RELAY_ID}"
+SVC_FILE="/etc/init.d/\${SERVICE}"
 ENV_FILE="/etc/gost/relay-\${RELAY_ID}.env"
 
 ${relayRootCheck()}
-echo "→ 停止并移除 \$UNIT"
-systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
-rm -f "/etc/systemd/system/\$UNIT" "$ENV_FILE"
-systemctl daemon-reload
+if command -v systemctl >/dev/null 2>&1; then
+  echo "→ 停止并移除 systemd unit \$UNIT"
+  systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/\$UNIT"
+  systemctl daemon-reload
+fi
+if command -v rc-service >/dev/null 2>&1; then
+  if [ -f "$SVC_FILE" ]; then
+    echo "→ 停止并移除 OpenRC 服务 \$SERVICE"
+    rc-service "$SERVICE" stop >/dev/null 2>&1 || true
+    rc-update del "$SERVICE" default >/dev/null 2>&1 || true
+    rm -f "$SVC_FILE" "/run/\$SERVICE.pid"
+  fi
+fi
+rm -f "$ENV_FILE"
 
 OK=1
 echo "✓ 卸载完成：中转规则已从中转服务器移除"
 echo "  面板里的规则记录还在，重新生成 install 脚本执行即可恢复。"
 
 # --purge：所有中转规则都清完时连 gost 二进制一起删（保守：还有别的规则就不动）
-if [ "\${1:-}" = '--purge' ] && ! ls /etc/systemd/system/gost-relay-*.service >/dev/null 2>&1; then
+if [ "\${1:-}" = '--purge' ] && ! ls /etc/systemd/system/gost-relay-*.service /etc/init.d/gost-relay-* >/dev/null 2>&1; then
   rm -f "$GOST_BIN"
   echo "✓ 已删除 \$GOST_BIN（最后一个中转规则）"
 fi
@@ -1493,19 +1606,33 @@ ${relayAck()}
 `;
   }
 
-  // check：unit active + 端口真的在监听才算存活
+  // check：服务 active + 端口真的在监听才算存活（systemd / OpenRC 都认）
   return `${relayHeader({ rule, mode, panelUrl, site, comment: '只读检查：gost-relay 服务与端口监听状态' })}
 LISTEN_PORT=${listenPort}
 UNIT="gost-relay-\${RELAY_ID}.service"
+SERVICE="gost-relay-\${RELAY_ID}"
+SVC_FILE="/etc/init.d/\${SERVICE}"
 
 ${relayRootCheck()}
 OK=0
-if systemctl is-active --quiet "$UNIT" 2>/dev/null && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
-  OK=1
-  echo "✓ 规则存活：\$UNIT active，端口 \${LISTEN_PORT} 监听中"
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl is-active --quiet "$UNIT" 2>/dev/null && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
+    OK=1
+    echo "✓ 规则存活：systemd \$UNIT active，端口 \${LISTEN_PORT} 监听中"
+  else
+    echo "✗ 规则不在运行（未安装或已停止）"
+    systemctl status "$UNIT" --no-pager -n 5 2>/dev/null || echo "  （unit 不存在）"
+  fi
+elif command -v rc-service >/dev/null 2>&1; then
+  if [ -f "$SVC_FILE" ] && rc-service "$SERVICE" status >/dev/null 2>&1 && ss -lntu 2>/dev/null | grep -E ":\${LISTEN_PORT}[[:space:]]" >/dev/null; then
+    OK=1
+    echo "✓ 规则存活：OpenRC \$SERVICE started，端口 \${LISTEN_PORT} 监听中"
+  else
+    echo "✗ 规则不在运行（未安装或已停止）"
+    rc-service "$SERVICE" status 2>&1 || echo "  （OpenRC 服务不存在）"
+  fi
 else
-  echo "✗ 规则不在运行（未安装或已停止）"
-  systemctl status "$UNIT" --no-pager -n 5 2>/dev/null || echo "  （unit 不存在）"
+  echo "✗ 未找到 systemd / OpenRC"
 fi
 
 ${relayAck()}
@@ -1523,28 +1650,42 @@ ${relayAck()}
  *
  * 命名与手动脚本完全一致（gost-relay-<id>.service / np-relay:<id>），两条通道可以互相接手。
  */
-function buildRelaySyncScript({ rules = [] } = {}) {
+function buildRelaySyncScript({ rules = [], githubProxy = '' } = {}) {
   const gostRules = rules.filter((r) => r.tool === 'gost');
   const iptRules = rules.filter((r) => r.tool === 'iptables');
   const idList = (list) => `' ${list.map((r) => shellSafe(r.id)).join(' ')} '`;
+  const proxy = shellSafe(String(githubProxy || ''));
 
   const gostBlock = (r) => {
     const id = shellSafe(r.id);
     const listen = Number(r.listenPort) || 443;
     const targets = relayTargets(r);
-    const targetList = targets.map((t) => `${t.host}:${t.port}`).join(',');
+    const targetList = targets.map((t) => `${t.host}:${t.port}`).join(' ');
     const forwards = r.proto === 'both' ? ['tcp', 'udp'] : [r.proto === 'udp' ? 'udp' : 'tcp'];
-    // 多目标交给 gost 自己按 fifo 顺序做故障切换（首个优先，失败后剔除）
-    const query = targets.length > 1 ? '?strategy=fifo&max_fails=1&fail_timeout=30s' : '';
-    const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}${query}/\${NP_TARGETS}`).join(' ');
+    // 不用 gost 的 strategy/max_fails 参数（版本兼容性不一致，unit 可能直接起不来）。
+    // 每轮探测选第一个可达目标，单目标下发；切换粒度 = 收敛周期。
+    const execArgs = forwards.map((p) => `-L ${p}://:\${NP_LISTEN}/\${NP_TARGET}`).join(' ');
+    const openrcArgs = forwards.map((p) => `-L ${p}://:${listen}/$PICK`).join(' ');
     return `
 # ---- gost 规则 ${id} ----
+NP_TARGETS='${targetList}'
+PICK=''
+for _t in $NP_TARGETS; do
+  _h=\${_t%:*}; _p=\${_t##*:}
+  if command -v nc >/dev/null 2>&1 && nc -z -w 2 "$_h" "$_p" >/dev/null 2>&1; then PICK=$_t; break; fi
+done
+if [ -z "$PICK" ]; then
+  for _t in $NP_TARGETS; do PICK=$_t; break; done
+  echo "! gost 规则 ${id}：目标都不可达，暂用 $PICK"
+  NP_FAIL=1
+fi
 mkdir -p /etc/gost
-cat > "/etc/gost/relay-${id}.env" <<'NP_ENV_EOF'
+cat > "/etc/gost/relay-${id}.env" <<NP_ENV_EOF
 NP_LISTEN=${listen}
-NP_TARGETS=${targetList}
+NP_TARGET=$PICK
 NP_ENV_EOF
-cat > "/etc/systemd/system/gost-relay-${id}.service" <<'NP_UNIT_EOF'
+if command -v systemctl >/dev/null 2>&1; then
+  cat > "/etc/systemd/system/gost-relay-${id}.service" <<'NP_UNIT_EOF'
 [Unit]
 Description=nodepanel relay ${id} (${targets.length} targets)
 After=network-online.target
@@ -1559,11 +1700,34 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 NP_UNIT_EOF
-systemctl daemon-reload >/dev/null 2>&1 || true
-if systemctl enable --now "gost-relay-${id}.service" >/dev/null 2>&1; then
-  echo "✓ gost 规则就位 ${id}（:${listen} → ${targetListText(targets)}）"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl enable --now "gost-relay-${id}.service" >/dev/null 2>&1; then
+    echo "✓ gost 规则就位 ${id}（systemd · :${listen} → $PICK）"
+  else
+    echo "! gost 规则启动失败 ${id}：journalctl -u gost-relay-${id} -n 20"
+    NP_FAIL=1
+  fi
+elif command -v rc-service >/dev/null 2>&1; then
+  # Alpine / OpenRC：写 init 脚本。没有 /etc/systemd/system 时不能硬写 unit
+  cat > "/etc/init.d/gost-relay-${id}" <<NP_SVC_EOF
+#!/sbin/openrc-run
+name="gost-relay-${id}"
+description="nodepanel relay ${id}"
+command="/usr/local/bin/gost"
+command_args="${openrcArgs}"
+command_background=true
+pidfile="/run/gost-relay-${id}.pid"
+NP_SVC_EOF
+  chmod +x "/etc/init.d/gost-relay-${id}"
+  rc-update add "gost-relay-${id}" default >/dev/null 2>&1 || true
+  if rc-service "gost-relay-${id}" restart >/dev/null 2>&1 || rc-service "gost-relay-${id}" start >/dev/null 2>&1; then
+    echo "✓ gost 规则就位 ${id}（OpenRC · :${listen} → $PICK）"
+  else
+    echo "! gost 规则启动失败 ${id}：rc-service gost-relay-${id} status"
+    NP_FAIL=1
+  fi
 else
-  echo "! gost 规则启动失败 ${id}：journalctl -u gost-relay-${id} -n 20"
+  echo "! 未找到 systemd / OpenRC：gost 规则无法常驻（可改用 iptables 规则）"
   NP_FAIL=1
 fi
 # 入口流量计数（gost 没有 DNAT 规则可挂计数器）：往固定计数链里插一条 RETURN 规则。
@@ -1647,23 +1811,37 @@ NP_GOST_N=${gostRules.length}
 NP_IPT_N=${iptRules.length}
 NP_GOST_IDS=${idList(gostRules)}
 NP_IPT_IDS=${idList(iptRules)}
+# GitHub 反代前缀（面板设置项）；空 = 直连
+GOST_PROXY="${proxy}"
 
-# 1) 清理面板已经删除的 gost 规则（unit 名就是锚点）
-if [ -d /etc/systemd/system ]; then
-  for _f in /etc/systemd/system/gost-relay-*.service; do
-    [ -f "$_f" ] || continue
-    _id=$(basename "$_f" .service)
-    _id=\${_id#gost-relay-}
-    case "$NP_GOST_IDS" in
-      *" $_id "*) ;;
-      *)
-        systemctl disable --now "gost-relay-$_id.service" >/dev/null 2>&1 || true
-        rm -f "$_f" "/etc/gost/relay-$_id.env"
-        echo "· 已移除过期 gost 规则 $_id"
-        ;;
-    esac
-  done
-fi
+# 1) 清理面板已经删除的 gost 规则（systemd unit / OpenRC init 都是锚点）
+for _f in /etc/systemd/system/gost-relay-*.service; do
+  [ -f "$_f" ] || continue
+  _id=$(basename "$_f" .service)
+  _id=\${_id#gost-relay-}
+  case "$NP_GOST_IDS" in
+    *" $_id "*) ;;
+    *)
+      systemctl disable --now "gost-relay-$_id.service" >/dev/null 2>&1 || true
+      rm -f "$_f" "/etc/gost/relay-$_id.env"
+      echo "· 已移除过期 gost 规则 $_id（systemd）"
+      ;;
+  esac
+done
+for _f in /etc/init.d/gost-relay-*; do
+  [ -f "$_f" ] || continue
+  _id=$(basename "$_f")
+  _id=\${_id#gost-relay-}
+  case "$NP_GOST_IDS" in
+    *" $_id "*) ;;
+    *)
+      rc-service "gost-relay-$_id" stop >/dev/null 2>&1 || true
+      rc-update del "gost-relay-$_id" default >/dev/null 2>&1 || true
+      rm -f "$_f" "/run/gost-relay-$_id.pid" "/etc/gost/relay-$_id.env"
+      echo "· 已移除过期 gost 规则 $_id（OpenRC）"
+      ;;
+  esac
+done
 
 # 2) 清理面板已经删除的规则（DNAT 标签 np-relay:<id> / gost 计数标签 np-relay-count:<id>）
 if command -v iptables >/dev/null 2>&1; then
@@ -1704,13 +1882,24 @@ if [ "$NP_GOST_N" -gt 0 ] && [ ! -x /usr/local/bin/gost ]; then
     echo "! 不支持的架构 $(uname -m)：gost 只发 amd64 / arm64，相关规则不会生效"
     NP_FAIL=1
   else
+    _GOST_URL="\${GOST_DL_BASE:-https://github.com/go-gost/gost/releases/download}/v${DEFAULT_GOST_VER}/gost_${DEFAULT_GOST_VER}_linux_\${ARCH}.tar.gz"
+    # 有反代且机器在中国大陆（或判断不出来）时，把反代拼在 GitHub 地址前；
+    # 自定义镜像已经是替代源，不再叠加反代
+    if [ -n "$GOST_PROXY" ] && [ -z "\${GOST_DL_BASE:-}" ]; then
+      _loc=$(curl -fsS -m 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p')
+      case "$_loc" in
+        CN|'') _GOST_URL="\${GOST_PROXY}\${_GOST_URL}" ;;
+      esac
+    fi
+    echo "→ 下载 gost v${DEFAULT_GOST_VER}：$_GOST_URL"
     _TMP=$(mktemp -d)
-    if curl -fsSL "\${GOST_DL_BASE:-https://github.com/go-gost/gost/releases/download}/v${DEFAULT_GOST_VER}/gost_${DEFAULT_GOST_VER}_linux_\${ARCH}.tar.gz" -o "$_TMP/gost.tgz" \\
+    if curl -fsSL "$_GOST_URL" -o "$_TMP/gost.tgz" \\
        && tar -xzf "$_TMP/gost.tgz" -C "$_TMP" \\
        && install -m 755 "$_TMP/gost" /usr/local/bin/gost; then
       echo "✓ gost v${DEFAULT_GOST_VER} 已安装"
     else
-      echo "! gost 下载/安装失败（GitHub 连通性？可用 GOST_DL_BASE 指向镜像后重跑）"
+      echo "! gost 下载/安装失败：$_GOST_URL"
+      echo "  · 404 = 版本 / 资产名不存在；连不上 = 在面板设置里配置 GitHub 反代"
       NP_FAIL=1
     fi
     rm -rf "$_TMP"
@@ -1752,7 +1941,8 @@ echo "✓ 中转规则已收敛（gost ${gostRules.length} 条 / iptables ${iptR
 /** 按 tool 分发：gost / iptables 各自的三态生成器 */
 function buildRelayRuleScript({ rule, mode = 'install', panelUrl = '' }) {
   const gen = rule.tool === 'iptables' ? buildIptablesRelayScript : buildGostRelayScript;
-  return gen({ rule, mode, panelUrl });
+  // gost 下载可能要用面板设置里的 GitHub 反代前缀；iptables 生成器会忽略这个字段
+  return gen({ rule, mode, panelUrl, githubProxy: store.db().settings.githubProxy || '' });
 }
 
 module.exports = {

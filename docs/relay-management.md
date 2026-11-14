@@ -10,8 +10,8 @@
 - v2 只支持手动脚本（生成 → 复制执行 → curl 回执），规则变更必须重新生成并执行
 - v3 起：中转机 = `servers.type='relay'`，与落地机共用 token / 心跳 / 安装脚本框架；
   规则由 agent 每 60s 拉取并幂等收敛，手动三态脚本保留作为未装 agent 时的兜底
-- v4 起：一条规则可配置最多 8 个目标（顺序即切换顺序），gost 进程内 fifo 切换、
-  iptables 每轮收敛时探测重选；列表提供「诊断」按钮，TCP 握手测延迟与可用性
+- v4 起：一条规则可配置最多 8 个目标（顺序即切换顺序），gost / iptables 都在每轮收敛时
+  按顺序探测选优（60 秒粒度）；列表提供「诊断」按钮，TCP 握手测延迟与可用性
 
 ## 2. 总体设计
 
@@ -111,12 +111,20 @@
 - install：
   1. 架构检测（uname -m → amd64/arm64）+ `GOST_VER` 版本变量（默认锁定一个稳定版，**白名单 `^\d+\.\d+\.\d+$`**，防注入）
   2. `/usr/local/bin/gost` 不存在则从 GitHub release 下载解压（已存在则跳过，不覆盖用户自装版本）
-  3. 写 `/etc/gost/relay-<id>.env`（LISTEN / TARGETS，多目标逗号分隔）
-  4. 写 systemd unit `/etc/systemd/system/gost-relay-<id>.service`：`ExecStart=/usr/local/bin/gost -L "tcp://:${NP_LISTEN}/${NP_TARGETS}" ...`（按 proto 裁剪；多目标时监听地址后带 `?strategy=fifo&max_fails=1&fail_timeout=30s`）→ `daemon-reload` → `enable --now`（幂等：unit 覆盖写）
+  3. 写 `/etc/gost/relay-<id>.env`（LISTEN / TARGET，**单个可达目标**）
+  4. 写 systemd unit `/etc/systemd/system/gost-relay-<id>.service`：`ExecStart=/usr/local/bin/gost -L "tcp://:${NP_LISTEN}/${NP_TARGET}" ...`（按 proto 裁剪）→ `daemon-reload` → `enable --now`（幂等：unit 覆盖写）
   5. `ss -lntu` 端口自检 → curl 回执
 - uninstall：`disable --now` + 删 unit + 删 env + daemon-reload；`--purge` 才删二进制
 - check：`systemctl is-active gost-relay-<id>` + 端口监听自检 → 回执
-- 多目标：gost 进程内 fifo 策略 —— 首选第一个目标，连接失败按 `max_fails/fail_timeout` 剔除并切下一个
+- 多目标：不用 gost 的 `strategy` / `max_fails` 参数（不同版本兼容性不一致，unit 可能直接起不来），
+  改为脚本按顺序探测、只下发一个可达目标；切换粒度 = 收敛周期（60s），与 iptables 行为一致
+- 默认版本 **3.3.3**（与 GitHub Release 资产名一致；3.5.1 不存在会 404），下载前打印最终 URL，
+  404 与「连不上」能分开判断
+- 服务管理：优先 systemd；**Alpine / OpenRC 写 `/etc/init.d/gost-relay-<id>`**（`command_background` + pidfile），
+  不再硬写 `/etc/systemd/system`（Alpine 上该目录不存在，会直接报 nonexistent directory）
+- GitHub 反代：面板设置项 `githubProxy`。中转机下载时先查 `cdn-cgi/trace` 的 `loc`，
+  `CN` 或判断不出来 → URL 前缀加上反代（`https://ghproxy.com/https://github.com/...`）；
+  `GOST_DL_BASE` 自定义镜像不叠加反代
 
 ### 5.3 端口占用预检
 
@@ -127,7 +135,8 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 `buildRelaySyncScript({ rules })` 生成 POSIX sh 收敛脚本，由 relay bundle 每轮执行：
 
 1. 枚举 `gost-relay-*.service` 与带 `np-relay:` / `np-relay-count:` 标签的 NAT 规则，**删除面板已不存在的**（删规则 / 改端口 / 换 tool 自动生效）
-2. 期望规则逐条写入：gost 写 env + systemd unit（多目标直接写全量）并 `enable --now`；iptables 每轮按顺序探测目标，**期望规则已在位时跳过重建**（否则计数器每秒归零），目标变化才删旧标签重写
+2. 期望规则逐条写入：gost 按顺序探测目标、写单目标 env + 服务（systemd unit 或 OpenRC init）并启动；iptables 每轮按顺序探测目标，**期望规则已在位时跳过重建**（否则计数器每秒归零），目标变化才删旧标签重写
+3. 清理段同时识别 `gost-relay-*.service` 与 `/etc/init.d/gost-relay-*`，卸载时把 OpenRC 服务、pidfile、计数链一起清掉
 3. gost 没有 DNAT 规则可挂计数器，收敛时在固定计数链 `NP_RELAY_COUNT` 里插一条 `RETURN` 规则（标签 `np-relay-count:<id>`），只建一次、不重建
 4. gost 二进制按需下载（版本走 `GOST_VER` 白名单；`GOST_DL_BASE` 可指镜像）
 5. 端口自检交给 agent 的 `probe_ports`（`NP_LISTEN_PORTS` 由 bundle 写入，只统计 gost 规则），失败通过 receipt 暴露
@@ -145,6 +154,8 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 - 「服务器」视图按 **tab 分组**：节点服务器 / 中转服务器（互斥展示，新增按钮跟着当前 tab）
   - 新建弹窗先选类型：节点服务器（跑 Xray / Hysteria2）或中转服务器（入口机）
   - 中转卡片显示「转发规则」数而不是节点 / 用户数；部署 / 卸载弹窗文案按类型分叉
+- 「设置 → 站点信息」新增 **GitHub 反代加速**：只影响中转机下载 gost；留空直连。
+  中转机检测到中国大陆 IP 时自动拼接，格式 `反代前缀 + GitHub 地址`
 - 「中转」视图只管规则：改为添加规则时若还没有中转机，提示并跳到服务器页的中转 tab
   - 规则表在机器名旁提示「入口机离线」；服务器 CRUD 入口已移除（统一在服务器页）
   - 目标地址改为**大文本框**（一行一个 `host:port`，最多 8 个），列表转发方向显示首个目标 + `+N`
@@ -180,9 +191,10 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
 | 数据 | schema 12→15：`servers` 增 `type`、`relays` 增 `targets` 与流量字段；旧 `relay_servers` 行迁入并 DROP 旧表；自动备份后迁移 |
 | 兼容 | `node.entries` 仅增可选 `relayId`；旧规则单目标自动补 `targets`；`targetHost/targetPort` 保留为第一项镜像；`GET /api/relay-servers` 保留只读一个版本；写入端点已移除 |
 | 落地机 agent | **零影响**：payload 字段集合与 hash 输入不变，不触发重下发（test/relay.js 锁死） |
-| 中转机侧 | 装 agent 后新增 `gost-relay-<id>.service` / `np-relay:<id>` 的 60s 自动收敛；多目标切换：gost 进程内、iptables 每轮重选（未变化不重建，保留计数器）；入口流量随回执上报 |
+| 中转机侧 | 装 agent 后新增 `gost-relay-<id>.service` / `np-relay:<id>` 的 60s 自动收敛；多目标切换：gost / iptables 都每轮探测重选（gost 单目标下发；iptables 未变化不重建、保留计数器）；入口流量随回执上报 |
 | 安全面 | 中转机获得设备级 token（可被下发 root shell），relay bundle 只由固定模板生成，不接受自由字段；流量数字仅作展示 |
-| 风险点 | 入口流量只统计单向（客户端 → 入口机），且依赖 `iptables` + `comment`；计数器在目标切换 / 规则重建时归零，面板按「原值下降视为重置」处理；无 `nc` 时 iptables 目标探测退化为取第一个；gost 下载依赖 GitHub 连通性（`GOST_DL_BASE` 可指镜像）；同机双角色（既入口又落地）不支持 |
+| 风险点 | 入口流量只统计单向（客户端 → 入口机），且依赖 `iptables` + `comment`；计数器在目标切换 / 规则重建时归零，面板按「原值下降视为重置」处理；无 `nc` 时目标探测退化为取第一个；gost 下载依赖 GitHub 连通性（反代 / `GOST_DL_BASE` 兜底）；同机双角色（既入口又落地）不支持 |
+| bundle 版本 | relay payload hash 额外包含 `RELAY_BUNDLE_REV`：生成逻辑有行为修复时 +1，agent 下一轮就会拉新包，不必为此单独发版本号 |
 
 ## 10. 分期
 
@@ -202,4 +214,9 @@ install 脚本开头检测 listenPort 是否已被占用（`ss -lntu | grep`）�
    > 检查前面的 nginx `limit_req` / frp 或云厂商 WAF，而不是面板。
 2. **升级后新旧前端混跑**：静态 JS/CSS 以前缓存 5 分钟且 URL 不带版本，升级后旧页面继续提交
    旧字段会表现为「页面状态过期」。现在 HTML 里的 `?v=__V__` 由服务端替换成 `APP_VERSION`，
-   升级后资源 URL 变化，浏览器不会再拿上一版前端配这一版后端。
+   升级后资源 URL 变化，浏览器不会再拿上一版前端配这一版后端。3. **gost 下载 404**：默认版本写成 3.5.1，但 GitHub Release 并不存在该 tag/资产，实际最新稳定版为 3.3.3。
+   现在版本常量带注释，下载前打印最终 URL，404 与网络不通能一眼区分。
+4. **Alpine 上 gost 服务建不起来**：OpenRC 机器没有 `/etc/systemd/system`，以前会报
+   `nonexistent directory`。现在自动识别 systemd / OpenRC，OpenRC 写 `/etc/init.d/gost-relay-<id>`。
+5. **GitHub 下载被墙**：设置页新增「GitHub 反代加速」，中转机按 IP 归属决定是否拼接前缀
+   （`CN` 或判断失败 → 使用反代），自定义镜像地址不叠加。

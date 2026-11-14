@@ -128,6 +128,15 @@ RENDERERS.settings = async () => {
             <label>订阅页公告</label>
             <textarea id="set-notice">${esc(s.notice || '')}</textarea>
           </div>
+          <div class="field">
+            <label>GitHub 反代加速（中转机下载 gost）</label>
+            <input type="text" id="set-ghproxy" value="${esc(s.githubProxy || '')}" placeholder="https://ghproxy.com/" spellcheck="false" autocomplete="off">
+            <div class="hint">
+              留空则直连 GitHub。中转机检测到中国大陆 IP 时，自动把它拼在下载地址前：
+              <span class="mono">https://ghproxy.com/</span> + <span class="mono">https://github.com/...</span> →
+              <span class="mono">https://ghproxy.com/https://github.com/...</span>
+            </div>
+          </div>
           <button class="btn btn-primary" data-act="save-settings">保存设置</button>
         </div>
       </div>
@@ -1938,6 +1947,7 @@ async function runAction(act, btn, id) {
           siteName: $('#set-name').value.trim(),
           subBase: base.value,
           notice: $('#set-notice').value,
+          githubProxy: $('#set-ghproxy') ? $('#set-ghproxy').value.trim() : undefined,
         }),
       });
       if ($('#set-base')) $('#set-base').value = base.value;

@@ -816,9 +816,18 @@ probe_ports() {
   [ -n "$BAD_PORTS" ] || return 0
 
   log "! 端口未在监听：$BAD_PORTS（配置已落盘，但服务没把它监听起来）"
-  log "  排查：ss -lntup | grep -E 'xray|hysteria'；journalctl -u xray -n 50"
+  if [ "$RELAY_ONLY" = '1' ]; then
+    # 中转机没有 xray/hysteria，排查方向只有 gost 与 agent 日志
+    log "  排查：systemctl list-units 'gost-relay-*'；journalctl -u 'gost-relay-*' -n 50；tail -n 50 $LOG_DIR/agent.log"
+  else
+    log "  排查：ss -lntup | grep -E 'xray|hysteria'；journalctl -u xray -n 50"
+  fi
   RC_OK=0
-  RC_ERR="${RC_ERR}${RC_ERR:+；}端口未监听：$BAD_PORTS"
+  if [ "$RELAY_ONLY" = '1' ]; then
+    RC_ERR="${RC_ERR}${RC_ERR:+；}转发端口未监听：$BAD_PORTS（多半是 gost 没启动，见 agent.log）"
+  else
+    RC_ERR="${RC_ERR}${RC_ERR:+；}端口未监听：$BAD_PORTS"
+  fi
   return 1
 }
 
@@ -2117,16 +2126,27 @@ np_uninstall() {
       rm -f "$_u"
       echo "  ✓ 已移除 $_name"
     done
+    # Alpine / OpenRC：服务脚本在 /etc/init.d，必须单独清
+    for _f in /etc/init.d/gost-relay-*; do
+      [ -f "$_f" ] || continue
+      _name=$(basename "$_f")
+      rc-service "$_name" stop >/dev/null 2>&1 || true
+      rc-update del "$_name" default >/dev/null 2>&1 || true
+      rm -f "$_f" "/run/$_name.pid"
+      echo "  ✓ 已移除 $_name（OpenRC）"
+    done
     rm -f /etc/gost/relay-*.env 2>/dev/null
     systemctl daemon-reload >/dev/null 2>&1 || true
     if command -v iptables >/dev/null 2>&1; then
-      for _chain in PREROUTING POSTROUTING; do
-        iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay:' | sed "s/^-A $_chain //" | while IFS= read -r _r; do
+      for _chain in PREROUTING POSTROUTING NP_RELAY_COUNT; do
+        iptables -t nat -S "$_chain" 2>/dev/null | grep -F 'np-relay' | sed "s/^-A $_chain //" | while IFS= read -r _r; do
           [ -n "$_r" ] || continue
           iptables -t nat -D "$_chain" $_r 2>/dev/null || true
         done
       done
-      echo "  ✓ 已清理带 np-relay: 标签的 NAT 规则"
+      iptables -t nat -D PREROUTING -j NP_RELAY_COUNT 2>/dev/null || true
+      iptables -t nat -X NP_RELAY_COUNT 2>/dev/null || true
+      echo "  ✓ 已清理带 np-relay 标签的 NAT 规则"
     fi
   fi
 
@@ -2294,23 +2314,25 @@ log "Node Panel Agent $VERSION 启动"
 log "面板：$PANEL_URL"
 if [ "$RELAY_ONLY" = '1' ]; then
   log "角色：中转机（只同步端口转发规则，不管理 Xray / Hysteria2）"
+  log "转发：gost / iptables · 轮询 ${INTERVAL}s"
 else
   log "HTTP：${HTTP:-未找到 curl/wget}"
   log "Xray：$XRAY_CONFIG · Hysteria2：$HYSTERIA_DIR"
+  # 重载命令是「配置没生效」类问题的第一嫌疑，启动时先把它亮出来。
+  # 中转机不做 Xray 重载，这段检测也一并跳过（否则日志会误导成「中转机也在管 Xray」）
+  _detect_cmd=$(detect_reload_cmd)
+  if [ -n "${RELOAD_CMD:-}" ]; then
+    _reload_show=$RELOAD_CMD
+  elif [ -n "$_detect_cmd" ]; then
+    _reload_show=$_detect_cmd
+  elif command -v systemctl >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; then
+    # 有服务管理器却没匹配到 xray 单元：这台机器的服务名可能不叫 xray / xray-core / x-ui
+    _reload_show='未找到 xray 服务单元（配置写入后需手动重启）'
+  else
+    _reload_show='无服务管理器（配置写入后需手动重启）'
+  fi
+  log "重载：$_reload_show · 轮询 ${INTERVAL}s"
 fi
-# 重载命令是「配置没生效」类问题的第一嫌疑，启动时先把它亮出来
-_detect_cmd=$(detect_reload_cmd)
-if [ -n "${RELOAD_CMD:-}" ]; then
-  _reload_show=$RELOAD_CMD
-elif [ -n "$_detect_cmd" ]; then
-  _reload_show=$_detect_cmd
-elif command -v systemctl >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; then
-  # 有服务管理器却没匹配到 xray 单元：这台机器的服务名可能不叫 xray / xray-core / x-ui
-  _reload_show='未找到 xray 服务单元（配置写入后需手动重启）'
-else
-  _reload_show='无服务管理器（配置写入后需手动重启）'
-fi
-log "重载：$_reload_show · 轮询 ${INTERVAL}s"
 
 if [ "${1:-}" = '--once' ]; then
   tick

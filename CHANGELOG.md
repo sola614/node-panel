@@ -53,6 +53,22 @@
   「无法连接面板（可能正在重启或网络中断）」；`api()` 对 429 优先使用后端文案，
   拿不到时提示可能是反向代理限流，并保留 `err.status` / `retry-after` 供排查。
   面板自身没有对写接口限流，429 多来自前置 nginx `limit_req` / frp / WAF。
+- **中转机仍显示 Xray 重载 / 排查 xray-hysteria**：`RELAY_ONLY=1` 时启动横幅不再打印
+  「重载：rc-service xray restart」，端口未监听的排查提示改为 gost unit / agent.log，
+  回执错误也明确写「转发端口未监听（多半是 gost 没启动）」。
+- **gost 多目标可能起不来**：去掉 `strategy=fifo&max_fails=...` 参数（不同 gost 版本兼容性
+  不一致，unit 会直接启动失败），改为每轮按顺序探测、只下发一个可达目标；
+  切换粒度与 iptables 一致（60 秒）。
+- **relay bundle 修复无法下发**：relay payload hash 加入 `RELAY_BUNDLE_REV`，生成逻辑有行为
+  修复时递增即可让 agent 下一轮拉新包，不必为此单独升版本号。
+- **gost 下载 404**：默认版本写成 3.5.1，但 GitHub Release 不存在该 tag/资产（实际最新稳定版 3.3.3）。
+  已改为 3.3.3，并在下载前打印最终 URL，404 与网络不通能明确区分。
+- **Alpine 上 gost 起不来**：OpenRC 机器没有 `/etc/systemd/system`，以前直接报
+  `can't create ...: nonexistent directory`。现在自动识别 systemd / OpenRC，OpenRC 写
+  `/etc/init.d/gost-relay-<id>`；卸载与清理同时处理两种服务。
+- **GitHub 下载被墙**：设置页新增「GitHub 反代加速」。中转机下载 gost 时检测 IP 归属
+  （`cdn-cgi/trace` 的 `loc`），中国大陆或判断失败时自动拼成
+  `https://ghproxy.com/https://github.com/...`；`GOST_DL_BASE` 自定义镜像不叠加。
 
 ## [0.1.45] - 2026-11-14
 
