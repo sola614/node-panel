@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.48'
+VERSION='0.1.49'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -1901,14 +1901,19 @@ collect_relay_traffic() {
   {
     iptables -t nat -L PREROUTING -v -n -x 2>/dev/null
     iptables -t nat -L NP_RELAY_COUNT -v -n -x 2>/dev/null
+    iptables -t mangle -L NP_RELAY_BACK -v -n -x 2>/dev/null
   } | awk '
     {
       for (i = 1; i <= NF; i++) {
-        if ($i ~ /^np-relay-count:/) { id = $i; sub(/^np-relay-count:/, "", id); sum[id] += $2; break }
-        if ($i ~ /^np-relay:/) { id = $i; sub(/^np-relay:/, "", id); sum[id] += $2; break }
+        if ($i ~ /^np-relay-count:/) { id = $i; sub(/^np-relay-count:/, "", id); up[id] += $2; break }
+        if ($i ~ /^np-relay-back:/) { id = $i; sub(/^np-relay-back:/, "", id); down[id] += $2; break }
+        if ($i ~ /^np-relay:/) { id = $i; sub(/^np-relay:/, "", id); up[id] += $2; break }
       }
     }
-    END { for (id in sum) print id, sum[id] }
+    END {
+      for (id in up) print id, up[id], down[id]
+      for (id in down) if (!(id in up)) print id, 0, down[id]
+    }
   ' > "$RUN_DIR/relay-traffic.txt" 2>/dev/null || true
   return 0
 }
@@ -1918,7 +1923,7 @@ send_receipt() {
   # 指纹清单也进签名：证书重签 → 指纹变化 → 回执立即重发，面板订阅里的 pcs 才不会拿着旧指纹
   # 流量总量也进签名：有流量就刷新回执，没流量则不重复发
   # 入口机诊断结果同样进签名：结果一到就优先回执，不等 10 分钟
-  _traffic_sum=$(awk '{ s += $2 } END { print s + 0 }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
+  _traffic_sum=$(awk '{ s += $2 + $3 } END { print s + 0 }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
   _probe_sig=$(tr '\n' ' ' 2>/dev/null < "$STATE_DIR/relay-probe.json")
   _sig="${NP_HASH:-}|$RC_OK|$RC_XRAY|$RC_HY|${RC_HOP:-}|${BAD_PORTS:-}|$(printf '%s' "$RC_ERR" | tr '\n' ' ')|$(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/selfcerts.list")|${_traffic_sum:-0}|$(printf '%s' "$_probe_sig" | cut -c1-200)"
   _last=''
@@ -1945,7 +1950,7 @@ send_receipt() {
   _f="$RUN_DIR/receipt.$$.json"
   _traffic=''
   if [ -s "$RUN_DIR/relay-traffic.txt" ]; then
-    _traffic=$(awk '{ printf "%s\"%s\":%s", sep, $1, $2; sep="," }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
+    _traffic=$(awk '{ printf "%s\"%s\":{\"up\":%s,\"down\":%s}", sep, $1, $2, $3 + 0; sep="," }' "$RUN_DIR/relay-traffic.txt" 2>/dev/null)
   fi
   # 入口机诊断结果：bundle 写好的 JSON 原样带上；没有就用空对象占位
   _probe=''

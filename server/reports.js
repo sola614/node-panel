@@ -62,6 +62,39 @@ function statsView(req, res, params, body, session, ctx) {
 
   const totals = dates.map((d, i) => users.reduce((a, u) => a + (u.days[i] || 0), 0));
 
+  // 中转入口：up = 客户端 → 入口机，down = 入口机 → 客户端（0.1.49 起）
+  const relayDaily = store.allRelayDaily(days);
+  const relays = db.relays
+    .map((r) => {
+      const rows = relayDaily.get(r.id) || new Map();
+      const up = dates.map((d) => (rows.get(d) ? rows.get(d).up : 0));
+      const down = dates.map((d) => (rows.get(d) ? rows.get(d).down : 0));
+      const upTotal = up.reduce((a, b) => a + b, 0);
+      const downTotal = down.reduce((a, b) => a + b, 0);
+      const server = db.servers.find((s) => s.id === r.serverId);
+      return {
+        id: r.id,
+        name: r.name,
+        tool: r.tool,
+        listenPort: r.listenPort,
+        serverName: server ? server.name : '（已删除）',
+        serverHost: server ? server.host : '',
+        enabled: r.enabled !== false,
+        up,
+        down,
+        upTotal,
+        downTotal,
+        upToday: up[up.length - 1] || 0,
+        downToday: down[down.length - 1] || 0,
+        today: (up[up.length - 1] || 0) + (down[down.length - 1] || 0),
+        total: upTotal + downTotal,
+      };
+    })
+    .sort((a, b) => b.total - a.total);
+  const relayUpTotals = dates.map((d, i) => relays.reduce((a, r) => a + (r.up[i] || 0), 0));
+  const relayDownTotals = dates.map((d, i) => relays.reduce((a, r) => a + (r.down[i] || 0), 0));
+  const relayTotals = dates.map((d, i) => relayUpTotals[i] + relayDownTotals[i]);
+
   sendJson(res, 200, {
     days,
     dates,
@@ -73,6 +106,15 @@ function statsView(req, res, params, body, session, ctx) {
     nodeDetailReady: nodes.some((n) => n.total > 0) || nodeDaily.size > 0,
     users,
     nodes,
+    /** 中转入口：按规则（端口）维度，无法按用户拆分；不参与用户额度计费 */
+    relays,
+    relayUpTotals,
+    relayDownTotals,
+    relayTotals,
+    relayTotal: relayTotals.reduce((a, b) => a + b, 0),
+    relayToday: relayTotals[relayTotals.length - 1] || 0,
+    relayPeak: Math.max(0, ...relayTotals),
+    relayReady: relays.some((r) => r.total > 0) || relayDaily.size > 0,
     todayKey: last,
   });
 }

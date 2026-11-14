@@ -66,6 +66,71 @@ function relayTargetText(r) {
   }`;
 }
 
+/* 中转规则视图：默认按归属服务器分组，切换后全部平铺 */
+let RELAY_GROUPED = true;
+
+/* 规则表格的行渲染：分组 / 平铺共用，避免两套 DOM 走样 */
+function relayRowHtml(r) {
+  const st = relayStateOf(r);
+  const node = r.nodeName ? esc(r.nodeName) : '<span style="color:var(--muted)">未关联</span>';
+  const up = Number(r.trafficBytes) || 0;
+  const down = Number(r.trafficDown) || 0;
+  const usedCell =
+    r.enabled === false
+      ? '<span style="color:var(--muted)">—</span>'
+      : !r.trafficAt
+        ? '<span style="color:var(--muted)" title="需要在中转机部署 agent 才能采集入口流量">未采集</span>'
+        : up > 0 || down > 0
+          ? `<span class="mono">↑ ${fmtBytes(up)}</span><div class="cell-sub">↓ ${fmtBytes(down)}${
+              r.lastUsedAt ? ' · ' + esc(fmtAgo(r.lastUsedAt)) + '用过' : ''
+            }</div>`
+          : '<span style="color:var(--muted)">未使用</span>';
+  // agent 在线时规则会自动同步，「脚本」只作为手动重跑 / 排查入口，不该抢主按钮的位置
+  const scriptBtn = r.serverOnline
+    ? `<button class="btn btn-sm btn-ghost" data-act="relay-script" data-id="${r.id}" title="agent 在线时自动同步；这里用于手动重跑或排查">手动脚本</button>`
+    : `<button class="btn btn-sm btn-primary" data-act="relay-script" data-id="${r.id}">脚本</button>`;
+  return `<tr>
+    <td>
+      <div class="cell-name">${esc(r.name)}</div>
+      <div class="cell-sub">${esc(r.serverName)}${r.serverOnline ? '' : ' · 入口机离线'}${
+        r.note ? ' · ' + esc(r.note) : ''
+      }</div>
+    </td>
+    <td><span class="badge ${RELAY_TOOL_BADGE[r.tool] || 'badge-dim'}">${esc(r.tool)}</span></td>
+    <td class="mono" style="white-space:nowrap">${relayTargetText(r)}</td>
+    <td>${esc(r.proto)}</td>
+    <td>${node}${r.usedEntryCount ? `<div class="cell-sub">${r.usedEntryCount} 个入口引用</div>` : ''}</td>
+    <td>${usedCell}</td>
+    <td><span class="badge ${st.cls}" title="${esc(st.tip)}">${st.label}</span>${
+      r.appliedAt ? `<div class="cell-sub">${esc(fmtAgo(r.appliedAt))}回执</div>` : ''
+    }</td>
+    <td>
+      <div class="row-actions">
+        ${scriptBtn}
+        <button class="btn btn-sm btn-ghost" data-act="relay-diag" data-id="${r.id}">诊断</button>
+        <button class="btn btn-sm btn-ghost" data-act="relay-toggle" data-id="${r.id}">${r.enabled === false ? '启用' : '停用'}</button>
+        <button class="btn btn-sm btn-ghost" data-act="relay-copy" data-id="${r.id}">复制</button>
+        <button class="btn btn-sm btn-ghost" data-act="relay-edit" data-id="${r.id}">编辑</button>
+        <button class="btn btn-sm btn-danger" data-act="relay-del" data-id="${r.id}">删</button>
+      </div>
+    </td>
+  </tr>`;
+}
+
+function relayTableHtml(items) {
+  const empty = `<tr><td colspan="8" class="empty"><b>还没有中转规则</b>
+    先到「服务器」页的「中转服务器」tab 添加一台入口机，再回来为它添加端口转发规则。
+    装了 agent 的中转机会自动同步规则；未装 agent 时可生成脚本复制到机器上以 root 执行。
+    节点编辑里的「中转入口」可以直接下拉选择这里的规则。</td></tr>`;
+  return `<table>
+    <thead><tr>
+      <th>规则</th><th>工具</th><th>转发方向</th><th>协议</th><th>关联节点</th><th>使用</th><th>状态</th>
+      <th style="text-align:right">操作</th>
+    </tr></thead>
+    <tbody>${items.length ? items.map(relayRowHtml).join('') : empty}</tbody>
+  </table>`;
+}
+
 RENDERERS.relays = async () => {
   const d = await api('/api/relays');
   state.data.relayItems = d.items;
@@ -75,73 +140,42 @@ RENDERERS.relays = async () => {
   // 中转机统一在「服务器」页（中转服务器 tab）新增 / 编辑，这里只维护规则
   $('#page-actions').innerHTML =
     '<button class="btn btn-sm btn-ghost" data-act="relay-refresh" title="重新拉取规则与流量">刷新</button>' +
+    `<button class="btn btn-sm btn-ghost" data-act="relay-view" title="在「按服务器分组」与「全部平铺」之间切换">${
+      RELAY_GROUPED ? '平铺视图' : '按服务器分组'
+    }</button>` +
     '<button class="btn btn-primary btn-sm" data-act="relay-new">+ 添加规则</button>';
 
-  const rows = d.items.length
-    ? d.items
-        .map((r) => {
-          const st = relayStateOf(r);
-          const node = r.nodeName
-            ? esc(r.nodeName)
-            : '<span style="color:var(--muted)">未关联</span>';
-          const used = Number(r.trafficBytes) || 0;
-          const usedCell =
-            r.enabled === false
-              ? '<span style="color:var(--muted)">—</span>'
-              : !r.trafficAt
-                ? '<span style="color:var(--muted)" title="需要在中转机部署 agent 才能采集入口流量">未采集</span>'
-                : used > 0
-                  ? `<span class="mono">↓ ${fmtBytes(used)}</span><div class="cell-sub">${
-                      r.lastUsedAt ? esc(fmtAgo(r.lastUsedAt)) + '用过' : '—'
-                    }</div>`
-                  : '<span style="color:var(--muted)">未使用</span>';
-          // agent 在线时规则会自动同步，「脚本」只作为手动重跑 / 排查入口，不该抢主按钮的位置
-          const scriptBtn = r.serverOnline
-            ? `<button class="btn btn-sm btn-ghost" data-act="relay-script" data-id="${r.id}" title="agent 在线时自动同步；这里用于手动重跑或排查">手动脚本</button>`
-            : `<button class="btn btn-sm btn-primary" data-act="relay-script" data-id="${r.id}">脚本</button>`;
-          return `<tr>
-        <td>
-          <div class="cell-name">${esc(r.name)}</div>
-          <div class="cell-sub">${esc(r.serverName)}${r.serverOnline ? '' : ' · 入口机离线'}${
-            r.note ? ' · ' + esc(r.note) : ''
-          }</div>
-        </td>
-        <td><span class="badge ${RELAY_TOOL_BADGE[r.tool] || 'badge-dim'}">${esc(r.tool)}</span></td>
-        <td class="mono" style="white-space:nowrap">${relayTargetText(r)}</td>
-        <td>${esc(r.proto)}</td>
-        <td>${node}${r.usedEntryCount ? `<div class="cell-sub">${r.usedEntryCount} 个入口引用</div>` : ''}</td>
-        <td>${usedCell}</td>
-        <td><span class="badge ${st.cls}" title="${esc(st.tip)}">${st.label}</span>${
-            r.appliedAt ? `<div class="cell-sub">${esc(fmtAgo(r.appliedAt))}回执</div>` : ''
-          }</td>
-        <td>
-          <div class="row-actions">
-            ${scriptBtn}
-            <button class="btn btn-sm btn-ghost" data-act="relay-diag" data-id="${r.id}">诊断</button>
-            <button class="btn btn-sm btn-ghost" data-act="relay-toggle" data-id="${r.id}">${r.enabled === false ? '启用' : '停用'}</button>
-            <button class="btn btn-sm btn-ghost" data-act="relay-copy" data-id="${r.id}">复制</button>
-            <button class="btn btn-sm btn-ghost" data-act="relay-edit" data-id="${r.id}">编辑</button>
-            <button class="btn btn-sm btn-danger" data-act="relay-del" data-id="${r.id}">删</button>
-          </div>
-        </td>
-      </tr>`;
-        })
-        .join('')
-    : `<tr><td colspan="8" class="empty"><b>还没有中转规则</b>
-        先到「服务器」页的「中转服务器」tab 添加一台入口机，再回来为它添加端口转发规则。
-        装了 agent 的中转机会自动同步规则；未装 agent 时可生成脚本复制到机器上以 root 执行。
-        节点编辑里的「中转入口」可以直接下拉选择这里的规则。</td></tr>`;
+  // 分组按服务器台账顺序；已删除服务器上的规则单独归到最后一组，避免漏显示
+  const servers = d.servers || [];
+  const known = new Set(servers.map((s) => s.id));
+  const groups = servers
+    .map((s) => ({ server: s, items: d.items.filter((r) => r.serverId === s.id) }))
+    .filter((g) => g.items.length);
+  const orphan = d.items.filter((r) => !known.has(r.serverId));
+  if (orphan.length) {
+    groups.push({ server: { id: '', name: '（已删除的服务器）', host: '', online: false }, items: orphan });
+  }
 
-  $('#view').innerHTML = `
-    <div class="card">
-      <div class="table-wrap"><table>
-        <thead><tr>
-          <th>规则</th><th>工具</th><th>转发方向</th><th>协议</th><th>关联节点</th><th>使用</th><th>状态</th>
-          <th style="text-align:right">操作</th>
-        </tr></thead>
-        <tbody>${rows}</tbody>
-      </table></div>
-    </div>
+  const groupCard = (g) => {
+    const entries = g.items.reduce((sum, r) => sum + (Number(r.usedEntryCount) || 0), 0);
+    return `<div class="card" style="margin-bottom:16px">
+      <div class="card-head" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <h3 style="margin:0">${esc(g.server.name)}</h3>
+        <span class="mono" style="font-size:12px;color:var(--muted)">${esc(g.server.host || '')}</span>
+        <span class="badge ${g.server.online ? 'badge-ok' : 'badge-dim'}">${g.server.online ? '在线' : '离线'}</span>
+        <span class="hint" style="margin:0">${g.items.length} 条规则${entries ? ` · ${entries} 个入口引用` : ''}</span>
+      </div>
+      <div class="table-wrap">${relayTableHtml(g.items)}</div>
+    </div>`;
+  };
+
+  const body = !d.items.length
+    ? `<div class="card"><div class="table-wrap">${relayTableHtml(d.items)}</div></div>`
+    : RELAY_GROUPED
+      ? groups.map(groupCard).join('')
+      : `<div class="card"><div class="table-wrap">${relayTableHtml(d.items)}</div></div>`;
+
+  $('#view').innerHTML = `${body}
     <p class="hint" style="margin-top:14px">
       gost：用户态转发，systemd 常驻（每条规则一个 <span class="mono">gost-relay-&lt;id&gt;.service</span>），
       不改内核转发，适配 NAT / 受限环境。iptables：内核态 DNAT，零常驻进程，

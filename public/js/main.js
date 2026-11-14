@@ -1934,6 +1934,10 @@ async function runAction(act, btn, id) {
     case 'relay-refresh':
       await render();
       break;
+    case 'relay-view':
+      RELAY_GROUPED = !RELAY_GROUPED;
+      await render();
+      break;
     case 'relay-del':
       relayDelFlow(id);
       break;

@@ -38,6 +38,19 @@ RENDERERS.stats = async () => {
     })
     .join('');
 
+  // 中转入口：按规则（端口）聚合的日流量，口径是「客户端 → 入口机」单向
+  const relayPeak = Math.max(d.relayPeak || 0, 1);
+  const relayBars = (d.relayTotals || [])
+    .map((bytes, i) => {
+      const h = Math.max(1.5, (bytes / relayPeak) * 100);
+      const cap = days > 14 ? (i % 2 === 0 ? d.dates[i].slice(5) : '') : d.dates[i].slice(5);
+      return `<div class="col" title="${d.dates[i]} · ${fmtBytes(bytes)}">
+        <div class="track"><div class="fill" style="height:${h}%"></div></div>
+        <div class="cap">${cap}</div>
+      </div>`;
+    })
+    .join('');
+
   const totalAll = d.total || 1;
   const userRows = d.users.length
     ? d.users
@@ -77,6 +90,32 @@ RENDERERS.stats = async () => {
         )
         .join('')
     : `<tr><td colspan="4" class="empty" style="padding:24px">还没有节点</td></tr>`;
+
+  const relayTotalAll = d.relayTotal || 1;
+  const relayRows = (d.relays || []).length
+    ? d.relays
+        .map((r) => {
+          const share = Math.round((r.total / relayTotalAll) * 1000) / 10;
+          return `<tr>
+        <td>
+          <div class="cell-name">${esc(r.name)}${r.enabled ? '' : ' <span class="chip">已停用</span>'}</div>
+          <div class="cell-sub">${esc(r.serverName)}${r.serverHost ? ' · ' + esc(r.serverHost) : ''}</div>
+        </td>
+        <td><span class="badge badge-dim">${esc(r.tool)}</span></td>
+        <td class="mono">↑ ${fmtBytes(r.upTotal)}</td>
+        <td class="mono">↓ ${fmtBytes(r.downTotal)}</td>
+        <td class="mono">${fmtBytes(r.total)}</td>
+        <td class="mono">${fmtBytes(r.today)}</td>
+        <td style="min-width:150px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <div class="bar" style="flex:1"><i style="width:${Math.min(100, share * 3)}%"></i></div>
+            <span style="font-size:11.5px;color:var(--muted);width:44px;text-align:right">${share}%</span>
+          </div>
+        </td>
+      </tr>`;
+        })
+        .join('')
+    : `<tr><td colspan="7" class="empty" style="padding:24px">还没有中转规则</td></tr>`;
 
   const nodeHint = d.nodeDetailReady
     ? ''
@@ -131,9 +170,37 @@ RENDERERS.stats = async () => {
       </div>
     </div>
     ${nodeHint}
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head">
+        <h3>中转入口每日流量</h3>
+        <span style="font-size:12px;color:var(--muted)">客户端 ↔ 入口机（↑ 入站 / ↓ 回程） · 峰值 ${fmtBytes(d.relayPeak || 0)}</span>
+      </div>
+      <div class="card-body">
+        ${
+          d.relayReady
+            ? `<div class="chart">${relayBars}</div>`
+            : `<div class="alert alert-warn" style="margin:0">
+                中转入口流量从本版本开始累计（agent 每轮读 iptables 计数器上报），暂时没有历史曲线。
+               </div>`
+        }
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><h3>中转入口用量</h3><span style="font-size:12px;color:var(--muted)">按区间总量排序</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>规则</th><th>工具</th><th>↑ 入站</th><th>↓ 回程</th><th>合计</th><th>今日</th><th>占比</th></tr></thead>
+        <tbody>${relayRows}</tbody>
+      </table></div>
+    </div>
+
     <p class="hint" style="margin-top:14px">
       用户用量来自 agent 的增量上报，精度取决于上报间隔（默认 60 秒）；
       节点用量取 Xray 入站计数器与每个 Hysteria2 实例的合计，含少量未归属到具体用户的流量。
+      <br>中转入口用量统计 <b>↑ 客户端 → 入口机</b> 与 <b>↓ 入口机 → 客户端</b> 两个方向，
+      按规则 / 端口维度聚合，无法按用户拆分；它用于判断哪条入口有没有人用、回程带宽多大，
+      <b>不参与用户额度计费</b>（计费仍在落地机）。
     </p>`;
 };
 

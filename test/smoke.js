@@ -1848,6 +1848,26 @@ function totpCodeOf(secret) {
   const relayTraffic3 = (await call('/api/relays')).data.items.find((x) => x.id === rlId) || {};
   ok('计数器归零后按当前值重算', relayTraffic3.trafficBytes === 4000);
 
+  // 流量统计页（0.1.49）：入口流量按天落到 relay_daily，stats 接口要能返回明细
+  const statsWithRelay = await call('/api/stats?days=7');
+  const relayStat = (statsWithRelay.data.relays || []).find((x) => x.id === rlId) || {};
+  ok('流量统计包含中转入口按日数据',
+    statsWithRelay.status === 200
+    && Number(relayStat.total) > 0
+    && Number(relayStat.today) > 0
+    && Array.isArray(relayStat.up)
+    && Array.isArray(relayStat.down));
+
+  // 双向（0.1.49）：回程计数器按差值入账，统计页要有 down 数据
+  await call('/api/agent/receipt?token=' + rsToken, {
+    method: 'POST',
+    body: json({ hash: 't4', ok: true, traffic: { [rlId]: { up: 4000, down: 2500 } } }),
+  });
+  const relayAfterDown = (await call('/api/relays')).data.items.find((x) => x.id === rlId) || {};
+  ok('回程流量按差值入账', relayAfterDown.trafficDown === 2500);
+  const statsRelayDown = (await call('/api/stats?days=7')).data.relays.find((x) => x.id === rlId) || {};
+  ok('统计页包含回程流量', Number(statsRelayDown.downTotal) > 0 && Number(statsRelayDown.upTotal) > 0);
+
   // agent 自动同步（0.1.47）：回执的 hash 与面板期望一致时，规则状态应自动推进到 applied，
   // 不能再依赖「手动执行脚本 + ack」
   const relayCfg = await call('/api/agent/config?token=' + rsToken);

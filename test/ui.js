@@ -1022,8 +1022,9 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   await waitFor(() => d9.querySelector(`[data-act="node-edit"][data-id="${hintNode.item.id}"]`), '入口套餐节点行');
   click(d9.querySelector(`[data-act="node-edit"][data-id="${hintNode.item.id}"]`), w9);
   await waitFor(() => d9.querySelector('#entries-list'), '节点编辑弹窗（入口套餐）');
+  const planNotice = d9.querySelector('#entries-plan-notice');
   ok('入口单独挂套餐时提示「拦不住人」',
-    /拦不住人/.test(d9.querySelector('#entries-list').textContent));
+    !!planNotice && !planNotice.classList.contains('hidden') && /拦不住人/.test(planNotice.textContent));
   d9.querySelector('.modal [data-close]').dispatchEvent(new w9.MouseEvent('click', { bubbles: true }));
   await sleep(100);
   await json('/api/nodes/' + hintNode.item.id, { method: 'DELETE' }, T);

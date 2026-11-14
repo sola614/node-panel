@@ -285,7 +285,7 @@ function buildAgentPayload(scope) {
  * 不依赖 APP_VERSION —— 一次脚本修复不需要单独发版本号，也能让 agent 立刻拉新包；
  * 否则 hash 不变，agent 永远按旧 bundle 跑（「改完了但线上没生效」）。
  */
-const RELAY_BUNDLE_REV = 9;
+const RELAY_BUNDLE_REV = 10;
 
 /**
  * 中转机配置包（relay scope）：只产规则清单，不读 nodes / users / certs。
@@ -757,14 +757,26 @@ function agentReceipt(req, res, params, body, session, ctx) {
     let applied = 0;
     for (const [rid, raw] of Object.entries(body.traffic)) {
       const rule = db.relays.find((r) => r.id === rid && r.serverId === scope.id);
-      const n = Number(raw);
-      if (!rule || !Number.isFinite(n) || n < 0) continue;
-      const last = Number(rule.trafficRaw) || 0;
-      const delta = n >= last ? n - last : n;
-      rule.trafficBytes = (Number(rule.trafficBytes) || 0) + delta;
-      rule.trafficRaw = n;
+      if (!rule) continue;
+      // 0.1.49 起是 { up, down }；旧 agent 只报数字，按入站处理
+      const isObj = raw && typeof raw === 'object';
+      const up = Number(isObj ? raw.up : raw);
+      const down = Number(isObj ? raw.down : 0);
+      if (!Number.isFinite(up) || !Number.isFinite(down) || up < 0 || down < 0) continue;
+      const lastUp = Number(rule.trafficRaw) || 0;
+      const lastDown = Number(rule.trafficRawDown) || 0;
+      const dUp = up >= lastUp ? up - lastUp : up;
+      const dDown = down >= lastDown ? down - lastDown : down;
+      rule.trafficBytes = (Number(rule.trafficBytes) || 0) + dUp;
+      rule.trafficDown = (Number(rule.trafficDown) || 0) + dDown;
+      rule.trafficRaw = up;
+      rule.trafficRawDown = down;
       rule.trafficAt = now;
-      if (delta > 0) rule.lastUsedAt = now;
+      if (dUp || dDown) {
+        rule.lastUsedAt = now;
+        // 按天入账：入站 / 回程分开，统计页才能画双向曲线
+        store.bumpRelayDaily(rule.id, dUp, dDown);
+      }
       applied++;
     }
     if (applied) logAgent.debug('中转入口流量已记录', { rid: ctx.rid, scope: scope.name, rules: applied });

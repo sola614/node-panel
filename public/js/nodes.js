@@ -847,6 +847,10 @@ ${lockMode ? '只填一条：保存后会覆盖本节点的地址、端口与凭
         <br>· 与「端口跳跃」<b>互斥</b>：填了跳跃范围就不能再用中转入口（客户端连的是入口机，落地机的转发表看不到这批流量）。
         <br>· 多个入口时，拖动每行左侧的 <b>⋮⋮</b> 调整顺序，订阅里的入口顺序与之相同。
       </p>
+      <p class="hint hidden" id="entries-plan-notice" style="margin-top:6px;color:var(--warn);line-height:1.6">
+        入口套餐只决定订阅里显示哪几条链接，<b>拦不住人</b>：能直连本节点的用户都能通过这个入口访问。
+        要让中转成为高等级专属，请另建一个高等级节点（同机换端口即可），把入口挂在那个节点上。
+      </p>
     </div>
 
     <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:6px">
@@ -1159,12 +1163,19 @@ function bindNodeForm(mask) {
   const planOptions = (state.data.planList || []).map((p) => p.id);
   const planNames = new Map((state.data.planList || []).map((p) => [p.id, p.name]));
 
+  // 入口套餐提示固定在列表下方：只要任一入口选了套餐就显示，避免每张卡片重复
+  const syncEntryPlanNotice = () => {
+    const box = $('#entries-plan-notice', mask);
+    if (box) box.classList.toggle('hidden', !entries.some((e) => (e.planIds || []).length));
+  };
+
   const renderEntries = () => {
     const box = $('#entries-list', mask);
     if (!entries.length) {
       box.innerHTML = '<div class="hint" style="margin:0 0 4px">尚未添加入口，订阅将使用节点自身地址。</div>';
       // 删掉最后一个入口也要重算互斥提示 —— 这条 early return 以前直接把提示留在屏幕上
       syncHopGate();
+      syncEntryPlanNotice();
       return;
     }
     box.innerHTML = entries
@@ -1209,22 +1220,13 @@ function bindNodeForm(mask) {
           </div>
           <span class="hint" style="margin:0;white-space:nowrap">${e.planIds.length ? '' : '不选 = 继承节点套餐'}</span>
         </div>
-        ${
-          // 入口套餐只影响订阅里显示哪几条链接，不参与鉴权：
-          // 流量最终落在本节点的 inbound 上，节点只认 UUID，分不出请求从哪个入口来。
-          // 不说清楚的话，管理员会以为这样就能单独控权限，等降级后才发现拦不住。
-          e.planIds.length
-            ? `<div class="hint" style="margin:7px 0 0;color:var(--warn);line-height:1.6">
-                入口套餐只决定订阅里显示哪几条链接，<b>拦不住人</b>：能直连本节点的用户都能通过这个入口访问。
-                要让中转成为高等级专属，请另建一个高等级节点（同机换端口即可），把入口挂在那个节点上。
-               </div>`
-            : ''
-        }
+
       </div>`;
       })
       .join('');
     // 行数变了要重算「填了范围还留着几个入口」，否则删光入口后红字还挂着
     syncHopGate();
+    syncEntryPlanNotice();
   };
 
   /* 入口套餐多选下拉：面板按需插入，事件委托到 #entries-list */
@@ -1276,6 +1278,7 @@ function bindNodeForm(mask) {
     if (e.target.checked) set.add(pid);
     else set.delete(pid);
     entries[i].planIds = [...set];
+    syncEntryPlanNotice();
 
     // 就地更新按钮文案，不重建整行（避免丢失面板状态）
     const names = entries[i].planIds.map((x) => planNames.get(x)).filter(Boolean);

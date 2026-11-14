@@ -1885,6 +1885,15 @@ if [ "$HAS_COMMENT" = '1' ]; then
       || iptables -t nat -A NP_RELAY_COUNT -p $_cp --dport ${listen} -m comment --comment np-relay-count:${id} -j RETURN || NP_FAIL=1
   done
 fi
+# 回程流量（0.1.49）：gost 是本机端点，回包走 OUTPUT，源端口 = 监听端口
+if [ "$HAS_COMMENT" = '1' ]; then
+  iptables -t mangle -N NP_RELAY_BACK 2>/dev/null || true
+  iptables -t mangle -C OUTPUT -j NP_RELAY_BACK 2>/dev/null || iptables -t mangle -A OUTPUT -j NP_RELAY_BACK
+  for _cp in ${forwards.join(' ')}; do
+    iptables -t mangle -C NP_RELAY_BACK -p $_cp --sport ${listen} -m comment --comment np-relay-back:${id} -j RETURN 2>/dev/null \
+      || iptables -t mangle -A NP_RELAY_BACK -p $_cp --sport ${listen} -m comment --comment np-relay-back:${id} -j RETURN || NP_FAIL=1
+  done
+fi
 `;
   };
 
@@ -1907,6 +1916,18 @@ fi
       .join('\n');
     const fwdRules = protos
       .map((p) => `add_fwd FORWARD -p ${p} -d "$_h" --dport $_p -j ACCEPT $TAG || NP_FAIL=1`)
+      .join('\n');
+    // 回程计数（0.1.49）：落地机回包的源地址/源端口是落地目标，挂在 mangle FORWARD 的自定义链上。
+    // 只计数不改变转发：链内 -j RETURN 直接回到 FORWARD。
+    const backChecks = protos
+      .map(
+        (p) => `iptables -t mangle -C NP_RELAY_BACK -s "$_h" -p ${p} --sport $_p -m comment --comment np-relay-back:${id} -j RETURN 2>/dev/null || _need=1`,
+      )
+      .join('\n');
+    const backRules = protos
+      .map(
+        (p) => `iptables -t mangle -C NP_RELAY_BACK -s "$_h" -p ${p} --sport $_p -m comment --comment np-relay-back:${id} -j RETURN 2>/dev/null || iptables -t mangle -A NP_RELAY_BACK -s "$_h" -p ${p} --sport $_p -m comment --comment np-relay-back:${id} -j RETURN || NP_FAIL=1`,
+      )
       .join('\n');
     return `
 # ---- iptables 规则 ${id} ----
@@ -1937,6 +1958,9 @@ _need=0
 iptables -t nat -C POSTROUTING -d "$_h" -j MASQUERADE $TAG 2>/dev/null || _need=1
 ${checks}
 ${fwdChecks}
+if [ "$HAS_COMMENT" = '1' ]; then
+${backChecks}
+fi
 del_tag() {
   iptables -t nat -S "$1" 2>/dev/null | grep -F "np-relay:${id}" | sed "s/^-A $1 //" | while IFS= read -r _r; do
     [ -n "$_r" ] || continue
@@ -1949,11 +1973,18 @@ del_fwd() {
     iptables -D FORWARD $_r 2>/dev/null || true
   done
 }
+del_back() {
+  iptables -t mangle -S NP_RELAY_BACK 2>/dev/null | grep -F "np-relay-back:${id}" | sed 's/^-A NP_RELAY_BACK //' | while IFS= read -r _r; do
+    [ -n "$_r" ] || continue
+    iptables -t mangle -D NP_RELAY_BACK $_r 2>/dev/null || true
+  done
+}
 if [ "$_need" = '1' ]; then
   if [ "$HAS_COMMENT" = '1' ]; then
     del_tag PREROUTING
     del_tag POSTROUTING
     del_fwd
+    del_back
   else
     iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- "--dport ${listen}( |$)" | sed 's/^-A PREROUTING //' | while IFS= read -r _r; do
       [ -n "$_r" ] || continue
@@ -1963,6 +1994,12 @@ if [ "$_need" = '1' ]; then
   add_rule POSTROUTING -d "$_h" -j MASQUERADE $TAG || NP_FAIL=1
 ${dnat}
 ${fwdRules}
+  if [ "$HAS_COMMENT" = '1' ]; then
+    # 回程计数：mangle FORWARD 上按「落地 IP + 落地端口」匹配，链内 RETURN 不影响转发
+    iptables -t mangle -N NP_RELAY_BACK 2>/dev/null || true
+    iptables -t mangle -C FORWARD -j NP_RELAY_BACK 2>/dev/null || iptables -t mangle -A FORWARD -j NP_RELAY_BACK
+${backRules}
+  fi
   if [ "$NP_FAIL" = '0' ]; then
     echo "· iptables 规则 ${id} 已更新（使用目标 $_h:$_p，候选 ${targets.length} 个）"
   else
@@ -2075,6 +2112,20 @@ if command -v iptables >/dev/null 2>&1; then
     _rule=\${_line#-A FORWARD }
     iptables -D FORWARD $_rule 2>/dev/null || true
     echo "· 已移除过期 FORWARD 规则 $_id"
+  done
+fi
+
+# 回程计数链（mangle）：按 np-relay-back:<id> 清过期规则
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t mangle -S NP_RELAY_BACK 2>/dev/null | grep -F 'np-relay-back:' | while IFS= read -r _line; do
+    _id=$(printf '%s' "$_line" | sed -n 's/.*np-relay-back:\\([A-Za-z0-9]*\\).*/\\1/p')
+    [ -n "$_id" ] || continue
+    case "$NP_IPT_IDS $NP_GOST_IDS" in
+      *" $_id "*) continue ;;
+    esac
+    _rule=\${_line#-A NP_RELAY_BACK }
+    iptables -t mangle -D NP_RELAY_BACK $_rule 2>/dev/null || true
+    echo "· 已移除过期回程计数规则 $_id"
   done
 fi
 
