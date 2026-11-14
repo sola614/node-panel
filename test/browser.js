@@ -735,7 +735,13 @@ async function main() {
 
     const countBefore = await textOf('#a-count', cdp);
     await type('#a-q', TAG + '-甲', cdp);
-    await sleep(900);
+    // 等条件而不是固定 sleep：CI 的库里是几百条日志，搜索防抖 260ms + 请求 + 重画
+    // 在慢机器上会超过 900ms，硬等就会抢跑（0.1.53 的 CI 正是挂在这里）
+    await waitFor(
+      `return (() => { const n = document.querySelectorAll('#a-tbody tr').length; return n > 0 && n < 30; })()`,
+      '搜索收敛到少量行',
+      cdp,
+    );
     const filteredRows = await count('#a-tbody tr', cdp);
     const countAfter = await textOf('#a-count', cdp);
     ok('搜关键字能过滤日志', filteredRows > 0 && filteredRows < 30, `${filteredRows} 行`);
@@ -744,8 +750,8 @@ async function main() {
     ok('计数与实际命中条数一致', filteredNum === filteredRows, `文案 ${filteredNum} / 实际 ${filteredRows} 行`);
 
     await type('#a-q', 'zzz-不存在-zzz', cdp);
-    await sleep(900);
-    ok('搜不到时给出空态', /没有匹配的日志/.test(await textOf('#a-tbody', cdp)));
+    await waitFor(`return /没有匹配的日志/.test(document.querySelector('#a-tbody').textContent)`, '空态', cdp);
+    ok('搜不到时给出空态', true);
 
     /* ==================== 9. 上传恢复（破坏性，放最后） ==================== */
     console.log('\n9. 上传 .db 恢复');
