@@ -17,6 +17,8 @@ const ROOT = path.join(__dirname, '..');
 const SRC = path.join(ROOT, 'public');
 const DIST = path.join(ROOT, 'dist');
 const DEMO = __dirname;
+// 静态站没有服务端替换，__V__ 必须在这里换成真实版本号（否则 ?v=__V__ 会原样留在 URL 里）
+const appVersion = require('../scripts/version').readVersion(ROOT);
 
 function copyDir(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
@@ -43,11 +45,13 @@ for (const name of fs.readdirSync(DIST)) {
   if (!name.endsWith('.html')) continue;
   const file = path.join(DIST, name);
   let html = relativize(fs.readFileSync(file, 'utf8'));
+  html = html.replace(/__V__/g, appVersion);
 
   if (name === 'index.html') {
-    const anchor = '<script src="theme.js"></script>';
-    if (!html.includes(anchor)) throw new Error('index.html 里找不到 theme.js 的引入位置，无法插入演示层');
-    html = html.replace(anchor, anchor + '\n<script src="demo.js"></script>');
+    // theme.js 现在带 ?v=<版本> 做缓存失效，锚点不能写死整串，否则改一次静态资源版本就断
+    const anchor = /<script src="theme\.js(?:\?[^"]*)?"><\/script>/;
+    if (!anchor.test(html)) throw new Error('index.html 里找不到 theme.js 的引入位置，无法插入演示层');
+    html = html.replace(anchor, (m) => `${m}\n<script src="demo.js"></script>`);
   }
   fs.writeFileSync(file, html, 'utf8');
   pages++;
@@ -58,7 +62,7 @@ copyDir(path.join(DEMO, 'api'), path.join(DIST, 'api'));
 
 // 快照是录出来的字面量，重录不勤就会比 package.json 落后（0.1.33 就漏了两处）。
 // 构建时按唯一来源兜底注入：仓库里忘了同步，Pages 上显示的版本号也仍然正确。
-const appVersion = require('../scripts/version').readVersion(ROOT);
+
 let synced = 0;
 for (const name of fs.readdirSync(path.join(DIST, 'api'))) {
   if (!name.endsWith('.json')) continue;
