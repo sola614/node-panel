@@ -1875,6 +1875,33 @@ else
   echo "! 未找到 systemd / OpenRC：gost 规则无法常驻（可改用 iptables 规则）"
   NP_FAIL=1
 fi
+# gost 本身不依赖 iptables 转发，但入口流量统计要用它的计数链。
+# 缺 iptables 时自动安装（Alpine 默认不装），安装后重新探测 comment 模块。
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "→ gost 流量统计需要 iptables，尝试自动安装"
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache iptables 2>&1 | tail -n 3
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables 2>&1 | tail -n 3
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y iptables 2>&1 | tail -n 3
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y iptables 2>&1 | tail -n 3
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm iptables 2>&1 | tail -n 3
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install iptables 2>&1 | tail -n 3
+  fi
+  export PATH="$PATH:/usr/sbin:/sbin"
+fi
+HAS_COMMENT=0
+if command -v iptables >/dev/null 2>&1; then
+  iptables -m comment -h >/dev/null 2>&1 && HAS_COMMENT=1
+fi
+if [ "$HAS_COMMENT" != '1' ]; then
+  echo "! gost 流量统计需要 iptables + comment 模块；当前不可用，规则会正常转发但没有流量数据"
+fi
 # 入口流量计数（gost 没有 DNAT 规则可挂计数器）：往固定计数链里插一条 RETURN 规则。
 # 规则只建一次、不重建，所以计数器跨轮累积；agent 每轮读它上报。
 if [ "$HAS_COMMENT" = '1' ]; then

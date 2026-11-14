@@ -270,6 +270,8 @@ if (!hasBash) {
     gostInstall.includes('tar -xzO gost') && gostInstall.includes('df -k'));
   ok('中转收敛包下载走流式解压',
     sync.includes('tar -xzO gost') && sync.includes('df -k'));
+  ok('gost 模式缺 iptables 时自动安装（收敛包）',
+    sync.includes('gost 流量统计需要 iptables') && sync.includes('apk add --no-cache iptables'));
   ok('中转收敛包兼容 OpenRC', sync.includes('rc-service') && sync.includes('/etc/init.d/gost-relay-'));
   ok('gost 规则带流量计数链', sync.includes('NP_RELAY_COUNT') && sync.includes('np-relay-count:ab12cd34'));
   ok('iptables 规则未变化时保留计数器', sync.includes('保留计数器'));

@@ -1178,6 +1178,19 @@ function bindNodeForm(mask) {
       syncEntryPlanNotice();
       return;
     }
+    // 下拉按「中转服务器」分组：同名规则在不同入口机上很常见，组头能区分
+    const relayGroups = [];
+    const relayByServer = new Map();
+    for (const rule of relayRules) {
+      const key = rule.serverId || '';
+      if (!relayByServer.has(key)) {
+        const group = { name: rule.serverName || '中转机', host: rule.serverHost || '', items: [] };
+        relayByServer.set(key, group);
+        relayGroups.push(group);
+      }
+      relayByServer.get(key).items.push(rule);
+    }
+
     box.innerHTML = entries
       .map((e, i) => {
         const names = (e.planIds || []).map((pid) => planNames.get(pid)).filter(Boolean);
@@ -1192,12 +1205,21 @@ function bindNodeForm(mask) {
           <button type="button" class="btn btn-sm btn-ghost e-down" title="下移" ${i === entries.length - 1 ? 'disabled' : ''} style="padding:2px 6px;flex-shrink:0">↓</button>
           ${e.disabled ? '<span class="badge badge-dim" style="flex-shrink:0" title="关联的中转规则已停用，或手动停用了这个入口">已停用</span>' : ''}
           <input type="text" class="e-name" value="${esc(e.name)}" placeholder="名称，如：广州中转" style="flex:0 0 130px">
-          <select class="e-relay" style="flex:0 0 190px;min-width:0">
+          <select class="e-relay" style="flex:0 0 235px;min-width:0">
             <option value="">手填地址</option>
-            ${relayRules
+            ${relayGroups
               .map(
-                (r) =>
-                  `<option value="${esc(r.id)}" ${e.relayId === r.id ? 'selected' : ''}>${esc(r.name)} · ${esc(r.serverHost || '')}:${esc(r.listenPort)}</option>`,
+                (g) =>
+                  `<optgroup label="${esc(g.name)}${g.host ? ' · ' + esc(g.host) : ''}">
+                    ${g.items
+                      .map(
+                        (r) =>
+                          `<option value="${esc(r.id)}" ${e.relayId === r.id ? 'selected' : ''}>${esc(
+                            r.name,
+                          )} · :${esc(r.listenPort)}</option>`,
+                      )
+                      .join('')}
+                  </optgroup>`,
               )
               .join('')}
           </select>

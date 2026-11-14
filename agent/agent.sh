@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.50'
+VERSION='0.1.51'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -1901,7 +1901,17 @@ receipt_escape() {
 # 注意：只统计客户端 → 入口机方向；回程由 conntrack 反向 NAT，不进 PREROUTING。
 collect_relay_traffic() {
   [ "$RELAY_ONLY" = '1' ] || return 0
-  command -v iptables >/dev/null 2>&1 || return 0
+  # iptables 可能装在 /usr/sbin，而 agent 的 PATH 不一定包含
+  export PATH="$PATH:/usr/sbin:/sbin"
+  if ! command -v iptables >/dev/null 2>&1; then
+    # gost 转发不依赖 iptables，但流量统计依赖它的计数链；只提示一次，装好后自动恢复
+    if [ ! -f "$STATE_DIR/.traffic-no-iptables" ]; then
+      log "! 中转流量统计需要 iptables，但本机未安装：计数链无法读取；装好后会自动恢复"
+      : > "$STATE_DIR/.traffic-no-iptables" 2>/dev/null
+    fi
+    return 0
+  fi
+  rm -f "$STATE_DIR/.traffic-no-iptables" 2>/dev/null
   mkdir -p "$RUN_DIR" 2>/dev/null
   {
     iptables -t nat -L PREROUTING -v -n -x 2>/dev/null
