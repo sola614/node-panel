@@ -81,6 +81,118 @@ function disguiseAgent(text, stealth) {
 }
 
 /**
+
+ * 旧布局迁移（0.1.54）：把 nodepanel-agent / /opt/nodepanel 迁到伪装名。
+ *
+ * 为什么默认也迁移：伪装不再是「每台服务器一个开关」，agent 统一装成 logsync。
+ * 但老机器上跑的是 nodepanel-agent，直接按新名字装会**双开** —— 同一个 token
+ * 两个 agent 同时拉配置、同时发回执，日志翻倍、状态互相覆盖。
+ *
+ * 保守顺序（关键）：**先复制、不搬移，旧服务全程不停**。
+ * 反过来「先停旧再搬」的风险是：新服务一旦起不来，这台机就彻底失联了，
+ * 而那时面板也连不上，只能上控制台救。现在即使新服务失败，旧进程照常在跑。
+ *
+ * 迁移块里会出现旧名 nodepanel，这是必须的（要告诉人往哪搬）。
+ * 脚本是一次性执行的、不留在机器上，而伪装针对的是**运行态**被人看见，
+ * 两者不冲突。测试用 `# >>> 旧布局迁移` 标记把这段剥掉再断言。
+ */
+function legacyMigrateBlock() {
+  return `# >>> 旧布局迁移（0.1.54）
+OLD_DIR="/opt/nodepanel"
+OLD_UNIT="nodepanel-agent"
+NEW_UNIT="logsync"
+MIGRATED=''
+
+# 判定看 agent.env 而不是目录：脚本开头已经 mkdir 过 /opt/logsync（日志/运行时目录），
+# 用「目录不存在」当条件会永远为假；而 agent.env 只会在真正部署过之后才存在。
+if [ -f "$OLD_DIR/agent.env" ] && [ ! -f /opt/logsync/agent.env ]; then
+  say "检测到旧布局 $OLD_DIR，复制到 /opt/logsync（旧服务保持运行）"
+  if mkdir -p /opt/logsync && cp -a "$OLD_DIR"/. /opt/logsync/ 2>/dev/null; then
+    mkdir -p /var/log/logsync
+    [ -d /var/log/nodepanel ] && cp -a /var/log/nodepanel/. /var/log/logsync/ 2>/dev/null
+    # 旧 agent.env 里可能写着指向旧目录的绝对路径，删掉让下面按新布局重写
+    rm -f /opt/logsync/agent.env
+    MIGRATED=1
+    say "复制完成（新服务验证通过后才会停旧服务）"
+  else
+    bad "复制旧目录失败（权限或磁盘）—— 本次安装中止，机器仍按旧布局运行"
+    exit 1
+  fi
+fi
+# <<< 旧布局迁移`;
+}
+
+/** 迁移收尾：新服务确认在跑，才停旧的。没起来就原样保留，机器不失联。 */
+function legacyMigrateDoneBlock() {
+  return `# >>> 旧布局迁移收尾（0.1.54）
+if [ "$MIGRATED" = '1' ]; then
+  _new_ok=0
+  if command -v systemctl >/dev/null 2>&1; then
+    _i=0
+    while [ "$_i" -lt 5 ]; do
+      systemctl is-active --quiet "$NEW_UNIT" >/dev/null 2>&1 && { _new_ok=1; break; }
+      sleep 1
+      _i=$((_i + 1))
+    done
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service "$NEW_UNIT" status >/dev/null 2>&1 && _new_ok=1
+  else
+    # cron 模式没有常驻服务可比，crontab 已写入即视为就位
+    _new_ok=1
+  fi
+
+  if [ "$_new_ok" = '1' ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop "$OLD_UNIT" >/dev/null 2>&1
+      systemctl disable "$OLD_UNIT" >/dev/null 2>&1
+      rm -f "/etc/systemd/system/$OLD_UNIT.service"
+      systemctl daemon-reload >/dev/null 2>&1
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+      rc-service "$OLD_UNIT" stop >/dev/null 2>&1
+      rc-update del "$OLD_UNIT" default >/dev/null 2>&1
+      rm -f "/etc/init.d/$OLD_UNIT"
+    fi
+    # cron 兜底：旧条目必须删，否则两个 agent 同时跑
+    if command -v crontab >/dev/null 2>&1; then
+      crontab -l 2>/dev/null | grep -v "$OLD_DIR/agent.sh" | crontab - 2>/dev/null
+    fi
+    say "旧服务已停用；$OLD_DIR 保留为备份，确认新服务稳定后可手工删除"
+  else
+    bad "新服务没起来，旧布局继续运行（机器不会失联）"
+    note "排查：systemctl status $NEW_UNIT / journalctl -u $NEW_UNIT -n 50"
+  fi
+fi
+# <<< 旧布局迁移收尾`;
+}
+
+/**
+ * 卸载时顺带摘掉旧布局（0.1.54 之前的 nodepanel-agent）。
+ *
+ * 不自动删 /opt/nodepanel：里面可能有旧日志，留给人判断。但要停用并删除单元文件，
+ * 否则「卸载完重装」会被迁移逻辑再认成老机器，白复制一遍。
+ */
+function legacyUninstallBlock() {
+  return `# >>> 旧布局清理（0.1.54）
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl stop nodepanel-agent >/dev/null 2>&1
+  systemctl disable nodepanel-agent >/dev/null 2>&1
+  rm -f /etc/systemd/system/nodepanel-agent.service
+  systemctl daemon-reload >/dev/null 2>&1
+fi
+if command -v rc-service >/dev/null 2>&1; then
+  rc-service nodepanel-agent stop >/dev/null 2>&1
+  rc-update del nodepanel-agent default >/dev/null 2>&1
+  rm -f /etc/init.d/nodepanel-agent
+fi
+if command -v crontab >/dev/null 2>&1; then
+  crontab -l 2>/dev/null | grep -v '/opt/nodepanel/agent.sh' | crontab - 2>/dev/null
+fi
+[ -d /opt/nodepanel ] && echo "· 保留旧目录 /opt/nodepanel（确认不需要后可手工删除）"
+# <<< 旧布局清理`;
+}
+
+/**
  * 中转落地地址：只接受裸 IPv4 或域名。
  *
  * 它会被拼进 `iptables -t nat -j DNAT --to-destination`，这个位置必须是一个纯
@@ -98,7 +210,11 @@ function relayTarget(raw) {
   return isValidHost(v, v) ? v : '';
 }
 
-function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc, relayOnly = false, stealth = false }) {
+function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc, relayOnly = false, stealth = true }) {
+  // 0.1.54 起统一伪装：不再提供「不伪装」的部署方式。
+  // 这里强制覆盖参数而不是只改默认值 —— 任何一处调用忘了传、或老代码传了 false，
+  // 那台机器就会退回 /opt/nodepanel，和已经迁移过来的机器各用一套命名。
+  stealth = true;
   // 面板地址来自请求头，插进 shell 之前先去掉能掀起风浪的字符
   const safeUrl = urlSafe(panelUrl);
   // 名称会进双引号变量：换行撕开语句，引号/反引号/$ 能跑命令
@@ -106,6 +222,9 @@ function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, ag
   // 中转机只跑 agent 的转发同步：不下载 Xray / hysteria，也不碰机器上已有的同类服务
   const wantHy = relayOnly ? false : !!needHysteria;
   const wantXray = relayOnly ? false : !!needXray;
+  // 备用面板地址（0.1.5x）：写进 agent.env 做初始兜底，之后以面板下发的为准。
+  // 留空时这一行是空串，agent 侧等同「未配置备用地址」。
+  const backupUrl = urlSafe(String(store.db().settings.agentBackupUrl || '').trim());
   return disguiseAgent(`#!/bin/sh
 # ${shellSafe(store.db().settings.siteName)} · ${relayOnly ? '中转机部署脚本' : '节点部署脚本'}
 # 目标：${safeLabel}
@@ -118,6 +237,7 @@ ${relayOnly
 set -u
 
 PANEL_URL="${safeUrl}"
+PANEL_URL_BACKUP="${backupUrl}"
 AGENT_TOKEN="${token}"
 TARGET_LABEL="${safeLabel}"
 NEED_HYSTERIA="${wantHy ? '1' : '0'}"
@@ -193,6 +313,10 @@ download() {
 }
 
 # ------------------------------- 1. agent ----------------------------------
+# 迁移必须在装 agent 之前：它会把旧目录整体复制过来（含旧的 agent.sh / agent.env），
+# 放到后面就会把刚写好的新脚本覆盖回旧版本。
+# 放在这一步之前还有个好处：复制完紧接着重写 agent.sh，不需要单独清理。
+@MIGRATE@
 step "agent 脚本 → /opt/nodepanel/agent.sh"
 mkdir -p /opt/nodepanel /var/log/nodepanel /run/nodepanel
 
@@ -545,6 +669,7 @@ fi
 # 任何 source 它的地方都会把空格后面那截当命令执行（restart: not found）
 cat > /opt/nodepanel/agent.env <<EOF
 PANEL_URL="$PANEL_URL"
+PANEL_URL_BACKUP="$PANEL_URL_BACKUP"
 AGENT_TOKEN="$AGENT_TOKEN"
 INTERVAL="$INTERVAL"
 RELAY_ONLY="$RELAY_ONLY"
@@ -557,6 +682,11 @@ EOF
 chmod 600 /opt/nodepanel/agent.env
 
 say "PANEL_URL=$PANEL_URL"
+if [ -n "$PANEL_URL_BACKUP" ]; then
+  say "备用地址=$PANEL_URL_BACKUP（连续 3 次取不到配置时切换）"
+else
+  note "未配置备用地址：主地址不可达时只能等它恢复（面板「设置 → 基础」可填）"
+fi
 say "INTERVAL=\${INTERVAL}s · XRAY_CONFIG=$XRAY_ETC/config.json"
 if [ -n "$RELOAD_CMD" ]; then
   say "RELOAD_CMD=\\"$RELOAD_CMD\\""
@@ -678,6 +808,8 @@ if [ "$NEED_XRAY" = "1" ] && [ "\${SKIP_XRAY:-0}" != "1" ]; then
   fi
 fi
 
+@MIGRATE_DONE@
+
 # ------------------------------ 汇总 ----------------------------------------
 ELAPSED=$(( $(date +%s) - START_TS ))
 
@@ -734,7 +866,11 @@ esac
 printf '  手动一轮   %s\\n' 'sh /opt/nodepanel/agent.sh --once'
 printf '  卸载       %s\\n' 'sh /opt/nodepanel/uninstall.sh'
 printf '\\n'
-`, stealth);
+`, stealth)
+    // 迁移块放最后注入：里面必须出现旧名 nodepanel（要告诉人往哪搬），
+    // 不能经过 disguiseAgent 的整体替换，否则新旧两个路径会被换成同一个。
+    .replace('@MIGRATE@', stealth ? legacyMigrateBlock() : '')
+    .replace('@MIGRATE_DONE@', stealth ? legacyMigrateDoneBlock() : '');
 }
 
 function readAgentSource() {
@@ -752,7 +888,9 @@ function readAgentSource() {
  * 不碰 Xray 配置和日志 —— 那两样可能是人家自己的资产，想连根拔起要显式 --purge。
  * 幂等：没有对应文件时各分支直接跳过，重复执行不报错。
  */
-function buildUninstallScript({ label, relayOnly = false, stealth = false }) {
+function buildUninstallScript({ label, relayOnly = false, stealth = true }) {
+  // 与部署保持一致：卸载必须按同一套命名去找东西，传 false 会把 logsync 那套留在机器上
+  stealth = true;
   // 同上：名称里的换行会把注释行撕开
   const safeLabel = shellSafe(label);
   return disguiseAgent(`#!/bin/sh
@@ -1010,7 +1148,10 @@ else
   echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
 fi
 echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即可恢复接入。"
-`, stealth);
+
+@MIGRATE_UNINSTALL@
+`, stealth)
+    .replace('@MIGRATE_UNINSTALL@', stealth ? legacyUninstallBlock() : '');
 }
 
 /** 服务器 / 独立节点共用的卸载脚本鉴权 */
@@ -1794,47 +1935,138 @@ ${relayAck()}
  *
  * 命名与手动脚本完全一致（gost-relay-<id>.service / np-relay:<id>），两条通道可以互相接手。
  */
-function buildRelaySyncScript({ rules = [], githubProxy = '', probe = [] } = {}) {
+function buildRelaySyncScript({ rules = [], githubProxy = '', probe = [], diag = {} } = {}) {
   const gostRules = rules.filter((r) => r.tool === 'gost');
   const iptRules = rules.filter((r) => r.tool === 'iptables');
   const idList = (list) => `' ${list.map((r) => shellSafe(r.id)).join(' ')} '`;
   const proxy = shellSafe(String(githubProxy || ''));
+  // 诊断参数来自面板设置：采样次数决定能不能算丢包率，超时决定「多久算断」。
+  // 上限与 server/settings.js 的校验一致，防止老面板/脏数据把命令拼坏。
+  const diagCount = Math.min(10, Math.max(1, Number(diag && diag.count) || 3));
+  const diagTimeout = Math.min(15, Math.max(1, Number(diag && diag.timeout) || 5));
+  const diagProbes = String((diag && diag.probes) || '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => /^[A-Za-z0-9._-]+:\d{1,5}$/.test(s))
+    .slice(0, 6);
 
   /**
    * 入口机视角诊断（面板点「从入口机检测」后的一次性探测）。
    * 只在这一轮 bundle 里生成，探测结果写 JSON 文件，agent 随回执带回后删除。
-   * 延迟用 curl 的 time_connect（TCP 握手耗时），目标可能是任意 TCP 端口。
+   *
+   * 0.1.5x 起从「单次 curl 看握手」升级成一组证据：DNS 解析结果、多次采样
+   * 的丢包率、出口参考点、本机 gost / 监听 / 计数增量。原因是单次探测只能
+   * 给出「可达/不可达」，而中转故障里「解析错了」「偶发丢包」「入口机出境
+   * 被切」这三种在结果上都表现为不可达，排查时会往完全错误的方向走。
    */
   const probeBlock = (list) => {
     if (!Array.isArray(list) || !list.length) return '';
+    const exitList = diagProbes.length ? diagProbes.join(' ') : 'www.baidu.com:443 8.8.8.8:443';
     const chunks = [];
     chunks.push(`
 # ---- 入口机视角诊断（面板触发的一次性探测） ----
-_probe_file="/opt/nodepanel/relay-probe.json"
-mkdir -p /opt/nodepanel
-if command -v curl >/dev/null 2>&1; then
+# 只在面板点了「从入口机检测」的这一轮生成，不做定时探测 —— 避免变成对外扫描。
+_probe_dir="\${STATE_DIR:-/opt/nodepanel}"
+_probe_file="\$_probe_dir/relay-probe.json"
+mkdir -p "\$_probe_dir" 2>/dev/null
+NP_DIAG_N=${diagCount}
+NP_DIAG_T=${diagTimeout}
+NP_DIAG_EXIT='${exitList}'
+
+# 单次 TCP 握手。用 curl 而不是 nc：busybox 的 nc 基本没有 -z（Alpine 里直接不可用），
+# 而 agent 本来就依赖 curl。端口上跑的不是 HTTP 也无所谓 —— 只看握手是否完成，
+# 不看响应内容；握手成功但对端不说话记为 open（链路通、服务可能没起）。
+np_diag_once() {
+  _rc=0
+  _tc=\$(curl -s -o /dev/null --connect-timeout "\$NP_DIAG_T" --max-time "\$NP_DIAG_T" \\
+        -w '%{time_connect}' "http://\$1:\$2/" 2>/dev/null) || _rc=\$?
+  case "\$_rc" in 6) printf 'no-dns'; return 0 ;; esac
+  case "\$_tc" in '' | 0 | 0.000000) printf 'timeout'; return 0 ;; esac
+  _ms=\$(printf '%s' "\$_tc" | awk '{ printf "%d", \$1 * 1000 }')
+  if [ "\$_rc" = '0' ]; then printf 'ok:%s' "\$_ms"; else printf 'open:%s' "\$_ms"; fi
+}
+
+# 多采样：返回 "<平均ms> <丢包%> <状态>"。
+# 单次探测分不出「偶发丢包」和「断链」，而这恰恰是中转排障最需要区分的一件事。
+np_diag_stats() {
+  _i=0; _okn=0; _sum=0; _state=''
+  while [ "\$_i" -lt "\$NP_DIAG_N" ]; do
+    _r=\$(np_diag_once "\$1" "\$2")
+    case "\$_r" in
+      ok:* | open:*) _okn=\$((_okn + 1)); _sum=\$((_sum + \${_r#*:})); _state=\${_r%%:*} ;;
+      *) [ -n "\$_state" ] || _state=\$_r ;;
+    esac
+    _i=\$((_i + 1))
+    [ "\$_i" -lt "\$NP_DIAG_N" ] && sleep 0.2 2>/dev/null
+  done
+  _avg=0
+  [ "\$_okn" -gt 0 ] && _avg=\$((_sum / _okn))
+  _loss=\$(( (NP_DIAG_N - _okn) * 100 / NP_DIAG_N ))
+  printf '%s %s %s' "\$_avg" "\$_loss" "\${_state:-timeout}"
+}
+
+# 解析结果单独回报：这次排障真正卡住的一步就是「域名解析到哪」，
+# 只给一个可达/不可达永远看不出来。
+np_diag_dns() {
+  _ips=\$(getent ahosts "\$1" 2>/dev/null | awk '\$2 == "STREAM" { print \$1 }' | sort -u | tr '\\n' ' ' 2>/dev/null)
+  case "\$_ips" in '') _ips=\$(nslookup "\$1" 2>/dev/null | awk '/^Address: / { print \$2 }' | tr '\\n' ' ') ;; esac
+  printf '%s' "\$_ips" | sed 's/[[:space:]]*\$//'
+}
+
+# 本机证据：包有没有到、服务有没有在跑。这两项是「面板显示离线但业务正常」
+# 与「服务真挂了」的分水岭，也是这次事故里最先该看的东西。
+_gost_n=\$(ps 2>/dev/null | grep -c '[g]ost')
+[ -n "\$_gost_n" ] || _gost_n=0
+_listen_n=\$(netstat -lnt 2>/dev/null | grep -c 'LISTEN')
+[ -n "\$_listen_n" ] || _listen_n=0
+_nat1=\$(iptables -t nat -L NP_RELAY_COUNT -v -n -x 2>/dev/null | awk 'NR > 2 { s += \$1 } END { print s + 0 }')
+sleep 2 2>/dev/null
+_nat2=\$(iptables -t nat -L NP_RELAY_COUNT -v -n -x 2>/dev/null | awk 'NR > 2 { s += \$1 } END { print s + 0 }')
+_nat_delta=\$(( \${_nat2:-0} - \${_nat1:-0} ))
+[ "\$_nat_delta" -lt 0 ] && _nat_delta=0
+`);
+
+    chunks.push(`if command -v curl >/dev/null 2>&1; then
   {
-    printf '{'
-    _rsep=''`);
+    printf '{"_meta":{"at":"%s","count":%s,"timeout":%s,"exit":[' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$NP_DIAG_N" "\$NP_DIAG_T"
+    _sep=''
+    for _ep in \$NP_DIAG_EXIT; do
+      _eh=\${_ep%:*}; _epp=\${_ep##*:}
+      _st=\$(np_diag_stats "\$_eh" "\$_epp")
+      _avg=\${_st%% *}; _rest=\${_st#* }; _loss=\${_rest%% *}; _state=\${_rest#* }
+      _ok=false
+      case "\$_state" in ok | open) _ok=true ;; esac
+      _err=''
+      [ "\$_ok" = 'true' ] || _err=\$_state
+      printf '%s{"probe":"%s","ok":%s,"avg":%s,"loss":%s,"error":"%s"}' "\$_sep" "\$_ep" "\$_ok" "\$_avg" "\$_loss" "\$_err"
+      _sep=','
+    done
+    printf '],"local":{"gost":%s,"listen":%s,"natDelta":%s}}' "\$_gost_n" "\$_listen_n" "\$_nat_delta"`);
+
     for (const p of list) {
       const id = shellSafe(p.id);
-      chunks.push(`    printf '%s"${id}":{"at":"%s","targets":[' "$_rsep" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    _rsep=','
+      chunks.push(`    printf ',"${id}":{"at":"%s","targets":[' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     _tsep=''`);
-      for (const t of p.targets || []) {
+      for (const t of (p.targets || []).slice(0, 4)) {
         const host = shellSafe(t.host);
         const port = Number(t.port) || 443;
-        chunks.push(`    _tc=$(curl -s -o /dev/null --connect-timeout 3 --max-time 4 -w '%{time_connect}' "http://${host}:${port}/" 2>/dev/null)
-    _ok=false; _ms=0; _err=unreachable
-    case "$_tc" in ''|0|0.000000) ;; *) _ok=true; _err=''; _ms=$(printf '%s' "$_tc" | awk '{printf "%d", $1*1000}') ;; esac
-    printf '%s{"host":"${host}","port":${port},"ok":%s,"ms":%s,"error":"%s"}' "$_tsep" "$_ok" "$_ms" "$_err"
+        chunks.push(`    _ips=\$(np_diag_dns "${host}")
+    _st=\$(np_diag_stats "${host}" ${port})
+    _avg=\${_st%% *}; _rest=\${_st#* }; _loss=\${_rest%% *}; _state=\${_rest#* }
+    _ok=false
+    case "\$_state" in ok | open) _ok=true ;; esac
+    _err=''
+    [ "\$_ok" = 'true' ] || _err=\$_state
+    printf '%s{"host":"${host}","port":${port},"ok":%s,"ms":%s,"loss":%s,"ips":"%s","state":"%s","error":"%s"}' \\
+      "\$_tsep" "\$_ok" "\$_avg" "\$_loss" "\$_ips" "\$_state" "\$_err"
     _tsep=','`);
       }
       chunks.push(`    printf ']}'`);
     }
+
     chunks.push(`    printf '}'
-  } > "$_probe_file" 2>/dev/null
-  echo "· 入口机诊断完成：$_probe_file"
+  } > "\$_probe_file" 2>/dev/null
+  echo "· 入口机诊断完成：\$_probe_file"
 else
   echo "! 未找到 curl：无法从入口机执行诊断"
 fi

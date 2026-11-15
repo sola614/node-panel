@@ -137,6 +137,37 @@ RENDERERS.settings = async () => {
               <span class="mono">https://ghproxy.com/https://github.com/...</span>
             </div>
           </div>
+          <div class="field">
+            <label>备用面板地址（主地址连不上时自动切换）</label>
+            <input type="text" id="set-backup" value="${esc(s.agentBackupUrl || '')}" placeholder="https://203.0.113.10:8443" spellcheck="false" autocomplete="off">
+            <div class="hint">
+              必须能<b>直连面板源站</b>：填 IP:端口，或一条灰云（DNS only）域名。
+              <b>不要填 Cloudflare 加速（橙云）的域名</b> —— 它和主地址走同一条 CF 链路，
+              主地址被 CF 影响时会一起断，保存时也会被拒绝。
+              改动会随下一轮配置包下发，节点无需重跑部署命令。
+            </div>
+            <div class="field-err" id="set-backup-err" hidden></div>
+          </div>
+          <div class="field">
+            <label>入口机诊断</label>
+            <div class="form-row">
+              <div class="field">
+                <label>采样次数</label>
+                <input type="number" id="set-diag-count" min="1" max="10" value="${esc(s.diagCount || '3')}">
+              </div>
+              <div class="field">
+                <label>单次超时（秒）</label>
+                <input type="number" id="set-diag-timeout" min="1" max="15" value="${esc(s.diagTimeout || '5')}">
+              </div>
+            </div>
+            <input type="text" id="set-diag-probes" value="${esc(s.diagProbes || '')}" placeholder="www.baidu.com:443,github.com:443,8.8.8.8:443" spellcheck="false" autocomplete="off">
+            <div class="hint">
+              出口参考点，<span class="mono">host:port</span> 逗号分隔，最多 6 个。
+              用 TCP 握手判断（机房常直接丢 ICMP，用 ping 会把「能通」误判成「断了」）；
+              留空则不做出口探测。建议至少留一个境内地址做对照，否则分不清「出口被切」和「整机没网」。
+            </div>
+            <div class="field-err" id="set-diag-err" hidden></div>
+          </div>
           <button class="btn btn-primary" data-act="save-settings">保存设置</button>
         </div>
       </div>
@@ -1954,18 +1985,39 @@ async function runAction(act, btn, id) {
         $('#set-base').focus();
         return;
       }
-      await api('/api/settings', {
-        method: 'PUT',
-        body: JSON.stringify({
-          siteName: $('#set-name').value.trim(),
-          subBase: base.value,
-          notice: $('#set-notice').value,
-          githubProxy: $('#set-ghproxy') ? $('#set-ghproxy').value.trim() : undefined,
-        }),
-      });
+      const errBox = $('#set-backup-err');
+      if (errBox) {
+        errBox.hidden = true;
+        errBox.textContent = '';
+      }
+      let saved;
+      try {
+        saved = await api('/api/settings', {
+          method: 'PUT',
+          body: JSON.stringify({
+            siteName: $('#set-name').value.trim(),
+            subBase: base.value,
+            notice: $('#set-notice').value,
+            githubProxy: $('#set-ghproxy') ? $('#set-ghproxy').value.trim() : undefined,
+            agentBackupUrl: $('#set-backup') ? $('#set-backup').value.trim() : undefined,
+            diagCount: $('#set-diag-count') ? $('#set-diag-count').value : undefined,
+            diagTimeout: $('#set-diag-timeout') ? $('#set-diag-timeout').value : undefined,
+            diagProbes: $('#set-diag-probes') ? $('#set-diag-probes').value.trim() : undefined,
+          }),
+        });
+      } catch (err) {
+        // 备用地址被后端拒绝（格式/CF 段）时把原因贴在字段下面，比一个全局 toast 好找
+        if (errBox) {
+          errBox.hidden = false;
+          errBox.textContent = err.message || String(err);
+        }
+        return;
+      }
+      if (saved && saved.settings && $('#set-backup')) $('#set-backup').value = saved.settings.agentBackupUrl || '';
       if ($('#set-base')) $('#set-base').value = base.value;
       checkSubBaseField(false);
-      toast('设置已保存', 'ok');
+      if (saved && saved.warning) toast(saved.warning, 'warn');
+      else toast('设置已保存', 'ok');
       break;
     }
     case 'save-sub': {

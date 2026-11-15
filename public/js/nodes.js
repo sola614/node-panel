@@ -1663,9 +1663,9 @@ async function nodeDeployFlow(id) {
   if (!n) return;
   const cmd = rootShCmd(`${location.origin}/api/nodes/${n.id}/install?token=${n.token}`, '', 'np-node-setup.sh');
 
-  // 伪装部署（独立节点）与服务器同一个机制：目录 / 服务名整体换成中性名
-  const alias = n.stealth ? 'logsync' : 'nodepanel';
-  const unit = n.stealth ? 'logsync' : 'nodepanel-agent';
+  // 0.1.54 起独立节点与服务器统一伪装：目录 / 服务名固定是 logsync
+  const alias = 'logsync';
+  const unit = 'logsync';
   const pad = (c) => c + ' '.repeat(Math.max(1, 38 - c.length));
   const lastTip =
     n.protocol === 'hysteria2'
@@ -1679,12 +1679,10 @@ async function nodeDeployFlow(id) {
     body: `
       <p class="hint" style="margin:0 0 10px">在 <b>${esc(n.host || '待上报地址')}</b> 的终端执行（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）：</p>
 
-      <label style="display:flex;align-items:flex-start;gap:8px;margin:0 0 12px;cursor:pointer">
-        <input type="checkbox" id="nd-stealth" ${n.stealth ? 'checked' : ''} style="width:auto;margin-top:3px">
-        <span class="hint" style="margin:0">伪装部署标识：装到 <code>/opt/logsync</code>，服务名 <code>logsync</code>
-          （默认是 <code>/opt/nodepanel</code> + <code>nodepanel-agent</code>）。
-          只影响之后生成的部署 / 卸载脚本，<b>已经装好的机器要重跑一次部署才生效</b>。</span>
-      </label>
+      <div class="hint" style="margin:0 0 12px">
+        统一安装为 <code>/opt/logsync</code>，服务名 <code>logsync</code>。
+        早期按默认名装过的机器，重跑一次本命令会自动迁移（先复制、新服务确认在跑才停旧的，不会失联）。
+      </div>
 
       <div class="code-wrap">
         <pre class="code">${esc(cmd)}</pre>
@@ -1705,28 +1703,11 @@ ${lastTip}</div>
       <div id="relay-box"></div>`,
   });
 
-  // 勾选当场落库并重算命令：命令来自服务端，不重开弹窗就会前后不一致
-  const stealthBox = $('#nd-stealth', mask);
-  if (stealthBox) {
-    stealthBox.addEventListener('change', async () => {
-      const next = stealthBox.checked;
-      stealthBox.disabled = true;
-      try {
-        await api('/api/nodes/' + id, { method: 'PUT', body: JSON.stringify({ stealth: next }) });
-        await render();
-        nodeDeployFlow(id);
-        toast(next ? '已切换为伪装部署，命令已更新' : '已恢复默认部署名，命令已更新', 'ok');
-      } catch (e) {
-        stealthBox.checked = !next;
-        stealthBox.disabled = false;
-        toast(e.message || '保存失败', 'bad');
-      }
-    });
-  }
-
   /* 中转入口：为每个入口生成 L4 转发脚本 */
   const entries = (n.entries || []).filter((e) => e.host);
-  const box = $('#relay-box', modalEl);
+  // 这里原来写的是 modalEl —— 一个从未定义过的变量。中性节点走不到这段所以没暴露，
+  // 一旦节点配了中转入口就会 ReferenceError，整个诊断弹窗后半段直接崩。
+  const box = $('#relay-box', mask);
   if (entries.length) {
     box.innerHTML = `
       <div class="section-title">中转部署</div>

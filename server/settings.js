@@ -14,6 +14,8 @@ const store = require('../lib/store');
 const sub = require('../lib/sub');
 const subTemplate = require('../lib/subTemplate');
 const logger = require('../lib/log');
+const dns = require('node:dns');
+const net = require('node:net');
 const { sendJson } = require('./http-util');
 const { auditAction } = require('./context');
 const { TLS_PORT, TLS_CERT_FILE, TLS_KEY_FILE } = require('./config');
@@ -82,6 +84,114 @@ function normalizeHttpUrl(raw, label) {
 }
 
 
+/* ------------------------- 备用面板地址与诊断参数 ------------------------- */
+/**
+ * 备用面板地址只接受「origin」形态：agent 把它当 PANEL_URL 用，所有请求都是在
+ * 后面拼 /api/agent/...，带路径会拼出 /foo/api/agent/bundle 这种 404 地址。
+ */
+function normalizePanelOrigin(raw, label) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) return '';
+  let url;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : 'https://' + text);
+  } catch {
+    throw new Error(`${label}格式不正确，请填完整地址，如 https://203.0.113.10:8443`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`${label}只支持 http:// 或 https:// 开头`);
+  }
+  if (url.username || url.password) throw new Error(`${label}不能包含账号密码`);
+  if (url.search || url.hash) throw new Error(`${label}不能带 ? 查询参数或 # 片段`);
+  if (url.pathname.replace(/\/+$/, '')) throw new Error(`${label}只需填到域名或 IP（可带端口），不要带路径`);
+  if (!isValidHost(rawHostOf(text), url.hostname)) {
+    throw new Error(`${label}不合法：需要是 IP 或带点号的域名`);
+  }
+  return url.origin;
+}
+
+// Cloudflare 公布的 IPv4 段（https://www.cloudflare.com/ips-v4）。
+// 只用于「拦住明显会跟着主地址一起断的配置」，不追求覆盖 v6：
+// agent 用 curl 访问备用地址，v4 走不通时这条备用链路本来也救不了场。
+const CF_V4_CIDRS = [
+  '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '104.16.0.0/13',
+  '104.24.0.0/14', '108.162.192.0/18', '131.0.72.0/22', '141.101.64.0/18',
+  '162.158.0.0/15', '172.64.0.0/13', '173.245.48.0/20', '188.114.96.0/20',
+  '190.93.240.0/20', '197.234.240.0/22', '198.41.128.0/17',
+];
+
+function ipv4ToInt(ip) {
+  const parts = String(ip).split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    const v = Number(p);
+    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+    n = n * 256 + v;
+  }
+  return n;
+}
+
+function inCidr(ip, cidr) {
+  const [base, bitsRaw] = String(cidr).split('/');
+  const bits = bitsRaw === undefined ? 32 : Number(bitsRaw);
+  const a = ipv4ToInt(ip);
+  const b = ipv4ToInt(base);
+  if (a === null || b === null || !Number.isInteger(bits)) return false;
+  const size = 2 ** (32 - bits);
+  return Math.floor(a / size) === Math.floor(b / size);
+}
+
+const isCloudflareIp = (ip) => CF_V4_CIDRS.some((c) => inCidr(ip, c));
+
+/**
+ * 判断一个备用地址会不会跟着 Cloudflare 一起断。
+ * 返回 'blocked'（解析到 CF 段）、'unresolved'（解析不到，仍允许保存）、''（正常）。
+ *
+ * 解析失败**不拦**：保存设置的时候 DNS 可能刚好没生效，拦下来会让人反复重试；
+ * 但要把这个事实带回给前端，因为切过去的瞬间必然失败。
+ */
+async function backupUrlCfState(origin) {
+  let hostname;
+  try {
+    hostname = new URL(origin).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    return '';
+  }
+  if (net.isIP(hostname) === 4) return isCloudflareIp(hostname) ? 'blocked' : '';
+  if (net.isIP(hostname) === 6) return '';
+  let addrs;
+  try {
+    addrs = await dns.promises.lookup(hostname, { all: true, family: 4 });
+  } catch {
+    return 'unresolved';
+  }
+  if (!addrs || !addrs.length) return 'unresolved';
+  return addrs.some((a) => isCloudflareIp(a.address)) ? 'blocked' : '';
+}
+
+/** 出口参考点：host:port 列表，最多 6 个（多了就是拿诊断当扫描器用） */
+function parseProbeList(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) return { value: '' };
+  const out = [];
+  for (const item of text.split(/[,\s]+/)) {
+    const t = item.trim();
+    if (!t) continue;
+    const m = /^([A-Za-z0-9._-]+):(\d{1,5})$/.exec(t);
+    if (!m) return { error: `出口参考点「${t}」格式不对，应为 host:port，如 8.8.8.8:443` };
+    const port = Number(m[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return { error: `出口参考点「${t}」端口不合法（1–65535）` };
+    }
+    if (!isValidHost(m[1], m[1])) return { error: `出口参考点「${t}」主机名不合法` };
+    out.push(`${m[1]}:${port}`);
+    if (out.length >= 6) break;
+  }
+  return { value: out.join(',') };
+}
+
+
 /* --------------------------------- 设置 ---------------------------------- */
 
 function getSettings(req, res) {
@@ -108,7 +218,7 @@ function getSettings(req, res) {
   });
 }
 
-function updateSettings(req, res, params, body) {
+async function updateSettings(req, res, params, body) {
   const s = store.db().settings;
 
   // 两段式：先把整份改动算进影子对象 next，全部校验通过才一次性写回 s。
@@ -147,6 +257,54 @@ function updateSettings(req, res, params, body) {
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
+  }
+
+  // 备用面板地址（0.1.5x）：存在的唯一意义是「主地址那条路断了还能过去」。
+  // 所以它必须与主地址**链路独立** —— 填一个 Cloudflare 橙云域名的话，
+  // 主地址因 CF 断掉时会跟着一起断，等于设了个摆设。这里直接拦掉。
+  let backupWarning = '';
+  if (body.agentBackupUrl !== undefined) {
+    let v;
+    try {
+      v = normalizePanelOrigin(body.agentBackupUrl, '备用面板地址');
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    if (v) {
+      const state = await backupUrlCfState(v);
+      if (state === 'blocked') {
+        return sendJson(res, 400, {
+          error:
+            '备用面板地址不能是 Cloudflare 加速（橙云）的域名：它解析到 Cloudflare 段，' +
+            '主地址被 CF 影响时会一起失效。请填源站直连地址 —— IP:端口，或一条灰云（DNS only）域名。',
+        });
+      }
+      if (state === 'unresolved') {
+        backupWarning = '备用面板地址当前解析不到 IPv4，已保存；但真切换过去会连不上，请确认域名/端口。';
+      }
+    }
+    next.agentBackupUrl = v;
+  }
+
+  // 入口机诊断参数（0.1.5x）：采样次数与超时决定「能不能区分抖动和断链」
+  if (body.diagCount !== undefined) {
+    const n = Math.floor(Number(body.diagCount));
+    if (!Number.isInteger(n) || n < 1 || n > 10) {
+      return sendJson(res, 400, { error: '诊断采样次数只能是 1–10' });
+    }
+    next.diagCount = String(n);
+  }
+  if (body.diagTimeout !== undefined) {
+    const n = Math.floor(Number(body.diagTimeout));
+    if (!Number.isInteger(n) || n < 1 || n > 15) {
+      return sendJson(res, 400, { error: '诊断单次超时只能是 1–15 秒' });
+    }
+    next.diagTimeout = String(n);
+  }
+  if (body.diagProbes !== undefined) {
+    const parsed = parseProbeList(body.diagProbes);
+    if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+    next.diagProbes = parsed.value;
   }
 
   // 在线订阅转换：转换地址与模板地址都只是拼进链接里给用户复制，
@@ -272,10 +430,16 @@ function updateSettings(req, res, params, body) {
     body.subTemplateAutoSync !== undefined || body.subTemplateSyncDay !== undefined || body.subTemplateSyncHour !== undefined
       ? `模板定时同步 ${s.subTemplateAutoSync === '1' ? `开（${tplSyncLabel(tplSyncConfig().day, tplSyncConfig().hour)}）` : '关'}`
       : '',
+    body.agentBackupUrl !== undefined ? `备用面板地址 ${s.agentBackupUrl || '(清空)'}` : '',
+    body.diagCount !== undefined || body.diagTimeout !== undefined || body.diagProbes !== undefined
+      ? `诊断参数 采样 ${s.diagCount} 次 / 超时 ${s.diagTimeout}s / 参考点 ${s.diagProbes || '未设置'}`
+      : '',
   ].filter(Boolean).join(' · '));
   sendJson(res, 200, {
     ok: true,
     settings: s,
+    // 备用地址解析不到时的软提示：保存成功但切过去必失败，前端要显示出来
+    warning: backupWarning || undefined,
     tplSyncNext: tplSyncConfig().enabled ? new Date(tplSyncNextAt(Date.now(), tplSyncConfig().day, tplSyncConfig().hour)).toISOString() : '',
     httpsActive: httpsState.ready,
     httpsError: httpsState.error,
@@ -495,4 +659,9 @@ module.exports = {
   updateSettings,
   syncClashTemplate,
   sweepTemplateSync,
+  // 纯函数，导出只给 test/settings-cf.js 验证 CIDR 边界：
+  // 判错一个网段，用户就会存进一个「主地址断了它也跟着断」的备用地址
+  __isCloudflareIp: isCloudflareIp,
+  __parseProbeList: parseProbeList,
+  __normalizePanelOrigin: normalizePanelOrigin,
 };

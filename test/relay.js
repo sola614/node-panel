@@ -114,10 +114,21 @@ ok('用户主动停用（无 appliedAt）保持停用', r3.enabled === false);
 console.log('\n下发隔离');
 const nodePayload = agent.buildAgentPayload(agent.scopeOfServer(db.servers.find((s) => s.id === 'srv-0001')));
 ok(
-  '落地机 payload 字段集合未变',
+  // runtime（备用面板地址 + 诊断参数）是有意加进两类 payload 的：它是 agent 的
+  // 运行期配置，落地机也需要备用地址。形状变化会改 hash，让所有 agent 重拉一次包，
+  // 这正是「改完设置立刻下发」需要的行为 —— 所以这里的期望跟着一起更新。
+  '落地机 payload 字段集合（含 runtime）',
   JSON.stringify(Object.keys(nodePayload).sort()) ===
-    JSON.stringify(['agentVersion', 'certs', 'hash', 'hysteria', 'nodes', 'ok', 'scope', 'userCount', 'xray']),
+    JSON.stringify(['agentVersion', 'certs', 'hash', 'hysteria', 'nodes', 'ok', 'runtime', 'scope', 'userCount', 'xray']),
   `(${Object.keys(nodePayload).sort().join(',')})`,
+);
+ok(
+  'runtime 带备用地址与诊断参数',
+  !!nodePayload.runtime &&
+    typeof nodePayload.runtime.backupUrl === 'string' &&
+    /^[0-9]+$/.test(nodePayload.runtime.diagCount) &&
+    /^[0-9]+$/.test(nodePayload.runtime.diagTimeout),
+  JSON.stringify(nodePayload.runtime),
 );
 ok('落地机 payload 不含 relay 段', !('relay' in nodePayload) && !JSON.stringify(nodePayload.scope).includes('relay'));
 

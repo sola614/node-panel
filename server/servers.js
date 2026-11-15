@@ -258,7 +258,9 @@ function installScript(req, res, params, body, session, ctx) {
     needHysteria,
     needXray,
     relayOnly,
-    stealth: !!s.stealth,
+    // 0.1.54 起统一伪装：agent 一律装成 logsync，不再按服务器开关。
+    // 老机器重跑部署命令时脚本会做一次保守迁移（先复制、新服务起来才停旧的）。
+    stealth: true,
     agentSrc,
   });
 
@@ -278,7 +280,8 @@ function uninstallScript(req, res, params, body, session, ctx) {
     session: getSession(ctx.req),
     filename: `uninstall-${s.name}.sh`,
     relayOnly: s.type === 'relay',
-    stealth: !!s.stealth,
+    // 与部署一致：卸载脚本也要按 logsync 的布局清理，并顺带摘掉旧单元
+    stealth: true,
   });
 }
 
@@ -311,7 +314,8 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
     label: `${node.name}（独立部署 · ${node.address}）`,
     needHysteria: node.protocol === 'hysteria2',
     needXray: node.protocol !== 'hysteria2',
-    stealth: !!node.stealth,
+    // 独立节点同样统一伪装（见 installScript 的说明）
+    stealth: true,
     agentSrc,
   });
 
@@ -333,7 +337,7 @@ function nodeUninstallScript(req, res, params, body, session, ctx) {
     tokenInUrl: ctx.query.get('token'),
     session: getSession(ctx.req),
     filename: `uninstall-${node.name}.sh`,
-    stealth: !!node.stealth,
+    stealth: true,
   });
 }
 

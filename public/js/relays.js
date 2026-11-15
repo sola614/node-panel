@@ -520,6 +520,14 @@ function parseAgentProbe(raw) {
   }
 }
 
+/* 诊断状态码 → 人话。这些值是入口机侧 shell 给的，故意保持短小便于塞进 JSON */
+const PROBE_STATE_TEXT = {
+  ok: '握手成功',
+  open: '握手成功但无响应',
+  timeout: '超时（无回应）',
+  'no-dns': '域名解析失败',
+};
+
 function agentProbeHtml(probe, requestedAt) {
   if (!probe) {
     return `<div class="hint" style="margin:0">${
@@ -528,22 +536,60 @@ function agentProbeHtml(probe, requestedAt) {
         : '还没有入口机诊断数据，点下方按钮触发一次。'
     }</div>`;
   }
+  const meta = probe.meta || null;
   const rows = (probe.targets || [])
     .map(
       (t, i) => `<tr>
         <td>${i + 1}</td>
         <td class="mono">${esc(t.host)}:${esc(t.port)}</td>
-        <td><span class="badge ${t.ok ? 'badge-ok' : 'badge-bad'}">${t.ok ? '可达' : '不可达'}</span></td>
+        <td><span class="badge ${t.ok ? 'badge-ok' : 'badge-bad'}">${
+          t.loss > 0 && t.ok ? `丢包 ${t.loss}%` : t.ok ? '可达' : '不可达'
+        }</span></td>
         <td class="mono">${t.ok ? t.ms + ' ms' : '—'}</td>
-        <td class="cell-sub">${t.error ? esc(t.error) : '—'}</td>
+        <td class="cell-sub mono">${t.ips ? esc(t.ips) : '—'}</td>
+        <td class="cell-sub">${
+          t.ok && !t.loss ? '—' : esc(PROBE_STATE_TEXT[t.state] || t.error || '—')
+        }</td>
       </tr>`,
     )
     .join('');
-  return `<div class="hint" style="margin:0 0 8px">采集于 ${esc(fmtAgo(probe.at))} · 入口机 → 目标（TCP 握手耗时）</div>
+
+  // 出口参考点：入口机自己能不能出境。这一块是这次事故里最该先看的东西 ——
+  // 「境内通、境外全败」和「两个都不通」对应的处置完全不同。
+  const exitRows = meta && meta.exit && meta.exit.length
+    ? `<div class="section-title" style="margin-top:14px">出口连通性（入口机 → 参考点）</div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>参考点</th><th>结果</th><th>延迟</th><th>丢包</th></tr></thead>
+        <tbody>${meta.exit
+          .map(
+            (e) => `<tr>
+              <td class="mono">${esc(e.probe)}</td>
+              <td><span class="badge ${e.ok ? 'badge-ok' : 'badge-bad'}">${e.ok ? '通' : '不通'}</span></td>
+              <td class="mono">${e.ok ? e.avg + ' ms' : '—'}</td>
+              <td class="mono">${e.loss ? e.loss + '%' : '0%'}</td>
+            </tr>`,
+          )
+          .join('')}</tbody>
+      </table></div>`
+    : '';
+
+  const local = meta && meta.local
+    ? `<div class="hint" style="margin:10px 0 0">
+       本机：gost 进程 <b>${meta.local.gost}</b> 个 · 监听端口 <b>${meta.local.listen}</b> 个 ·
+       2 秒内计数链新增 <b>${meta.local.natDelta}</b> 个包${
+         meta.local.gost === 0 ? ' · <span style="color:var(--bad)">没有 gost 在跑，先看服务状态</span>' : ''
+       }
+     </div>`
+    : '';
+
+  return `<div class="hint" style="margin:0 0 8px">采集于 ${esc(fmtAgo(probe.at))} · 入口机 → 目标（TCP 握手，${
+    meta && meta.count ? meta.count + ' 次采样 · 单次 ' + meta.timeout + 's' : '单次'
+  }）</div>
     <div class="table-wrap"><table>
-      <thead><tr><th>#</th><th>目标</th><th>结果</th><th>延迟</th><th>说明</th></tr></thead>
+      <thead><tr><th>#</th><th>目标</th><th>结果</th><th>延迟</th><th>解析到</th><th>说明</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table></div>`;
+    </table></div>
+    ${exitRows}${local}`;
 }
 
 /** 面板机探测结果表 */

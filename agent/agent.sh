@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.53'
+VERSION='0.1.54'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -90,9 +90,9 @@ env_read() {
 }
 
 if [ -f "$ENV_FILE" ]; then
-  for _env_key in PANEL_URL AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
+  for _env_key in PANEL_URL PANEL_URL_BACKUP AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
                   HYSTERIA_BIN HYSTERIA_AUTO_INSTALL HOP_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR \
-                  HTTP_TIMEOUT LOG_MAX RELAY_ONLY \
+                  HTTP_TIMEOUT LOG_MAX RELAY_ONLY FAILOVER_AFTER BACKOFF_MAX \
                   ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD ORPHAN_GRACE ORPHAN_INTERVAL; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
@@ -102,6 +102,14 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 PANEL_URL=${PANEL_URL:-}
+# 备用面板地址（0.1.5x）：主地址连续取不到配置时切过去。
+# 部署脚本会写一份，之后**以面板下发的 NP_BACKUP_URL 为准**（state.env）——
+# 主地址已经断了的时候没法重跑部署命令，改配置只能在面板上改完等下发的下一轮生效。
+PANEL_URL_BACKUP=${PANEL_URL_BACKUP:-}
+# 连续失败几次切一次；退避上限（秒）。两者都按「次数」而不是时间算，
+# 因为 INTERVAL 本身可以被改，按时间算会让切点漂移。
+FAILOVER_AFTER=${FAILOVER_AFTER:-3}
+BACKOFF_MAX=${BACKOFF_MAX:-900}
 AGENT_TOKEN=${AGENT_TOKEN:-}
 # 中转机：只同步端口转发规则，完全不碰 Xray / Hysteria2 / 证书 / 端口跳跃
 RELAY_ONLY=${RELAY_ONLY:-0}
@@ -173,12 +181,95 @@ if [ "$NP_MODE" = 'run' ] && { [ -z "$PANEL_URL" ] || [ -z "$AGENT_TOKEN" ]; }; 
   exit 1
 fi
 PANEL_URL=${PANEL_URL%/}
+PANEL_URL_BACKUP=${PANEL_URL_BACKUP%/}
 
 # 卸载模式不要建目录：正要删的东西被重新 mkdir 出来，
 # 会让「本来就没有 /var/log/nodepanel」的机器卸完反而多一个空目录
 if [ "$NP_MODE" = 'run' ]; then
   mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR" 2>/dev/null
 fi
+
+# ------------------------- 主备地址与失败退避 -------------------------------
+# 状态落盘而不是只放内存：--once（cron）模式下每轮都是新进程，
+# 只放内存会让「连续失败几次」永远数到 1，切不过去。
+NP_ACTIVE=$(cat "$STATE_DIR/.panel-active" 2>/dev/null)
+case "$NP_ACTIVE" in backup | main) ;; *) NP_ACTIVE=main ;; esac
+NP_FAIL_COUNT=$(cat "$STATE_DIR/.fail-count" 2>/dev/null)
+case "$NP_FAIL_COUNT" in '' | *[!0-9]*) NP_FAIL_COUNT=0 ;; esac
+
+# 本轮要用的基础地址。空备用地址时永远走主地址，行为与旧版一致。
+NP_BASE_URL=$PANEL_URL
+if [ "$NP_ACTIVE" = 'backup' ] && [ -n "$PANEL_URL_BACKUP" ]; then
+  NP_BASE_URL=$PANEL_URL_BACKUP
+fi
+
+# 记录本轮结果并决定要不要切地址。
+# $1 = 1 表示网络层失败（000 / 空响应 / 超时）。
+#
+# 注意只把「连不上」算失败：401 说明链路是通的（面板不认这个 token），
+# 切到备用地址照样 401，反而会把「面板记录被删」误当成网络故障。
+#
+# 关键设计：**切换不清零失败计数**。
+# 早期版本切换后把计数归零，结果是「主备都不通」时永远在 60/120 秒之间来回，
+# 一天试五百多次 —— 面板整体挂掉时反而比不配备用地址更吵（不配会退到 900 秒）。
+# 现在计数只由「成功」清零，退避因此能一路增长到 BACKOFF_MAX；
+# 地址则按 FAILOVER_AFTER 的整数倍切换（3、6、9…），到上限后正好是每 15 分钟
+# 换一条路试一次，两条链路都有机会，频率又是最省的。
+np_advance_link() {
+  if [ "${1:-0}" = '1' ]; then
+    NP_FAIL_COUNT=$((NP_FAIL_COUNT + 1))
+  else
+    NP_FAIL_COUNT=0
+    rm -f "$STATE_DIR/.just-switched" 2>/dev/null
+  fi
+  printf '%s\n' "$NP_FAIL_COUNT" > "$STATE_DIR/.fail-count" 2>/dev/null
+
+  [ "$NP_FAIL_COUNT" -ge "$FAILOVER_AFTER" ] || return 0
+  # 只在阈值整数倍处切换：否则到达阈值后每一轮都会切换，等于没有退避
+  [ $((NP_FAIL_COUNT % FAILOVER_AFTER)) -eq 0 ] || return 0
+  [ -n "$PANEL_URL_BACKUP" ] || return 0
+
+  if [ "$NP_ACTIVE" = 'backup' ]; then
+    NP_ACTIVE=main
+    NP_BASE_URL=$PANEL_URL
+    log "已连续 $NP_FAIL_COUNT 次取不到配置，切回主地址：$PANEL_URL"
+  else
+    NP_ACTIVE=backup
+    NP_BASE_URL=$PANEL_URL_BACKUP
+    log "已连续 $NP_FAIL_COUNT 次取不到配置，切到备用地址：$PANEL_URL_BACKUP"
+  fi
+  printf '%s\n' "$NP_ACTIVE" > "$STATE_DIR/.panel-active" 2>/dev/null
+  # 下一轮用短间隔试新地址，别让它等到退避上限才验证。
+  # 用文件而不是变量：np_next_sleep 跑在 $( ) 子 shell 里，变量改了传不回来，
+  # 只看变量会让标记永远为真、每一轮都用 60 秒（--once 模式下也得靠文件跨进程）。
+  printf '1\n' > "$STATE_DIR/.just-switched" 2>/dev/null
+}
+
+# 下一轮等待秒数：连续失败时指数退避，成功则回到 INTERVAL
+np_next_sleep() {
+  if [ "$NP_ORPHAN" = '1' ]; then
+    printf '%s' "$ORPHAN_INTERVAL"
+    return 0
+  fi
+  if [ -f "$STATE_DIR/.just-switched" ]; then
+    # 标记只消费一次：这一轮用短间隔验证新地址，之后重新回到退避曲线
+    rm -f "$STATE_DIR/.just-switched" 2>/dev/null
+    printf '%s' "$INTERVAL"
+    return 0
+  fi
+  if [ "$NP_FAIL_COUNT" -le 0 ]; then
+    printf '%s' "$INTERVAL"
+    return 0
+  fi
+  _w=$INTERVAL
+  _i=1
+  while [ "$_i" -lt "$NP_FAIL_COUNT" ] && [ "$_w" -lt "$BACKOFF_MAX" ]; do
+    _w=$((_w * 2))
+    _i=$((_i + 1))
+  done
+  [ "$_w" -gt "$BACKOFF_MAX" ] && _w=$BACKOFF_MAX
+  printf '%s' "$_w"
+}
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -1420,7 +1511,7 @@ verify_started_hy() {
 fetch_bundle() {
   # 第一个参数是 body 的落盘位置：状态码从 stdout 回，内容进文件，
   # 这样 4xx 的响应体也不会被 curl -f 丢掉
-  _url="$PANEL_URL/api/agent/bundle?token=$AGENT_TOKEN&v=$VERSION&hash=${NP_HASH:-}"
+  _url="$NP_BASE_URL/api/agent/bundle?token=$AGENT_TOKEN&v=$VERSION&hash=${NP_HASH:-}"
   _ip=''
   [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
@@ -1508,15 +1599,18 @@ apply_bundle() {
       ;;
     000 | '')
       # 暂时状态：网络断了、DNS 挂了、面板没起、反代在重启。
-      # 这种情况永远按正常间隔重试 —— 面板恢复的瞬间就该连上
-      log "✗ 无法连接面板：$PANEL_URL"
-      RC_ERR="无法连接面板 $PANEL_URL"
+      # 记成网络失败（np_advance_link 据此计失败次数并切换主备），
+      # 但不在这里退避 —— 等待时长由主循环统一算，重试节奏只在一处控制。
+      NP_LINK_FAIL=1
+      log "✗ 无法连接面板：$NP_BASE_URL"
+      RC_ERR="无法连接面板 $NP_BASE_URL"
       return 1
       ;;
   esac
 
   if [ -z "$_out" ]; then
-    log "✗ 面板返回空内容（HTTP $NP_HTTP_CODE）：$PANEL_URL"
+    NP_LINK_FAIL=1
+    log "✗ 面板返回空内容（HTTP $NP_HTTP_CODE）：$NP_BASE_URL"
     RC_ERR="面板返回空内容（HTTP $NP_HTTP_CODE）"
     return 1
   fi
@@ -1537,6 +1631,21 @@ apply_bundle() {
 
   _tmp="$RUN_DIR/bundle.$$.sh"
   printf '%s\n' "$_out" > "$_tmp" || return 1
+  # 语法预检：反代、CDN、本机代理都可能返回 **HTTP 200 的错误页**（HTML / 纯文本），
+  # 直接 sh 执行会喷出「syntax error near unexpected token」并报「配置包执行失败」，
+  # 看起来像面板生成的包坏了，实际是链路中间有人插了一页。这里拦一道，
+  # 报「返回内容不是脚本」，并把开头几个字记下来方便一眼认出是什么页面。
+  if ! sh -n "$_tmp" 2>/dev/null; then
+    _head=$(printf '%s' "$_out" | tr '\n' ' ' | cut -c1-120)
+    log "✗ 面板返回的内容不是脚本（可能是代理/反代的错误页）：$NP_BASE_URL"
+    log "  开头：${_head:-（空）}"
+    RC_ERR="面板返回内容不是脚本（HTTP $NP_HTTP_CODE）"
+    # 算链路失败：换备用地址很可能就能拿到真包，交给主备切换去试
+    NP_LINK_FAIL=1
+    LAST_FETCH_OK=0
+    rm -f "$_tmp"
+    return 1
+  fi
   _blog="$RUN_DIR/bundle.$$.log"
   if sh "$_tmp" > "$_blog" 2>&1; then
     cat "$_blog" >> "$LOG_DIR/agent.log" 2>/dev/null
@@ -1837,7 +1946,7 @@ report_v2() {
 
   _ip=''
   [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
-  _url="$PANEL_URL/api/agent/report?token=$AGENT_TOKEN&v=$VERSION"
+  _url="$NP_BASE_URL/api/agent/report?token=$AGENT_TOKEN&v=$VERSION"
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
 
   _f="$RUN_DIR/report.$$.json"
@@ -1876,7 +1985,7 @@ report() {
   fi
 
   [ -s "$RUN_DIR/stats.agg" ] || return 0
-  _url="$PANEL_URL/api/agent/report?token=$AGENT_TOKEN&v=$VERSION"
+  _url="$NP_BASE_URL/api/agent/report?token=$AGENT_TOKEN&v=$VERSION"
   _ip=''
   [ "$REPORT_IP" = '1' ] && _ip=$(public_ip)
   [ -n "$_ip" ] && _url="$_url&ip=$_ip"
@@ -1984,7 +2093,7 @@ send_receipt() {
     "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${RC_HOP:-}" "${BAD_PORTS:-}" \
     "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" "$_traffic" "$_probe" > "$_f" 2>/dev/null
 
-  if http_post_json "$PANEL_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
+  if http_post_json "$NP_BASE_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
     printf '%s\n%s\n' "$_now" "$_sig" > "$STATE_DIR/.receipt" 2>/dev/null
     # 诊断结果只上报一次：面板收到后会清掉请求标记，下一轮不再重发
     rm -f "$STATE_DIR/relay-probe.json" 2>/dev/null
@@ -2040,7 +2149,7 @@ agent_self_update() {
   log "发现新版本 agent $_want（当前 $VERSION），开始自更新"
   _tmp="$STATE_DIR/agent.sh.new"
   rm -f "$_tmp" 2>/dev/null
-  if ! http_get "$PANEL_URL/api/agent/script?token=$AGENT_TOKEN&v=$VERSION" "Authorization: Bearer $AGENT_TOKEN" 30 > "$_tmp" 2>/dev/null; then
+  if ! http_get "$NP_BASE_URL/api/agent/script?token=$AGENT_TOKEN&v=$VERSION" "Authorization: Bearer $AGENT_TOKEN" 30 > "$_tmp" 2>/dev/null; then
     agent_update_fail "$_want" "$_cnt"
     return 1
   fi
@@ -2087,7 +2196,19 @@ agent_self_update() {
 tick() {
   CURRENT_ACTION=tick
   # 每轮都重新读一次状态，--once 模式下也能拿到上一轮的结果
-  [ -f "$STATE_DIR/state.env" ] && . "$STATE_DIR/state.env"
+  if [ -f "$STATE_DIR/state.env" ]; then
+    . "$STATE_DIR/state.env" 2>/dev/null
+    # 面板下发的备用地址优先于 agent.env 里那份：部署时写的是兜底，
+    # 真正要改的时候主地址往往已经断了，只能靠上一轮下发进来的值。
+    # 有这一行就以它为准 —— 空值代表面板上清空了，跟着清掉。
+    if grep -q '^NP_BACKUP_URL=' "$STATE_DIR/state.env" 2>/dev/null; then
+      PANEL_URL_BACKUP=${NP_BACKUP_URL%/}
+      NP_BASE_URL=$PANEL_URL
+      if [ "$NP_ACTIVE" = 'backup' ] && [ -n "$PANEL_URL_BACKUP" ]; then
+        NP_BASE_URL=$PANEL_URL_BACKUP
+      fi
+    fi
+  fi
   [ -f "$STATE_DIR/changed.env" ] && . "$STATE_DIR/changed.env"
 
   # 回执状态按轮重置，避免上一轮的失败一直挂着
@@ -2102,6 +2223,7 @@ tick() {
   NP_STARTED_HY=''
   SOCK_LIST=''
   LAST_FETCH_OK=0
+  NP_LINK_FAIL=0
 
   if apply_bundle; then
     apply_services changed
@@ -2368,7 +2490,11 @@ if [ "$NP_MODE" = 'uninstall' ]; then
 fi
 
 log "Node Panel Agent $VERSION 启动"
-log "面板：$PANEL_URL"
+if [ -n "$PANEL_URL_BACKUP" ]; then
+  log "面板：$PANEL_URL · 备用 $PANEL_URL_BACKUP（连续 $FAILOVER_AFTER 次取不到配置就切换）"
+else
+  log "面板：$PANEL_URL · 未配置备用地址"
+fi
 if [ "$RELAY_ONLY" = '1' ]; then
   log "角色：中转机（只同步端口转发规则，不管理 Xray / Hysteria2）"
   log "转发：gost / iptables · 轮询 ${INTERVAL}s"
@@ -2393,6 +2519,11 @@ fi
 
 if [ "${1:-}" = '--once' ]; then
   tick
+  # cron 模式每轮都是新进程，主备切换状态必须在这里落盘，否则永远数不到阈值
+  np_advance_link "$NP_LINK_FAIL"
+  # --once 不 sleep，切换标记不会被 np_next_sleep 消费，留在这里只会让下一次
+  # 常驻启动时白等一轮 —— 直接清掉
+  rm -f "$STATE_DIR/.just-switched" 2>/dev/null
   exit 0
 fi
 
@@ -2413,11 +2544,11 @@ trap 'agent_exit_reason TERM' TERM
 trap 'agent_exit_reason INT' INT
 while :; do
   tick
-  # 面板已经不认这台机器时转低频：日志不刷屏、请求不空转，
-  # 面板记录一旦恢复（重新部署 / 从备份恢复），最多一个 ORPHAN_INTERVAL 就自己回来
-  if [ "$NP_ORPHAN" = '1' ]; then
-    sleep "$ORPHAN_INTERVAL"
-  else
-    sleep "$INTERVAL"
-  fi
+  # 网络层失败才计次：401 / #ERROR 说明链路是通的，切备用地址照样不通，
+  # 反而会把「面板记录被删」误当成网络故障。
+  np_advance_link "${NP_LINK_FAIL:-0}"
+  # 等待时长统一由 np_next_sleep 决定：成功 = INTERVAL，
+  # 连续失败 = 指数退避（60→120→240…封顶 BACKOFF_MAX），面板不认这台机器
+  # （401 宽限期之后）走 ORPHAN_INTERVAL 的低频。
+  sleep "$(np_next_sleep)"
 done

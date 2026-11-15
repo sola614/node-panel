@@ -173,8 +173,9 @@ function resolveScope(token, ip) {
 }
 
 function buildAgentPayload(scope) {
-  // 中转机走独立配置包：只同步转发规则，绝不触碰 xray / hysteria / certs，
-  // 也保证落地机（server/node scope）的 payload 形状与 hash 与本改动前完全一致
+  // 中转机走独立配置包：只同步转发规则，绝不触碰 xray / hysteria / certs。
+  // 两类包都带 runtime（备用地址 + 诊断参数）—— 它是 agent 的运行期配置，
+  // 落地机同样需要备用地址，所以这里不再追求「与本改动前形状一致」。
   if (scope.type === 'relay') return buildRelayPayload(scope);
 
   sweepRenewals();
@@ -264,12 +265,14 @@ function buildAgentPayload(scope) {
   // 否则 agent 永远拿不到「目标版本」这个信号，自更新就形同虚设。
   // hop 同理 —— 它不在 yaml 里（跳跃是 NAT 层的事），漏掉就会出现
   // 「面板上改了范围、agent 那边规则一直没变」这种查不出来的不同步
+  const runtime = runtimePayload();
   const payloadForHash = JSON.stringify({
     xray: xrayConfig,
     hysteria: hysteriaList.map((h) => h.yaml),
     hop: hysteriaList.map((h) => `${h.nodeId}:${h.port}:${h.hop}`),
     certs,
     agent: APP_VERSION,
+    runtime,
   });
 
   return {
@@ -283,6 +286,7 @@ function buildAgentPayload(scope) {
     xray: xrayConfig,
     hysteria: hysteriaList,
     certs,
+    runtime,
   };
 }
 
@@ -291,7 +295,26 @@ function buildAgentPayload(scope) {
  * 不依赖 APP_VERSION —— 一次脚本修复不需要单独发版本号，也能让 agent 立刻拉新包；
  * 否则 hash 不变，agent 永远按旧 bundle 跑（「改完了但线上没生效」）。
  */
-const RELAY_BUNDLE_REV = 11;
+const RELAY_BUNDLE_REV = 12;
+
+/**
+ * 下发到 agent 的「运行时设置」：备用面板地址 + 诊断参数。
+ *
+ * 为什么走配置包而不是只写在 agent.env：
+ *   agent.env 是部署时生成的，面板上改完要重新跑部署命令才生效，而这几个值
+ *   恰恰是「主地址断了、临时切过去」时最需要改的 —— 那条路走不通。
+ * 代价是它们进 hash：改一次设置，所有 agent 下一轮都会重拉一遍包。
+ * 这是期望行为（值确实变了），一次性的，也顺带保证节点侧不需要重启。
+ */
+function runtimePayload() {
+  const s = store.db().settings;
+  return {
+    backupUrl: String(s.agentBackupUrl || '').trim(),
+    diagCount: String(s.diagCount || '3'),
+    diagTimeout: String(s.diagTimeout || '5'),
+    diagProbes: String(s.diagProbes || ''),
+  };
+}
 
 /**
  * 中转机配置包（relay scope）：只产规则清单，不读 nodes / users / certs。
@@ -340,6 +363,8 @@ function buildRelayPayload(scope) {
     }))
     .filter((p) => p.targets.length);
 
+  const runtime = runtimePayload();
+
   return {
     ok: true,
     hash: sha256(
@@ -348,6 +373,7 @@ function buildRelayPayload(scope) {
         agent: APP_VERSION,
         rev: RELAY_BUNDLE_REV,
         probe: pendingProbe.map((p) => `${p.id}@${p.at}`).join(','),
+        runtime,
       }),
     ).slice(0, 16),
     scope: { type: 'relay', id: scope.id, name: scope.name },
@@ -356,6 +382,7 @@ function buildRelayPayload(scope) {
     userCount: 0,
     relay: { rules },
     probe: pendingProbe,
+    runtime,
   };
 }
 
@@ -792,8 +819,31 @@ function agentReceipt(req, res, params, body, session, ctx) {
   // 收到即清掉 diagRequestedAt，避免下一轮又触发一次探测。
   if (scope.type === 'relay' && body.probe && typeof body.probe === 'object' && !Array.isArray(body.probe)) {
     const now = store.iso();
+    // _meta 是所有规则共享的一份「环境证据」：出口参考点、本机 gost / 监听 / 计数。
+    // 放在顶层只存一次，键名带下划线，遍历规则时会跳过。
+    const rawMeta = body.probe._meta && typeof body.probe._meta === 'object' ? body.probe._meta : null;
+    const meta = rawMeta
+      ? {
+          at: String(rawMeta.at || now),
+          count: Math.max(1, Number(rawMeta.count) || 0),
+          timeout: Math.max(1, Number(rawMeta.timeout) || 0),
+          exit: (Array.isArray(rawMeta.exit) ? rawMeta.exit : []).slice(0, 6).map((e) => ({
+            probe: String((e && e.probe) || '').slice(0, 80),
+            ok: !!(e && e.ok),
+            avg: Math.max(0, Number(e && e.avg) || 0),
+            loss: Math.min(100, Math.max(0, Number(e && e.loss) || 0)),
+            error: String((e && e.error) || '').slice(0, 40),
+          })),
+          local: {
+            gost: Math.max(0, Number(rawMeta.local && rawMeta.local.gost) || 0),
+            listen: Math.max(0, Number(rawMeta.local && rawMeta.local.listen) || 0),
+            natDelta: Number(rawMeta.local && rawMeta.local.natDelta) || 0,
+          },
+        }
+      : null;
     let applied = 0;
     for (const [rid, info] of Object.entries(body.probe)) {
+      if (rid.startsWith('_')) continue;
       const rule = db.relays.find((r) => r.id === rid && r.serverId === scope.id);
       if (!rule || !info || !Array.isArray(info.targets)) continue;
       const targets = info.targets
@@ -802,11 +852,15 @@ function agentReceipt(req, res, params, body, session, ctx) {
           port: Number(t && t.port) || 0,
           ok: !!(t && t.ok),
           ms: Math.max(0, Number(t && t.ms) || 0),
+          // 0.1.5x：三次采样算出的丢包率与解析结果，用来区分「抖动」和「断链」
+          loss: Math.min(100, Math.max(0, Number(t && t.loss) || 0)),
+          ips: String((t && t.ips) || '').slice(0, 120),
+          state: String((t && t.state) || '').slice(0, 16),
           error: String((t && t.error) || '').slice(0, 40),
         }))
         .filter((t) => t.host && t.port >= 1 && t.port <= 65535);
       if (!targets.length) continue;
-      rule.agentProbe = JSON.stringify({ at: info.at || now, targets });
+      rule.agentProbe = JSON.stringify({ at: info.at || now, targets, meta });
       rule.diagRequestedAt = null;
       applied++;
     }
@@ -912,9 +966,10 @@ function agentBundleHandler(req, res, params, body, session, ctx) {
   const script = agentBundle.buildBundle(payload, {
     panelUrl: baseUrl(ctx.req),
     siteName: store.db().settings.siteName,
-    // 伪装部署的机器装在 /opt/logsync：配置包要写同一份状态目录，否则
-    // changed.env 落回 /opt/nodepanel，agent 认不出服务变更就不会重载
-    stateDir: scope.stealth ? `/opt/${STEALTH_NAME}` : '/opt/nodepanel',
+    // agent 统一装到 /opt/logsync（0.1.54 起伪装不再是开关）：配置包要写同一份
+    // 状态目录，否则 changed.env 落回 /opt/nodepanel，agent 认不出服务变更就不会重载。
+    // 老机器仍在 /opt/nodepanel，但它自己 export 了 STATE_DIR，这里的兜底不生效。
+    stateDir: `/opt/${STEALTH_NAME}`,
     // 中转机下载 gost 用的反代前缀（设置页可配；空 = 直连）
     githubProxy: store.db().settings.githubProxy || '',
   });

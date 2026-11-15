@@ -388,11 +388,11 @@ async function serverDeployFlow(id) {
         <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}">${s.online ? '在线' : '离线'}</b></div>
       </div>`;
 
-  // 伪装部署时，面板生成的脚本把 agent 装到 /opt/logsync、注册成 logsync，
+  // 0.1.54 起统一伪装：面板生成的脚本一律把 agent 装到 /opt/logsync、注册成 logsync，
   // 这里必须跟着同一个名字显示命令 —— 否则用户照着 nodepanel-agent 去查只会得到
   // 「service does not exist」，反过来误判成机器没装
-  const alias = s.stealth ? 'logsync' : 'nodepanel';
-  const unit = s.stealth ? 'logsync' : 'nodepanel-agent';
+  const alias = 'logsync';
+  const unit = 'logsync';
   // 命令与注释对齐到同一列：名字一变（nodepanel → logsync）原地对齐会错位
   const pad = (c) => c + ' '.repeat(Math.max(1, 45 - c.length));
 
@@ -444,19 +444,17 @@ ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</d
         要让这台机器彻底退出纳管，用同张卡片上的「卸载命令」，别手动删目录 —— 服务注册和 Hysteria2 实例会残留。
       </p>`;
 
-  const mask = openModal({
+  openModal({
     title: '部署到 ' + s.name,
     wide: true,
     footer: false,
     body: `
       <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
 
-      <label style="display:flex;align-items:flex-start;gap:8px;margin:0 0 12px;cursor:pointer">
-        <input type="checkbox" id="dep-stealth" ${s.stealth ? 'checked' : ''} style="width:auto;margin-top:3px">
-        <span class="hint" style="margin:0">伪装部署标识：装到 <code>/opt/logsync</code>，服务名 <code>logsync</code>
-          （默认是 <code>/opt/nodepanel</code> + <code>nodepanel-agent</code>）。
-          只影响之后生成的部署 / 卸载脚本，<b>已经装好的机器要重跑一次部署才生效</b>。</span>
-      </label>
+      <div class="hint" style="margin:0 0 12px">
+        统一安装为 <code>/opt/logsync</code>，服务名 <code>logsync</code>。
+        早期按默认名装过的机器，重跑一次本命令会自动迁移（先复制、新服务确认在跑才停旧的，不会失联）。
+      </div>
 
       <div class="code-wrap">
         <pre class="code">${esc(cmd)}</pre>
@@ -466,25 +464,6 @@ ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</d
       ${stats}
       ${tips}`,
   });
-
-  // 勾选当场落库并重算命令：弹窗里的命令是从服务端取的，不重开一次就会前后不一致
-  const box = $('#dep-stealth', mask);
-  if (box) {
-    box.addEventListener('change', async () => {
-      const next = box.checked;
-      box.disabled = true;
-      try {
-        await api('/api/servers/' + id, { method: 'PUT', body: JSON.stringify({ stealth: next }) });
-        await render();
-        serverDeployFlow(id);
-        toast(next ? '已切换为伪装部署，命令已更新' : '已恢复默认部署名，命令已更新', 'ok');
-      } catch (e) {
-        box.checked = !next;
-        box.disabled = false;
-        toast(e.message || '保存失败', 'bad');
-      }
-    });
-  }
 }
 
 /* ============================== 卸载命令 ============================== */
@@ -504,9 +483,9 @@ function uninstallFlow(kind, id) {
   const purge = rootShCmd(url, '--purge', 'np-uninstall.sh');
   const where = isServer ? item.address || item.host || '该机器' : item.host || '该机器';
 
-  // 伪装部署的机器上，目录与服务名都不是默认那套，说明文字必须跟着换
-  const alias = item.stealth ? 'logsync' : 'nodepanel';
-  const unit = item.stealth ? 'logsync' : 'nodepanel-agent';
+  // 0.1.54 起统一伪装，目录与服务名固定这一套
+  const alias = 'logsync';
+  const unit = 'logsync';
 
   const clean = relay
     ? `<li>停止并注销 <b>${unit}</b>（systemd / OpenRC / crontab 三种部署方式都认），并结束残留进程</li>

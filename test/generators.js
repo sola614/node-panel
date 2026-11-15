@@ -768,15 +768,25 @@ const plain = buildInstallScript({
   agentSrc: AGENT_SRC,
 });
 
-ok('伪装部署脚本里搜不到 nodepanel', !/nodepanel/i.test(hidden));
+// 迁移块里必须出现旧名（要告诉人往哪搬），断言前先把它剥掉，
+// 这样「运行态里搜不到特征名」这条约束仍然是严格的
+const stripLegacy = (text) =>
+  String(text).replace(/# >>> 旧布局[^\n]*\n[\s\S]*?# <<< 旧布局[^\n]*\n?/g, '');
+
+ok('伪装部署脚本（除迁移块）里搜不到 nodepanel', !/nodepanel/i.test(stripLegacy(hidden)));
 ok('伪装部署脚本装到 /opt/logsync', hidden.includes('/opt/logsync/logsync.sh') && hidden.includes('mkdir -p /opt/logsync /var/log/logsync /run/logsync'));
-ok('伪装后脚本文件名也不叫 agent.sh（ps 里看不到 agent）', !/agent\.sh/.test(hidden) && hidden.includes('ExecStart=/bin/sh /opt/logsync/logsync.sh'));
+ok('伪装后脚本文件名也不叫 agent.sh（ps 里看不到 agent）', !/agent\.sh/.test(stripLegacy(hidden)) && hidden.includes('ExecStart=/bin/sh /opt/logsync/logsync.sh'));
 ok('伪装后 systemd / OpenRC 单元都叫 logsync', hidden.includes('systemctl enable logsync') && hidden.includes('rc-update add logsync default'));
 ok('伪装后 nft 链名一起换', !/NODEPANEL_HYHOP/.test(hidden) && hidden.includes('LOGSYNC_HYHOP'));
 ok('伪装后内嵌 agent 的默认目录也换了', hidden.includes('STATE_DIR=${STATE_DIR:-/opt/logsync}'));
 ok('伪装后内嵌 agent 的卸载单元也换了', hidden.includes('/etc/init.d/logsync') && !hidden.includes('/etc/init.d/nodepanel-agent'));
-ok('伪装卸载脚本里搜不到 nodepanel', !/nodepanel/i.test(hiddenUninstall));
-ok('不勾选时输出里没有 logsync', !/logsync/i.test(plain) && !/logsync/i.test(buildUninstallScript({ label: '隐藏 01' })));
+ok('伪装卸载脚本（除旧布局块）里搜不到 nodepanel', !/nodepanel/i.test(stripLegacy(hiddenUninstall)));
+// 0.1.54 起伪装不再是开关：不传 stealth 也走伪装，否则服务器字段一漏就退回裸名
+ok('默认部署即伪装（不需要开关）', /\/opt\/logsync/.test(plain) && !/nodepanel/i.test(stripLegacy(plain)));
+ok('默认卸载脚本也按伪装名清理', !/nodepanel/i.test(stripLegacy(buildUninstallScript({ label: '隐藏 01' }))));
+ok('部署脚本带旧布局迁移块', /# >>> 旧布局迁移/.test(hidden) && /cp -a "\$OLD_DIR"\/\./.test(hidden));
+ok('卸载脚本带旧布局清理块', /# >>> 旧布局清理/.test(hiddenUninstall));
+ok('迁移是先复制、不是搬移（旧的全程不掉线）', /cp -a "\$OLD_DIR"\/\./.test(hidden) && !/mv "\$OLD_DIR"/.test(hidden));
 
 // 配置包（bundle）也要跟着换状态目录：写死 /opt/nodepanel 会有两个后果 ——
 // 机器上凭空多一个旧目录（藏名字白藏）、changed.env 落错地方导致 Xray 不重载
