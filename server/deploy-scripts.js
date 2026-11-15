@@ -81,107 +81,96 @@ function disguiseAgent(text, stealth) {
 }
 
 /**
-
- * 旧布局迁移（0.1.54）：把 nodepanel-agent / /opt/nodepanel 迁到伪装名。
+ * 停用旧的 nodepanel-agent（0.1.54）。
  *
- * 为什么默认也迁移：伪装不再是「每台服务器一个开关」，agent 统一装成 logsync。
- * 但老机器上跑的是 nodepanel-agent，直接按新名字装会**双开** —— 同一个 token
- * 两个 agent 同时拉配置、同时发回执，日志翻倍、状态互相覆盖。
+ * 背景：伪装取消开关后，agent 统一装成 logsync。老机器上跑的是 nodepanel-agent，
+ * 直接按新名字装就是**双开** —— 同一个 token 两个 agent 抢同一份配置，
+ * 一个刚启动服务、另一个因为 hash 不同又 reload，端口在「起—断」之间来回，
+ * 日志里只看到「✗ 未运行 → ✓ 已启动 → ! 端口未监听」的循环，很难联想到双开。
  *
- * 保守顺序（关键）：**先复制、不搬移，旧服务全程不停**。
- * 反过来「先停旧再搬」的风险是：新服务一旦起不来，这台机就彻底失联了，
- * 而那时面板也连不上，只能上控制台救。现在即使新服务失败，旧进程照常在跑。
+ * 这里的取舍：**先停旧的，再起新的**。之前是「先复制、新服务起来才停旧」，
+ * 但在残留 /opt/logsync/agent.env 的机器上那套判定会整段跳过，旧的一直留着。
+ * 现在的顺序牺牲了「安装失败时仍有一个 agent 在跑」，换来的是不会再漏停。
+ * 兜底在清理块里：新服务没起来就把旧的 enable --now 拉回来。
  *
- * 迁移块里会出现旧名 nodepanel，这是必须的（要告诉人往哪搬）。
- * 脚本是一次性执行的、不留在机器上，而伪装针对的是**运行态**被人看见，
- * 两者不冲突。测试用 `# >>> 旧布局迁移` 标记把这段剥掉再断言。
+ * 停用点放在「启动新服务之前」而不是脚本开头：前面还要下载安装 Xray / Hysteria，
+ * 那一步可能几分钟，提前停会让机器在这段时间里完全没有 agent。
  */
-function legacyMigrateBlock() {
-  return `# >>> 旧布局迁移（0.1.54）
+function legacyStopBlock() {
+  return `# >>> 旧 agent 停用（0.1.54）
 OLD_DIR="/opt/nodepanel"
 OLD_UNIT="nodepanel-agent"
-NEW_UNIT="logsync"
-MIGRATED=''
+STOPPED_OLD=0
 
-# 判定看 agent.env 而不是目录：脚本开头已经 mkdir 过 /opt/logsync（日志/运行时目录），
-# 用「目录不存在」当条件会永远为假；而 agent.env 只会在真正部署过之后才存在。
-if [ -f "$OLD_DIR/agent.env" ] && [ ! -f /opt/logsync/agent.env ]; then
-  say "检测到旧布局 $OLD_DIR，复制到 /opt/logsync（旧服务保持运行）"
-  if mkdir -p /opt/logsync && cp -a "$OLD_DIR"/. /opt/logsync/ 2>/dev/null; then
-    mkdir -p /var/log/logsync
-    [ -d /var/log/nodepanel ] && cp -a /var/log/nodepanel/. /var/log/logsync/ 2>/dev/null
-    # 旧 agent.env 里可能写着指向旧目录的绝对路径，删掉让下面按新布局重写
-    rm -f /opt/logsync/agent.env
-    MIGRATED=1
-    say "复制完成（新服务验证通过后才会停旧服务）"
-  else
-    bad "复制旧目录失败（权限或磁盘）—— 本次安装中止，机器仍按旧布局运行"
-    exit 1
-  fi
+# 旧痕迹要全过一遍：systemd 单元 / OpenRC 脚本 / crontab 条目 / 手工 nohup 的进程。
+# 只看单元文件会漏掉后两种，而那两种正好是「重装后仍然双开」的常见来源。
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "$OLD_UNIT.service" 2>/dev/null | grep -q "^$OLD_UNIT\\.service"; then
+  systemctl stop "$OLD_UNIT" >/dev/null 2>&1
+  systemctl disable "$OLD_UNIT" >/dev/null 2>&1
+  STOPPED_OLD=1
 fi
-# <<< 旧布局迁移`;
+if [ -f "/etc/init.d/$OLD_UNIT" ]; then
+  rc-service "$OLD_UNIT" stop >/dev/null 2>&1
+  rc-update del "$OLD_UNIT" default >/dev/null 2>&1
+  STOPPED_OLD=1
+fi
+if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "$OLD_DIR/agent.sh"; then
+  crontab -l 2>/dev/null | grep -v "$OLD_DIR/agent.sh" | crontab - 2>/dev/null
+  STOPPED_OLD=1
+fi
+# 只杀「sh 在跑这个脚本」的进程：不加前缀的话，vi /opt/nodepanel/agent.sh
+# 这种临时打开的编辑器也会被一起杀掉（pkill -f 匹配的是完整命令行）
+if command -v pkill >/dev/null 2>&1 && pkill -f "sh .*$OLD_DIR/agent\\.sh" 2>/dev/null; then
+  STOPPED_OLD=1
+fi
+
+if [ "$STOPPED_OLD" = '1' ]; then
+  say "已停用旧 agent（$OLD_UNIT），避免与新 agent 双开"
+else
+  say "没有发现旧 agent，跳过停用"
+fi
+# <<< 旧 agent 停用`;
 }
 
 /**
- * 迁移收尾：新服务确认在跑，才停旧的。没起来就原样保留，机器不失联。
+ * 停用后的收尾：新服务确认在跑才删旧单元文件；没起来就把旧的拉回来。
  *
- * 判定**不能只看「这一轮做了复制」**：机器上可能已经残留 /opt/logsync/agent.env
- * （之前手工试过、或某次中断），这时迁移块会被跳过、MIGRATED 为空，
- * 旧单元就永远留着 —— 两个 agent 用同一个 token 抢同一份配置，一个启动一个重载，
- * 端口反复断开，日志里表现为「已启动 → 端口未监听」循环，很难看出是双开。
- * 所以这里再按「旧单元是否还在」单独判一次。
+ * 单元文件在停用阶段**故意不删**，就是为了留这条回滚路：删了之后
+ * `systemctl start nodepanel-agent` 会报 unit not found，机器上就真的没有 agent 了。
  */
-function legacyMigrateDoneBlock() {
-  return `# >>> 旧布局迁移收尾（0.1.54）
-_old_present=0
-if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "$OLD_UNIT.service" 2>/dev/null | grep -q "^$OLD_UNIT\\.service"; then
-  _old_present=1
-fi
-[ -f "/etc/init.d/$OLD_UNIT" ] && _old_present=1
-# cron 方式装的旧 agent 没有单元文件，只能看 crontab
-if [ "$_old_present" = '0' ] && command -v crontab >/dev/null 2>&1; then
-  crontab -l 2>/dev/null | grep -q "$OLD_DIR/agent.sh" && _old_present=1
-fi
-
-if [ "$MIGRATED" = '1' ] || [ "$_old_present" = '1' ]; then
+function legacyCleanupBlock() {
+  return `# >>> 旧 agent 清理（0.1.54）
+if [ "$STOPPED_OLD" = '1' ]; then
   _new_ok=0
   if command -v systemctl >/dev/null 2>&1; then
     _i=0
-    while [ "$_i" -lt 5 ]; do
-      systemctl is-active --quiet "$NEW_UNIT" >/dev/null 2>&1 && { _new_ok=1; break; }
+    while [ "$_i" -lt 8 ]; do
+      systemctl is-active --quiet logsync >/dev/null 2>&1 && { _new_ok=1; break; }
       sleep 1
       _i=$((_i + 1))
     done
   elif command -v rc-service >/dev/null 2>&1; then
-    rc-service "$NEW_UNIT" status >/dev/null 2>&1 && _new_ok=1
+    rc-service logsync status >/dev/null 2>&1 && _new_ok=1
   else
-    # cron 模式没有常驻服务可比，crontab 已写入即视为就位
     _new_ok=1
   fi
 
   if [ "$_new_ok" = '1' ]; then
-    if command -v systemctl >/dev/null 2>&1; then
-      systemctl stop "$OLD_UNIT" >/dev/null 2>&1
-      systemctl disable "$OLD_UNIT" >/dev/null 2>&1
-      rm -f "/etc/systemd/system/$OLD_UNIT.service"
-      systemctl daemon-reload >/dev/null 2>&1
-    fi
-    if command -v rc-service >/dev/null 2>&1; then
-      rc-service "$OLD_UNIT" stop >/dev/null 2>&1
-      rc-update del "$OLD_UNIT" default >/dev/null 2>&1
-      rm -f "/etc/init.d/$OLD_UNIT"
-    fi
-    # cron 兜底：旧条目必须删，否则两个 agent 同时跑
-    if command -v crontab >/dev/null 2>&1; then
-      crontab -l 2>/dev/null | grep -v "$OLD_DIR/agent.sh" | crontab - 2>/dev/null
-    fi
-    say "旧服务 $OLD_UNIT 已停用（$OLD_DIR 保留为备份，确认稳定后可手工删除）"
+    rm -f "/etc/systemd/system/$OLD_UNIT.service"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1
+    rm -f "/etc/init.d/$OLD_UNIT"
+    say "旧单元已删除；$OLD_DIR 保留为回滚备份"
   else
-    bad "新服务没起来，旧布局继续运行（机器不会失联）"
-    note "排查：systemctl status $NEW_UNIT / journalctl -u $NEW_UNIT -n 50"
+    bad "新 agent 没起来，把旧的拉回来（否则这台机就没有 agent 了）"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl enable --now "$OLD_UNIT" >/dev/null 2>&1 || true
+    elif command -v rc-service >/dev/null 2>&1; then
+      rc-service "$OLD_UNIT" start >/dev/null 2>&1 || true
+    fi
+    note "排查：systemctl status logsync；journalctl -u logsync -n 50"
   fi
 fi
-# <<< 旧布局迁移收尾`;
+# <<< 旧 agent 清理`;
 }
 
 /**
@@ -191,7 +180,7 @@ fi
  * 否则「卸载完重装」会被迁移逻辑再认成老机器，白复制一遍。
  */
 function legacyUninstallBlock() {
-  return `# >>> 旧布局清理（0.1.54）
+  return `# >>> 旧 agent 清理（卸载，0.1.54）
 if command -v systemctl >/dev/null 2>&1; then
   systemctl stop nodepanel-agent >/dev/null 2>&1
   systemctl disable nodepanel-agent >/dev/null 2>&1
@@ -207,7 +196,7 @@ if command -v crontab >/dev/null 2>&1; then
   crontab -l 2>/dev/null | grep -v '/opt/nodepanel/agent.sh' | crontab - 2>/dev/null
 fi
 [ -d /opt/nodepanel ] && echo "· 保留旧目录 /opt/nodepanel（确认不需要后可手工删除）"
-# <<< 旧布局清理`;
+# <<< 旧 agent 清理`;
 }
 
 /**
@@ -331,10 +320,6 @@ download() {
 }
 
 # ------------------------------- 1. agent ----------------------------------
-# 迁移必须在装 agent 之前：它会把旧目录整体复制过来（含旧的 agent.sh / agent.env），
-# 放到后面就会把刚写好的新脚本覆盖回旧版本。
-# 放在这一步之前还有个好处：复制完紧接着重写 agent.sh，不需要单独清理。
-@MIGRATE@
 step "agent 脚本 → /opt/nodepanel/agent.sh"
 mkdir -p /opt/nodepanel /var/log/nodepanel /run/nodepanel
 
@@ -715,6 +700,11 @@ else
 fi
 note "权限 600（内含 token）"
 
+# ------------------------- 4.5 停用旧 agent --------------------------------
+# 停在「启动新服务之前」而不是脚本开头：前面还要下载安装 Xray / Hysteria，
+# 那一步可能几分钟，提前停会让这台机在这段时间里完全没有 agent。
+@STOP_OLD@
+
 # ---------------------------- 5. 开机自启 ----------------------------------
 step "开机自启 → nodepanel-agent"
 case "$SVC" in
@@ -887,8 +877,8 @@ printf '\\n'
 `, stealth)
     // 迁移块放最后注入：里面必须出现旧名 nodepanel（要告诉人往哪搬），
     // 不能经过 disguiseAgent 的整体替换，否则新旧两个路径会被换成同一个。
-    .replace('@MIGRATE@', stealth ? legacyMigrateBlock() : '')
-    .replace('@MIGRATE_DONE@', stealth ? legacyMigrateDoneBlock() : '');
+    .replace('@STOP_OLD@', stealth ? legacyStopBlock() : '')
+    .replace('@MIGRATE_DONE@', stealth ? legacyCleanupBlock() : '');
 }
 
 function readAgentSource() {

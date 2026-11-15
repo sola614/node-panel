@@ -768,10 +768,10 @@ const plain = buildInstallScript({
   agentSrc: AGENT_SRC,
 });
 
-// 迁移块里必须出现旧名（要告诉人往哪搬），断言前先把它剥掉，
+// 停用/清理块里必须出现旧名（要告诉人停了什么），断言前先把它剥掉，
 // 这样「运行态里搜不到特征名」这条约束仍然是严格的
 const stripLegacy = (text) =>
-  String(text).replace(/# >>> 旧布局[^\n]*\n[\s\S]*?# <<< 旧布局[^\n]*\n?/g, '');
+  String(text).replace(/# >>> 旧 agent[^\n]*\n[\s\S]*?# <<< 旧 agent[^\n]*\n?/g, '');
 // 证书根目录是**故意保留**旧路径的：它是面板下发 xray/hysteria 配置时写死的，
 // 跟着伪装名改会让卸载去删一个不存在的目录。单独剥掉再断言其余部分干净。
 const stripCertsLine = (text) =>
@@ -790,9 +790,19 @@ ok('默认部署即伪装（不需要开关）', /\/opt\/logsync/.test(plain) &&
 ok('默认卸载脚本也按伪装名清理', !/nodepanel/i.test(stripCertsLine(buildUninstallScript({ label: '隐藏 01' }))));
 // 反过来的约束：证书根必须保持面板下发的那条路径，不能被换成 /etc/logsync
 ok('卸载脚本的证书根不随伪装改名', /^CERTS_DIR=\/etc\/nodepanel$/m.test(hiddenUninstall) && !/CERTS_DIR=\/etc\/logsync/.test(hiddenUninstall));
-ok('部署脚本带旧布局迁移块', /# >>> 旧布局迁移/.test(hidden) && /cp -a "\$OLD_DIR"\/\./.test(hidden));
-ok('卸载脚本带旧布局清理块', /# >>> 旧布局清理/.test(hiddenUninstall));
-ok('迁移是先复制、不是搬移（旧的全程不掉线）', /cp -a "\$OLD_DIR"\/\./.test(hidden) && !/mv "\$OLD_DIR"/.test(hidden));
+ok('部署脚本带旧 agent 停用块', /# >>> 旧 agent 停用/.test(hidden) && /systemctl stop "\$OLD_UNIT"/.test(hidden));
+ok('卸载脚本带旧 agent 清理块', /# >>> 旧 agent 清理（卸载/.test(hiddenUninstall));
+// 四种安装方式都要覆盖到：只看单元文件会漏掉 cron 和手工 nohup 起的那两种
+ok('停用覆盖 systemd / OpenRC / crontab / 进程四路',
+  /list-unit-files "\$OLD_UNIT\.service"/.test(hidden) &&
+    /rc-update del "\$OLD_UNIT"/.test(hidden) &&
+    /crontab -l[^\n]*"\$OLD_DIR\/agent\.sh"/.test(hidden) &&
+    /pkill -f "sh \.\*\$OLD_DIR\/agent/.test(hidden));
+// 顺序要求：先停旧的再启新的，但不能早到「Xray 还在下载」那一步
+ok('停用发生在新服务启动之前、写 agent.env 之后',
+  hidden.indexOf('# >>> 旧 agent 停用') > hidden.indexOf('cat > /opt/logsync/agent.env') &&
+    hidden.indexOf('# >>> 旧 agent 停用') < hidden.indexOf('5. 开机自启'));
+ok('新服务没起来会把旧 agent 拉回来', /systemctl enable --now "\$OLD_UNIT"/.test(hidden));
 
 // 配置包（bundle）也要跟着换状态目录：写死 /opt/nodepanel 会有两个后果 ——
 // 机器上凭空多一个旧目录（藏名字白藏）、changed.env 落错地方导致 Xray 不重载
