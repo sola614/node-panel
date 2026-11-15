@@ -803,6 +803,10 @@ ok('停用发生在新服务启动之前、写 agent.env 之后',
   hidden.indexOf('# >>> 旧 agent 停用') > hidden.indexOf('cat > /opt/logsync/agent.env') &&
     hidden.indexOf('# >>> 旧 agent 停用') < hidden.indexOf('5. 开机自启'));
 ok('新服务没起来会把旧 agent 拉回来', /systemctl enable --now "\$OLD_UNIT"/.test(hidden));
+// 权限判断在脚本内部：命令行只留「下载 + 执行」两句
+ok('非 root 且有 sudo 时脚本自己重入', /exec sudo sh "\$NP_SELF" "\$@"/.test(hidden) && /exec sudo sh "\$NP_SELF" "\$@"/.test(hiddenUninstall));
+ok('没有 sudo 时提示 su -', /先执行 su - 切到 root/.test(hidden) && /先执行 su - 切到 root/.test(hiddenUninstall));
+ok('re-exec 用绝对路径（先钉死 $0 再 cd /）', hidden.indexOf('NP_SELF=$0') < hidden.indexOf('cd / 2>/dev/null'));
 
 // 配置包（bundle）也要跟着换状态目录：写死 /opt/nodepanel 会有两个后果 ——
 // 机器上凭空多一个旧目录（藏名字白藏）、changed.env 落错地方导致 Xray 不重载

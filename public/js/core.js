@@ -57,23 +57,22 @@ const STATUS_BADGE = { active: 'badge-ok', over: 'badge-bad', expired: 'badge-wa
 /**
  * 「以 root 执行面板下发的远程脚本」的命令行，部署 / 卸载共用。
  *
- * 不能直接写 `curl … | sudo sh`：Alpine、精简 Debian、只给 root 登录的 LXC 与
- * 容器里根本没有 sudo，用户复制过去第一行就是
- *     -bash: sudo: command not found
- * 所以按三档展开：已经是 root → 有 sudo → 都没有（给一句能照做的提示）。
+ * 权限判断不在这里做，而是**放进脚本内部**：脚本发现自己不是 root 且系统有 sudo，
+ * 就 exec sudo 重入一次。这样命令行只剩「下载 + 执行」两句，复制时不容易被终端
+ * 截断（原来那段 if/elif/else 有 200 多个字符，手机上复制经常断在半截）。
+ * 顺带少了两个隐患：提示文案只有脚本里一份，不会和命令行里的版本走岔；
+ * 脚本重入时参数（如 --purge）能原样带过去。
  *
- * 先落盘再执行，而不是 `| sh`：管道两端的成败会互相牵连 —— 没有 sudo 时 curl
- * 还在往一个已经关掉的管道写，最后报出来的是一句和真实原因无关的错误。
+ * 仍然先落盘再执行，不用 `curl … | sh`：
+ *   1. 管道模式下 $0 不是文件，脚本拿不到自己的内容，没法 exec sudo 重入；
+ *   2. 管道两端成败会互相牵连 —— curl 还在往一个已经关掉的管道写，
+ *      最后报出来的是一句和真实原因无关的错误。
  * 语法全是 POSIX sh，bash / dash / ash 都能跑。
  */
 function rootShCmd(url, args = '', tmpName = 'np-setup.sh') {
   const file = '/tmp/' + tmpName;
   const tail = args ? ' ' + args : '';
-  return `curl -fsSL "${url}" -o ${file} && `
-    + `if [ "$(id -u)" = 0 ]; then sh ${file}${tail}; `
-    + `elif command -v sudo >/dev/null 2>&1; then sudo sh ${file}${tail}; `
-    + `else echo "✗ 当前不是 root，系统里也没有 sudo：先执行 su - 切到 root，再重跑这条命令" >&2; `
-    + `rm -f ${file}; exit 1; fi`;
+  return `curl -fsSL "${url}" -o ${file} && sh ${file}${tail}`;
 }
 
 /* ---------------------------- 同步回执（节点/服务器共用） ---------------------------- */

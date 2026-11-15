@@ -243,11 +243,12 @@ ${relayOnly
     : '# 已有 Xray 安装（xray / xray-core / x-ui）不会被覆盖；SKIP_XRAY=1 可跳过 Xray 安装。'}
 set -u
 
-# 调用者的 cwd 可能已经悬空：在 /opt/nodepanel 里执行完旧卸载脚本、目录被删之后，
-# 同一终端里再跑本脚本会先报 getcwd() failed —— shell 启动时要读当前目录，
-# 读不到只警告不退出，但后面的相对路径全失效。
-# 这里立刻回到 /，全部操作本来就用绝对路径，不受影响。
-cd / 2>/dev/null || true
+# re-exec 要用绝对路径，而下面会 cd / —— 先把 $0 定死，别让相对路径失效
+NP_SELF=$0
+case "$NP_SELF" in
+  /*) ;;
+  *) NP_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0") ;;
+esac
 
 PANEL_URL="${safeUrl}"
 PANEL_URL_BACKUP="${backupUrl}"
@@ -286,9 +287,23 @@ os_name() {
 }
 
 if [ "$(id -u)" != "0" ]; then
+  # 有 sudo 就自己重入一次，而不是让用户在命令行里写 if/elif/else：
+  # 那种写法 200 多个字符，手机上复制经常断在半截。
+  # 管道（curl | sh）模式下 $0 不是文件，拿不到内容，重入没有意义，只能提示切到 root。
+  if command -v sudo >/dev/null 2>&1 && [ -f "$NP_SELF" ]; then
+    echo "· 当前不是 root，改用 sudo 重新执行（可能要输密码）"
+    exec sudo sh "$NP_SELF" "$@"
+  fi
   printf '\\n✗ 需要 root：要写 /opt、/etc、/usr/local 并注册系统服务\\n' >&2
+  printf '  当前不是 root：先执行 su - 切到 root，再重跑这条命令\\n' >&2
   exit 1
 fi
+
+# 调用者的 cwd 可能已经悬空：在 /opt/nodepanel 里执行完旧卸载脚本、目录被删之后，
+# 同一终端里再跑本脚本会先报 getcwd() failed —— shell 启动时要读当前目录，
+# 读不到只警告不退出，但后面的相对路径全失效。确认过权限之后回到 /，
+# 后面所有操作本来就用绝对路径，不受影响。
+cd / 2>/dev/null || true
 
 # 服务管理器先定下来，后面注册和汇总都用同一个结论
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
@@ -922,8 +937,12 @@ function buildUninstallScript({ label, relayOnly = false, stealth = true }) {
 # 不会动面板里的服务器 / 节点记录；想恢复接入，重新执行一遍部署命令即可。
 set -u
 
-# 同部署脚本：被删掉的目录里执行卸载时，cwd 已经不存在了，先回 /
-cd / 2>/dev/null || true
+# re-exec 要用绝对路径，而下面会 cd / —— 先把 $0 定死
+NP_SELF=$0
+case "$NP_SELF" in
+  /*) ;;
+  *) NP_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0") ;;
+esac
 
 RELAY_ONLY="${relayOnly ? '1' : '0'}"
 PURGE=0
@@ -941,9 +960,18 @@ for _arg in "$@"; do
 done
 
 if [ "$(id -u)" != "0" ]; then
+  # 同部署脚本：有 sudo 就自己重入，参数（--purge）原样带过去
+  if command -v sudo >/dev/null 2>&1 && [ -f "$NP_SELF" ]; then
+    echo "· 当前不是 root，改用 sudo 重新执行（可能要输密码）"
+    exec sudo sh "$NP_SELF" "$@"
+  fi
   echo "✗ 请用 root 执行（需要删除 /opt、/etc 与注销系统服务）"
+  echo "· 当前不是 root：先执行 su - 切到 root，再重跑这条命令"
   exit 1
 fi
+
+# 同部署脚本：在 agent 目录里执行卸载、删完目录后 cwd 就悬空了，回到 /
+cd / 2>/dev/null || true
 
 # 机器上还留着 agent 本体时，优先交给它自己卸（agent.sh --uninstall）：
 # 清理逻辑只有一份实现，而且它更清楚自己用的是官方名还是伪装名。

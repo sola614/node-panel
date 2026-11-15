@@ -449,7 +449,7 @@ ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</d
     wide: true,
     footer: false,
     body: `
-      <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
+      <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号 —— <b>有 sudo 时脚本会自己提权</b>；两者都没有就先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
 
       <div class="hint" style="margin:0 0 12px">
         统一安装为 <code>/opt/logsync</code>，服务名 <code>logsync</code>。
@@ -512,7 +512,7 @@ function uninstallFlow(kind, id) {
     wide: true,
     footer: false,
     body: `
-      <p class="hint" style="margin:0 0 10px">在 <b>${esc(where)}</b> 的终端执行（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）。脚本可重复执行，不会报错：</p>
+      <p class="hint" style="margin:0 0 10px">在 <b>${esc(where)}</b> 的终端执行（root 账号，或有 sudo 的账号 —— <b>有 sudo 时脚本会自己提权</b>；两者都没有就先 <code>su -</code>）。脚本可重复执行，不会报错：</p>
       <div class="code-wrap">
         <pre class="code">${esc(plain)}</pre>
         <button class="btn btn-sm btn-primary copy-btn" data-copy="${esc(plain)}">复制</button>

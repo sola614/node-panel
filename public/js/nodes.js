@@ -1677,7 +1677,7 @@ async function nodeDeployFlow(id) {
     wide: true,
     footer: false,
     body: `
-      <p class="hint" style="margin:0 0 10px">在 <b>${esc(n.host || '待上报地址')}</b> 的终端执行（root 账号，或有 sudo 的账号；<b>没有 sudo 的系统</b>请先 <code>su -</code> 切到 root）：</p>
+      <p class="hint" style="margin:0 0 10px">在 <b>${esc(n.host || '待上报地址')}</b> 的终端执行（root 账号，或有 sudo 的账号 —— <b>有 sudo 时脚本会自己提权</b>；两者都没有就先 <code>su -</code>）：</p>
 
       <div class="hint" style="margin:0 0 12px">
         统一安装为 <code>/opt/logsync</code>，服务名 <code>logsync</code>。

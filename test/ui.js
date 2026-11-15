@@ -173,10 +173,13 @@ const json = (p, o = {}, t = '') => fetch(BASE + p, {
   const purgeCmd = w1.rootShCmd('http://h/api/servers/x/uninstall?token=t', '--purge', 'np-uninstall.sh');
   // 起因：`curl … | sudo sh` 在 Alpine / 只给 root 的 LXC 上第一行就报
   // -bash: sudo: command not found
-  ok('部署命令不再硬依赖 sudo', !/\|\s*sudo sh/.test(shCmd));
-  ok('部署命令先判断是不是 root', /"\$\(id -u\)"\s*=\s*0/.test(shCmd));
-  ok('有 sudo 才用 sudo', /command -v sudo/.test(shCmd));
-  ok('两者都没有时提示 su -', /su -/.test(shCmd), shCmd.slice(-70));
+  // 权限判断已经挪进脚本内部（非 root 且有 sudo 时脚本自己 exec sudo 重入），
+  // 命令行只剩两句：下载 + 执行。原来那段 if/elif/else 有 200 多个字符，
+  // 手机上复制经常断在半截，而且提示文案会和脚本里的版本走岔。
+  ok('部署命令只剩「下载 + 执行」',
+    /^curl -fsSL "[^"]+" -o \/tmp\/np-server-setup\.sh && sh \/tmp\/np-server-setup\.sh$/.test(shCmd),
+    shCmd);
+  ok('部署命令里不再有 sudo 判断', !shCmd.includes('sudo') && !shCmd.includes('id -u'));
   ok('命令先落盘再执行（不是管道给 sh）', /-o \/tmp\/np-server-setup\.sh/.test(shCmd));
   ok('卸载命令把 --purge 透传给脚本', /sh \/tmp\/np-uninstall\.sh --purge/.test(purgeCmd));
 
