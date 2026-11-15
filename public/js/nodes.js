@@ -1679,9 +1679,13 @@ async function nodeDeployFlow(id) {
     body: `
       <p class="hint" style="margin:0 0 10px">在 <b>${esc(n.host || '待上报地址')}</b> 的终端执行（root 账号，或有 sudo 的账号 —— <b>有 sudo 时脚本会自己提权</b>；两者都没有就先 <code>su -</code>）：</p>
 
-      <div class="hint" style="margin:0 0 12px">
+      <div class="hint" style="margin:0 0 8px">
         统一安装为 <code>/opt/logsync</code>，服务名 <code>logsync</code>。
-        早期按默认名装过的机器，重跑一次本命令会自动迁移（先复制、新服务确认在跑才停旧的，不会失联）。
+        早期按默认名装过的机器，重跑一次本命令会自动停用旧的 <code>nodepanel-agent</code>
+        （新服务没起来会把旧的拉回来，不会失联）。
+      </div>
+      <div class="hint" style="margin:0 0 12px">
+        执行中可随时 <code>Ctrl-C</code> 中断；脚本是幂等的，重跑同一条命令即可继续。
       </div>
 
       <div class="code-wrap">
@@ -1696,6 +1700,10 @@ async function nodeDeployFlow(id) {
       <div class="code" style="white-space:pre-wrap"># 部署完成后
 ${pad(`journalctl -u ${unit} -f`)}# 查看日志（systemd）
 ${pad(`tail -f /var/log/${alias}/agent.log`)}# 查看日志（Alpine / cron）
+${pad(`systemctl stop ${unit}`)}# 停止 agent（systemd）
+${pad(`rc-service ${unit} stop`)}# 停止 agent（Alpine）
+${pad(`sh /opt/${alias}/uninstall.sh`)}# 卸载本机 agent（保留日志与备份）
+${pad(`sh /opt/${alias}/uninstall.sh --purge`)}# 彻底清理（连日志一起删）
 ${lastTip}</div>
       <p class="hint" style="margin-top:14px">
         独立节点使用自己的 token 拉取配置，与服务器 agent 互不影响。修改节点后同样 60 秒内自动生效。

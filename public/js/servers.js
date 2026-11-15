@@ -401,13 +401,17 @@ async function serverDeployFlow(id) {
 # —— systemd（Debian / Ubuntu / CentOS / Rocky …）——
 ${pad(`journalctl -u ${unit} -f`)}# 查看 agent 日志
 ${pad(`systemctl restart ${unit}`)}# 手动重载
+${pad(`systemctl stop ${unit}`)}# 停止 agent（开机自启仍保留）
 # —— Alpine / OpenRC ——
 ${pad(`tail -f /var/log/${alias}/agent.log`)}# 查看 agent 日志
 ${pad(`rc-service ${unit} status`)}# 查看运行状态
 ${pad(`rc-service ${unit} restart`)}# 手动重载
+${pad(`rc-service ${unit} stop`)}# 停止 agent（开机自启仍保留）
 ${pad(`rc-update show default | grep ${alias}`)}# 确认已加入开机自启
 # —— 两种系统通用 ——
 ${pad(`sh /opt/${alias}/agent.sh --once`)}# 手动跑一轮
+${pad(`sh /opt/${alias}/uninstall.sh`)}# 卸载本机 agent（保留日志与备份）
+${pad(`sh /opt/${alias}/uninstall.sh --purge`)}# 彻底清理（连日志、配置备份一起删）
 ${pad("systemctl list-units 'gost-relay-*'")}# 查看 gost 转发实例
 ${pad('iptables -t nat -S PREROUTING | grep np-relay')}# 查看 iptables 转发规则</div>
 
@@ -423,13 +427,17 @@ ${pad('iptables -t nat -S PREROUTING | grep np-relay')}# 查看 iptables 转发�
 # —— systemd（Debian / Ubuntu / CentOS / Rocky …）——
 ${pad(`journalctl -u ${unit} -f`)}# 查看 agent 日志
 ${pad(`systemctl restart ${unit}`)}# 手动重载
+${pad(`systemctl stop ${unit}`)}# 停止 agent（开机自启仍保留）
 # —— Alpine / OpenRC ——
 ${pad(`tail -f /var/log/${alias}/agent.log`)}# 查看 agent 日志
 ${pad(`rc-service ${unit} status`)}# 查看运行状态
 ${pad(`rc-service ${unit} restart`)}# 手动重载
+${pad(`rc-service ${unit} stop`)}# 停止 agent（开机自启仍保留）
 ${pad(`rc-update show default | grep ${alias}`)}# 确认已加入开机自启
 # —— 两种系统通用 ——
 ${pad(`sh /opt/${alias}/agent.sh --once`)}# 手动跑一轮
+${pad(`sh /opt/${alias}/uninstall.sh`)}# 卸载本机 agent（保留日志与备份）
+${pad(`sh /opt/${alias}/uninstall.sh --purge`)}# 彻底清理（连日志、配置备份一起删）
 cat /usr/local/etc/xray/config.json           # 查看 Xray 配置
 ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</div>
 
@@ -451,9 +459,14 @@ ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</d
     body: `
       <p class="hint" style="margin:0 0 10px">在服务器终端执行以下命令（root 账号，或有 sudo 的账号 —— <b>有 sudo 时脚本会自己提权</b>；两者都没有就先 <code>su -</code> 切到 root）。agent 是纯 shell 脚本，<b>不需要装 Node</b>，会自动注册为开机自启服务：</p>
 
-      <div class="hint" style="margin:0 0 12px">
+      <div class="hint" style="margin:0 0 8px">
         统一安装为 <code>/opt/logsync</code>，服务名 <code>logsync</code>。
-        早期按默认名装过的机器，重跑一次本命令会自动迁移（先复制、新服务确认在跑才停旧的，不会失联）。
+        早期按默认名装过的机器，重跑一次本命令会自动停用旧的 <code>nodepanel-agent</code>
+        （新服务没起来会把旧的拉回来，不会失联）。
+      </div>
+      <div class="hint" style="margin:0 0 12px">
+        执行中可随时 <code>Ctrl-C</code> 中断；脚本是幂等的，重跑同一条命令即可继续。
+        想临时停掉 agent（比如排查问题），部署完成后用下面的 <code>systemctl stop</code> / <code>rc-service stop</code>。
       </div>
 
       <div class="code-wrap">
