@@ -772,6 +772,10 @@ const plain = buildInstallScript({
 // 这样「运行态里搜不到特征名」这条约束仍然是严格的
 const stripLegacy = (text) =>
   String(text).replace(/# >>> 旧布局[^\n]*\n[\s\S]*?# <<< 旧布局[^\n]*\n?/g, '');
+// 证书根目录是**故意保留**旧路径的：它是面板下发 xray/hysteria 配置时写死的，
+// 跟着伪装名改会让卸载去删一个不存在的目录。单独剥掉再断言其余部分干净。
+const stripCertsLine = (text) =>
+  stripLegacy(text).replace(/^CERTS_DIR=\/etc\/nodepanel.*$/gm, '');
 
 ok('伪装部署脚本（除迁移块）里搜不到 nodepanel', !/nodepanel/i.test(stripLegacy(hidden)));
 ok('伪装部署脚本装到 /opt/logsync', hidden.includes('/opt/logsync/logsync.sh') && hidden.includes('mkdir -p /opt/logsync /var/log/logsync /run/logsync'));
@@ -780,10 +784,12 @@ ok('伪装后 systemd / OpenRC 单元都叫 logsync', hidden.includes('systemctl
 ok('伪装后 nft 链名一起换', !/NODEPANEL_HYHOP/.test(hidden) && hidden.includes('LOGSYNC_HYHOP'));
 ok('伪装后内嵌 agent 的默认目录也换了', hidden.includes('STATE_DIR=${STATE_DIR:-/opt/logsync}'));
 ok('伪装后内嵌 agent 的卸载单元也换了', hidden.includes('/etc/init.d/logsync') && !hidden.includes('/etc/init.d/nodepanel-agent'));
-ok('伪装卸载脚本（除旧布局块）里搜不到 nodepanel', !/nodepanel/i.test(stripLegacy(hiddenUninstall)));
+ok('伪装卸载脚本（除旧布局块与证书根）里搜不到 nodepanel', !/nodepanel/i.test(stripCertsLine(hiddenUninstall)));
 // 0.1.54 起伪装不再是开关：不传 stealth 也走伪装，否则服务器字段一漏就退回裸名
 ok('默认部署即伪装（不需要开关）', /\/opt\/logsync/.test(plain) && !/nodepanel/i.test(stripLegacy(plain)));
-ok('默认卸载脚本也按伪装名清理', !/nodepanel/i.test(stripLegacy(buildUninstallScript({ label: '隐藏 01' }))));
+ok('默认卸载脚本也按伪装名清理', !/nodepanel/i.test(stripCertsLine(buildUninstallScript({ label: '隐藏 01' }))));
+// 反过来的约束：证书根必须保持面板下发的那条路径，不能被换成 /etc/logsync
+ok('卸载脚本的证书根不随伪装改名', /^CERTS_DIR=\/etc\/nodepanel$/m.test(hiddenUninstall) && !/CERTS_DIR=\/etc\/logsync/.test(hiddenUninstall));
 ok('部署脚本带旧布局迁移块', /# >>> 旧布局迁移/.test(hidden) && /cp -a "\$OLD_DIR"\/\./.test(hidden));
 ok('卸载脚本带旧布局清理块', /# >>> 旧布局清理/.test(hiddenUninstall));
 ok('迁移是先复制、不是搬移（旧的全程不掉线）', /cp -a "\$OLD_DIR"\/\./.test(hidden) && !/mv "\$OLD_DIR"/.test(hidden));

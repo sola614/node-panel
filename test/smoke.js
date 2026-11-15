@@ -1125,10 +1125,11 @@ function totpCodeOf(secret) {
   /* ---------- 11. 部署脚本 ---------- */
   const srvInstall = await fetch(`${BASE}/api/servers/${serverId}/install?token=${serverToken}`).then((r) => r.text());
   ok('服务器部署脚本可下载', srvInstall.startsWith('#!/bin/sh') && srvInstall.includes(serverToken));
-  ok('部署脚本不再要求 Node 运行时', !srvInstall.includes('command -v node') && !srvInstall.includes('node /opt/nodepanel'));
-  ok('脚本内嵌 shell agent', srvInstall.includes('Node Panel Agent') && srvInstall.includes('NODEPANEL_AGENT_EOF'));
+  // 0.1.54 起部署脚本一律伪装：agent 装到 /opt/logsync、注册成 logsync
+  ok('部署脚本不再要求 Node 运行时', !srvInstall.includes('command -v node') && !srvInstall.includes('node /opt/logsync'));
+  ok('脚本内嵌 shell agent', srvInstall.includes('Log Sync') && srvInstall.includes('LOGSYNC_AGENT_EOF'));
   ok('脚本注册服务（systemd + OpenRC 双分支）',
-    srvInstall.includes('nodepanel-agent.service') && srvInstall.includes('/run/systemd/system') && srvInstall.includes('rc-update add nodepanel-agent'));
+    srvInstall.includes('logsync.service') && srvInstall.includes('/run/systemd/system') && srvInstall.includes('rc-update add logsync'));
 
   const nodeInstall = await fetch(`${BASE}/api/nodes/${node3Id}/install?token=${node3Token}`).then((r) => r.text());
   ok('独立节点部署脚本可下载', nodeInstall.startsWith('#!/bin/sh') && nodeInstall.includes(node3Token));
@@ -1169,27 +1170,27 @@ function totpCodeOf(secret) {
       srvInstall.includes('部署完成 · 耗时') &&
       srvInstall.includes('手动一轮'));
   // 只检查部署脚本自己的那部分：内嵌的 agent.sh 里有「acme.sh 是纯 shell」这类说明
-  const srvWrapper = srvInstall.split('NODEPANEL_AGENT_EOF')[0];
+  const srvWrapper = srvInstall.split('LOGSYNC_AGENT_EOF')[0];
   ok('部署输出不含「纯 shell，无需 Node」这类修饰语',
     !srvWrapper.includes('无需 Node') && !srvWrapper.includes('纯 shell'));
   ok('纯 Hysteria2 独立节点不装 Xray', nodeInstall.includes('NEED_XRAY="0"'));
 
   // 面板被删 / 换域名 / token 失效之后，机器上要有一条不依赖面板的退路
-  ok('部署脚本落地本机卸载入口 /opt/nodepanel/uninstall.sh',
-    srvInstall.includes('cat > /opt/nodepanel/uninstall.sh') &&
-      srvInstall.includes('exec sh /opt/nodepanel/agent.sh --uninstall'));
-  const entrySrc = (srvInstall.split("<<'NODEPANEL_UNINSTALL_EOF'\n")[1] || '').split('\nNODEPANEL_UNINSTALL_EOF')[0];
+  ok('部署脚本落地本机卸载入口 /opt/logsync/uninstall.sh',
+    srvInstall.includes('cat > /opt/logsync/uninstall.sh') &&
+      srvInstall.includes('exec sh /opt/logsync/logsync.sh --uninstall'));
+  const entrySrc = (srvInstall.split("<<'LOGSYNC_UNINSTALL_EOF'\n")[1] || '').split('\nLOGSYNC_UNINSTALL_EOF')[0];
   const entryCheck = spawnSync('sh', ['-n'], { input: entrySrc, encoding: 'utf8' });
   ok('本机卸载入口通过 sh -n 语法检查', entrySrc.length > 0 && entryCheck.status === 0,
     String(entryCheck.stderr || '').slice(0, 120));
 
   /* ---------- 11.1 卸载脚本 ---------- */
   const srvUninstall = await fetch(`${BASE}/api/servers/${serverId}/uninstall?token=${serverToken}`).then((r) => r.text());
-  ok('服务器卸载脚本可下载', srvUninstall.startsWith('#!/bin/sh') && srvUninstall.includes('nodepanel-agent'));
+  ok('服务器卸载脚本可下载', srvUninstall.startsWith('#!/bin/sh') && srvUninstall.includes('logsync'));
   ok(
     '卸载脚本注销服务并清理目录',
-    srvUninstall.includes('systemctl disable nodepanel-agent') &&
-      srvUninstall.includes('rc-update del nodepanel-agent') &&
+    srvUninstall.includes('systemctl disable logsync') &&
+      srvUninstall.includes('rc-update del logsync') &&
       srvUninstall.includes('rm -rf "$AGENT_DIR" "$RUN_DIR"'),
   );
   ok('卸载脚本会停掉 agent 托管的 Hysteria2 实例', srvUninstall.includes('node-*.yaml') && srvUninstall.includes('RUN_DIR"/*.pid'));
@@ -1210,10 +1211,10 @@ function totpCodeOf(secret) {
     srvUninstall.includes('不是面板生成的'));
   ok('卸载脚本不再保留 Xray 配置（只保留备份）',
     srvUninstall.includes('保留 $XRAY_BAK') && !srvUninstall.includes('Xray 仍在按这份配置跑'));
-  ok('卸载脚本支持 --purge 深度清理', srvUninstall.includes('--purge') && srvUninstall.includes('nodepanel.bak'));
+  ok('卸载脚本支持 --purge 深度清理', srvUninstall.includes('--purge') && srvUninstall.includes('logsync.bak'));
   // 清理逻辑只保留一份：机器上还有 agent 本体时，交给它的 --uninstall 去做
   ok('卸载脚本优先转交 agent 自己的 --uninstall',
-    srvUninstall.includes('exec sh /opt/nodepanel/agent.sh --uninstall "$@"'));
+    srvUninstall.includes('exec sh /opt/logsync/logsync.sh --uninstall "$@"'));
 
   // 脚本是拼模板拼出来的，少个转义就是语法错 —— 真机执行前先让 sh 自己检查一遍
   const shCheck = spawnSync('sh', ['-n'], { input: srvUninstall, encoding: 'utf8' });

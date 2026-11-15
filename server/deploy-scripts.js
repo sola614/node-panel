@@ -938,7 +938,11 @@ fi
 AGENT_DIR=/opt/nodepanel
 RUN_DIR=/run/nodepanel
 LOG_DIR=/var/log/nodepanel
-CERTS_DIR=/etc/nodepanel
+# 证书根目录**不随伪装改名**：它是面板下发 xray / hysteria 配置时写死的路径
+# （lib/cert.js 的 CERTS_ROOT），agent 只是照着这个路径落盘。跟着改成
+# /etc/logsync 的话，卸载会去一个不存在的目录删除，真证书全留在 /etc/nodepanel/certs。
+# 用占位符是因为整个模板要过一遍名字替换，写字面量会被一起换掉。
+CERTS_DIR=@CERTS_ROOT@
 
 # 0.1.9 起机器上的安装可能是伪装名（webcore / streamd），也可能是老官方名
 # （xray / hysteria）。一切以 agent.env 里记录的为准 —— 它还没被删，就在下面
@@ -1151,7 +1155,9 @@ echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即
 
 @MIGRATE_UNINSTALL@
 `, stealth)
-    .replace('@MIGRATE_UNINSTALL@', stealth ? legacyUninstallBlock() : '');
+    .replace('@MIGRATE_UNINSTALL@', stealth ? legacyUninstallBlock() : '')
+    // 证书根目录固定成面板实际下发的那个（见 CERTS_DIR 那行的说明）
+    .replace('@CERTS_ROOT@', '/etc/nodepanel');
 }
 
 /** 服务器 / 独立节点共用的卸载脚本鉴权 */
