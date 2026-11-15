@@ -243,6 +243,12 @@ ${relayOnly
     : '# 已有 Xray 安装（xray / xray-core / x-ui）不会被覆盖；SKIP_XRAY=1 可跳过 Xray 安装。'}
 set -u
 
+# 调用者的 cwd 可能已经悬空：在 /opt/nodepanel 里执行完旧卸载脚本、目录被删之后，
+# 同一终端里再跑本脚本会先报 getcwd() failed —— shell 启动时要读当前目录，
+# 读不到只警告不退出，但后面的相对路径全失效。
+# 这里立刻回到 /，全部操作本来就用绝对路径，不受影响。
+cd / 2>/dev/null || true
+
 PANEL_URL="${safeUrl}"
 PANEL_URL_BACKUP="${backupUrl}"
 AGENT_TOKEN="${token}"
@@ -916,6 +922,9 @@ function buildUninstallScript({ label, relayOnly = false, stealth = true }) {
 # 不会动面板里的服务器 / 节点记录；想恢复接入，重新执行一遍部署命令即可。
 set -u
 
+# 同部署脚本：被删掉的目录里执行卸载时，cwd 已经不存在了，先回 /
+cd / 2>/dev/null || true
+
 RELAY_ONLY="${relayOnly ? '1' : '0'}"
 PURGE=0
 for _arg in "$@"; do
@@ -1160,6 +1169,9 @@ else
   echo "✓ 卸载完成：agent 已注销，节点端口不再监听"
 fi
 echo "  面板里的服务器 / 节点记录还在，重新执行部署命令即可恢复接入。"
+# 卸载删掉了 agent 目录，如果刚才是在那个目录里执行的，当前 shell 的工作目录
+# 已经不存在了 —— 后面任何命令都会先报 getcwd() failed，很容易误以为机器坏了
+echo "  · 如果刚才是在 agent 目录里执行的，请先 cd / 再继续操作"
 
 @MIGRATE_UNINSTALL@
 `, stealth)

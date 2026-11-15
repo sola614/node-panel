@@ -147,6 +147,12 @@ NP_ORPHAN=0
 NP_HTTP_CODE=''
 
 # 看版本不需要配置：装好没装好、装的是哪一版，先问这个最省事
+# log 必须定义在这个 case 之前：--uninstall 分支第一句就要用它，
+# 而它原本在 200 行之后才定义，卸载时会先报一句 `log: not found`（不影响结果但很难看）
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
 case "${1:-}" in
   --version | -v)
     echo "nodepanel-agent $VERSION (shell)"
@@ -269,10 +275,6 @@ np_next_sleep() {
   done
   [ "$_w" -gt "$BACKOFF_MAX" ] && _w=$BACKOFF_MAX
   printf '%s' "$_w"
-}
-
-log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
 # ------------------------------- HTTP 客户端 --------------------------------
