@@ -791,6 +791,47 @@ xray_running() {
   return 1
 }
 
+# $1=单元名：服务是否真的在跑。
+# systemctl start 的返回码在 Type=simple 下只代表 fork 成功，进程完全可以一秒后崩掉，
+# 所以「起来了」必须另外确认一次，不能拿 start 的返回码当结论。
+unit_active() {
+  [ -n "$1" ] || return 1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet "$1" 2>/dev/null && return 0
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "$1" status >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# $1=单元名：这台机器上「看该服务日志」的正确命令。
+# Alpine 没有 journalctl，写死它等于让人去执行一条不存在的命令。
+unit_log_hint() {
+  # 默认值不要写 "$_u"：set -u 下那个变量可能还没赋值，取一次就直接退出了
+  _un=${1:-xray}
+  if command -v systemctl >/dev/null 2>&1; then
+    printf 'journalctl -u %s -n 50 --no-pager' "$_un"
+  elif command -v logread >/dev/null 2>&1; then
+    printf 'logread | grep -i %s | tail -n 50' "$_un"
+  else
+    printf 'tail -n 50 /var/log/messages'
+  fi
+}
+
+# $1=单元名：该单元实际读取的配置文件路径（抠 ExecStart / command_args 里的 -config）。
+# 用来发现「agent 写 A、服务读 B」——重装时布局判定从官方名翻到伪装名，
+# 就会出现这种错位：进程拿旧配置反复崩，日志却只显示「已启动/未运行」来回跳。
+unit_config_path() {
+  [ -n "$1" ] || return 0
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl show -p ExecStart --value "$1" 2>/dev/null \
+      | grep -oE '\-config [^ ;]+' | head -1 | awk '{print $2}'
+  elif [ -f "/etc/init.d/$1" ]; then
+    sed -n 's/.*-config \([^ "]*\).*/\1/p' "/etc/init.d/$1" 2>/dev/null | head -1
+  fi
+}
+
 xray_ensure() {
   # 本机没有 Xray 节点（纯 Hysteria2 / 空节点）：没有需要重载的对象。
   # 这里必须落一个值 —— 留空会被回执兜底成 skip，面板于是永远显示「待重载」
@@ -835,6 +876,15 @@ xray_ensure() {
   fi
 
   log "! Xray 未运行（$_u 不是 active），尝试拉起"
+
+  # 配置路径错位：agent 写的和单元读的不是同一个文件。这时进程会用旧配置启动，
+  # 崩掉之后 start 依然返回 0，看起来就像「拉起来了但端口不监听」。
+  _unit_cfg=$(unit_config_path "$_u")
+  if [ -n "$_unit_cfg" ] && [ "$_unit_cfg" != "$XRAY_CONFIG" ]; then
+    log "! 配置路径不一致：agent 写 $XRAY_CONFIG，但 $_u 读 $_unit_cfg"
+    log "  多半是重装时布局判定从官方名翻到了伪装名（或反过来），重跑一次部署命令即可对齐"
+  fi
+
   if command -v systemctl >/dev/null 2>&1; then
     # 顺手 enable：否则下次重启又是同样的坑，而且没人会发现
     systemctl enable "$_u" >/dev/null 2>&1
@@ -842,12 +892,33 @@ xray_ensure() {
   else
     _err=$(rc-service "$_u" start 2>&1)
   fi
-  if [ $? -eq 0 ]; then
-    log "✓ Xray 已启动"
-    rm -f "$_xf" 2>/dev/null
-    RC_XRAY=ok
-    NP_JUST_RESTARTED=1
-    return 0
+  _rc=$?
+
+  # start 返回 0 不等于进程活着（Type=simple 只要 fork 成功就算启动）。
+  # 以前这里直接报「✓ 已启动」并清掉失败标记，于是下一轮又「未运行」、又「已启动」，
+  # 每 60 秒循环一次，日志里永远看不到真实原因 —— 必须先等一拍再确认。
+  if [ "$_rc" -eq 0 ]; then
+    sleep 1
+    if unit_active "$_u"; then
+      log "✓ Xray 已启动"
+      rm -f "$_xf" 2>/dev/null
+      RC_XRAY=ok
+      NP_JUST_RESTARTED=1
+      return 0
+    fi
+    log "✗ $_u 启动后立刻退出（start 返回 0 只代表 fork 成功）"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl status "$_u" --no-pager -n 8 2>&1 | sed -n '1,14p' | sed 's/^/    /'
+    else
+      rc-service "$_u" status 2>&1 | sed -n '1,8p' | sed 's/^/    /'
+    fi
+    log "  完整日志：$(unit_log_hint "$_u")"
+    RC_ERR="$_u 启动后立即退出：配置错误或端口被占，见上面的日志"
+    log "✗ $RC_ERR"
+    RC_XRAY=fail
+    RC_OK=0
+    printf '%s\n%s\n' "$(date +%s)" "$RC_ERR" > "$_xf" 2>/dev/null
+    return 1
   fi
 
   case "$_err" in
@@ -915,9 +986,19 @@ probe_ports() {
   log "! 端口未在监听：$BAD_PORTS（配置已落盘，但服务没把它监听起来）"
   if [ "$RELAY_ONLY" = '1' ]; then
     # 中转机没有 xray/hysteria，排查方向只有 gost 与 agent 日志
-    log "  排查：systemctl list-units 'gost-relay-*'；journalctl -u 'gost-relay-*' -n 50；tail -n 50 $LOG_DIR/agent.log"
+    if command -v systemctl >/dev/null 2>&1; then
+      log "  排查：systemctl list-units 'gost-relay-*'；journalctl -u 'gost-relay-*' -n 50 --no-pager"
+    else
+      log "  排查：rc-service --list 2>/dev/null | grep relay；logread | grep -i gost | tail -n 50"
+    fi
+    log "  本机日志：tail -n 50 $LOG_DIR/agent.log"
   else
-    log "  排查：ss -lntup | grep -E 'xray|hysteria'；journalctl -u xray -n 50"
+    # 进程名按实际别名找：伪装机器上跑的是 webcore / streamd，
+    # grep xray 永远匹配不到，等于给了一条查不出东西的命令
+    _hy_n=$(basename "${HY_BIN:-hysteria}" 2>/dev/null)
+    log "  排查：ss -lntup 2>/dev/null || netstat -lntup"
+    log "  确认进程：pgrep -a -x '${XRAY_ALIAS:-xray}' 或 pgrep -a -x '${_hy_n}'"
+    log "  服务日志：$(unit_log_hint "$(xray_unit)")"
   fi
   RC_OK=0
   if [ "$RELAY_ONLY" = '1' ]; then
@@ -2495,6 +2576,32 @@ if [ -n "$PANEL_URL_BACKUP" ]; then
 else
   log "面板：$PANEL_URL · 未配置备用地址"
 fi
+
+# 同一台机器上不该有两个 agent 同时在跑：两边用同一个 token 抢同一份配置，
+# 一个刚启动服务、另一个因为 hash 不同又 reload，端口会反复断开。
+# 而日志里只看到「✗ Xray 未运行 → ✓ 已启动 → ! 端口未在监听」的循环，
+# 极难联想到双开，所以这里主动点破。只报警不自愈 —— 杀错进程的代价太大。
+np_report_duplicate_agents() {
+  [ -d /proc ] || return 0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  _others=''
+  for _p in $(pgrep -f '(agent|logsync)\.sh' 2>/dev/null); do
+    [ "$_p" = "$$" ] && continue
+    _c=$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null) || continue
+    case "$_c" in
+      *'/opt/nodepanel/agent.sh'* | *'/opt/logsync/logsync.sh'* | *'/opt/logsync/agent.sh'*)
+        _others="${_others}${_others:+ }$_p"
+        ;;
+    esac
+  done
+  [ -n "$_others" ] || return 0
+  log "! 同一台机器上还有另一个 agent 在跑（pid $_others）"
+  log "  两个 agent 抢同一份配置：一个启动、另一个重载，端口会反复断开"
+  log "  停掉旧的：systemctl disable --now nodepanel-agent（没有该单元就用 rc-update del nodepanel-agent）"
+  log "  或者重跑一次面板上的部署命令，0.1.54 起会自动停用旧单元"
+}
+np_report_duplicate_agents
+
 if [ "$RELAY_ONLY" = '1' ]; then
   log "角色：中转机（只同步端口转发规则，不管理 Xray / Hysteria2）"
   log "转发：gost / iptables · 轮询 ${INTERVAL}s"

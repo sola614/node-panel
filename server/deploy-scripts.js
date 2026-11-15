@@ -122,10 +122,28 @@ fi
 # <<< 旧布局迁移`;
 }
 
-/** 迁移收尾：新服务确认在跑，才停旧的。没起来就原样保留，机器不失联。 */
+/**
+ * 迁移收尾：新服务确认在跑，才停旧的。没起来就原样保留，机器不失联。
+ *
+ * 判定**不能只看「这一轮做了复制」**：机器上可能已经残留 /opt/logsync/agent.env
+ * （之前手工试过、或某次中断），这时迁移块会被跳过、MIGRATED 为空，
+ * 旧单元就永远留着 —— 两个 agent 用同一个 token 抢同一份配置，一个启动一个重载，
+ * 端口反复断开，日志里表现为「已启动 → 端口未监听」循环，很难看出是双开。
+ * 所以这里再按「旧单元是否还在」单独判一次。
+ */
 function legacyMigrateDoneBlock() {
   return `# >>> 旧布局迁移收尾（0.1.54）
-if [ "$MIGRATED" = '1' ]; then
+_old_present=0
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "$OLD_UNIT.service" 2>/dev/null | grep -q "^$OLD_UNIT\\.service"; then
+  _old_present=1
+fi
+[ -f "/etc/init.d/$OLD_UNIT" ] && _old_present=1
+# cron 方式装的旧 agent 没有单元文件，只能看 crontab
+if [ "$_old_present" = '0' ] && command -v crontab >/dev/null 2>&1; then
+  crontab -l 2>/dev/null | grep -q "$OLD_DIR/agent.sh" && _old_present=1
+fi
+
+if [ "$MIGRATED" = '1' ] || [ "$_old_present" = '1' ]; then
   _new_ok=0
   if command -v systemctl >/dev/null 2>&1; then
     _i=0
@@ -157,7 +175,7 @@ if [ "$MIGRATED" = '1' ]; then
     if command -v crontab >/dev/null 2>&1; then
       crontab -l 2>/dev/null | grep -v "$OLD_DIR/agent.sh" | crontab - 2>/dev/null
     fi
-    say "旧服务已停用；$OLD_DIR 保留为备份，确认新服务稳定后可手工删除"
+    say "旧服务 $OLD_UNIT 已停用（$OLD_DIR 保留为备份，确认稳定后可手工删除）"
   else
     bad "新服务没起来，旧布局继续运行（机器不会失联）"
     note "排查：systemctl status $NEW_UNIT / journalctl -u $NEW_UNIT -n 50"
