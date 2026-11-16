@@ -125,9 +125,10 @@ const hy2Node = {
 };
 const hy2Cfg = singbox.buildConfig([hy2Node], USERS);
 const hy2Inb = hy2Cfg.inbounds[0];
-ok('hysteria2 入站：users 密码 + obfs + 带宽 + TLS 无条件启用（v2ray_api users 也收录）',
+ok('hysteria2 入站：users 密码=userpass 组合（与订阅 auth 逐字一致）+ obfs + 带宽 + TLS 无条件启用（v2ray_api users 也收录）',
   hy2Inb.type === 'hysteria2' &&
-    hy2Inb.users[0].name === 'u' + USERS[0].id && hy2Inb.users[0].password === USERS[0].uuid &&
+    hy2Inb.users[0].name === 'u' + USERS[0].id &&
+    hy2Inb.users[0].password === `u${USERS[0].id}:${USERS[0].uuid}` &&
     hy2Inb.obfs.type === 'salamander' && hy2Inb.up_mbps === 100 && hy2Inb.down_mbps === 200 &&
     hy2Inb.tls.enabled === true && hy2Inb.tls.certificate_path && hy2Inb.tls.key_path &&
     hy2Cfg.experimental.v2ray_api.stats.users.includes('u' + USERS[0].id),

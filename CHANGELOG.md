@@ -28,6 +28,12 @@
   才进回执失败。清理范围仍只限 hysteria 家族（streamd/hysteria），撞端口的其他服务
   不动、只记日志。占用者身份待实机 `ss -lunp`/`lsof` 输出确认（怀疑升级/目录迁移
   断链的旧实例或同机其他 hysteria 残留）。
+- **hy2 入站的认证语义对齐**（hy2-in-singbox 首次实机部署不通的根因，实机排查确认：
+  vless/hysteria 都通、仅 sing-box 承载的 hy2 不通）——sing-box 的 users[].password
+  是「纯密码」，而订阅链接的 auth 是官方 hysteria 的 userpass 组合（u<id>:<uuid>），
+  官方客户端把组合**整体当密码**发送——sing-box 侧只存 uuid 会认证失败（sing-box
+  官方文档明确警告了这个别名差异）。password 改存组合，与订阅 auth 逐字一致；
+  hysteria 独立实例不受影响（它本来就按官方语义拆分比对）。
 
 ## [0.2.5] - 2026-11-16
 
