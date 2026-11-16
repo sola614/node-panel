@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.2.3'
+VERSION='0.2.4'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -1571,6 +1571,29 @@ hy_ensure() {
   if [ -f "$_log" ]; then
     _size=$(wc -c < "$_log" 2>/dev/null || echo 0)
     [ "$_size" -gt "$LOG_MAX" ] && : > "$_log"
+  fi
+
+  # 启动前端口预检（0.2.3.1）：占着本实例端口的若是**升级残留的旧 hysteria 进程**
+  # （pid 文件在 RUN_DIR/目录迁移或 agent.env 跨版本后断链，hy_ensure 看不到旧
+  # pid），直接清掉再拉起 —— 否则新实例 bind 失败进入每轮崩溃循环，而旧实例还在
+  # 用旧配置服务（配置漂移，面板与机器对不上）。实测场景：升级后 FATAL
+  # 「listen udp :24578: bind: address already in use」且节点还在跑（旧实例活着）。
+  # 只清 hysteria 家族进程（streamd/hysteria），撞端口的别的服务不动、只记日志
+  _lport=$(sed -n 's/^listen:[[:space:]]*:\{0,1\}\([0-9][0-9]*\).*/\1/p' "$_cfg" 2>/dev/null | sed -n '1p')
+  if [ -n "$_lport" ]; then
+    _holders=$(ss -lunp 2>/dev/null | grep ":$_lport " || netstat -lunp 2>/dev/null | grep ":$_lport " || true)
+    for _hp in $(printf '%s\n' "$_holders" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+      [ -n "$_hp" ] || continue
+      _hn=$(ps -p "$_hp" -o comm= 2>/dev/null || true)
+      case "$_hn" in
+        hysteria | streamd | *hysteria*)
+          kill "$_hp" 2>/dev/null && log "  · 清理升级残留的旧 hysteria 进程（pid=$_hp 占 $_lport/udp），重新拉起"
+          ;;
+        *)
+          [ -n "$_hn" ] && log "  ! $_lport/udp 被其他进程占用（$_hn pid=$_hp），不自动处理"
+          ;;
+      esac
+    done
   fi
 
   nohup "$HYSTERIA_BIN" server -c "$_cfg" >> "$_log" 2>&1 &
