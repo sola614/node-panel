@@ -1245,6 +1245,27 @@ function totpCodeOf(secret) {
   const badBundle = await fetch(`${BASE}/api/agent/bundle?token=wrong`).then((r) => r.text());
   ok('错误 token 拿不到配置包', badBundle.startsWith('#ERROR'));
 
+  /* ---------- 11.25 服务器停用 ---------- */
+  // 停用要同时做到三件事：配置包标记 disabled（agent 据此拉长间隔、不碰服务）、
+  // 离线告警跳过、UI 显示「已停用」而不是「离线」。这里测前两条里能量化的部分。
+  await call('/api/servers/' + serverId, { method: 'PUT', body: json({ enabled: false }) });
+  const offBundle = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}`).then((r) => r.text());
+  ok('停用后配置包标记 NP_DISABLED=1', /NP_DISABLED=1/.test(offBundle));
+  const offHash = /NP_HASH='([^']+)'/.exec(offBundle);
+  ok('停用会让 hash 变化（否则 agent 拿不到新状态）', !!offHash && offHash[1] !== bundleHash[1],
+    `before=${bundleHash[1]} off=${offHash && offHash[1]} | ${(offBundle.match(/NP_(HASH|DISABLED)=[^\n]*/g) || []).join(' ')}`);
+  const offAgain = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}&hash=${offHash[1]}`).then((r) => r.text());
+  ok('停用状态下 hash 稳定（不会每轮重下发）', offAgain.trim() === '#UNCHANGED');
+
+  const srvOff = await call('/api/servers');
+  const foundOff = (srvOff.data.items || []).find((x) => x.id === serverId);
+  ok('列表里能看到停用状态', !!foundOff && foundOff.enabled === false, `enabled=${foundOff && JSON.stringify(foundOff.enabled)}`);
+
+  await call('/api/servers/' + serverId, { method: 'PUT', body: json({ enabled: true }) });
+  const onBundle = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}`).then((r) => r.text());
+  ok('重新启用后回到 NP_DISABLED=0', /NP_DISABLED=0/.test(onBundle));
+  ok('启用后 hash 回到停用前（状态位可逆）', /NP_HASH='([^']+)'/.exec(onBundle)[1] === bundleHash[1]);
+
   // 纯文本上报（shell agent 用的格式）
   const textReport = await fetch(`${BASE}/api/agent/report?token=${serverToken}`, {
     method: 'POST',

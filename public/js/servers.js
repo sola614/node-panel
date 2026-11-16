@@ -27,7 +27,7 @@ function serverCardHtml(s) {
       <input type="checkbox" class="s-pick" data-id="${s.id}" title="勾选后可批量删除">
       <div class="server-body">
         <div class="server-name">
-          <i class="dot" style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}"></i>
+          <i class="dot" style="color:${s.enabled === false || !s.online ? 'var(--muted)' : 'var(--ok)'}"></i>
           <span class="server-name-text">${esc(s.name)}</span>
           ${relay ? '<span class="chip">中转机</span>' : ''}
         </div>
@@ -37,7 +37,9 @@ function serverCardHtml(s) {
         </div>
         <div class="server-status-row">
           ${syncBadge(s.sync, s.name)}
-          <span class="badge ${s.online ? 'badge-ok' : 'badge-dim'}">${s.online ? '在线' : '离线'}</span>
+          ${s.enabled === false
+            ? '<span class="badge badge-warn">已停用</span>'
+            : `<span class="badge ${s.online ? 'badge-ok' : 'badge-dim'}">${s.online ? '在线' : '离线'}</span>`}
           <span class="hint" style="margin:0">最后心跳 ${fmtAgo(s.lastSeen)}</span>
         </div>
         <div class="server-meta">
@@ -55,6 +57,7 @@ function serverCardHtml(s) {
         <div style="display:flex;gap:7px;flex-wrap:wrap">
           <button class="btn btn-sm btn-primary" data-act="server-deploy" data-id="${s.id}">部署命令</button>
           <button class="btn btn-sm btn-ghost" data-act="server-uninstall" data-id="${s.id}">卸载命令</button>
+          <button class="btn btn-sm btn-ghost" data-act="server-toggle" data-id="${s.id}">${s.enabled === false ? '启用' : '停用'}</button>
           <button class="btn btn-sm btn-ghost" data-act="server-edit" data-id="${s.id}">编辑</button>
           <button class="btn btn-sm btn-ghost" data-act="server-copy" data-id="${s.id}">复制</button>
           <button class="btn btn-sm btn-ghost" data-act="server-rotate" data-id="${s.id}">重置 token</button>
@@ -380,12 +383,12 @@ async function serverDeployFlow(id) {
     ? `<div style="display:flex;gap:18px;margin:18px 0 14px">
         <div><div class="hint" style="margin:0 0 3px">转发规则</div><b>${s.ruleCount || 0} 条</b></div>
         <div><div class="hint" style="margin:0 0 3px">机器角色</div><b>中转机</b></div>
-        <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}">${s.online ? '在线' : '离线'}</b></div>
+        <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.enabled === false ? 'var(--muted)' : s.online ? 'var(--ok)' : 'var(--muted)'}">${s.enabled === false ? '已停用' : s.online ? '在线' : '离线'}</b></div>
       </div>`
     : `<div style="display:flex;gap:18px;margin:18px 0 14px">
         <div><div class="hint" style="margin:0 0 3px">本机节点</div><b>${nodes.length} 个</b></div>
         <div><div class="hint" style="margin:0 0 3px">可用用户</div><b>${s.userCount}</b></div>
-        <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.online ? 'var(--ok)' : 'var(--muted)'}">${s.online ? '在线' : '离线'}</b></div>
+        <div><div class="hint" style="margin:0 0 3px">状态</div><b style="color:${s.enabled === false ? 'var(--muted)' : s.online ? 'var(--ok)' : 'var(--muted)'}">${s.enabled === false ? '已停用' : s.online ? '在线' : '离线'}</b></div>
       </div>`;
 
   // 0.1.54 起统一伪装：面板生成的脚本一律把 agent 装到 /opt/logsync、注册成 logsync，

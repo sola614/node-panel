@@ -93,7 +93,7 @@ if [ -f "$ENV_FILE" ]; then
   for _env_key in PANEL_URL PANEL_URL_BACKUP AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
                   HYSTERIA_BIN HYSTERIA_AUTO_INSTALL HOP_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR \
                   HTTP_TIMEOUT LOG_MAX RELAY_ONLY FAILOVER_AFTER BACKOFF_MAX \
-                  ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD ORPHAN_GRACE ORPHAN_INTERVAL; do
+                  ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD ORPHAN_GRACE ORPHAN_INTERVAL DISABLED_INTERVAL; do
     _env_val=$(env_read "$_env_key")
     [ -n "$_env_val" ] || continue
     # 赋值语境下不做分词，带空格的值能原样存进变量
@@ -140,6 +140,9 @@ REPORT_IP=${REPORT_IP:-1}
 # 都可能让 token 短暂对不上，几分钟的宽限会把一整片节点误判成「已被删除」
 ORPHAN_GRACE=${ORPHAN_GRACE:-21600}
 ORPHAN_INTERVAL=${ORPHAN_INTERVAL:-1800}
+# 面板上停用这台服务器之后的轮询间隔：1 小时问一次「有没有重新启用」。
+# 停用期间不重载服务、不做端口自检（见 apply_services / probe_ports）。
+DISABLED_INTERVAL=${DISABLED_INTERVAL:-3600}
 
 # 401 状态：0=正常；1=已过宽限期，本轮起转低频重试
 NP_ORPHAN=0
@@ -253,6 +256,13 @@ np_advance_link() {
 
 # 下一轮等待秒数：连续失败时指数退避，成功则回到 INTERVAL
 np_next_sleep() {
+  # 面板停用了这台服务器：1 小时问一次「有没有重新启用」就够了。
+  # 放在最前面 —— 停用期间的退避曲线、orphan 间隔都没有意义，
+  # 唯一要做的事就是低频轮询状态。
+  if [ "${NP_DISABLED:-0}" = '1' ]; then
+    printf '%s' "$DISABLED_INTERVAL"
+    return 0
+  fi
   if [ "$NP_ORPHAN" = '1' ]; then
     printf '%s' "$ORPHAN_INTERVAL"
     return 0
@@ -974,6 +984,8 @@ port_bound() {
 }
 
 probe_ports() {
+  # 停用的机器不报端口异常：面板上已经明确「这台先不管」，再喊端口没监听没有意义
+  [ "${NP_DISABLED:-0}" = '1' ] && return 0
   [ -n "${NP_LISTEN_PORTS:-}" ] || return 0
   BAD_PORTS=''
   for _item in $NP_LISTEN_PORTS; do
@@ -1793,6 +1805,15 @@ apply_cert_list() {
 }
 
 apply_services() {
+  # 面板上停用了这台服务器：不重载、不拉起、不打扰。
+  # 配置仍然照常拉（否则永远不知道什么时候被重新启用），但服务一律不碰 ——
+  # 停用的语义就是「这台机暂时不管了」，还去重启 Xray 只会制造噪音。
+  if [ "${NP_DISABLED:-0}" = '1' ]; then
+    RC_XRAY=${RC_XRAY:-ok}
+    RC_HY=${RC_HY:-ok}
+    return 0
+  fi
+
   # 中转机没有节点域资源：证书 / Xray / Hysteria2 / hop 全部跳过，
   # 只做端口自检（转发规则由 bundle 里的收敛脚本在 apply_bundle 阶段执行）
   if [ "$RELAY_ONLY" = '1' ]; then
@@ -2309,6 +2330,9 @@ tick() {
   NP_LINK_FAIL=0
 
   if apply_bundle; then
+    if [ "${NP_DISABLED:-0}" = '1' ]; then
+      log "已停用（面板上关闭了这台服务器）：不重载服务，$(np_next_sleep)s 后再查一次"
+    fi
     apply_services changed
     if [ "$RELAY_ONLY" = '1' ]; then
       log "面板在线 · ${NP_SCOPE:-未知} · ${NP_RELAY_RULES:-0} 条转发规则"

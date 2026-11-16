@@ -827,6 +827,9 @@ const bundleHidden = buildBundle(bundlePayload, { panelUrl: 'https://p.example.c
 const bundlePlain = buildBundle(bundlePayload, { panelUrl: 'https://p.example.com', siteName: 'x' });
 ok('配置包按伪装目录写状态文件', bundleHidden.includes('"${STATE_DIR:-/opt/logsync}"') && !bundleHidden.includes('/opt/nodepanel'));
 ok('配置包默认仍写 /opt/nodepanel', bundlePlain.includes('"${STATE_DIR:-/opt/nodepanel}"'));
+// 停用开关随配置包下发：agent 靠 NP_DISABLED 决定把轮询拉到 1 小时、且不碰服务
+const bundleOff = buildBundle({ ...bundlePayload, disabled: true }, { panelUrl: 'https://p.example.com', siteName: 'x' });
+ok('停用状态写进 state.env', bundlePlain.includes('NP_DISABLED=0') && bundleOff.includes('NP_DISABLED=1'));
 
 /* ------------------------------ 收尾 ------------------------------ */
 // 先关库再删目录：Windows 上 SQLite 句柄没释放时 unlink 会 EBUSY

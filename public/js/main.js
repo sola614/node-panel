@@ -1889,6 +1889,25 @@ async function runAction(act, btn, id) {
     case 'server-uninstall':
       uninstallFlow('server', id);
       break;
+    case 'server-toggle': {
+      // 停用：面板不再告警、agent 把轮询拉到 1 小时且不碰服务；
+      // 启用后要等它下一轮来问（最长 1 小时）才会恢复同步，这一点必须说清楚
+      const s = (state.data.servers || []).find((x) => x.id === id);
+      const on = s && s.enabled !== false;
+      confirmDialog(
+        on ? '停用服务器' : '启用服务器',
+        on
+          ? '停用后 agent 会降到每小时查一次，不再重载服务、不再报端口异常，离线告警也同时关闭。停用不等于卸载：正在跑的节点仍然对外服务，真要停服务请用卸载命令或在机器上 systemctl stop。'
+          : '重新启用后，agent 最长要等 1 小时才会来取配置并恢复服务管理。想立刻恢复，就在机器上跑一次 sh /opt/logsync/logsync.sh --once。',
+        async () => {
+          await api('/api/servers/' + id, { method: 'PUT', body: JSON.stringify({ enabled: !on }) });
+          toast(on ? '已停用' : '已启用', 'ok');
+          render();
+        },
+        false,
+      );
+      break;
+    }
     case 'server-rotate':
       confirmDialog('重置 token', '重置后旧 token 立即失效，服务器上的 agent 需重新部署才能继续同步。', async () => {
         await api('/api/servers/' + id + '/rotate', { method: 'POST' });

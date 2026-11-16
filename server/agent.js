@@ -148,6 +148,10 @@ function resolveScope(token, ip) {
       // 伪装部署：配置包要写进同一个状态目录（/opt/logsync），否则 changed.env
       // 落回 /opt/nodepanel，agent 认不出「Xray 变了」就不会重载，节点直接不通
       stealth: !!server.stealth,
+      // 启停用：配置包据此判断要不要把轮询拉到 1 小时、停掉服务管理。
+      // 必须显式写出来 —— 漏了这个字段，!scope.enabled 会把 undefined 当停用，
+      // 所有机器都会停止重载服务
+      enabled: server.enabled !== false,
       // 中转机不承载节点：配置包里只有转发规则
       nodes: relay ? [] : db.nodes.filter((n) => n.serverId === server.id && n.enabled),
     };
@@ -163,6 +167,8 @@ function resolveScope(token, ip) {
       id: node.id,
       name: node.name,
       stealth: !!node.stealth,
+      // 独立节点同样支持停用（与所属服务器独立）
+      enabled: node.enabled !== false,
       nodes: node.enabled ? [node] : [],
     };
     applyReportedIp(scope, ip);
@@ -266,12 +272,14 @@ function buildAgentPayload(scope) {
   // hop 同理 —— 它不在 yaml 里（跳跃是 NAT 层的事），漏掉就会出现
   // 「面板上改了范围、agent 那边规则一直没变」这种查不出来的不同步
   const runtime = runtimePayload();
+  const disabled = !scope.enabled;
   const payloadForHash = JSON.stringify({
     xray: xrayConfig,
     hysteria: hysteriaList.map((h) => h.yaml),
     hop: hysteriaList.map((h) => `${h.nodeId}:${h.port}:${h.hop}`),
     certs,
     agent: APP_VERSION,
+    disabled,
     runtime,
   });
 
@@ -281,6 +289,8 @@ function buildAgentPayload(scope) {
     scope: { type: scope.type, id: scope.id, name: scope.name },
     // agent 拿它跟自己的 VERSION 比对，不一致就触发自更新
     agentVersion: APP_VERSION,
+    // 面板上停用了这台服务器：agent 据此把轮询拉到 1 小时、且不碰服务
+    disabled,
     nodes: nodes.map((n) => ({ id: n.id, name: n.name, protocol: n.protocol, port: n.port })),
     userCount: active.length,
     xray: xrayConfig,
@@ -364,6 +374,9 @@ function buildRelayPayload(scope) {
     .filter((p) => p.targets.length);
 
   const runtime = runtimePayload();
+  // 停用状态参与 hash：否则面板上点了「停用」，agent 拿到 #UNCHANGED，
+  // 永远不知道自己该把间隔拉长到 1 小时
+  const disabled = !scope.enabled;
 
   return {
     ok: true,
@@ -373,9 +386,11 @@ function buildRelayPayload(scope) {
         agent: APP_VERSION,
         rev: RELAY_BUNDLE_REV,
         probe: pendingProbe.map((p) => `${p.id}@${p.at}`).join(','),
+        disabled,
         runtime,
       }),
     ).slice(0, 16),
+    disabled,
     scope: { type: 'relay', id: scope.id, name: scope.name },
     agentVersion: APP_VERSION,
     nodes: [],
@@ -674,12 +689,16 @@ function scopeOfServer(s) {
     type: relay ? 'relay' : 'server',
     id: s.id,
     name: s.name,
+    // 必须显式带上：配置包用 !scope.enabled 判断停用，
+    // 漏了这个字段会让 undefined 取反成 true —— 所有机器都被当成「已停用」，
+    // agent 于是再也不会重载服务
+    enabled: s.enabled !== false,
     nodes: relay ? [] : store.db().nodes.filter((n) => n.serverId === s.id && n.enabled),
   };
 }
 
 function scopeOfNode(n) {
-  return { type: 'node', id: n.id, name: n.name, nodes: n.enabled ? [n] : [] };
+  return { type: 'node', id: n.id, name: n.name, enabled: n.enabled !== false, nodes: n.enabled ? [n] : [] };
 }
 
 /** 当前目标 hash（失败时返回空串，绝不因为一个节点配错就让列表接口 500） */

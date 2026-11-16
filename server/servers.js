@@ -130,6 +130,11 @@ function updateServer(req, res, params, body) {
   if (body.note !== undefined) s.note = String(body.note);
   // 伪装部署只影响「下次生成的部署/卸载脚本」，已经装好的机器要重跑部署才会生效
   if (body.stealth !== undefined) s.stealth = body.stealth ? 1 : 0;
+  // 启停用：停用后不再告警，agent 通过配置包里的 disabled 得知，
+  // 会把轮询拉到 1 小时并停手不碰服务。
+  // 必须存布尔而不是 1/0：decodeRow 只在「从库里读」时做转换，这里是直接改内存对象，
+  // 写 0 的话 scopeOfServer 的 `enabled !== false` 会把它当成启用。
+  if (body.enabled !== undefined) s.enabled = !!body.enabled;
   store.save();
   auditAction('server.update', s.name, s.host || '地址由服务器上报');
   sendJson(res, 200, { ok: true, item: s });
