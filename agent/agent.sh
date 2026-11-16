@@ -1805,15 +1805,10 @@ apply_cert_list() {
 }
 
 apply_services() {
-  # 面板上停用了这台服务器：不重载、不拉起、不打扰。
-  # 配置仍然照常拉（否则永远不知道什么时候被重新启用），但服务一律不碰 ——
-  # 停用的语义就是「这台机暂时不管了」，还去重启 Xray 只会制造噪音。
-  if [ "${NP_DISABLED:-0}" = '1' ]; then
-    RC_XRAY=${RC_XRAY:-ok}
-    RC_HY=${RC_HY:-ok}
-    return 0
-  fi
-
+  # 停用时这里**不能跳过**：配置包里已经没有节点了，必须应用一次才能把 Xray 的入站
+  # 和 Hysteria2 实例真正关掉 —— 那正是「停用」要做的事。跳过的话节点会一直跑着。
+  # 之后每轮（1 小时一次）配置没变，只会走「进程还在不在」的检查，不会反复重载。
+  #
   # 中转机没有节点域资源：证书 / Xray / Hysteria2 / hop 全部跳过，
   # 只做端口自检（转发规则由 bundle 里的收敛脚本在 apply_bundle 阶段执行）
   if [ "$RELAY_ONLY" = '1' ]; then
@@ -2331,7 +2326,7 @@ tick() {
 
   if apply_bundle; then
     if [ "${NP_DISABLED:-0}" = '1' ]; then
-      log "已停用（面板上关闭了这台服务器）：不重载服务，$(np_next_sleep)s 后再查一次"
+      log "已停用（节点已停止下发，端口应已关闭）：$(np_next_sleep)s 后再查一次"
     fi
     apply_services changed
     if [ "$RELAY_ONLY" = '1' ]; then

@@ -1251,6 +1251,9 @@ function totpCodeOf(secret) {
   await call('/api/servers/' + serverId, { method: 'PUT', body: json({ enabled: false }) });
   const offBundle = await fetch(`${BASE}/api/agent/bundle?token=${serverToken}`).then((r) => r.text());
   ok('停用后配置包标记 NP_DISABLED=1', /NP_DISABLED=1/.test(offBundle));
+  // 停用 = 节点一并停掉：配置包里节点数为 0，agent 应用后 Xray 只剩 api 入站、端口关闭
+  ok('停用后配置包不再下发节点', /NP_NODES=0\n/.test(offBundle) && /NP_XRAY_NODES=0\n/.test(offBundle),
+    (offBundle.match(/NP_(NODES|XRAY_NODES)=\d+/g) || []).join(' '));
   const offHash = /NP_HASH='([^']+)'/.exec(offBundle);
   ok('停用会让 hash 变化（否则 agent 拿不到新状态）', !!offHash && offHash[1] !== bundleHash[1],
     `before=${bundleHash[1]} off=${offHash && offHash[1]} | ${(offBundle.match(/NP_(HASH|DISABLED)=[^\n]*/g) || []).join(' ')}`);

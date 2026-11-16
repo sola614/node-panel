@@ -23,6 +23,24 @@ const { getSession } = require('./tokens');
 const { sweepExpiredTotp } = require('./auth');
 const { subFormatList, sweepRenewals, usersForNode } = require('./users');
 const { orderedNodes } = require('./nodes');
+
+/**
+ * 可发布的节点：节点自己启用，**且**所属服务器也启用（独立节点只看自己）。
+ *
+ * 「停用服务器」的语义是整台机器退出服务，不是只让面板别管它 ——
+ * 所以它的节点不能再出现在订阅里，否则客户端会一直往一个已经不再监听的上游连。
+ * 外部订阅导入的节点（ext）不在 db.nodes 里，不受这里影响。
+ */
+function liveNodes(db) {
+  const on = new Set(db.servers.filter((s) => s.enabled !== false).map((s) => s.id));
+  return db.nodes.filter((n) => {
+    if (!n.enabled) return false;
+    // 只有「挂在某台服务器上」的节点才受服务器启停影响：
+    // 独立节点（standalone）和没有 serverId 的分享节点都只看自己
+    if (n.mode === 'standalone' || !n.serverId) return true;
+    return on.has(n.serverId);
+  });
+}
 const extsubs = require('./extsubs');
 
 const logData = logger.create('data');
@@ -59,7 +77,7 @@ function subscriptionPayload(user, req) {
 
   // 只按 enabled 过滤（agent 是否监听），套餐与显隐交给订阅生成器按入口粒度判断。
   // 顺序即「节点排序」页里拖出来的顺序：客户端列表的顺序就靠它
-  const nodes = usable ? orderedNodes(db.nodes.filter((n) => n.enabled)) : [];
+  const nodes = usable ? orderedNodes(liveNodes(db)) : [];
   // 把「生效地址」算好再交给订阅生成器：独立节点用自身地址（可能是上报的 IP），
   // 跟随服务器的节点用服务器地址。不修改内存中的原始对象。
   const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
@@ -412,7 +430,7 @@ function subPage(req, res, params, body, session, ctx) {
     const db = store.db();
     // 与 JSON 订阅保持一致：只按 enabled 预过滤，套餐与显隐交给 toClash 按端点粒度判断；
     // ext=true 的外部节点跳过套餐判断（整包语义），其余照旧
-    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled)).concat(extsubs.extNodes());
+    const nodes = orderedNodes(liveNodes(db)).concat(extsubs.extNodes());
     const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
     const nodesForLinks = nodes.map((n) => ({ ...n, address: n.ext ? n.address : store.nodeHost(n) }));
     const yaml = sub.toClash(
@@ -434,7 +452,7 @@ function subPage(req, res, params, body, session, ctx) {
   // 必须是纯 JSON，头部注释都会让客户端的严格解析失败
   if (format === 'singbox') {
     const db = store.db();
-    const nodes = orderedNodes(db.nodes.filter((n) => n.enabled)).concat(extsubs.extNodes());
+    const nodes = orderedNodes(liveNodes(db)).concat(extsubs.extNodes());
     const servers = db.servers.map((s) => ({ id: s.id, name: s.name, host: store.serverAddress(s) }));
     const nodesForLinks = nodes.map((n) => ({ ...n, address: n.ext ? n.address : store.nodeHost(n) }));
     const json = sub.toSingBox(

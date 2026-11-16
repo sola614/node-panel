@@ -187,7 +187,10 @@ function buildAgentPayload(scope) {
   sweepRenewals();
   const db = store.db();
   const active = store.activeUsers();
-  const nodes = scope.nodes;
+  // 停用：节点一个都不下发。agent 应用后 Xray 配置里只剩 api 入站，
+  // 端口随之关闭 —— 这才是「停用」的本体，机器真的不再对外服务了，
+  // 而不是只让面板别管它。agent 留着的意义是低频轮询何时被重新启用。
+  const nodes = scope.enabled === false ? [] : scope.nodes;
 
   const xrayNodes = nodes.filter((n) => n.protocol !== 'hysteria2');
   const hyNodes = nodes.filter((n) => n.protocol === 'hysteria2');
@@ -334,7 +337,9 @@ function runtimePayload() {
  */
 function buildRelayPayload(scope) {
   const db = store.db();
-  const rules = db.relays
+  // 停用：一条规则都不下发，agent 的收敛脚本会把本机 gost 实例与 iptables 规则全撤掉 ——
+  // 入口不再监听，和节点停用是同一个语义
+  const rules = (scope.enabled === false ? [] : db.relays)
     .filter((r) => r.serverId === scope.id && r.enabled !== false)
     .slice()
     .sort((a, b) => Number(a.listenPort) - Number(b.listenPort) || String(a.id).localeCompare(String(b.id)))

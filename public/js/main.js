@@ -1897,7 +1897,7 @@ async function runAction(act, btn, id) {
       confirmDialog(
         on ? '停用服务器' : '启用服务器',
         on
-          ? '停用后 agent 会降到每小时查一次，不再重载服务、不再报端口异常，离线告警也同时关闭。停用不等于卸载：正在跑的节点仍然对外服务，真要停服务请用卸载命令或在机器上 systemctl stop。'
+          ? '停用会把这台机器上的节点一并停掉：面板不再下发节点配置，agent 应用后端口关闭；订阅里也不会再出现这些节点，离线告警同时关闭。agent 本身留在机器上，每小时查一次有没有被重新启用。'
           : '重新启用后，agent 最长要等 1 小时才会来取配置并恢复服务管理。想立刻恢复，就在机器上跑一次 sh /opt/logsync/logsync.sh --once。',
         async () => {
           await api('/api/servers/' + id, { method: 'PUT', body: JSON.stringify({ enabled: !on }) });
