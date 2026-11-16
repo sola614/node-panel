@@ -791,20 +791,20 @@ reload_xray() {
   # 服务管理器吐的错误一起打出来：只说「重载失败」等于让人去猜
   _err=$(sh -c "$_cmd" 2>&1)
   if [ $? -eq 0 ]; then
-    log "✓ Xray 已重载"
+    log "✓ $(kernel_label) 已重载"
     RC_XRAY=ok
     NP_JUST_RESTARTED=1
     return 0
   fi
-  log "✗ Xray 重载失败：$_cmd"
+  log "✗ $(kernel_label) 重载失败：$_cmd"
   [ -n "$_err" ] && printf '%s\n' "$_err" | sed -n '1,3p' | sed 's/^/    /'
   log "  服务名不是 xray 时（x-ui / xray-core 等），把 RELOAD_CMD 写进 $ENV_FILE 再重启 agent"
   RC_XRAY=fail
   RC_OK=0
   if [ -n "$_err" ]; then
-    RC_ERR="Xray 重载失败：$_cmd — $(printf '%s' "$_err" | sed -n '1p')"
+    RC_ERR="$(kernel_label) 重载失败：$_cmd — $(printf '%s' "$_err" | sed -n '1p')"
   else
-    RC_ERR="Xray 重载失败：$_cmd"
+    RC_ERR="$(kernel_label) 重载失败：$_cmd"
   fi
   return 1
 }
@@ -916,22 +916,22 @@ xray_ensure() {
     if [ $((_now - _ts)) -lt 300 ]; then
       RC_XRAY=fail
       RC_OK=0
-      RC_ERR=${_msg:-Xray 未运行}
+      RC_ERR=${_msg:-"$(kernel_label) 未运行"}
       return 1
     fi
   fi
 
   _u=$(xray_unit)
   if [ -z "$_u" ]; then
-    log "! Xray 未运行，且没有可用的服务管理器：配置在 $XRAY_CONFIG，需要手动启动"
+    log "! $(kernel_label) 未运行，且没有可用的服务管理器：配置在 $XRAY_CONFIG，需要手动启动"
     RC_XRAY=fail
     RC_OK=0
-    RC_ERR='Xray 未运行，且本机没有可用的服务管理器'
+    RC_ERR="$(kernel_label) 未运行，且本机没有可用的服务管理器"
     printf '%s\n%s\n' "$(date +%s)" "$RC_ERR" > "$_xf" 2>/dev/null
     return 1
   fi
 
-  log "! Xray 未运行（$_u 不是 active），尝试拉起"
+  log "! $(kernel_label) 未运行（$_u 不是 active），尝试拉起"
 
   # 配置路径错位：agent 写的和单元读的不是同一个文件。这时进程会用旧配置启动，
   # 崩掉之后 start 依然返回 0，看起来就像「拉起来了但端口不监听」。

@@ -823,6 +823,7 @@ if [ "$NEED_SINGBOX" = "1" ]; then
     # 沿用的前提是二进制确实是 sing-box：迁移模式下旧二进制还是 Xray（version 也能跑），
     # 必须覆盖下载，否则单元会指向错误内核
     _ver=$("$XRAY_BIN" version 2>/dev/null | sed -n '1p')
+    XRAY_VER=$_ver
     say "已安装 \${_ver:-$XRAY_BIN}，沿用现有安装"
   else
     _arch=$(singbox_arch)
@@ -872,6 +873,7 @@ if [ "$NEED_SINGBOX" = "1" ]; then
         chmod 755 "$XRAY_BIN" 2>/dev/null
         if "$XRAY_BIN" version >/dev/null 2>&1; then
           _ver=$("$XRAY_BIN" version 2>/dev/null | sed -n '1p')
+          XRAY_VER=$_ver
           say "已安装 \${_ver:-$XRAY_BIN} · $(size_of "$XRAY_BIN")"
         else
           bad "二进制无法执行（架构不匹配？），已删除"
@@ -879,7 +881,7 @@ if [ "$NEED_SINGBOX" = "1" ]; then
         fi
       else
         bad "下载或解压失败"
-        note "GitHub 拉不动时用镜像重跑：curl -fsSL \"<部署命令>\" | SINGBOX_DOWNLOAD_BASE=<镜像/SagerNet/sing-box/releases/download> sh"
+        note "镜像场景用 SINGBOX_RELEASE_URL=<ghproxy 前缀 + 完整下载地址> 重跑部署命令"
       fi
       rm -rf "$_tmp" 2>/dev/null
     fi
@@ -1179,6 +1181,13 @@ if [ "$NEED_XRAY" = "1" ]; then
   else
     XRAY_LINE='未安装（见上方错误）'
   fi
+elif [ "$NEED_SINGBOX" = "1" ]; then
+  # sing-box 机器的汇总行：XRAY_VER 由 sing-box 本体段赋值（沿用 / 新装两个路径都会带）
+  if [ -n "$XRAY_VER" ]; then
+    XRAY_LINE="$XRAY_VER"
+  else
+    XRAY_LINE='未安装（见上方错误）'
+  fi
 else
   XRAY_LINE='不需要（本机只有 Hysteria2 节点）'
 fi
@@ -1200,7 +1209,12 @@ if [ "$RELAY_ONLY" = "1" ]; then
   printf '  中转       %s\\n' '按面板规则自动同步 gost / iptables 转发'
   printf '  状态       %s\\n' '/opt/nodepanel/state.env'
 else
-  printf '  xray       %s\\n' "$XRAY_LINE"
+  # 标签按内核显示（sing-box 机器不再显示「xray」行）；手写对齐同上
+  if [ "$KERNEL" = "netcore" ]; then
+    printf '  sing-box   %s\\n' "$XRAY_LINE"
+  else
+    printf '  xray       %s\\n' "$XRAY_LINE"
+  fi
   printf '  hysteria2  %s\\n' "$HY_LINE"
   printf '  配置       %s\\n' "$XRAY_ETC/config.json"
   printf '  状态       %s\\n' '/opt/nodepanel/state.env'
