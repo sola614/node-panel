@@ -8,8 +8,10 @@ data/
 .workbuddy-ai/
 .codeartsdoer/
 
-# 本地临时目录（测试实例、拆分脚本等）
-.tmp-*/
+# 本地临时目录（测试实例、拆分脚本等）与临时诊断脚本（.tmp-*.js）
+# 注意不能写 .tmp-*/（尾斜杠只匹配目录，漏掉 .tmp-read-log.js 这类临时文件——
+# 曾连续两次把诊断脚本误提交进仓库）
+.tmp-*
 .test/
 .demo-tmp/
 
