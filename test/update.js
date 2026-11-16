@@ -50,7 +50,10 @@ function startApi() {
       if (state.mode === 'notfound') return send(404, { message: 'Not Found' });
       if (state.mode === 'error') return send(500, { message: 'boom' });
       if (state.mode === 'badjson') return send(200, '<html>not json</html>');
-      return send(200, state.release);
+      // 0.2.2 起 update.check 走 /releases 列表（不用 /releases/latest：sing-box 的
+      // 自构建 release 也会发在本仓库，latest 会把 sb-* tag 当成面板新版本）。
+      // 单对象 fixture 自动包一层列表，新旧用例都能跑
+      return send(200, Array.isArray(state.release) ? state.release : [state.release]);
     });
     server.listen(0, '127.0.0.1', () => {
       state.port = server.address().port;
@@ -117,7 +120,8 @@ const R = (v) => ({ tag_name: 'v' + v });
   update.resetCache();
   api.mode = 'ok';
   let r = await update.check('0.1.37');
-  ok('请求打到 releases/latest', api.lastPath === '/repos/sola614/node-panel/releases/latest', api.lastPath);
+  ok('请求打到 releases 列表（不能是 /releases/latest：sb-* 的自构建发行会污染比较）',
+    api.lastPath === '/repos/sola614/node-panel/releases?per_page=30', api.lastPath);
   ok('请求带 User-Agent（GitHub 不接受空 UA）', /^node-panel\/0\.1\.37$/.test(api.lastUa), api.lastUa);
   ok('有新版本时 hasUpdate=true', r.ok === true && r.hasUpdate === true);
   ok('新版号去掉了 v 前缀', r.latest === '0.1.38', r.latest);
@@ -127,6 +131,27 @@ const R = (v) => ({ tag_name: 'v' + v });
   ok('回带当前版本（前端要显示 v旧 → v新）', r.current === '0.1.37');
   ok('回带部署形态与命令', r.deployKind === 'source' && /^git pull/.test(r.command));
   ok('首次检查不是缓存', r.cached === false);
+
+  update.resetCache();
+  // 0.2.2 起 sing-box 的自构建发行包（sb-* tag）也发在面板仓库：它不能被当成
+  // 面板新版本 —— 列表里 sb-* 排在前面时，过滤逻辑要能跳过它取到面板 tag
+  api.release = [
+    {
+      tag_name: 'sb-v1.14.4-np1',
+      published_at: '2026-11-16T00:00:00Z',
+      html_url: 'https://github.com/sola614/node-panel/releases/tag/sb-v1.14.4-np1',
+      body: 'sing-box 自构建发行包',
+    },
+    R('0.1.38'),
+  ];
+  r = await update.check('0.1.37');
+  ok('sing-box 自构建发行 tag（sb-*）被跳过，不污染面板版本比较',
+    r.ok === true && r.latest === '0.1.38' && r.hasUpdate === true, r.latest);
+
+  update.resetCache();
+  api.release = [{ tag_name: 'sb-v1.14.4-np1', published_at: '2026-11-16T00:00:00Z' }];
+  r = await update.check('0.1.37');
+  ok('列表里全是非面板 tag 时按 noRelease 处理（不是故障）', r.ok === true && r.noRelease === true);
 
   update.resetCache();
   api.release = R('0.1.37');
@@ -208,7 +233,10 @@ const R = (v) => ({ tag_name: 'v' + v });
   api.mode = 'ok';
   api.release = { published_at: '2026-01-01T00:00:00Z' };
   r = await update.check('0.1.37');
-  ok('Release 里没有版本号时降级成 ok=false', r.ok === false && /版本号/.test(r.error || ''), r.error);
+  // 0.2.2 起无 tag 的 release 会被列表过滤跳过（不是降级错误）：整个列表里
+  // 找不到面板版本形态的 tag 时统一按 noRelease 处理 —— 它可能只是别的发行物
+  ok('Release 里没有版本号时按 noRelease 处理（不是故障）',
+    r.ok === true && r.noRelease === true && r.hasUpdate === false);
 
   /* --------------------------- 6. 总开关 --------------------------- */
   console.log('\n── 总开关 ──');
