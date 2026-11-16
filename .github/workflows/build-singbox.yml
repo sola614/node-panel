@@ -55,9 +55,9 @@ jobs:
           - { goos: windows, goarch: amd64, sbarch: windows-amd64 }
     steps:
       - name: Checkout node-panel（获取 workflow 上下文）
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # stable 而不是固定 1.23：sing-box 1.14.4 的 go.mod 要求更高版本的 Go
           # （GOTOOLCHAIN=local 已设，stable 足够新时直接用，不额外下载 toolchain）
@@ -98,15 +98,18 @@ jobs:
             -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api" \
             -o "${DIR}/sing-box${EXT}" ./cmd/sing-box
           tar -czf "${DIR}.tar.gz" "$DIR"
-          sha256sum "${DIR}.tar.gz" >> sha256sums.txt
+          # 每架构独立命名的清单：release 作业合并时 cat sha256sums-*.txt —— 模式与
+          # 合并目标 sha256sums.txt 不同名，避免「> 先截断目标、find/cat 又搜到自己」
+          # 的自我覆盖陷阱（曾导致汇总步骤 grep -c 输出 0 而失败），同名 merge 覆盖也一并规避
+          sha256sum "${DIR}.tar.gz" > "sha256sums-${{ matrix.sbarch }}.txt"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.sbarch }}
           # 产物在 sing-box/ 子目录里（Build 步骤 working-directory 在源码目录）
           path: |
             sing-box/*.tar.gz
-            sing-box/sha256sums.txt
+            sing-box/sha256sums-*.txt
           if-no-files-found: error
 
   release:
@@ -114,14 +117,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 合并各架构产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           merge-multiple: true
 
       - name: 汇总 sha256 清单
         run: |
-          cat $(find . -name 'sha256sums.txt' | sort) > sha256sums.txt
+          # sha256sums-<架构>.txt 是各 build job 的独立清单（不同名，merge 后 8 份都在）；
+          # 汇总目标 sha256sums.txt 不匹配 sha256sums-*.txt 模式，无自我覆盖问题
+          cat sha256sums-*.txt > sha256sums.txt
           grep -c . sha256sums.txt
 
       - name: 发布 release
