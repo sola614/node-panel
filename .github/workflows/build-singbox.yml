@@ -15,25 +15,24 @@
 #   3. 用新产物跑一次 sing-box check（喂面板编译输出）确认 schema 兼容
 #      （sing-box schema 迭代快，lib/singbox.js 的注释锁定了已知的废弃项）
 #
-#   ⚠️ 为什么不能直接指定官方 latest：官方发行包不含 with_v2ray_api（按用户流量
-#   统计依赖它），且 lib/singbox.js 的编译输出与特定版本 schema 锁定（例如
-#   domain_strategy 在 1.14 移除）。版本升级必须走上面三步显式流程 —— CI 可对任意
-#   版本 tag 构建（workflow_dispatch 参数），部署侧也能用 SINGBOX_VERSION 环境变量
-#   指定任意已构建的版本，但「构建哪个版本 + 编译器是否兼容」由人确认。
+#   ⚠️ 为什么不能直接用官方 latest 发行包：不含 with_v2ray_api（按用户流量统计
+#   依赖它）。但版本本身可以跟 latest —— 当前 1.14.4 实测编译输出完全兼容
+#   （1.13/1.14 的破坏性变化全在 DNS 配置，我们的编译输出不生成 DNS 块；
+#   domain_strategy 在 1.14 仍是弃用未移除，只有 WARN）。升级仍走三步显式流程：
+#   编译器是否兼容由人确认，而不是自动跟 latest。
 #
 #   ⚠️ 字段级 TODO：lib/singbox.js 的 direct 出站仍用 domain_strategy: 'ipv4_only'
-#   （forceV4），sing-box 1.12 起 WARN、1.14 移除 —— 升级到 1.14+ 时必须同步把它
-#   迁到 route 规则动作（action: 'resolve', strategy: 'ipv4_only'），否则配置
-#   decode 直接失败。
+#   （forceV4），官方迁移指引是 route 规则动作（action: 'resolve', strategy）——
+#   1.14.4 只是 WARN，哪天官方真移除了再迁，避免引入语义差异。
 name: build-singbox
 
 on:
   workflow_dispatch:
     inputs:
       singbox_version:
-        description: 'sing-box 版本 tag（如 v1.12.0）'
+        description: 'sing-box 版本 tag（如 v1.14.4）'
         required: true
-        default: 'v1.12.0'
+        default: 'v1.14.4'
 
 permissions:
   contents: write
@@ -56,11 +55,13 @@ jobs:
           - { goos: windows, goarch: amd64, sbarch: windows-amd64 }
     steps:
       - name: Checkout node-panel（获取 workflow 上下文）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          # stable 而不是固定 1.23：sing-box 1.14.4 的 go.mod 要求更高版本的 Go
+          # （GOTOOLCHAIN=local 已设，stable 足够新时直接用，不额外下载 toolchain）
+          go-version: 'stable'
 
       - name: Checkout sing-box 源码
         run: |
@@ -69,6 +70,10 @@ jobs:
           echo "SB_VER=$(git describe --tags --abbrev=0)" >> "$GITHUB_ENV"
 
       - name: Build（官方默认 tags + with_v2ray_api）
+        # ⚠️ 必须显式 cd 进 sing-box 源码目录：每个 step 是独立 shell，上一层的 cd
+        # 不跨步骤持续 —— 不 cd 的话 go build 会在 node-panel 仓库根目录跑，报
+        # "cannot find main module"（首次运行 8 个 job 全红的根因）
+        working-directory: sing-box
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -98,9 +103,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.sbarch }}
+          # 产物在 sing-box/ 子目录里（Build 步骤 working-directory 在源码目录）
           path: |
-            *.tar.gz
-            sha256sums.txt
+            sing-box/*.tar.gz
+            sing-box/sha256sums.txt
           if-no-files-found: error
 
   release:

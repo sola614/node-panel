@@ -24,8 +24,10 @@ const APP_VERSION = require('../package.json').version;
  * sing-box 固定安装版本（0.2.0）。sing-box 的 schema 迭代快（1.11 弃用 legacy
  * 入站格式、路由规则转 rule-action），lib/singbox.js 的编译输出只对固定版本负责；
  * 要换版本用 SINGBOX_VERSION 环境变量覆盖部署脚本，同时确认编译输出兼容。
+ * 1.14.4（2026-10 发布的 latest）：迁移文档确认 1.13/1.14 的破坏性变化全在 DNS
+ * 配置（面板编译输出不生成 DNS 块），编译输出已实测兼容。
  */
-const SINGBOX_VERSION = '1.12.0';
+const SINGBOX_VERSION = '1.14.4';
 
 /**
  * 会进 shell 的文本：换行撕开注释与语句，引号 / 反引号 / $ 能跑命令。

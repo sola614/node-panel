@@ -344,7 +344,7 @@ const varUrl = (rVar.stdout || '').trim().split('\n').pop() || '';
 ok('内核版本常量先于发行源 URL 定义，set -u 下 URL 展开正确（防赋值顺序回归）',
   assignLines.length === 2 &&
     assignLines[0].startsWith('SINGBOX_VERSION_DEFAULT=') &&
-    rVar.status === 0 && varUrl.endsWith('/sb-v1.12.0-np1'),
+    rVar.status === 0 && varUrl.endsWith('/sb-v1.14.4-np1'),
   `(exit=${rVar.status} url=${varUrl.slice(-60)})`);
 
 /* --------------------- 6. bundle 落盘闸执行级测试 --------------------- */
