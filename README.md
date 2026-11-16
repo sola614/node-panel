@@ -467,6 +467,11 @@ curl -fsSL "http://面板/api/nodes/<id>/install?token=<节点token>" | sh
 两者都没有就提示先 `su -`**。所以没有 sudo 的精简系统（Alpine、只留 root 的 LXC / 容器、
 `-bash: sudo: command not found` 的那类机器）照抄即可，不需要自己去装 sudo。
 
+> **sing-box 内核前置**：sing-box 内核的发行源是**本仓库的自构建 release**（`sb-v<版本>-np1`，
+> 在官方默认构建标签之上加了 `with_v2ray_api` 按用户流量统计——官方发行包不含它）。
+> **首次使用前先在仓库 Actions 里手动跑一次 `build-singbox` workflow**，
+> 否则部署会停在「发行包下载失败」（这是预期行为，不是故障）。
+
 脚本会做这些事（输出按 `[n/m]` 分步，每步都把版本、体积、路径、服务状态打出来）：
 
 1. 把 agent 装到 `/opt/nodepanel/agent.sh`，`sh -n` 校验后打印版本与体积

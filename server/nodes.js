@@ -13,6 +13,7 @@ const dns = require('dns');
 const path = require('path');
 const store = require('../lib/store');
 const xray = require('../lib/xray');
+const singbox = require('../lib/singbox');
 const hysteria = require('../lib/hysteria');
 const cert = require('../lib/cert');
 const keys = require('../lib/keys');
@@ -44,6 +45,34 @@ function normCredential(c) {
   return { uuid: String(o.uuid || ''), password: String(o.password || '') };
 }
 
+/** 节点内核白名单：xray（默认）| singbox */
+const NODE_KERNELS = ['xray', 'singbox'];
+
+/** 节点生效的内核：server 模式跟随宿主服务器；standalone 自己的；imported 没有 agent */
+function nodeKernelOf(node) {
+  if (!node) return 'xray';
+  if (node.mode === 'standalone') return node.kernel === 'singbox' ? 'singbox' : 'xray';
+  if (node.mode === 'server') {
+    const s = store.db().servers.find((x) => x.id === node.serverId);
+    return s && s.kernel === 'singbox' ? 'singbox' : 'xray';
+  }
+  return 'xray';
+}
+
+/**
+ * 内核能力校验（返回空串表示通过）。
+ * sing-box 没有 Xray 25.6.0+ 的 VLESS Encryption（mlkem768 后量子加密），
+ * 也不打算在订阅层做「按内核降级」—— 同一个节点不可能一半客户端走 Xray 一半走
+ * sing-box，服务端配置是唯一的，必须在这里拦下而不是生成一份起不来的配置。
+ */
+function kernelError(node) {
+  if (!node.vlessEncryption) return '';
+  if (nodeKernelOf(node) === 'singbox') {
+    return 'sing-box 内核不支持 VLESS Encryption（后量子加密 mlkem768）：请关闭该选项，或把宿主切换为 Xray 内核';
+  }
+  return '';
+}
+
 function normalizeNode(body, prev = {}) {
   // 部分更新时必须沿用未指定的字段，否则一次小改动会把独立节点降级成服务器节点
   const protocol = PROTOCOLS.includes(body.protocol) ? body.protocol : prev.protocol || 'vless';
@@ -69,6 +98,16 @@ function normalizeNode(body, prev = {}) {
     importLink: mode === 'imported' ? String(body.importLink ?? prev.importLink ?? '') : '',
     insecure: mode === 'imported' ? (body.insecure !== undefined ? !!body.insecure : !!prev.insecure) : false,
     protocol,
+    // 节点内核（0.2.0）：standalone 自选（部署脚本按它装 Xray 或 sing-box），
+    // 但 Hysteria2 永远走独立 hysteria 实例，选内核没有意义 —— 强制 xray，
+    // 否则会出现 KERNEL=netcore 写进 env 却不装 sing-box 的半吊子状态；
+    // server 模式跟随宿主 servers.kernel，这里只留占位缺省；imported 没有 agent
+    kernel:
+      mode === 'standalone' && protocol !== 'hysteria2' && NODE_KERNELS.includes(body.kernel)
+        ? body.kernel
+        : mode === 'standalone'
+          ? prev.kernel === 'singbox' ? 'singbox' : 'xray'
+          : 'xray',
     // 用 ?? 而不是 !== undefined：部分更新时 body.port 可能是 null，
     // 那也应该沿用原值（旧代码的 `body.port ?? prev.port` 就是这个语义）
     port: normPort(body.port ?? prev.port),
@@ -447,6 +486,8 @@ function createNode(req, res, params, body) {
   if (badHost) return sendJson(res, 400, { error: badHost });
   const badCert = certRefError(data);
   if (badCert) return sendJson(res, 400, { error: badCert });
+  const badKernel = kernelError(data);
+  if (badKernel) return sendJson(res, 400, { error: badKernel });
   const db = store.db();
   if (nameTaken(db.nodes, data.name)) return sendJson(res, 409, { error: '已存在同名节点，换个名字' });
 
@@ -521,6 +562,8 @@ function updateNode(req, res, params, body) {
   if (badHost) return sendJson(res, 400, { error: badHost });
   const badCert = certRefError(next);
   if (badCert) return sendJson(res, 400, { error: badCert });
+  const badKernel = kernelError(next);
+  if (badKernel) return sendJson(res, 400, { error: badKernel });
   const badHop = hopError(next, node.id);
   if (badHop) return sendJson(res, 400, { error: badHop });
   Object.assign(node, next);
@@ -691,6 +734,14 @@ function nodePreview(req, res, params) {
     return sendJson(res, 200, {
       kind: 'hysteria2',
       yaml: hysteria.toYamlFile(node, users, db.settings.siteName),
+      users: users.length,
+    });
+  }
+  // 预览按生效内核编译：sing-box 与 Xray 的入站结构完全不同，kind 标明来源
+  if (nodeKernelOf(node) === 'singbox') {
+    return sendJson(res, 200, {
+      kind: 'singbox',
+      inbound: singbox.previewInbound(node, users),
       users: users.length,
     });
   }
@@ -945,6 +996,7 @@ function generateRealityKeys(req, res) {
 
 module.exports = {
   normalizeNode,
+  kernelError,
   hopError,
   portError,
   portWarnings,

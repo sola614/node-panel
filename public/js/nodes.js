@@ -92,6 +92,7 @@ RENDERERS.nodes = async () => {
           <span class="badge ${PROTO_BADGE[n.protocol] || 'badge-dim'}">${n.protocol}</span>
           ${n.security === 'reality' ? '<span class="badge badge-purple" style="margin-left:4px">reality</span>' : ''}
           ${n.mode === 'standalone' ? '<span class="badge badge-dim" style="margin-left:4px">独立</span>' : ''}
+          ${n.mode === 'standalone' && n.kernel === 'singbox' ? '<span class="badge badge-purple" style="margin-left:4px" title="独立节点使用 sing-box 内核">sing-box</span>' : ''}
           ${n.mode === 'imported' ? '<span class="badge badge-purple" style="margin-left:4px">分享</span>' : ''}
         </td>
         <td class="mono">${n.port}</td>
@@ -488,6 +489,15 @@ function nodeForm(node, servers) {
 ${lockMode ? '只填一条：保存后会覆盖本节点的地址、端口与凭证' : '每行一条，支持一次粘贴多条批量导入'}">${esc(n.importLink || '')}</textarea>
         <div class="hint" id="n-links-hint"></div>
       </div>
+    </div>
+
+    <div class="field hidden" id="wrap-kernel">
+      <label>节点内核</label>
+      <div class="seg" id="n-kernel">
+        <button type="button" data-kernel="xray" class="${n.kernel === 'singbox' ? '' : 'on'}">Xray</button>
+        <button type="button" data-kernel="singbox" class="${n.kernel === 'singbox' ? 'on' : ''}">sing-box</button>
+      </div>
+      <div class="hint">仅独立部署可选（跟随服务器时由服务器内核决定；导入分享没有 agent）。部署脚本按它装 Xray 或固定版 sing-box；sing-box 不支持 VLESS 后量子加密</div>
     </div>
 
     <div class="form-row">
@@ -919,6 +929,8 @@ function bindNodeForm(mask) {
 
     $('#wrap-server', mask).classList.toggle('hidden', mode !== 'server');
     $('#wrap-address', mask).classList.toggle('hidden', mode !== 'standalone');
+    // 节点内核：只有独立部署才可选；Hysteria2 走独立实例，没有内核语义
+    $('#wrap-kernel', mask).classList.toggle('hidden', mode !== 'standalone' || isHy2);
     const nodeAuto = $('#n-ipmode button.on', mask).dataset.ipmode === 'auto';
     $('#wrap-address-input', mask).classList.toggle('hidden', mode !== 'standalone' || nodeAuto);
     $('#n-address-hint', mask).textContent = nodeAuto
@@ -947,10 +959,21 @@ function bindNodeForm(mask) {
     const fpOn = !isHy2 && security !== 'none';
     $('#fp-box', mask).classList.toggle('hidden', !fpOn);
 
-    // VLESS Encryption：仅 VLESS 可选
+    // VLESS Encryption：仅 VLESS 可选；sing-box 内核不支持（服务端编译不出可用配置），
+    // 禁用输入并说明 —— 保存时服务端 kernelError 也会拦，这里提前给出可视反馈
+    const kernelBtn = $('#n-kernel button.on', mask);
+    const sbKernel = !!(kernelBtn && kernelBtn.dataset.kernel === 'singbox');
     const veOn = proto === 'vless' && !isHy2;
     $('#ve-box', mask).classList.toggle('hidden', !veOn);
     $('#ve-hint', mask).classList.toggle('hidden', !veOn);
+    const veEl = $('#n-ve', mask);
+    if (veEl) {
+      veEl.disabled = sbKernel;
+      if (sbKernel && veEl.checked) veEl.checked = false;
+      $('#ve-hint', mask).textContent = sbKernel
+        ? 'sing-box 内核不支持 VLESS Encryption（mlkem768）：选项已禁用。要使用后量子加密请把节点放回 Xray 内核的服务器，或改用独立部署选 Xray'
+        : '需 Xray 25.6.0+ 且服务端与客户端都支持。它替代了 vision 流控解决的 TLS-in-TLS 问题，与 Reality 二选一即可；同时开启在部分传输组合下有已知问题。';
+    }
 
     // 证书：TLS 或 Hysteria2 都需要。导入分享节点除外 —— 证书来自链接（含自签指纹 /
     // allowInsecure），面板既不下发也不签发，展示出来只会让人以为在这儿能改
@@ -1014,6 +1037,14 @@ function bindNodeForm(mask) {
     const btn = e.target.closest('button[data-ipmode]');
     if (!btn) return;
     $$('#n-ipmode button', mask).forEach((b) => b.classList.toggle('on', b === btn));
+    sync();
+  });
+
+  // 节点内核切换（独立部署）：联动 VLESS Encryption 的禁用状态（sing-box 不支持）
+  $('#n-kernel', mask).addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-kernel]');
+    if (!btn) return;
+    $$('#n-kernel button', mask).forEach((b) => b.classList.toggle('on', b === btn));
     sync();
   });
 
@@ -1468,9 +1499,16 @@ function readNodeForm(mask) {
     throw new Error(`中转入口「${bad.name || '未命名'}」还没有填地址，请补上或删除该行`);
   }
 
+  // 分段控件的当前值：读一次缓存，别像旧写法那样三次重复查询选择器
+  const kernelBtn = $('#n-kernel button.on', mask);
+  const kernel = kernelBtn && kernelBtn.dataset.kernel === 'singbox' ? 'singbox' : 'xray';
+  const veEl = $('#n-ve', mask);
   const payload = {
     name: v('#n-name'),
     mode,
+    // 独立节点自选内核（hy2 强制 xray：走独立 hysteria 实例，没有内核语义）；
+    // server/imported 模式服务端忽略该字段（跟随宿主 / 无 agent）
+    kernel: mode === 'standalone' && protocol !== 'hysteria2' ? kernel : 'xray',
     ipMode: $('#n-ipmode button.on', mask).dataset.ipmode,
     serverId: v('#n-server'),
     address: v('#n-address'),
@@ -1481,7 +1519,8 @@ function readNodeForm(mask) {
     // 出站强制 IPv4：对所有协议通用（Xray 走独立 freedom 出站，HY2 走 direct mode 4）
     forceV4: $('#n-force-v4', mask).checked,
     fp: v('#n-fp'),
-    vlessEncryption: protocol === 'vless' ? $('#n-ve', mask).checked : false,
+    // sing-box 内核下 #n-ve 被 disabled（不支持 mlkem768），连同勾选值一起忽略
+    vlessEncryption: protocol === 'vless' && !veEl.disabled ? veEl.checked : false,
     entries: draft.filter((e) => e.host),
     planIds: [...(state.planDraft || [])],
     certMode,
@@ -1670,7 +1709,7 @@ async function nodeDeployFlow(id) {
   const lastTip =
     n.protocol === 'hysteria2'
       ? pad(`ls /run/${alias}/`) + '# Hysteria2 实例 pid'
-      : pad('systemctl status xray') + '# Xray 服务状态';
+      : pad('systemctl status webcore') + '# 内核服务状态（Xray / sing-box 都叫它）';
 
   const mask = openModal({
     title: '独立部署 · ' + n.name,

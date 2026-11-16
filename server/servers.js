@@ -26,6 +26,10 @@ const {
 const SERVER_TYPES = ['node', 'relay'];
 const typeOf = (v) => (v === 'relay' ? 'relay' : 'node');
 
+/** 落地机节点内核（0.2.0）：xray = Xray-core（默认）；singbox = sing-box */
+
+const kernelOf = (v) => (v === 'singbox' ? 'singbox' : 'xray');
+
 /** 中转机列表（relays 域共用：规则只能挂在这些机器上） */
 function relayServers(db) {
   const d = db || store.db();
@@ -69,10 +73,13 @@ function createServer(req, res, params, body) {
   } else if (ipMode === 'manual' && !host) {
     return sendJson(res, 400, { error: '请填写服务器地址（IP 或域名）' });
   }
+  // 节点内核只在落地机上可选（0.2.0）；中转机没有内核语义
+  const kernel = type === 'node' ? kernelOf(body.kernel) : 'xray';
   // 自动上报模式允许地址为空：部署 agent 后由它自己上报，未上报前订阅链接暂时为空
   const s = {
     id: store.uid(),
     type,
+    kernel,
     name,
     host,
     token: store.rnd(20),
@@ -98,6 +105,32 @@ function updateServer(req, res, params, body) {
   // 类型决定安装脚本与下发内容，改类型等于换一台机器的语义：删了重建更安全
   if (body.type !== undefined && typeOf(body.type) !== typeOf(s.type)) {
     return sendJson(res, 400, { error: '服务器类型创建后不可修改；要换用途请删除后重新添加' });
+  }
+  // 内核同理：换内核 = 换部署脚本、换二进制、换配置编译器，机器上要整套重装。
+  // 内核允许修改（0.2.0 换内核流程）：改后面板立即按新内核编译下发，节点 / 端口 /
+  // 订阅链接全部复用。机器侧旧内核进程的配置自检会失败（自检保护让线上进程不被顶掉、
+  // 端口继续由旧内核服务），面板列表显示「内核切换未完成」——重跑一次部署命令完成
+  // 机器侧切换（部署脚本自动退役旧内核、装新内核），agent 下一轮拉包后恢复。
+  if (body.kernel !== undefined) {
+    const nextKernel = kernelOf(body.kernel);
+    // 切到 sing-box 前校验 VLESS Encryption（mlkem768）：编译层会静默降级成普通 vless，
+    // 但订阅仍在发后量子参数（lib/sub.js 的 vlessEncryption 分支）——客户端按 mlkem768
+    // 握手、服务端不认，节点直接不可用且面板看不出任何异常（配置合法、服务正常、回执 ok）。
+    // 必须在这里拦下并列出节点，让用户先关掉后量子加密选项
+    if (nextKernel === 'singbox' && kernelOf(s.kernel) !== 'singbox') {
+      const blocked = store.db().nodes.filter(
+        (n) => n.serverId === s.id && n.protocol === 'vless' && n.vlessEncryption,
+      );
+      if (blocked.length) {
+        return sendJson(res, 400, {
+          error:
+            `该服务器下有 ${blocked.length} 个节点启用了 VLESS Encryption（mlkem768），` +
+            `sing-box 不支持：${blocked.map((n) => n.name).join('、')}。` +
+            '请先关闭这些节点的后量子加密选项（或把它们移到 Xray 内核的服务器），再切换内核',
+        });
+      }
+    }
+    s.kernel = nextKernel;
   }
   if (body.name !== undefined) {
     const next = String(body.name).trim() || s.name;
@@ -254,14 +287,20 @@ function installScript(req, res, params, body, session, ctx) {
   const serverNodes = s.type === 'relay' ? [] : db.nodes.filter((n) => n.serverId === s.id);
   const relayOnly = s.type === 'relay';
   const needHysteria = serverNodes.some((n) => n.protocol === 'hysteria2');
-  // 还没有节点的服务器也装 Xray：否则以后加第一个节点又要为「机器上没装 Xray」返工一次
-  const needXray = !relayOnly && (serverNodes.length === 0 || serverNodes.some((n) => n.protocol !== 'hysteria2'));
+  // 节点内核（0.2.0）：xray 或 singbox，决定部署脚本装哪个二进制。
+  // 还没有节点的服务器也装内核：否则以后加第一个节点又要为「机器上没装」返工一次
+  const kernel = kernelOf(s.kernel);
+  const kernelOnly = relayOnly ? false : serverNodes.length === 0 || serverNodes.some((n) => n.protocol !== 'hysteria2');
+  const needXray = kernelOnly && kernel === 'xray';
+  const needSingbox = kernelOnly && kernel === 'singbox';
   const script = buildInstallScript({
     panelUrl: baseUrl(ctx.req),
     token: s.token,
     label: relayOnly ? `${s.name}（中转机 · ${s.host}）` : `${s.name} (${s.host})`,
     needHysteria,
     needXray,
+    needSingbox,
+    kernel,
     relayOnly,
     // 0.1.54 起统一伪装：agent 一律装成 logsync，不再按服务器开关。
     // 老机器重跑部署命令时脚本会做一次保守迁移（先复制、新服务起来才停旧的）。
@@ -318,7 +357,9 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
     token: node.token,
     label: `${node.name}（独立部署 · ${node.address}）`,
     needHysteria: node.protocol === 'hysteria2',
-    needXray: node.protocol !== 'hysteria2',
+    needXray: node.protocol !== 'hysteria2' && kernelOf(node.kernel) === 'xray',
+    needSingbox: node.protocol !== 'hysteria2' && kernelOf(node.kernel) === 'singbox',
+    kernel: kernelOf(node.kernel),
     // 独立节点同样统一伪装（见 installScript 的说明）
     stealth: true,
     agentSrc,

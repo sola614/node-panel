@@ -14,6 +14,7 @@ const net = require('net');
 const path = require('path');
 const store = require('../lib/store');
 const xray = require('../lib/xray');
+const singbox = require('../lib/singbox');
 const hysteria = require('../lib/hysteria');
 const cert = require('../lib/cert');
 const alerts = require('../lib/alerts');
@@ -152,6 +153,8 @@ function resolveScope(token, ip) {
       // 必须显式写出来 —— 漏了这个字段，!scope.enabled 会把 undefined 当停用，
       // 所有机器都会停止重载服务
       enabled: server.enabled !== false,
+      // 节点内核（0.2.0）：编译器按它选 lib/xray.js 或 lib/singbox.js
+      kernel: server.kernel === 'singbox' ? 'singbox' : 'xray',
       // 中转机不承载节点：配置包里只有转发规则
       nodes: relay ? [] : db.nodes.filter((n) => n.serverId === server.id && n.enabled),
     };
@@ -169,6 +172,7 @@ function resolveScope(token, ip) {
       stealth: !!node.stealth,
       // 独立节点同样支持停用（与所属服务器独立）
       enabled: node.enabled !== false,
+      kernel: node.kernel === 'singbox' ? 'singbox' : 'xray',
       nodes: node.enabled ? [node] : [],
     };
     applyReportedIp(scope, ip);
@@ -192,7 +196,10 @@ function buildAgentPayload(scope) {
   // 而不是只让面板别管它。agent 留着的意义是低频轮询何时被重新启用。
   const nodes = scope.enabled === false ? [] : scope.nodes;
 
-  const xrayNodes = nodes.filter((n) => n.protocol !== 'hysteria2');
+  // 节点内核（0.2.0）：xray / singbox 二选一，配置互斥产出 —— 另一边恒为 null，
+  // 且 null 也进 hash 与字段集合，让「这台机器跑什么内核」成为配置包的一部分
+  const kernel = scope.kernel === 'singbox' ? 'singbox' : 'xray';
+  const kernelNodes = nodes.filter((n) => n.protocol !== 'hysteria2');
   const hyNodes = nodes.filter((n) => n.protocol === 'hysteria2');
 
   // 同一作用域内统一分配统计端口，避免节点间碰撞导致流量串号
@@ -200,9 +207,11 @@ function buildAgentPayload(scope) {
 
   const usersResolver = (node) => usersForNode(node, active);
 
-  // 即使没有 Xray 节点也返回一份合法配置（仅含 api 入站），
-  // 这样删掉最后一个节点时旧监听会被真正关掉。agent 会自行判断本机是否装了 xray。
-  const xrayConfig = xray.buildConfig(xrayNodes, usersResolver);
+  // 即使没有节点也返回一份合法配置（Xray 仅含 api 入站 / sing-box 仅含 v2ray_api），
+  // 这样删掉最后一个节点时旧监听会被真正关掉。agent 会自行判断本机装了哪个内核。
+  const xrayConfig = kernel === 'xray' ? xray.buildConfig(kernelNodes, usersResolver) : null;
+  const singboxConfig =
+    kernel === 'singbox' ? singbox.buildConfig(kernelNodes, usersResolver) : null;
 
   const hysteriaList = hyNodes.map((n) => {
     const users = usersResolver(n);
@@ -242,7 +251,7 @@ function buildAgentPayload(scope) {
     });
   };
 
-  for (const n of [...xrayNodes, ...hyNodes]) {
+  for (const n of [...kernelNodes, ...hyNodes]) {
     const mode = n.certMode || 'path';
     if (mode === 'ref') {
       // 还没签下来的证书什么都不下发：让服务因为缺文件起不来，
@@ -277,7 +286,9 @@ function buildAgentPayload(scope) {
   const runtime = runtimePayload();
   const disabled = !scope.enabled;
   const payloadForHash = JSON.stringify({
+    kernel,
     xray: xrayConfig,
+    singbox: singboxConfig,
     hysteria: hysteriaList.map((h) => h.yaml),
     hop: hysteriaList.map((h) => `${h.nodeId}:${h.port}:${h.hop}`),
     certs,
@@ -294,9 +305,12 @@ function buildAgentPayload(scope) {
     agentVersion: APP_VERSION,
     // 面板上停用了这台服务器：agent 据此把轮询拉到 1 小时、且不碰服务
     disabled,
+    // 节点内核：bundle 与 agent.sh 按它选配置落盘与服务收敛分支
+    kernel,
     nodes: nodes.map((n) => ({ id: n.id, name: n.name, protocol: n.protocol, port: n.port })),
     userCount: active.length,
     xray: xrayConfig,
+    singbox: singboxConfig,
     hysteria: hysteriaList,
     certs,
     runtime,
@@ -698,12 +712,20 @@ function scopeOfServer(s) {
     // 漏了这个字段会让 undefined 取反成 true —— 所有机器都被当成「已停用」，
     // agent 于是再也不会重载服务
     enabled: s.enabled !== false,
+    kernel: s.kernel === 'singbox' ? 'singbox' : 'xray',
     nodes: relay ? [] : store.db().nodes.filter((n) => n.serverId === s.id && n.enabled),
   };
 }
 
 function scopeOfNode(n) {
-  return { type: 'node', id: n.id, name: n.name, enabled: n.enabled !== false, nodes: n.enabled ? [n] : [] };
+  return {
+    type: 'node',
+    id: n.id,
+    name: n.name,
+    enabled: n.enabled !== false,
+    kernel: n.kernel === 'singbox' ? 'singbox' : 'xray',
+    nodes: n.enabled ? [n] : [],
+  };
 }
 
 /** 当前目标 hash（失败时返回空串，绝不因为一个节点配错就让列表接口 500） */
@@ -762,6 +784,8 @@ function syncView(item, scope) {
     hash: sync ? sync.hash : '',
     error: sync ? sync.error || '' : '',
     xray: sync ? sync.xray || '' : '',
+    // 机器实际跑的内核（netcore/xray）：换内核后与目标不一致 = 还没重跑部署命令
+    kernel: sync ? sync.kernel || '' : '',
     hy: sync ? sync.hy || '' : '',
     hop: sync ? sync.hop || '' : '',
     unbound: sync ? sync.unbound || '' : '',
@@ -793,6 +817,8 @@ function agentReceipt(req, res, params, body, session, ctx) {
     hash: trim(body.hash, 40),
     ok: body.ok !== false,
     error: trim(body.error, 500),
+    // 机器实际内核（0.2.0 换内核流程）：与目标 kernel 对比，不符 = 待重跑部署命令
+    kernel: trim(body.kernel, 24),
     xray: trim(body.xray, 24),
     hy: trim(body.hy, 24),
     // 跳跃规则装载情况（`4/4`）。客户端拿到的是端口范围，规则没装上就等于整段不可达 ——

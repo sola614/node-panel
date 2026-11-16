@@ -1,0 +1,136 @@
+# sing-box 自构建发行包（0.2.0）：官方发行包不含 with_v2ray_api（按用户流量统计），
+# 面板侧 lib/singbox.js 的编译输出（experimental.v2ray_api 块）只对这里的产物负责。
+#
+# ⚠️ 本 workflow 跑完（产出 sb-<版本>-np1 release）之前，面板的 sing-box 内核
+# 不可部署 —— 部署脚本会在「发行包下载失败」处停下，这是预期行为。
+#
+# 触发：Actions 页手动运行 workflow_dispatch，填 sing-box 版本 tag（如 v1.12.0）。
+# 产物：发布到本仓库 release，tag 为 sb-<版本>-np1，含 linux 全架构 tar.gz
+# （部署脚本 deploy-scripts.js 的 SINGBOX_RELEASE_URL 默认指向该 release）与
+# windows-amd64 产物（本地真机验证 sing-box check / counter 命名用）。
+#
+# 升级 sing-box 版本的流程：
+#   1. 在 Actions 里用新版本号跑本 workflow
+#   2. 把 server/deploy-scripts.js 的 SINGBOX_VERSION 常量同步为新版本
+#   3. 用新产物跑一次 sing-box check（喂面板编译输出）确认 schema 兼容
+#      （sing-box schema 迭代快，lib/singbox.js 的注释锁定了已知的废弃项）
+#
+#   ⚠️ 为什么不能直接指定官方 latest：官方发行包不含 with_v2ray_api（按用户流量
+#   统计依赖它），且 lib/singbox.js 的编译输出与特定版本 schema 锁定（例如
+#   domain_strategy 在 1.14 移除）。版本升级必须走上面三步显式流程 —— CI 可对任意
+#   版本 tag 构建（workflow_dispatch 参数），部署侧也能用 SINGBOX_VERSION 环境变量
+#   指定任意已构建的版本，但「构建哪个版本 + 编译器是否兼容」由人确认。
+#
+#   ⚠️ 字段级 TODO：lib/singbox.js 的 direct 出站仍用 domain_strategy: 'ipv4_only'
+#   （forceV4），sing-box 1.12 起 WARN、1.14 移除 —— 升级到 1.14+ 时必须同步把它
+#   迁到 route 规则动作（action: 'resolve', strategy: 'ipv4_only'），否则配置
+#   decode 直接失败。
+name: build-singbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      singbox_version:
+        description: 'sing-box 版本 tag（如 v1.12.0）'
+        required: true
+        default: 'v1.12.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, sbarch: amd64 }
+          - { goos: linux, goarch: arm64, sbarch: arm64 }
+          - { goos: linux, goarch: arm, goarm: '7', sbarch: armv7 }
+          - { goos: linux, goarch: arm, goarm: '6', sbarch: armv6 }
+          - { goos: linux, goarch: '386', sbarch: '386' }
+          - { goos: linux, goarch: riscv64, sbarch: riscv64 }
+          - { goos: linux, goarch: s390x, sbarch: s390x }
+          # windows 产物不进发行包，供本地真机验证（check / counter 命名实测）
+          - { goos: windows, goarch: amd64, sbarch: windows-amd64 }
+    steps:
+      - name: Checkout node-panel（获取 workflow 上下文）
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Checkout sing-box 源码
+        run: |
+          git clone --depth 1 -b "${{ inputs.singbox_version }}" https://github.com/SagerNet/sing-box.git
+          cd sing-box
+          echo "SB_VER=$(git describe --tags --abbrev=0)" >> "$GITHUB_ENV"
+
+      - name: Build（官方默认 tags + with_v2ray_api）
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          set -e
+          SB_VER="${{ env.SB_VER }}"
+          NP_VER="${SB_VER}-np"
+          EXT=""
+          DIR="sing-box-${SB_VER#v}-linux-${{ matrix.sbarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            DIR="sing-box-${SB_VER#v}-windows-amd64"
+            EXT=".exe"
+          fi
+          mkdir -p "$DIR"
+          # 与官方 Makefile 同构：-trimpath + Version 注入；tags = 官方默认 + with_v2ray_api
+          # （按用户流量统计依赖它，官方发行包不含 —— 见 lib/singbox.js 注释）
+          export GOTOOLCHAIN=local
+          go build -trimpath \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${NP_VER}' -s -w -buildid=" \
+            -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api" \
+            -o "${DIR}/sing-box${EXT}" ./cmd/sing-box
+          tar -czf "${DIR}.tar.gz" "$DIR"
+          sha256sum "${DIR}.tar.gz" >> sha256sums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.sbarch }}
+          path: |
+            *.tar.gz
+            sha256sums.txt
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 合并各架构产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: 汇总 sha256 清单
+        run: |
+          cat $(find . -name 'sha256sums.txt' | sort) > sha256sums.txt
+          grep -c . sha256sums.txt
+
+      - name: 发布 release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sb-${{ inputs.singbox_version }}-np1
+          name: sing-box ${{ inputs.singbox_version }} (with_v2ray_api)
+          body: |
+            面板自构建的 sing-box 发行包：官方默认构建标签 + with_v2ray_api（按用户流量统计）。
+
+            - 部署脚本默认从这里拉取（SINGBOX_RELEASE_URL 可覆盖，含镜像前缀场景）
+            - sha256sums.txt 供部署脚本下载后校验
+            - windows-amd64 产物仅用于本地真机验证，不进部署链
+          draft: false
+          prerelease: false
+          files: |
+            *.tar.gz
+            sha256sums.txt

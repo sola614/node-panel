@@ -1712,6 +1712,97 @@ function totpCodeOf(secret) {
   const acmeLink = (subAcme.data.links || []).find((l) => l.name.includes('SMOKE-ACME'));
   ok('ACME 证书不需要 allowInsecure', !!acmeLink && !acmeLink.uri.includes('allowInsecure'));
 
+  /* ---------- 11.6.5 sing-box 内核（0.2.0） ---------- */
+  console.log('\n── sing-box 内核 ──');
+
+  const sbSrv = await call('/api/servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-singbox机', host: '198.51.100.30', kernel: 'singbox' }),
+  });
+  ok('新增服务器可指定 kernel=singbox',
+    sbSrv.status === 200 && sbSrv.data.item.kernel === 'singbox', `(${sbSrv.status})`);
+  const sbSrvId = sbSrv.data.item.id;
+  cleanup.push(['/api/servers/' + sbSrvId]);
+  const sbSrvToken = sbSrv.data.item.token;
+
+  ok('kernel 非法值归一为 xray', await (async () => {
+    const r = await call('/api/servers', {
+      method: 'POST',
+      body: json({ name: 'SMOKE-内核兜底', host: '198.51.100.31', kernel: 'evil;rm' }),
+    });
+    cleanup.push(['/api/servers/' + r.data.item.id]);
+    return r.status === 200 && r.data.item.kernel === 'xray';
+  })());
+
+  const sbInstall = await fetch(`${BASE}/api/servers/${sbSrvId}/install?token=${sbSrvToken}`);
+  const sbInstallText = await sbInstall.text();
+  ok('sing-box 部署脚本 NEED_SINGBOX=1、NEED_XRAY=0、KERNEL 伪装代号 netcore',
+    sbInstall.status === 200 && sbInstallText.includes('NEED_SINGBOX="1"')
+      && sbInstallText.includes('NEED_XRAY="0"') && sbInstallText.includes('KERNEL="netcore"'),
+    `(${sbInstall.status})`);
+  ok('sing-box 自构建源下载 + sha256 校验 + 统计客户端 + 官方名单元拒绝',
+    sbInstallText.includes('SINGBOX_RELEASE_URL')
+      && sbInstallText.includes('sola614/node-panel/releases/download/sb-v')
+      && sbInstallText.includes('sha256')
+      && sbInstallText.includes('np-statsq')
+      && sbInstallText.includes('本机已有 Xray 服务单元'));
+  ok('sing-box 伪装落地（webcore 单元 + WebCore Service + run -c）',
+    sbInstallText.includes('write_singbox_unit') && sbInstallText.includes('Description=WebCore Service')
+      && sbInstallText.includes('run -c $XRAY_ETC/config.json'));
+  ok('sing-box 脚本带 Xray 迁移分支（同名伪装单元自动退役）',
+    sbInstallText.includes('内核切换：退役 Xray 单元') && sbInstallText.includes('stop_retire_unit'));
+
+  // 内核可修改（0.2.0 换内核流程）：改完部署脚本按新内核生成，节点配置自动复用。
+  // 双向往返一次，验证两个方向的迁移分支都被正确生成
+  ok('内核允许修改（PUT 200）', (await call('/api/servers/' + sbSrvId, {
+    method: 'PUT',
+    body: json({ kernel: 'xray' }),
+  })).status === 200);
+  const backToXray = await (await fetch(`${BASE}/api/servers/${sbSrvId}/install?token=${sbSrvToken}`)).text();
+  ok('改回 xray 后脚本带 sing-box 迁移分支',
+    backToXray.includes('NEED_XRAY="1"') && backToXray.includes('NEED_SINGBOX="0"')
+      && backToXray.includes('内核切换：退役 sing-box 单元') && backToXray.includes('KERNEL="xray"'));
+  ok('改回 sing-box 内核', (await call('/api/servers/' + sbSrvId, {
+    method: 'PUT',
+    body: json({ kernel: 'singbox' }),
+  })).data.item.kernel === 'singbox');
+
+  // sing-box 宿主上的节点：VLESS Encryption 必须被拦（sing-box 不支持 mlkem768）
+  const sbNode = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-sb节点', serverId: sbSrvId, protocol: 'vless', port: 21105,
+      network: 'tcp', security: 'reality', vlessEncryption: true,
+      reality: { privateKey: 'k', publicKey: 'p', shortId: 'abcd1234' },
+    }),
+  });
+  ok('sing-box 服务器上 VLESS Encryption 被拦', sbNode.status === 400, sbNode.data.error || '');
+
+  // 切内核校验（第四轮 review §3.2）：xray 服务器上有 VE 节点时，切 sing-box 必须被拦 ——
+  // 否则编译层静默降级、订阅仍在发后量子参数，客户端握手必失败且面板无任何提示
+  const veSrv = await call('/api/servers', {
+    method: 'POST',
+    body: json({ name: 'SMOKE-切内核源', host: '198.51.100.32', kernel: 'xray' }),
+  });
+  cleanup.push(['/api/servers/' + veSrv.data.item.id]);
+  const veNode = await call('/api/nodes', {
+    method: 'POST',
+    body: json({
+      name: 'SMOKE-切内核VE节点', serverId: veSrv.data.item.id, protocol: 'vless', port: 21106,
+      network: 'tcp', security: 'reality', vlessEncryption: true,
+      reality: { privateKey: 'k', publicKey: 'p', shortId: 'abcd1234' },
+    }),
+  });
+  ok('xray 服务器可正常创建 VE 节点', veNode.status === 200, `(${veNode.status})`);
+  cleanup.push(['/api/nodes/' + veNode.data.item.id]);
+  const veSwitch = await call('/api/servers/' + veSrv.data.item.id, {
+    method: 'PUT',
+    body: json({ kernel: 'singbox' }),
+  });
+  ok('切内核被 VLESS Encryption 拦（400 且列出节点名）',
+    veSwitch.status === 400 && (veSwitch.data.error || '').includes('SMOKE-切内核VE节点'),
+    `(${veSwitch.status} ${veSwitch.data.error || ''})`);
+
   /* ---------- 11.7 中转管理：服务器台账 / 转发规则 / 回执（0.1.43） ---------- */
 
   const rsNew = await call('/api/servers', {

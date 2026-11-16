@@ -51,9 +51,13 @@ function serverCardHtml(s) {
         ${s.note ? `<div style="font-size:12px;color:var(--muted);margin-bottom:10px">${esc(s.note)}</div>` : ''}
         ${relay
           ? '<div class="hint" style="margin-bottom:10px">中转机只装 agent，转发规则在「中转」页维护，agent 每 60s 自动收敛（gost / iptables）</div>'
-          : s.hasHysteria
-            ? '<div class="hint" style="margin-bottom:10px">含 Hysteria2 节点，部署脚本会一并安装 hysteria</div>'
-            : ''}
+          : (s.sync && s.sync.kernel && s.sync.kernel !== (s.kernel === 'singbox' ? 'netcore' : 'xray')
+              ? '<div class="hint" style="margin-bottom:10px;color:var(--warn)">内核切换未完成：机器上还跑着旧内核，重跑一次「部署命令」即完成切换（节点配置自动复用）</div>'
+              : '') + (s.kernel === 'singbox'
+              ? '<div class="hint" style="margin-bottom:10px">内核 sing-box：vmess / vless / trojan / ss 由 sing-box 承载，部署脚本安装面板自构建的发行包（含按用户流量统计 API）并附装统计客户端</div>'
+              : '') + (s.hasHysteria
+              ? '<div class="hint" style="margin-bottom:10px">含 Hysteria2 节点，部署脚本会一并安装 hysteria</div>'
+              : '')}
         <div style="display:flex;gap:7px;flex-wrap:wrap">
           <button class="btn btn-sm btn-primary" data-act="server-deploy" data-id="${s.id}">部署命令</button>
           <button class="btn btn-sm btn-ghost" data-act="server-uninstall" data-id="${s.id}">卸载命令</button>
@@ -227,6 +231,7 @@ function serverForm(s, opts = {}) {
   const auto = (v.ipMode || 'manual') === 'auto';
   const type = v.type === 'relay' ? 'relay' : v.type === 'node' ? 'node' : SERVER_TAB;
   const relay = type === 'relay';
+  const kernel = v.kernel === 'singbox' ? 'singbox' : 'xray';
   return `
     <div class="field">
       <label>服务器类型</label>
@@ -240,6 +245,14 @@ function serverForm(s, opts = {}) {
             </div>`
       }
       <div class="hint">节点服务器跑 Xray / Hysteria2；中转服务器只做端口转发（入口机），安装脚本与下发内容不同</div>
+    </div>
+    <div class="field" id="s-kernel-field" ${relay ? 'hidden' : ''}>
+      <label>节点内核</label>
+      <div class="seg" id="s-kernel">
+        <button type="button" data-kernel="xray" class="${kernel === 'xray' ? 'on' : ''}">Xray</button>
+        <button type="button" data-kernel="singbox" class="${kernel === 'singbox' ? 'on' : ''}">sing-box</button>
+      </div>
+      <div class="hint">承载 vmess / vless / trojan / ss 节点的内核。${lockType ? '<b>修改内核后需在机器上重跑一次部署命令完成切换</b>（节点、端口、订阅自动复用，切换期间节点短暂中断）；' : '创建后如需更换，在编辑里改并重跑部署命令即可，节点配置自动复用。'}Hysteria2 始终用独立的 hysteria 实例；sing-box 不支持 VLESS 后量子加密</div>
     </div>
     <div class="field">
       <label>服务器名称</label>
@@ -272,6 +285,8 @@ function bindServerForm(mask, lockType = false) {
     const relay = type === 'relay';
     const ipField = $('#s-ipmode-field', mask);
     if (ipField) ipField.hidden = relay;
+    const kernelField = $('#s-kernel-field', mask);
+    if (kernelField) kernelField.hidden = relay;
     const hint = $('#s-host-hint', mask);
     if (!hint) return;
     if (relay) {
@@ -292,6 +307,14 @@ function bindServerForm(mask, lockType = false) {
       sync();
     });
   }
+  const kernelBox = $('#s-kernel', mask);
+  if (kernelBox) {
+    kernelBox.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-kernel]');
+      if (!btn) return;
+      $$('#s-kernel button', mask).forEach((b) => b.classList.toggle('on', b === btn));
+    });
+  }
   const ipBox = $('#s-ipmode', mask);
   if (ipBox) {
     ipBox.addEventListener('click', (e) => {
@@ -309,8 +332,10 @@ function readServerForm(mask) {
   const typeBtn = $('#s-type button.on', mask);
   const type = typeBtn ? typeBtn.dataset.type : mask.dataset.serverType || 'node';
   const ipBtn = $('#s-ipmode button.on', mask);
+  const kernelBtn = $('#s-kernel button.on', mask);
   return {
     type,
+    kernel: kernelBtn ? kernelBtn.dataset.kernel : 'xray',
     name: $('#s-name', mask).value.trim(),
     host: $('#s-host', mask).value.trim(),
     ipMode: type === 'relay' ? 'manual' : ipBtn ? ipBtn.dataset.ipmode : 'manual',
@@ -363,8 +388,9 @@ async function serverEditFlow(id) {
         throw new Error('手动模式下请填写服务器地址');
       }
       delete payload.type; // 类型不可改，不提交以免误触发 400
+      // kernel 允许修改（0.2.0 换内核流程）：改完在机器上重跑部署命令完成切换
       await api('/api/servers/' + id, { method: 'PUT', body: JSON.stringify(payload) });
-      toast('已保存', 'ok');
+      toast(payload.kernel && payload.kernel !== (state.data.servers.find((x) => x.id === id).kernel) ? '内核已修改，去机器上重跑部署命令完成切换' : '已保存', 'ok');
       render();
     },
   });
@@ -441,15 +467,17 @@ ${pad(`rc-update show default | grep ${alias}`)}# 确认已加入开机自启
 ${pad(`sh /opt/${alias}/agent.sh --once`)}# 手动跑一轮
 ${pad(`sh /opt/${alias}/uninstall.sh`)}# 卸载本机 agent（保留日志与备份）
 ${pad(`sh /opt/${alias}/uninstall.sh --purge`)}# 彻底清理（连日志、配置备份一起删）
-cat /usr/local/etc/xray/config.json           # 查看 Xray 配置
+cat /usr/local/etc/webcore/config.json       # 查看内核配置（伪装部署路径）
+cat /usr/local/etc/xray/config.json          # 查看内核配置（老机器官方路径）
 ls /etc/hysteria/                             # 查看 Hysteria2 实例配置</div>
 
       <p class="hint" style="margin-top:14px">
-        部署脚本会把 Xray 一并装好（本机已有 xray / xray-core / x-ui 服务时不会覆盖）；
-        有 Hysteria2 节点时顺带安装 hysteria。agent 之后只负责写配置和重启服务。
+        ${s.kernel === 'singbox'
+          ? '部署脚本会安装面板自构建的 sing-box（官方默认构建标签 + 按用户流量统计 API，版本固定；本机已有 sing-box 安装时沿用），并附装一份统计客户端（Xray 二进制，只当查询 CLI 用，不建服务）；已有 xray / xray-core / x-ui 服务的机器会拒绝部署 —— 一台机器只跑一个内核。有 Hysteria2 节点时顺带安装 hysteria。agent 之后只负责写配置和重启服务。'
+          : '部署脚本会把 Xray 一并装好（本机已有 xray / xray-core / x-ui 服务时不会覆盖）；有 Hysteria2 节点时顺带安装 hysteria。agent 之后只负责写配置和重启服务。'}
       </p>
       <p class="hint">
-        日志里出现「未找到 xray 服务」说明本机没有 Xray：重跑一次部署命令即可自动装好。
+        日志里出现「未找到${s.kernel === 'singbox' ? ' sing-box' : ' xray'} 服务」说明本机没有${s.kernel === 'singbox' ? ' sing-box' : ' Xray'}：重跑一次部署命令即可自动装好。
       </p>
       <p class="hint">
         要让这台机器彻底退出纳管，用同张卡片上的「卸载命令」，别手动删目录 —— 服务注册和 Hysteria2 实例会残留。

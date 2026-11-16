@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.1.54'
+VERSION='0.2.0'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -91,6 +91,7 @@ env_read() {
 
 if [ -f "$ENV_FILE" ]; then
   for _env_key in PANEL_URL PANEL_URL_BACKUP AGENT_TOKEN INTERVAL XRAY_ALIAS XRAY_CONFIG RELOAD_CMD HYSTERIA_DIR \
+                  KERNEL STATS_BIN \
                   HYSTERIA_BIN HYSTERIA_AUTO_INSTALL HOP_AUTO_INSTALL STATE_DIR RUN_DIR LOG_DIR \
                   HTTP_TIMEOUT LOG_MAX RELAY_ONLY FAILOVER_AFTER BACKOFF_MAX \
                   ACME_SH ACME_EMAIL REPORT_IP SOCK_CMD ORPHAN_GRACE ORPHAN_INTERVAL DISABLED_INTERVAL; do
@@ -116,11 +117,19 @@ RELAY_ONLY=${RELAY_ONLY:-0}
 INTERVAL=${INTERVAL:-60}
 XRAY_ALIAS=${XRAY_ALIAS:-xray}
 XRAY_CONFIG=${XRAY_CONFIG:-/usr/local/etc/xray/config.json}
+# 节点内核代号（0.2.0）：netcore = sing-box 的伪装名（下发面统一用代号，
+# agent.env 里 cat 不出内核）。agent.env 是部署时的初始值；state.env 每轮下发的
+# NP_KERNEL 优先（面板权威，见 kernel_id）。变量名沿用 XRAY_* 是历史兼容：
+# netcore 机器上 $XRAY_BIN 指向 sing-box、$XRAY_CONFIG 就是 sing-box 的配置
+KERNEL=${KERNEL:-xray}
+# 统计查询客户端（netcore 机器用）：部署时装的 Xray CLI 路径，Xray 机器恒空
+STATS_BIN=${STATS_BIN:-}
 HYSTERIA_DIR=${HYSTERIA_DIR:-/etc/hysteria}
 HYSTERIA_BIN=${HYSTERIA_BIN:-/usr/local/bin/hysteria}
 # 配置包（bundle）是「sh 子进程」执行的：不 export 的话，里面引用的
-# $XRAY_CONFIG / $HYSTERIA_DIR / $HYSTERIA_BIN 全是空的，文件会写到别处去
-export XRAY_CONFIG HYSTERIA_DIR HYSTERIA_BIN
+# $XRAY_CONFIG / $XRAY_ALIAS（内核切换闸探测二进制身份用）/ $HYSTERIA_DIR /
+# $HYSTERIA_BIN 全是空的，文件会写到别处去
+export XRAY_ALIAS XRAY_CONFIG HYSTERIA_DIR HYSTERIA_BIN
 # 有 hy2 实例却没有二进制时自己装一个（见 hy_install）；关掉就只记日志
 HYSTERIA_AUTO_INSTALL=${HYSTERIA_AUTO_INSTALL:-1}
 # 端口跳跃缺 nft/iptables 时自己装一个（见 hop_install_backend）；关掉就只记日志
@@ -693,6 +702,34 @@ xray_bin() {
   printf '%s' "$_b"
 }
 
+# ------------------------------ 节点内核（0.2.0） ----------------------------
+# 一台机器只跑一个内核，xray 与 netcore（= sing-box 的伪装代号）分支全靠这三个函数：
+# 二进制/服务名/配置路径共用 XRAY_* 变量（部署布局同构），行为差异只在下面几处。
+
+# 生效内核：state.env 的 NP_KERNEL（面板权威、每轮覆盖）优先于 agent.env 的初始值
+kernel_id() {
+  case "${NP_KERNEL:-$KERNEL}" in
+    netcore) printf 'netcore' ;;
+    *) printf 'xray' ;;
+  esac
+}
+
+# 日志与回执文案里的人话名称（netcore 机器直接说 sing-box，帮人少猜一层代号）
+kernel_label() {
+  if [ "$(kernel_id)" = 'netcore' ]; then printf 'sing-box'; else printf 'Xray'; fi
+}
+
+# 统计查询客户端：netcore 机器用部署时附装的 Xray CLI —— sing-box 的 v2ray_api
+# 兼容 Xray StatsService（gRPC），但它自己没有 statsquery 子命令，**绝不能回落到
+# 内核二进制**：api statsquery 打在 sing-box 上必然失败且被 2>/dev/null 吞掉，
+# usedBytes 永不增长、配额形同不存在还没人知道（0.2.0 首版就是这么静默失效的）。
+# Xray 机器直接用内核二进制，行为与 0.1.x 完全一致
+stats_cli() {
+  if [ -n "${STATS_BIN:-}" ] && [ -x "$STATS_BIN" ]; then printf '%s' "$STATS_BIN"; return 0; fi
+  if [ "$(kernel_id)" = 'netcore' ]; then return 1; fi
+  xray_bin
+}
+
 # agent.env 没写 RELOAD_CMD 时现猜一个：服务名不一定叫 xray
 # （xray-core / x-ui 都见过；0.1.9 起还可能是伪装名 webcore）
 detect_reload_cmd() {
@@ -715,14 +752,21 @@ detect_reload_cmd() {
   printf ''
 }
 
-# 重载 Xray 前先自检，坏配置绝不顶掉线上正在跑的
+# 重载内核进程前先自检，坏配置绝不顶掉线上正在跑的
 reload_xray() {
   _bin=$(xray_bin)
   if [ -x "$_bin" ] && [ -f "$XRAY_CONFIG" ]; then
-    if ! "$_bin" -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then
-      log "✗ Xray 配置自检未通过，放弃重载（线上配置保持不变）"
+    # 自检命令按内核分叉：Xray 是 `-test -config`，sing-box 是 `check -c`。
+    # 都只做语法/语义校验不触碰运行中进程，语义一致
+    if [ "$(kernel_id)" = 'netcore' ]; then
+      "$_bin" check -c "$XRAY_CONFIG" >/dev/null 2>&1 && _check_ok=1 || _check_ok=0
+    else
+      "$_bin" -test -config "$XRAY_CONFIG" >/dev/null 2>&1 && _check_ok=1 || _check_ok=0
+    fi
+    if [ "${_check_ok:-0}" != '1' ]; then
+      log "✗ $(kernel_label) 配置自检未通过，放弃重载（线上配置保持不变）"
       RC_XRAY=fail
-      RC_ERR='Xray 配置自检未通过，已放弃重载'
+      RC_ERR="$(kernel_label) 配置自检未通过，已放弃重载"
       RC_OK=0
       return 1
     fi
@@ -912,7 +956,7 @@ xray_ensure() {
   if [ "$_rc" -eq 0 ]; then
     sleep 1
     if unit_active "$_u"; then
-      log "✓ Xray 已启动"
+      log "✓ $(kernel_label) 已启动"
       rm -f "$_xf" 2>/dev/null
       RC_XRAY=ok
       NP_JUST_RESTARTED=1
@@ -935,13 +979,13 @@ xray_ensure() {
 
   case "$_err" in
     *'not found'* | *'not-found'* | *'No such file'*)
-      # 最容易踩的一种：机器上根本没有 Xray，装个节点却从来没装过服务。
-      # 0.1.5 起部署脚本会自己装 xray-core，所以这里直接给出能一键修好的动作
-      RC_ERR="未找到 $_u 服务：本机没有安装 Xray。到面板「服务器 / 节点」页复制部署命令重跑一次（会自动装 xray-core），或手工装好后把 RELOAD_CMD 写进 $ENV_FILE"
-      log "  修复：重跑面板上的部署命令即可自动安装 xray-core（已有安装不会被覆盖）"
+      # 最容易踩的一种：机器上根本没有内核本体，装个节点却从来没装过服务。
+      # 0.1.5 起部署脚本会自己装内核，所以这里直接给出能一键修好的动作
+      RC_ERR="未找到 $_u 服务：本机没有安装 $(kernel_label)。到面板「服务器 / 节点」页复制部署命令重跑一次（会自动安装内核），或手工装好后把 RELOAD_CMD 写进 $ENV_FILE"
+      log "  修复：重跑面板上的部署命令即可自动安装 $(kernel_label)（已有安装不会被覆盖）"
       ;;
     *)
-      RC_ERR="Xray 启动失败：$_u — $(printf '%s' "$_err" | sed -n '1p')"
+      RC_ERR="$(kernel_label) 启动失败：$_u — $(printf '%s' "$_err" | sed -n '1p')"
       ;;
   esac
   log "✗ $RC_ERR"
@@ -1753,7 +1797,9 @@ apply_bundle() {
     [ -f "$STATE_DIR/changed.env" ] && . "$STATE_DIR/changed.env" 2>/dev/null
     # 变更项写进日志：事后对时间线时，「这轮到底改了什么」比「更新了」有用得多
     _what=''
-    [ "${NP_CHANGED_XRAY:-0}" = '1' ] && _what='Xray'
+    if [ "${NP_CHANGED_XRAY:-0}" = '1' ]; then
+      if [ "$(kernel_id)" = 'netcore' ]; then _what='sing-box'; else _what='Xray'; fi
+    fi
     [ -n "${NP_CHANGED_HY:-}" ] && _what="${_what}${_what:+、}Hysteria2${NP_CHANGED_HY}"
     log "✓ 配置已更新（hash ${NP_HASH:-?}，变更：${_what:-无}）"
     CURRENT_ACTION=tick
@@ -1861,8 +1907,16 @@ split_records() {
 
 collect_xray() {
   [ "${NP_XRAY_NODES:-0}" -gt 0 ] 2>/dev/null || return 0
-  _bin=$(xray_bin)
-  [ -x "$_bin" ] || return 0
+  _bin=$(stats_cli)
+  if [ ! -x "$_bin" ]; then
+    # netcore 机器缺统计客户端时绝不能静默：usedBytes 不增长 = 配额失效，必须让回执可见
+    if [ "$(kernel_id)" = 'netcore' ]; then
+      RC_OK=0
+      RC_ERR='sing-box 机器缺少统计客户端（np-statsq）：本机无按用户流量计量，配额不生效。重跑部署命令安装，或按面板说明配置自编译 sing-box 发行源'
+      log "! $RC_ERR"
+    fi
+    return 0
+  fi
 
   "$_bin" api statsquery --server="${NP_STATS:-127.0.0.1:10085}" -pattern 'user>>>' -reset 2>/dev/null \
     | tr -d ' \r\n\t' \
@@ -1875,10 +1929,15 @@ collect_xray() {
         val = substr($0, RSTART + 8, RLENGTH - 8) + 0
         if (val <= 0) next
         n = split(nm, p, ">>>")
-        # 只要 user>>>email>>>traffic>>>(uplink|downlink)，inbound>>>tag>>>traffic>>>* 不算用户
-        if (n != 4 || p[1] != "user" || p[3] != "traffic") next
-        if (p[4] == "uplink") print p[2], "uplink", val
-        else if (p[4] == "downlink") print p[2], "downlink", val
+        # 用户 counter 分段：Xray 与 sing-box 的 v2ray_api 都沿用 V2Ray 4 段规范
+        #   user>>>email>>>traffic>>>(uplink|downlink)
+        # 3 段分支是上线前的兼容保险，自构建包真机实测确认 4 段后可删
+        if (p[1] != "user") next
+        if (n == 4 && p[3] == "traffic") seg = p[4]
+        else if (n == 3) seg = p[3]
+        else next
+        if (seg == "uplink") print p[2], "uplink", val
+        else if (seg == "downlink") print p[2], "downlink", val
       }'
 }
 
@@ -1887,8 +1946,16 @@ collect_xray() {
 # 不参与用户额度计算。
 collect_xray_nodes() {
   [ "${NP_XRAY_NODES:-0}" -gt 0 ] 2>/dev/null || return 0
-  _bin=$(xray_bin)
-  [ -x "$_bin" ] || return 0
+  _bin=$(stats_cli)
+  # 与 collect_xray 同一条降级路：netcore 缺统计客户端时错误要可见，不能静默归零
+  if [ ! -x "$_bin" ]; then
+    if [ "$(kernel_id)" = 'netcore' ] && [ -z "$RC_ERR" ]; then
+      RC_OK=0
+      RC_ERR='sing-box 机器缺少统计客户端（np-statsq）：本机无按用户流量计量，配额不生效。重跑部署命令安装，或按面板说明配置自编译 sing-box 发行源'
+      log "! $RC_ERR"
+    fi
+    return 0
+  fi
 
   "$_bin" api statsquery --server="${NP_STATS:-127.0.0.1:10085}" -pattern 'inbound>>>' -reset 2>/dev/null \
     | tr -d ' \r\n\t' \
@@ -1901,9 +1968,14 @@ collect_xray_nodes() {
         val = substr($0, RSTART + 8, RLENGTH - 8) + 0
         if (val <= 0) next
         n = split(nm, p, ">>>")
-        if (n != 4 || p[1] != "inbound" || p[3] != "traffic") next
-        if (p[4] == "uplink") print p[2], "uplink", val
-        else if (p[4] == "downlink") print p[2], "downlink", val
+        # 入站 counter 分段与用户 counter 同理：Xray 与 sing-box 的 v2ray_api 都沿用
+        # V2Ray 4 段规范（user>>>email>>>traffic>>>方向），3 段分支是兼容保险
+        if (p[1] != "inbound") next
+        if (n == 4 && p[3] == "traffic") seg = p[4]
+        else if (n == 3) seg = p[3]
+        else next
+        if (seg == "uplink") print p[2], "uplink", val
+        else if (seg == "downlink") print p[2], "downlink", val
       }' \
     | awk '
       { up[$1] += ($2 == "uplink" ? $3 : 0); down[$1] += ($2 == "downlink" ? $3 : 0); seen[$1] = 1 }
@@ -2188,8 +2260,10 @@ send_receipt() {
     _probe=$(cat "$STATE_DIR/relay-probe.json" 2>/dev/null)
   fi
   [ -n "$_probe" ] || _probe='{}'
-  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","hop":"%s","unbound":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s","traffic":{%s},"probe":%s}\n' \
+  # 实际生效的内核代号（netcore/xray）：换内核时面板用它判断「机器侧切换完成没有」
+  printf '{"hash":"%s","ok":%s,"error":"%s","xray":"%s","hy":"%s","hop":"%s","unbound":"%s","kernel":"%s",%s"nodes":%s,"users":%s,"agentVersion":"%s","traffic":{%s},"probe":%s}\n' \
     "${NP_HASH:-}" "$_ok" "$_err" "${RC_XRAY:-ok}" "${RC_HY:-0/0}" "${RC_HOP:-}" "${BAD_PORTS:-}" \
+    "$(kernel_id)" \
     "$_extra" "${NP_NODES:-0}" "${NP_USERS:-0}" "$VERSION" "$_traffic" "$_probe" > "$_f" 2>/dev/null
 
   if http_post_json "$NP_BASE_URL/api/agent/receipt?token=$AGENT_TOKEN&v=$VERSION" "$_f" "Authorization: Bearer $AGENT_TOKEN" >/dev/null; then
@@ -2507,7 +2581,7 @@ fi  # RELAY_ONLY=1 时跳过 Hysteria2 清理
   fi
 
   if [ "$RELAY_ONLY" != '1' ]; then
-  echo "→ 停掉 Xray 并清理面板生成的配置"
+  echo "→ 停掉 $(kernel_label) 并清理面板生成的配置"
   # 服务名不一定是 xray：伪装名 / xray-core / x-ui 都见过
   _unit=''
   if command -v systemctl >/dev/null 2>&1; then
@@ -2521,12 +2595,13 @@ fi  # RELAY_ONLY=1 时跳过 Hysteria2 清理
   if [ -z "$_unit" ] && [ -f "/etc/init.d/$XRAY_ALIAS" ]; then _unit=$XRAY_ALIAS; fi
   if [ -z "$_unit" ] && [ -f /etc/init.d/xray ]; then _unit=xray; fi
 
-  # 只动「确实是面板写的」那份配置：面板生成的配置一定带 StatsService。
-  # 机器上原有的、管理员自己的 xray 配置一律不碰 —— 卸载命令不该误删别人的服务
+  # 只动「确实是面板写的」那份配置：面板生成的 Xray 配置一定带 StatsService，
+  # sing-box 配置（0.2.0 netcore 内核）带 v2ray_api。机器上原有的、管理员自己的
+  # 配置一律不碰 —— 卸载命令不该误删别人的服务
   if [ ! -f "$XRAY_CONFIG" ]; then
     echo "  · 没有 $XRAY_CONFIG（这台机器可能还没部署过节点），跳过"
-  elif ! grep -q 'StatsService' "$XRAY_CONFIG" 2>/dev/null; then
-    echo "  · $XRAY_CONFIG 不是面板生成的（没有 StatsService），Xray 与配置都保留"
+  elif ! grep -q -e 'StatsService' -e 'v2ray_api' "$XRAY_CONFIG" 2>/dev/null; then
+    echo "  · $XRAY_CONFIG 不是面板生成的（没有 StatsService / v2ray_api），内核与配置都保留"
   else
     if [ -n "$_unit" ]; then
       if command -v systemctl >/dev/null 2>&1; then
@@ -2537,6 +2612,21 @@ fi  # RELAY_ONLY=1 时跳过 Hysteria2 清理
         command -v rc-update >/dev/null 2>&1 && rc-update del "$_unit" default >/dev/null 2>&1
       fi
       echo "  ✓ 已停止并取消开机自启 $_unit"
+
+      # 伪装名单元是面板装的：卸载时连单元文件一起删，否则残留的 disabled 单元
+      # 会让换内核部署被卡住（0.2.0 的 sing-box 安装分支检测到已有 Xray 单元直接拒绝）。
+      # 官方名（xray / xray-core / x-ui）可能是管理员自己的安装，维持现状不删
+      if [ "$XRAY_ALIAS" != 'xray' ]; then
+        if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/$XRAY_ALIAS.service" ]; then
+          rm -f "/etc/systemd/system/$XRAY_ALIAS.service"
+          systemctl daemon-reload >/dev/null 2>&1
+          echo "  ✓ 已删除面板注册的单元文件 /etc/systemd/system/$XRAY_ALIAS.service"
+        fi
+        if [ -f "/etc/init.d/$XRAY_ALIAS" ]; then
+          rm -f "/etc/init.d/$XRAY_ALIAS"
+          echo "  ✓ 已删除面板注册的服务脚本 /etc/init.d/$XRAY_ALIAS"
+        fi
+      fi
     fi
 
     if cp -f "$XRAY_CONFIG" "$_bak" 2>/dev/null; then
@@ -2569,6 +2659,17 @@ fi  # RELAY_ONLY=1 时跳过 Xray 清理
   if [ -x "/usr/local/bin/$XRAY_ALIAS" ] || [ -x /usr/local/bin/xray ]; then
     echo "· 保留 Xray 二进制与 geo 数据（可能是你自己装的；"
     echo "  确认是面板装的那份，可执行：rm -rf /usr/local/bin/$XRAY_ALIAS /usr/local/share/$XRAY_ALIAS）"
+  fi
+
+  # np-statsq 是面板附装的统计客户端（本质是一份 Xray 二进制），--purge 连它一起删；
+  # 非 purge 保留并说明 —— 它不是节点内核，机器上有它不代表装了 Xray
+  if [ -n "${STATS_BIN:-}" ] && [ -x "$STATS_BIN" ]; then
+    if [ "$_purge" = '1' ]; then
+      rm -f "$STATS_BIN"
+      echo "  ✓ 已删除统计客户端 $STATS_BIN"
+    else
+      echo "· 保留统计客户端 $STATS_BIN（--purge 连它一起删）"
+    fi
   fi
 
   echo ""

@@ -21,6 +21,13 @@ const AGENT_FILE = path.join(__dirname, '..', 'agent', 'agent.sh');
 const APP_VERSION = require('../package.json').version;
 
 /**
+ * sing-box 固定安装版本（0.2.0）。sing-box 的 schema 迭代快（1.11 弃用 legacy
+ * 入站格式、路由规则转 rule-action），lib/singbox.js 的编译输出只对固定版本负责；
+ * 要换版本用 SINGBOX_VERSION 环境变量覆盖部署脚本，同时确认编译输出兼容。
+ */
+const SINGBOX_VERSION = '1.12.0';
+
+/**
  * 会进 shell 的文本：换行撕开注释与语句，引号 / 反引号 / $ 能跑命令。
  *
  * 三个生成器（install / uninstall / relay）都必须走这里。0.1.33 里
@@ -73,6 +80,9 @@ function disguiseAgent(text, stealth) {
     .replace(/NODEPANEL_HYHOP/g, `${n.toUpperCase()}_HYHOP`)
     .replace(/\.nodepanel\.bak/g, `.${n}.bak`)
     .replace(/\/tmp\/nodepanel-xray/g, `/tmp/${n}-xray`)
+    // 0.2.0 起 /tmp 下的临时目录统一走 nodepanel- 前缀（singbox / statsq …），
+    // 泛化替换，新增临时目录不用再逐个补条目
+    .replace(/\/tmp\/nodepanel-/g, `/tmp/${n}-`)
     .replace(/\.nodepanel-uninstall\./g, `.${n}-uninstall.`)
     // 连脚本文件名一起换：`ps` 里是 `sh /opt/logsync/agent.sh`，把 agent 也留着了，
     // 而干净的部署（如 xboard-node）在进程名里既没有 panel 也没有 agent
@@ -217,7 +227,7 @@ function relayTarget(raw) {
   return isValidHost(v, v) ? v : '';
 }
 
-function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, agentSrc, relayOnly = false, stealth = true }) {
+function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, needSingbox = false, kernel = 'xray', agentSrc, relayOnly = false, stealth = true }) {
   // 0.1.54 起统一伪装：不再提供「不伪装」的部署方式。
   // 这里强制覆盖参数而不是只改默认值 —— 任何一处调用忘了传、或老代码传了 false，
   // 那台机器就会退回 /opt/nodepanel，和已经迁移过来的机器各用一套命名。
@@ -226,9 +236,16 @@ function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, ag
   const safeUrl = urlSafe(panelUrl);
   // 名称会进双引号变量：换行撕开语句，引号/反引号/$ 能跑命令
   const safeLabel = shellSafe(label);
-  // 中转机只跑 agent 的转发同步：不下载 Xray / hysteria，也不碰机器上已有的同类服务
+  // 中转机只跑 agent 的转发同步：不下载 Xray / sing-box / hysteria，也不碰机器上已有的同类服务
   const wantHy = relayOnly ? false : !!needHysteria;
   const wantXray = relayOnly ? false : !!needXray;
+  // 节点内核（0.2.0）：singbox 时装 sing-box（伪装布局与 Xray 完全同构），
+  // 另外附赠一份 Xray 二进制只当 gRPC 统计客户端（sing-box 的 v2ray_api 兼容
+  // StatsService，但它自己没有查询 CLI），不建服务单元、不写配置
+  const wantSingbox = relayOnly ? false : !!needSingbox;
+  // 下发面的内核代号：sing-box 在机器上一律伪装成 netcore（与 Xray→webcore 同标准，
+  // agent.env 的值 cat 出来不能看出内核）。面板数据层仍用 'singbox'，转换只发生在生成器
+  const safeKernel = kernel === 'singbox' ? 'netcore' : 'xray';
   // 备用面板地址（0.1.5x）：写进 agent.env 做初始兜底，之后以面板下发的为准。
   // 留空时这一行是空串，agent 侧等同「未配置备用地址」。
   const backupUrl = urlSafe(String(store.db().settings.agentBackupUrl || '').trim());
@@ -239,8 +256,10 @@ function buildInstallScript({ panelUrl, token, label, needHysteria, needXray, ag
 #
 # 幂等：重复执行只覆盖 agent 与配置，不重复堆积东西。
 ${relayOnly
-    ? '# 中转机：只部署 agent，转发规则由面板按「中转」页的规则自动同步（gost / iptables）。\n# 不会安装 Xray / Hysteria2，也不会改动本机已有的服务。'
-    : '# 已有 Xray 安装（xray / xray-core / x-ui）不会被覆盖；SKIP_XRAY=1 可跳过 Xray 安装。'}
+    ? '# 中转机：只部署 agent，转发规则由面板按「中转」页的规则自动同步（gost / iptables）。\n# 不会安装 Xray / sing-box / Hysteria2，也不会改动本机已有的服务。'
+    : kernel === 'singbox'
+      ? '# 节点内核 sing-box（0.2.0）：已有 Xray 安装（xray / xray-core / x-ui）时脚本会拒绝执行 ——\n# 一台机器只跑一个内核，要换内核请换机器或先卸载已有安装。SKIP_SINGBOX=1 可跳过安装。'
+      : '# 已有 Xray 安装（xray / xray-core / x-ui）不会被覆盖；SKIP_XRAY=1 可跳过 Xray 安装。'}
 set -u
 
 # re-exec 要用绝对路径，而下面会 cd / —— 先把 $0 定死，别让相对路径失效
@@ -256,6 +275,8 @@ AGENT_TOKEN="${token}"
 TARGET_LABEL="${safeLabel}"
 NEED_HYSTERIA="${wantHy ? '1' : '0'}"
 NEED_XRAY="${wantXray ? '1' : '0'}"
+NEED_SINGBOX="${wantSingbox ? '1' : '0'}"
+KERNEL="${safeKernel}"
 RELAY_ONLY="${relayOnly ? '1' : '0'}"
 INTERVAL=60
 
@@ -264,6 +285,9 @@ START_TS=$(date +%s)
 STEP=0
 TOTAL=3
 [ "$NEED_XRAY" = "1" ] && TOTAL=$((TOTAL + 1))
+# sing-box 只计「本体」一步：统计客户端装在守卫内（SKIP / 安装失败时不执行），
+# 单独计步会让进度停在 [4/5] 假装中途挂掉 —— 降级为 say 输出，账才平
+[ "$NEED_SINGBOX" = "1" ] && TOTAL=$((TOTAL + 1))
 [ "$NEED_HYSTERIA" = "1" ] && TOTAL=$((TOTAL + 1))
 
 step() { STEP=$((STEP + 1)); printf '\\n[%s/%s] %s\\n' "$STEP" "$TOTAL" "$1"; }
@@ -399,6 +423,22 @@ XRAY_ZIP_BASE=\${XRAY_DOWNLOAD_BASE:-https://github.com/XTLS/Xray-core/releases/
 XRAY_VER=''
 XRAY_STATE=''
 XRAY_SKIPPED=0
+# 节点内核 singbox（0.2.0）：二进制/配置仍落在 $XRAY_ALIAS 布局（伪装同构）。
+# 发行源是**面板仓库的自构建包**（官方默认构建标签 + with_v2ray_api）：sing-box
+# 官方发行包不含统计 API（真机 1.12.0 实测 FATAL），按用户计量依赖它 —— CI
+# workflow（build-singbox.yml）产出产物后发到面板仓库 release。schema 迭代快，不跟 latest
+# ⚠️ 赋值顺序不能换：shell 参数扩展的默认值（VAR 未设时用的那个 word）在 VAR 未设
+# 时也会被求值，而脚本开头是 set -u —— SINGBOX_VERSION_DEFAULT 必须先于引用它的
+# SINGBOX_RELEASE_URL 定义，否则所有部署脚本（含 Xray 存量机器）在变量段就
+# unbound variable 退出（第三轮 review P0）。注意本模板是 JS 模板字符串：注释里
+# 不能出现美元符号加花括号的 shell 扩展写法，会被当成 JS 插值
+SINGBOX_VERSION_DEFAULT='${SINGBOX_VERSION}'
+SINGBOX_RELEASE_URL=\${SINGBOX_RELEASE_URL:-https://github.com/sola614/node-panel/releases/download/sb-v$SINGBOX_VERSION_DEFAULT-np1}
+# 统计客户端：sing-box 的 v2ray_api 兼容 Xray StatsService（gRPC），但 sing-box
+# 没有 statsquery CLI —— singbox 机器上额外装一份 Xray 二进制只当查询客户端，
+# 不建服务单元、不写配置。伪装成中性名
+STATS_ALIAS=\${STATS_ALIAS:-np-statsq}
+STATS_BIN=''
 
 # uname -m → 官方发行包的架构后缀（与 XTLS/Xray-install 保持一致）
 xray_arch() {
@@ -435,6 +475,38 @@ xray_unit_name() {
   if [ -f "/etc/init.d/$XRAY_ALIAS" ]; then printf '%s' "$XRAY_ALIAS"; return 0; fi
   if [ -f /etc/init.d/xray ]; then printf 'xray'; return 0; fi
   printf ''
+}
+
+# 读已有单元实际跑的内核（0.2.0 换内核流程）：两种内核的伪装布局完全同构
+# （同名单元 webcore、同配置路径），单元文件里的启动参数是唯一特征 ——
+# "run -config" 是 Xray、"run -c" 是 sing-box（systemd ExecStart 与 OpenRC
+# command_args 都能 grep 到）。返回 netcore / xray / 空（识别不了）
+unit_kernel_of() {
+  _uf=''
+  if [ -f "/etc/systemd/system/$1.service" ]; then
+    _uf="/etc/systemd/system/$1.service"
+  elif [ -f "/etc/init.d/$1" ]; then
+    _uf="/etc/init.d/$1"
+  fi
+  [ -n "$_uf" ] || { printf ''; return 0; }
+  if grep -q 'run -c ' "$_uf" 2>/dev/null; then printf 'netcore';
+  elif grep -q 'run -config' "$_uf" 2>/dev/null; then printf 'xray';
+  else printf ''; fi
+}
+
+# 退役一个内核服务单元：停、disable、删单元文件。只对伪装布局单元调用
+# （官方名 xray/x-ui 可能是管理员自己的安装，一律不碰），所以这里不区分官方名
+stop_retire_unit() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "$1" >/dev/null 2>&1
+    systemctl disable "$1" >/dev/null 2>&1
+    rm -f "/etc/systemd/system/$1.service"
+    systemctl daemon-reload >/dev/null 2>&1
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service "$1" stop >/dev/null 2>&1
+    command -v rc-update >/dev/null 2>&1 && rc-update del "$1" default >/dev/null 2>&1
+    rm -f "/etc/init.d/$1"
+  fi
 }
 
 # 名称/路径决策：已有官方名单元的机器整条退回官方布局（xray-core / x-ui 的
@@ -547,6 +619,20 @@ if [ "$NEED_XRAY" = "1" ]; then
     note "配置仍会下发到 $XRAY_ETC/config.json，服务需自行管理"
   else
     _unit=$(xray_unit_name)
+    _migrate=0
+    # 目标内核是 Xray，但同名伪装单元里跑的是 sing-box（面板上把内核改回了 xray）：
+    # 退役旧单元后走全新安装，配置会被 Xray 格式覆盖。官方名单元不迁移（可能是管理员自己的）
+    if [ -n "$_unit" ] && [ "$_unit" = "$XRAY_ALIAS" ] && [ "$(unit_kernel_of "$_unit")" = 'netcore' ]; then
+      # 迁移的退役动作本身占一步（与 sing-box 分支同理，防进度 [N/N+1] 错位）
+      TOTAL=$((TOTAL + 1))
+      step "内核切换：退役 sing-box 单元（$_unit）"
+      stop_retire_unit "$_unit"
+      pkill -x "$XRAY_ALIAS" >/dev/null 2>&1
+      say "✓ sing-box 单元已退役"
+      note "切换期间节点短暂中断：agent 下一轮（≤60s）拉到 Xray 配置后自动恢复"
+      _unit=''
+      _migrate=1
+    fi
     if [ -n "$_unit" ]; then
       _act=''
       if command -v systemctl >/dev/null 2>&1; then
@@ -561,7 +647,9 @@ if [ "$NEED_XRAY" = "1" ]; then
         XRAY_VER=$("$XRAY_BIN" -version 2>/dev/null | sed -n '1p' | cut -d' ' -f1-2)
       fi
     else
-      if [ -x "$XRAY_BIN" ]; then
+      # 沿用前提是二进制确实是 Xray：迁移模式下旧二进制还是 sing-box（version 也能跑），
+      # 必须覆盖下载，否则单元会指向错误内核
+      if [ "$_migrate" != '1' ] && [ -x "$XRAY_BIN" ] && ! "$XRAY_BIN" version 2>/dev/null | grep -qi 'sing-box'; then
         XRAY_VER=$("$XRAY_BIN" -version 2>/dev/null | sed -n '1p' | cut -d' ' -f1-2)
         say "已有二进制 \${XRAY_VER:-$XRAY_BIN}，只补服务单元"
       else
@@ -612,8 +700,8 @@ if [ "$NEED_XRAY" = "1" ]; then
         fi
       fi
 
-      # 二进制到位（或本来就有）才建单元，否则会留一个永远起不来的服务
-      if [ -x "$XRAY_BIN" ]; then
+      # 二进制到位（且确实是 Xray）才建单元，否则会留一个永远起不来的服务
+      if [ -x "$XRAY_BIN" ] && "$XRAY_BIN" -version >/dev/null 2>&1; then
         mkdir -p "$XRAY_ETC" "$XRAY_DAT" 2>/dev/null
         _svc=$(write_xray_unit)
         case "$_svc" in
@@ -623,6 +711,231 @@ if [ "$NEED_XRAY" = "1" ]; then
         esac
       fi
     fi
+  fi
+fi
+
+# --------------------------- 2.5 sing-box 本体 -------------------------------
+# 节点内核 singbox（0.2.0）：伪装布局与 Xray 完全同构 —— 二进制/服务名/配置目录
+# 都用 $XRAY_ALIAS（webcore），后面 agent.env 与 agent.sh 全部无缝复用这些变量。
+# 与 Xray 的两点不同：
+#   1) 固定版本安装（SINGBOX_VERSION 可覆盖）：sing-box schema 迭代快，
+#      面板编译器（lib/singbox.js）只对固定版本负责；
+#   2) 流量统计走 v2ray_api（兼容 Xray StatsService 的 gRPC），但 sing-box
+#      自带不了查询 CLI —— 额外装一份 Xray 二进制只当统计客户端（$STATS_BIN），
+#      不建服务单元、不写配置，机器上不会有第二个节点内核在跑。
+# 已有 Xray 服务单元的机器直接拒绝：单元名/配置路径两套内核共用，混装必然互相覆盖。
+singbox_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64) printf 'amd64' ;;
+    aarch64 | arm64) printf 'arm64' ;;
+    armv7 | armv7l) printf 'armv7' ;;
+    armv6l) printf 'armv6' ;;
+    i386 | i686) printf '386' ;;
+    riscv64) printf 'riscv64' ;;
+    s390x) printf 's390x' ;;
+    *) printf '' ;;
+  esac
+}
+
+# 服务单元（systemd / OpenRC）。sing-box 的 run 子命令用 -c 指定配置（Xray 是 -config）；
+# 其余（Restart 策略、Description 中性词）与 Xray 单元同构。只 enable 不 start：
+# 首次部署时配置还没下发，sing-box 起来会因为找不到 config.json 直接退出
+write_singbox_unit() {
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    mkdir -p /etc/systemd/system 2>/dev/null
+    cat > /etc/systemd/system/$XRAY_ALIAS.service <<EOF
+[Unit]
+Description=WebCore Service
+After=network.target nss-lookup.target
+
+[Service]
+ExecStart=$XRAY_BIN run -c $XRAY_ETC/config.json
+Restart=on-failure
+RestartSec=3
+LimitNPROC=10000
+LimitNOFILE=1000000
+RuntimeDirectory=$XRAY_ALIAS
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable $XRAY_ALIAS >/dev/null 2>&1
+    printf 'systemd'
+  elif command -v rc-update >/dev/null 2>&1; then
+    mkdir -p /etc/init.d 2>/dev/null
+    cat > /etc/init.d/$XRAY_ALIAS <<EOF
+#!/sbin/openrc-run
+name="$XRAY_ALIAS"
+description="WebCore Service"
+command="$XRAY_BIN"
+command_args="run -c $XRAY_ETC/config.json"
+command_background="yes"
+pidfile="/run/$XRAY_ALIAS.pid"
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+    chmod 755 /etc/init.d/$XRAY_ALIAS
+    rc-update add $XRAY_ALIAS default >/dev/null 2>&1
+    printf 'openrc'
+  else
+    printf ''
+  fi
+}
+
+if [ "$NEED_SINGBOX" = "1" ]; then
+  XRAY_BIN=/usr/local/bin/$XRAY_ALIAS
+  XRAY_ETC=/usr/local/etc/$XRAY_ALIAS
+  _migrate=0
+  _preset=$(xray_unit_name)
+  if [ -n "$_preset" ]; then
+    if [ "$_preset" != "$XRAY_ALIAS" ]; then
+      # 官方名单元（xray / xray-core / x-ui）可能是管理员自己的安装，面板不会替你卸载
+      die "本机已有 Xray 服务单元（$_preset，官方名）。先卸载它或换一台机器再部署 sing-box 内核"
+    fi
+    _oldk=$(unit_kernel_of "$_preset")
+    if [ "$_oldk" = 'xray' ]; then
+      # 同名伪装单元里跑的是 Xray（面板上把内核改成了 sing-box）：退役旧单元后
+      # 走全新安装。节点 / 端口 / 订阅全部复用，agent 下一轮拉到 sing-box 配置即恢复
+      _migrate=1
+      # 迁移的退役动作本身占一步：TOTAL 不加的话进度会显示 [5/4]（第三轮 review §6）
+      TOTAL=$((TOTAL + 1))
+      step "内核切换：退役 Xray 单元（$_preset）"
+      stop_retire_unit "$_preset"
+      pkill -x "$XRAY_ALIAS" >/dev/null 2>&1
+      say "✓ Xray 单元已退役"
+      note "切换期间节点短暂中断：agent 下一轮（≤60s）拉到 sing-box 配置后自动恢复"
+    elif [ "$_oldk" != 'netcore' ]; then
+      die "已有服务单元 $_preset 无法识别内核（ExecStart 被改过？）。为避免覆盖自定义安装，请手动处理后再部署"
+    fi
+  fi
+  step "sing-box 本体 → $XRAY_BIN"
+  if [ "\${SKIP_SINGBOX:-0}" = "1" ]; then
+    say "SKIP_SINGBOX=1，跳过安装"
+    note "配置仍会下发到 $XRAY_ETC/config.json，服务需自行管理"
+  elif [ "$_migrate" != '1' ] && [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version 2>/dev/null | grep -qi 'sing-box'; then
+    # 沿用的前提是二进制确实是 sing-box：迁移模式下旧二进制还是 Xray（version 也能跑），
+    # 必须覆盖下载，否则单元会指向错误内核
+    _ver=$("$XRAY_BIN" version 2>/dev/null | sed -n '1p')
+    say "已安装 \${_ver:-$XRAY_BIN}，沿用现有安装"
+  else
+    _arch=$(singbox_arch)
+    if [ -z "$_arch" ]; then
+      say "本机没有 sing-box"
+      bad "不支持的架构 $(uname -m)，需手动安装"
+    else
+      _sbv=\${SINGBOX_VERSION:-$SINGBOX_VERSION_DEFAULT}
+      say "本机没有 sing-box，下载面板自构建发行包（v$_sbv · 含 with_v2ray_api 统计标签）"
+      _tmp="/tmp/nodepanel-singbox.$$"
+      rm -rf "$_tmp" 2>/dev/null
+      mkdir -p "$_tmp"
+      _tgz="sing-box-$_sbv-linux-$_arch.tar.gz"
+      note "来源 $SINGBOX_RELEASE_URL/$_tgz"
+      _got=0
+      if download "$SINGBOX_RELEASE_URL/$_tgz" "$_tmp/$_tgz"; then
+        # 发行源自带 sha256sums.txt：先校验再解压（防下载不完整 / 防源被篡改）。
+        # 清单拉不到时跳过校验继续（兼容用户把 SINGBOX_RELEASE_URL 指到别的源的场景）
+        _sha_ok=1
+        if download "$SINGBOX_RELEASE_URL/sha256sums.txt" "$_tmp/sha256sums.txt"; then
+          _expect=$(grep " $_tgz\$" "$_tmp/sha256sums.txt" 2>/dev/null | awk '{print $1}')
+          _actual=$(sha256sum "$_tmp/$_tgz" 2>/dev/null | awk '{print $1}')
+          if [ -z "$_expect" ]; then
+            # 清单里没有该资产：镜像站把错误页当 200 返回时会走到这里，按「无清单」
+            # 跳过校验继续，而不是误判成校验失败（第三轮 review §6 的假阴性）
+            note "sha256 清单里没有 $_tgz，跳过校验"
+          elif [ "$_expect" != "$_actual" ]; then
+            _sha_ok=0
+            bad "sha256 校验失败（发行包不完整或源被篡改），已放弃安装"
+            note "期望 $_expect / 实际 $_actual"
+          fi
+        fi
+        if [ "$_sha_ok" = "1" ]; then
+          note "已下载 $(size_of "$_tmp/$_tgz")，sha256 ✓，解压中"
+          # 发行包是 tar.gz，内层目录与资产同名（sing-box-x.y.z-linux-amd64/sing-box）
+          if tar -xzf "$_tmp/$_tgz" -C "$_tmp" 2>/dev/null && [ -f "$_tmp/sing-box-$_sbv-linux-$_arch/sing-box" ]; then
+            _got=1
+          fi
+        fi
+      else
+        bad "发行包下载失败（确认面板仓库 Actions 里已跑 build-singbox 并发布 release）"
+        note "镜像场景用 SINGBOX_RELEASE_URL=<ghproxy 前缀 + 完整下载地址> 重跑部署命令"
+      fi
+      if [ "$_got" = "1" ]; then
+        mkdir -p /usr/local/bin "$XRAY_ETC" 2>/dev/null
+        cp -f "$_tmp/sing-box-$_sbv-linux-$_arch/sing-box" "$XRAY_BIN" 2>/dev/null || cat "$_tmp/sing-box-$_sbv-linux-$_arch/sing-box" > "$XRAY_BIN"
+        chmod 755 "$XRAY_BIN" 2>/dev/null
+        if "$XRAY_BIN" version >/dev/null 2>&1; then
+          _ver=$("$XRAY_BIN" version 2>/dev/null | sed -n '1p')
+          say "已安装 \${_ver:-$XRAY_BIN} · $(size_of "$XRAY_BIN")"
+        else
+          bad "二进制无法执行（架构不匹配？），已删除"
+          rm -f "$XRAY_BIN"
+        fi
+      else
+        bad "下载或解压失败"
+        note "GitHub 拉不动时用镜像重跑：curl -fsSL \"<部署命令>\" | SINGBOX_DOWNLOAD_BASE=<镜像/SagerNet/sing-box/releases/download> sh"
+      fi
+      rm -rf "$_tmp" 2>/dev/null
+    fi
+  fi
+
+  # 统计客户端：Xray 二进制作纯 gRPC CLI（api statsquery），伪装名 $STATS_ALIAS。
+  # 缺它 agent 采不到流量 —— sing-box 自己没有 statsquery 子命令。
+  # 守卫要求二进制确实是 sing-box：迁移模式下载失败时 $XRAY_BIN 还是 Xray，
+  # 不能给它建 sing-box 单元（ExecStart 参数不匹配，服务永远起不来）
+  if [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version 2>/dev/null | grep -qi 'sing-box'; then
+    STATS_BIN=/usr/local/bin/$STATS_ALIAS
+    say "统计客户端 → $STATS_BIN"
+    if [ -x "$STATS_BIN" ] && "$STATS_BIN" version >/dev/null 2>&1; then
+      say "已安装，沿用"
+    else
+      _arch=$(xray_arch)
+      if [ -z "$_arch" ]; then
+        bad "不支持的架构 $(uname -m)，统计客户端需手动安装（任意 Xray-core 发行包，重命名为 $STATS_ALIAS）"
+      else
+        _tmp="/tmp/nodepanel-statsq.$$"
+        rm -rf "$_tmp" 2>/dev/null
+        mkdir -p "$_tmp"
+        _zip="Xray-linux-$_arch.zip"
+        note "来源 $XRAY_ZIP_BASE/$_zip"
+        _got=0
+        if download "$XRAY_ZIP_BASE/$_zip" "$_tmp/$_zip"; then
+          note "已下载 $(size_of "$_tmp/$_zip")，解压中"
+          if extract_zip "$_tmp/$_zip" "$_tmp"; then
+            _got=1
+          elif pkg_install unzip >/dev/null 2>&1 && extract_zip "$_tmp/$_zip" "$_tmp"; then
+            _got=1
+          fi
+        fi
+        if [ "$_got" = "1" ] && [ -f "$_tmp/xray" ]; then
+          mkdir -p /usr/local/bin 2>/dev/null
+          cp -f "$_tmp/xray" "$STATS_BIN" 2>/dev/null || cat "$_tmp/xray" > "$STATS_BIN"
+          chmod 755 "$STATS_BIN" 2>/dev/null
+          if "$STATS_BIN" version >/dev/null 2>&1; then
+            say "已安装 · $(size_of "$STATS_BIN")（只当统计 CLI 用，不建服务）"
+          else
+            bad "统计客户端无法执行（架构不匹配？），已删除"
+            rm -f "$STATS_BIN"
+          fi
+        else
+          bad "统计客户端下载或解压失败（不影响节点运行，但没有流量统计）"
+          note "手动装：把任意 Xray-core 的 xray 二进制放到 $STATS_BIN"
+        fi
+        rm -rf "$_tmp" 2>/dev/null
+      fi
+    fi
+
+    # 二进制到位才建单元，否则会留一个永远起不来的服务
+    _svc=$(write_singbox_unit)
+    case "$_svc" in
+      systemd) say "服务单元 /etc/systemd/system/$XRAY_ALIAS.service（已 enable，配置下发后启动）" ;;
+      openrc) say "服务脚本 /etc/init.d/$XRAY_ALIAS（已加入 default 运行级）" ;;
+      *) bad "没有可用的服务管理器，sing-box 需手动常驻" ;;
+    esac
   fi
 fi
 
@@ -687,6 +1000,13 @@ if [ "$NEED_XRAY" = "1" ]; then
   elif command -v rc-service >/dev/null 2>&1; then
     RELOAD_CMD="rc-service $XRAY_ALIAS restart"
   fi
+elif [ "$NEED_SINGBOX" = "1" ]; then
+  # sing-box 的单元就是上面刚装的伪装名单元（webcore.service），直接指向它
+  if command -v systemctl >/dev/null 2>&1; then
+    RELOAD_CMD="systemctl restart $XRAY_ALIAS"
+  elif command -v rc-service >/dev/null 2>&1; then
+    RELOAD_CMD="rc-service $XRAY_ALIAS restart"
+  fi
 fi
 
 # 值一律加引号：RELOAD_CMD 里带空格，不加引号写进 agent.env 后，
@@ -697,9 +1017,11 @@ PANEL_URL_BACKUP="$PANEL_URL_BACKUP"
 AGENT_TOKEN="$AGENT_TOKEN"
 INTERVAL="$INTERVAL"
 RELAY_ONLY="$RELAY_ONLY"
+KERNEL="$KERNEL"
 XRAY_ALIAS="$XRAY_ALIAS"
 XRAY_CONFIG="$XRAY_ETC/config.json"
 RELOAD_CMD="$RELOAD_CMD"
+STATS_BIN="$STATS_BIN"
 HYSTERIA_DIR="$HY_DIR"
 HYSTERIA_BIN="$HY_BIN"
 EOF
@@ -716,6 +1038,8 @@ if [ -n "$RELOAD_CMD" ]; then
   say "RELOAD_CMD=\\"$RELOAD_CMD\\""
 elif [ "$NEED_XRAY" = "1" ]; then
   bad "没有可用的服务管理器，Xray 需手动重载"
+elif [ "$NEED_SINGBOX" = "1" ]; then
+  bad "没有可用的服务管理器，sing-box 需手动重载"
 else
   say "RELOAD_CMD 留空（本机只有 Hysteria2 节点）"
 fi
@@ -798,8 +1122,9 @@ if [ "$STARTED" = 'cron' ]; then
   /bin/sh /opt/nodepanel/agent.sh --once || true
 fi
 
-# agent 启动后第一轮就会写配置并重启 xray，等它一下再把结果报出来
-if [ "$NEED_XRAY" = "1" ] && [ "\${SKIP_XRAY:-0}" != "1" ]; then
+# agent 启动后第一轮就会写配置并重启内核进程，等它一下再把结果报出来。
+# sing-box 机器同样要等：新内核这条路径最需要确认（服务起没起、配置过没过自检）
+if { [ "$NEED_XRAY" = "1" ] && [ "\${SKIP_XRAY:-0}" != "1" ]; } || { [ "$NEED_SINGBOX" = "1" ] && [ "\${SKIP_SINGBOX:-0}" != "1" ]; }; then
   _xs=$XRAY_UNIT_NAME
   [ -n "$_xs" ] || _xs=$XRAY_ALIAS
   if [ "$STARTED" = 'systemd' ]; then

@@ -3,6 +3,76 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.2.0] - 2026-11-16
+
+### 新增
+
+- **sing-box 节点内核**：落地机与独立部署新增内核选择 —— 新建服务器 / 独立节点时可选
+  `Xray`（默认，存量行为完全不变）或 `sing-box`。**内核支持切换**：编辑服务器改内核后
+  重跑一次部署命令即完成切换，节点 / 端口 / 用户 UUID / 订阅链接全部复用，客户端参数
+  零变化（部署脚本识别同名伪装单元里实际跑的内核 —— "run -config" 是 Xray、"run -c"
+  是 sing-box —— 不一致时自动退役旧单元再装新内核；切换期间节点短暂中断）。一台机器
+  只跑一个内核。agent 回执带上实际内核代号，机器没完成切换时服务器卡片显示
+  「内核切换未完成」。sing-box 机器沿用整套伪装布局：二进制 / 服务单元 / 配置目录都叫
+  `webcore`，下发面内核代号是 `netcore`（`cat agent.env` 看不出内核），`Description`
+  仍是中性的 `WebCore Service`。
+  - **配置全部面板侧编译**（新 `lib/singbox.js`，与 `lib/xray.js` 平行）：vless（含
+    Reality + Vision flow）/ vmess / trojan / ss 直译，BT 拦截、强制 v4 出站、证书落盘、
+    超量用户配置层剔除的语义与 Xray 一致。sing-box 没有 mlkem768 后量子加密，
+    sing-box 宿主上保存带 VLESS Encryption 的节点会被拦（400），前端表单同步禁用。
+  - **按用户流量计量（完整）**：sing-box 官方发行包不含 `with_v2ray_api`（按用户流量
+    统计的构建标签，真机 1.12.0 实测 FATAL），所以发行源是**面板仓库自构建的发行包**
+    （CI workflow `build-singbox.yml`：官方默认构建标签 + `with_v2ray_api`，linux 全架构
+    + windows 验证产物，附 sha256 清单，部署脚本下载后先校验再解压；`SINGBOX_RELEASE_URL`
+    可覆盖，镜像场景填 ghproxy 前缀 + 完整地址）。编译输出默认下发 `experimental.v2ray_api`
+    统计块（users 在 stats 内、enabled 显式 true —— 首版嵌套写错被真机 check 抓出），
+    agent 侧统计链路复用 Xray 的那套（np-statsq 查询 + per-user counter 解析），
+    **sing-box 机器的流量从第一天起就进配额**。`buildConfig(..., { api: false })` 可
+    降级回官方包（无按用户计量，回执显式提示）。sing-box 自身没有查询 CLI，部署时
+    附装一份 Xray 二进制只当统计客户端（伪装名 `np-statsq`，不建服务单元、不写配置），
+    counter 解析兼容 3 段与 4 段命名；netcore 机器缺统计客户端时回执显式报
+    「配额不生效」而不是静默归零。
+  - **部署脚本**：sing-box 固定版本安装（`SINGBOX_VERSION` 可覆盖，默认 1.12.0 ——
+    sing-box schema 迭代快，编译输出只对固定版本负责；升级时先跑 CI 再同步常量）。
+    官方名单元（xray / xray-core / x-ui，可能是管理员自装）拒绝部署、不自动迁移；
+    伪装名单元自动按上面流程切换内核。
+    Hysteria2 不受影响：仍走独立 hysteria 实例，端口跳跃是 iptables 层功能，与内核无关。
+  - **订阅零变化**：订阅输出与内核无关（sing-box JSON 订阅 0.1.x 已支持），存量用户无感知。
+
+### 修复（三轮外部 review 后的全部收口）
+
+- **部署脚本变量段赋值顺序（全量回归级）**：`SINGBOX_RELEASE_URL` 的默认值里引用了
+  还没赋值的 `SINGBOX_VERSION_DEFAULT`，而 shell 参数扩展的默认值在变量未设时也会被
+  求值 —— `set -u` 下**所有部署脚本（含 Xray 存量机器）在变量段直接退出**，且死在
+  agent 落盘之后（半装状态）。已两行换位修复；「grep 字面量」断言抓不到这类错
+  （错误值同样包含前缀），test/singbox.js 新增**真执行两行赋值**的回归用例。
+- **切换窗口的落盘闸**：面板切了内核但机器还没重跑部署时，磁盘配置（新内核格式）
+  与运行进程（旧内核）错位 —— 机器重启会让旧内核加载新格式配置起不来。bundle 现在
+  落盘前探测机器上的实际内核身份（`/usr/local/bin/$XRAY_ALIAS version`），不一致就
+  不落盘不触发重载，旧内核继续服务；二进制不存在（SKIP 安装 / 手工管理）照常落盘。
+  agent.sh 为此把 `XRAY_ALIAS` 加进 export 列表。
+- **切换内核校验 VLESS Encryption**：服务器切到 sing-box 时，若有节点开着后量子加密
+  （mlkem768）→ 400 并列出节点名 —— 否则编译层静默降级、订阅仍在发后量子参数，
+  客户端握手必失败且面板无任何异常提示。
+- **为什么不能直接指定官方 latest 版本**：官方发行包不含 `with_v2ray_api`（按用户
+  流量统计依赖它），且编译输出与特定版本 schema 锁定（`domain_strategy` 在 1.14
+  移除）。版本升级必须走显式三步（CI 构建新版本 → 同步 `SINGBOX_VERSION` 常量 →
+  真机 `check` 确认 schema），CI 可对任意版本构建、部署侧 `SINGBOX_VERSION` 可指定
+  任意已构建版本，但「构建哪个版本 + 编译器是否兼容」由人确认。
+- **其他**：迁移退役动作计入进度步数（防 `[5/4]` 错位）；sha256 清单缺资产时按
+  「无清单」跳过校验而非误判失败（镜像站 200 错误页假阴性）；counter 解析注释更新
+  （sing-box 沿用 V2Ray 4 段规范，3 段分支保留为上线前的兼容保险）；hy2 独立节点
+  不再显示内核选择（无内核语义）；清理未使用常量。
+
+### 迁移
+
+- **schema 22 → 23**：`servers.kernel` / `nodes.kernel` 两列（默认 `xray`，升级后行为不变）。
+- **payload 字段集合变化（预期内的一次性）**：`buildAgentPayload` 新增 `kernel` / `singbox`
+  字段（Xray 机器上 `singbox` 恒为 `null`），与 APP_VERSION 升级同轮触发存量机器一次
+  全量重下发（秒级重启），之后回到「hash 零变化」约束。
+- **版本号跳档**：0.1.54 → 0.2.0。一次发版只升末位的约定对能力级变更放行一次
+  （新内核 + schema 迁移 + payload 结构变化），之后 sing-box 相关修补在 0.2.x 滚动。
+
 ## [0.1.54] - 2026-11-15
 
 ### 新增
