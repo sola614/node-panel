@@ -108,6 +108,11 @@ function normalizeNode(body, prev = {}) {
         : mode === 'standalone'
           ? prev.kernel === 'singbox' ? 'singbox' : 'xray'
           : 'xray',
+    // hy2 承载方式（0.2.3）：hysteria（默认，独立 streamd 实例）| singbox（sing-box
+    // 入站承载）。仅 hy2 节点有效；「生效内核是 sing-box」的前提在编译层判定
+    // （agent.js 的 hyViaSingbox）—— xray 内核机器没有 sing-box 进程，编译时静默归
+    // hysteria，不引第二个内核进程。这里只做值白名单，宿主内核切换后语义自动生效
+    hy2Via: protocol === 'hysteria2' && body.hy2Via === 'singbox' ? 'singbox' : 'hysteria',
     // 用 ?? 而不是 !== undefined：部分更新时 body.port 可能是 null，
     // 那也应该沿用原值（旧代码的 `body.port ?? prev.port` 就是这个语义）
     port: normPort(body.port ?? prev.port),

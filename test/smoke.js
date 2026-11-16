@@ -311,6 +311,17 @@ function totpCodeOf(secret) {
   const node3Token = node3.data.item.token;
   cleanup.push(['/api/nodes/' + node3Id]);
 
+  // hy2Via 保存回读（0.2.3 曾因 normalizeNode 丢字段导致「保存后回显变回独立实例」）。
+  // node3 是 xray 内核（standalone 缺省）：字段照样持久化，编译层的静默归一是另一层
+  const viaPut = await call('/api/nodes/' + node3Id, { method: 'PUT', body: json({ hy2Via: 'singbox' }) });
+  ok('hy2Via=singbox 保存成功', viaPut.status === 200 && viaPut.data.item.hy2Via === 'singbox',
+    `(${viaPut.status} ${viaPut.data.item.hy2Via})`);
+  const viaList = await call('/api/nodes');
+  const viaItem = (viaList.data.items || []).find((x) => x.id === node3Id);
+  ok('hy2Via 持久化（列表回读一致）', !!viaItem && viaItem.hy2Via === 'singbox');
+  const viaBack = await call('/api/nodes/' + node3Id, { method: 'PUT', body: json({ hy2Via: 'hysteria' }) });
+  ok('切回独立实例也持久化', viaBack.status === 200 && viaBack.data.item.hy2Via === 'hysteria');
+
   /* ---------- 3. 套餐（只定义额度与有效期） ---------- */
   const plan = await call('/api/plans', {
     method: 'POST',

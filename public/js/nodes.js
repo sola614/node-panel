@@ -943,6 +943,41 @@ function bindNodeForm(mask) {
     $('#wrap-address', mask).classList.toggle('hidden', mode !== 'standalone');
     // 节点内核：只有独立部署才可选（0.2.1 起 sing-box 也承载 Hysteria2，hy2 同样有内核语义）
     $('#wrap-kernel', mask).classList.toggle('hidden', mode !== 'standalone');
+
+    // hy2 承载方式（0.2.3）：生效内核是 sing-box 才可选 sing-box 入站 —— Xray 内核的
+    // 机器没有 sing-box 进程，选项禁用并强制回独立实例（一台机器只跑一个节点内核）
+    if (isHy2) {
+      const kSeg = $('#n-kernel button.on', mask);
+      const hostS = mode === 'server'
+        ? (state.data.servers || []).find((x) => x.id === ($('#n-server', mask) || {}).value)
+        : null;
+      // 生效内核：standalone 看节点内核选择（编辑模式表单已按节点内核初始化 seg）；
+      // server 型看宿主 servers.kernel —— 宿主未选时按 Xray 锁定
+      const effKernel = mode === 'standalone'
+        ? (kSeg && kSeg.dataset.kernel) || 'xray'
+        : (hostS && hostS.kernel === 'singbox' ? 'singbox' : 'xray');
+      const sbBtn = $('#h-via button[data-via="singbox"]', mask);
+      if (sbBtn) {
+        sbBtn.disabled = effKernel !== 'singbox';
+        if (effKernel !== 'singbox' && sbBtn.classList.contains('on')) {
+          const hyBtn = $('#h-via button[data-via="hysteria"]', mask);
+          if (hyBtn) hyBtn.classList.add('on');
+          sbBtn.classList.remove('on');
+        }
+      }
+      const viaHint = $('#h-via-hint', mask);
+      if (viaHint) {
+        viaHint.innerHTML = effKernel === 'singbox'
+          ? '默认用独立 hysteria 实例（功能全）。选 <b>sing-box 入站</b>则由 sing-box 承载：伪装站点与出站强制 IPv4 不可用（相关输入已禁用，伪装站点保存时清空）；流量计量改走 v2ray_api。'
+          : '宿主/节点内核是 <b>Xray</b>：Hysteria2 由<b>独立 hysteria 实例</b>承载（一台机器只跑一个节点内核，不引入 sing-box 进程）。切到 sing-box 内核后可选由 sing-box 入站承载。';
+      }
+      const sbVia = effKernel === 'singbox' && sbBtn && sbBtn.classList.contains('on');
+      const maskEl = $('#h-mask', mask);
+      if (maskEl) maskEl.disabled = !!sbVia;
+      const fv = $('#n-force-v4', mask);
+      if (fv) fv.disabled = !!sbVia;
+    }
+
     const nodeAuto = $('#n-ipmode button.on', mask).dataset.ipmode === 'auto';
     $('#wrap-address-input', mask).classList.toggle('hidden', mode !== 'standalone' || nodeAuto);
     $('#n-address-hint', mask).textContent = nodeAuto
@@ -1083,6 +1118,9 @@ function bindNodeForm(mask) {
     $$('#n-kernel button', mask).forEach((b) => b.classList.toggle('on', b === btn));
     sync();
   });
+
+  // 宿主切换（server 型）：宿主内核决定 hy2 承载方式的可选性（xray 内核锁定独立实例）
+  $('#n-server', mask).addEventListener('change', sync);
 
   // 生成一对 Reality 密钥并填进表单（按钮与「新增节点」预热共用）
   const fillRealityKeys = async () => {
