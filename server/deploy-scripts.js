@@ -342,6 +342,24 @@ else
   SVC=none
 fi
 
+# ------------------- 重新部署前置：卸载已有 agent -------------------
+# 旧 agent 的运行时残留（内核进程、streamd 实例、nft 规则、旧配置）会在新内核
+# 启动时抢端口 —— 切换内核或重装场景下直接覆盖安装会失败（实测：lsof 显示端口
+# 仍被旧 agent 的 streamd 占用）。检测到已有 agent 就先完整卸载（幂等、保留
+# 二进制与日志备份），再走下面的全新安装；卸载脚本拷到 /tmp 执行 —— 它会 rm 掉
+# 自己所在的 /opt/logsync 目录，原地执行有读到一半被删的风险
+if [ -x /opt/logsync/uninstall.sh ]; then
+  say "检测到已有 agent（/opt/logsync），先执行卸载清理再全新安装"
+  cp /opt/logsync/uninstall.sh /tmp/np-reinstall.$$.sh 2>/dev/null || true
+  sh /tmp/np-reinstall.$$.sh || note "卸载脚本返回非零（已尽力清理），继续部署"
+  rm -f /tmp/np-reinstall.$$.sh 2>/dev/null
+elif [ -x /opt/nodepanel/uninstall.sh ]; then
+  say "检测到旧布局 agent（/opt/nodepanel），先执行卸载清理"
+  cp /opt/nodepanel/uninstall.sh /tmp/np-reinstall.$$.sh 2>/dev/null || true
+  sh /tmp/np-reinstall.$$.sh || note "卸载脚本返回非零，继续部署"
+  rm -f /tmp/np-reinstall.$$.sh 2>/dev/null
+fi
+
 printf '\\n%s\\n' '${store.db().settings.siteName} · 节点部署'
 say "目标      $TARGET_LABEL"
 say "面板      $PANEL_URL"

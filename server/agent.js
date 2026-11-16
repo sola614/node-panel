@@ -197,10 +197,13 @@ function buildAgentPayload(scope) {
   const nodes = scope.enabled === false ? [] : scope.nodes;
 
   // 节点内核（0.2.0）：xray / singbox 二选一，配置互斥产出 —— 另一边恒为 null，
-  // 且 null 也进 hash 与字段集合，让「这台机器跑什么内核」成为配置包的一部分
+  // 且 null 也进 hash 与字段集合，让「这台机器跑什么内核」成为配置包的一部分。
+  // 0.2.1 起 sing-box 也承载 Hysteria2（不再有 streamd 实例）—— kernel=singbox 时
+  // 全部节点（含 hy2）由 sing-box 编译；kernel=xray 时 hy2 仍走独立 hysteria 实例
   const kernel = scope.kernel === 'singbox' ? 'singbox' : 'xray';
-  const kernelNodes = nodes.filter((n) => n.protocol !== 'hysteria2');
-  const hyNodes = nodes.filter((n) => n.protocol === 'hysteria2');
+  const kernelNodes =
+    kernel === 'singbox' ? nodes : nodes.filter((n) => n.protocol !== 'hysteria2');
+  const hyNodes = kernel === 'singbox' ? [] : nodes.filter((n) => n.protocol === 'hysteria2');
 
   // 同一作用域内统一分配统计端口，避免节点间碰撞导致流量串号
   const statsPorts = hysteria.allocateStatsPorts(hyNodes);
@@ -283,6 +286,19 @@ function buildAgentPayload(scope) {
   // 否则 agent 永远拿不到「目标版本」这个信号，自更新就形同虚设。
   // hop 同理 —— 它不在 yaml 里（跳跃是 NAT 层的事），漏掉就会出现
   // 「面板上改了范围、agent 那边规则一直没变」这种查不出来的不同步
+  // 端口跳跃清单与 hysteria 配置解耦（0.2.1）：跳跃是 nft 层规则，目标端口 = 节点
+  // 监听口，与内核无关 —— kernel=singbox 时 hysteriaList 为空（hy2 由 sing-box 承载），
+  // 但跳跃规则仍要照常下发。hop 同理进 hash：漏掉就会出现「面板上改了范围、agent
+  // 那边规则一直没变」这种查不出来的不同步
+  const hopSource =
+    kernel === 'singbox' ? kernelNodes.filter((n) => n.protocol === 'hysteria2') : hyNodes;
+  const hops = hopSource
+    .map((n) => {
+      const hop = hysteria.hopOf(n);
+      return { nodeId: n.id, port: Number(n.port), hop: hop ? hop.text : '' };
+    })
+    .filter((h) => h.hop);
+
   const runtime = runtimePayload();
   const disabled = !scope.enabled;
   const payloadForHash = JSON.stringify({
@@ -290,7 +306,7 @@ function buildAgentPayload(scope) {
     xray: xrayConfig,
     singbox: singboxConfig,
     hysteria: hysteriaList.map((h) => h.yaml),
-    hop: hysteriaList.map((h) => `${h.nodeId}:${h.port}:${h.hop}`),
+    hop: hops.map((h) => `${h.nodeId}:${h.port}:${h.hop}`),
     certs,
     agent: APP_VERSION,
     disabled,
@@ -312,6 +328,8 @@ function buildAgentPayload(scope) {
     xray: xrayConfig,
     singbox: singboxConfig,
     hysteria: hysteriaList,
+    // 端口跳跃清单（内核无关）：bundle 据此建「端口段 → 监听口」的 nft 转发规则
+    hops,
     certs,
     runtime,
   };

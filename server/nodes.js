@@ -98,12 +98,12 @@ function normalizeNode(body, prev = {}) {
     importLink: mode === 'imported' ? String(body.importLink ?? prev.importLink ?? '') : '',
     insecure: mode === 'imported' ? (body.insecure !== undefined ? !!body.insecure : !!prev.insecure) : false,
     protocol,
-    // 节点内核（0.2.0）：standalone 自选（部署脚本按它装 Xray 或 sing-box），
-    // 但 Hysteria2 永远走独立 hysteria 实例，选内核没有意义 —— 强制 xray，
-    // 否则会出现 KERNEL=netcore 写进 env 却不装 sing-box 的半吊子状态；
+    // 节点内核（0.2.0）：standalone 自选（部署脚本按它装 Xray 或 sing-box）。
+    // 0.2.1 起 sing-box 也承载 Hysteria2 —— hy2 节点选 sing-box 内核时由 sing-box
+    // 入站承载（不再有 streamd 实例），选 xray 内核时维持独立 hysteria 实例；
     // server 模式跟随宿主 servers.kernel，这里只留占位缺省；imported 没有 agent
     kernel:
-      mode === 'standalone' && protocol !== 'hysteria2' && NODE_KERNELS.includes(body.kernel)
+      mode === 'standalone' && NODE_KERNELS.includes(body.kernel)
         ? body.kernel
         : mode === 'standalone'
           ? prev.kernel === 'singbox' ? 'singbox' : 'xray'

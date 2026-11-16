@@ -3,6 +3,29 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.2.2] - 2026-11-16
+
+### 新增
+
+- **Hysteria2 并入 sing-box 内核**：kernel=singbox 的机器不再有 streamd 实例 ——
+  hy2 节点由 sing-box 的 hysteria2 入站承载（1.14.4 原生支持），凭据（userpass）、
+  订阅链接、端口全部不变。端口跳跃与内核无关（nft 层「端口段 → 监听口」转发照常
+  下发，数据源改为内核无关的独立 hops 清单）。hy2 的 statsPort（独立统计 HTTP 端口）
+  与伪装站点（sing-box 无 masquerade）、forceV4（UDP 出站无等价开关）在 sing-box
+  内核下不适用；per-user 计量改走 v2ray_api 统计块（待真机实测 counter 有效性）。
+  Xray 内核机器维持独立 hysteria 实例，行为不变。
+- **重新部署前置卸载**：部署脚本检测到已有 agent（/opt/logsync 或旧布局
+  /opt/nodepanel）时先执行其卸载脚本（拷到 /tmp 执行，防读到一半被删）再全新安装 ——
+  旧 agent 的内核进程 / streamd 实例 / nft 规则残留会在新内核启动时抢端口
+  （实测：切换内核后直接覆盖部署失败，lsof 显示端口仍被旧 streamd 占用）。
+  卸载幂等且保留二进制与日志备份，失败不中止部署（note 提示后继续）。
+
+### 修复
+
+- bundle 的 Hysteria2 段在 hyList 为空时清理旧实例（停 pid、删 yaml、pkill 兜底）——
+  配合 hy2 并入，切内核后旧 streamd 会被 agent 下一轮自动收敛掉。
+- hy2 独立节点的内核选择限制回退（sing-box 承载后有内核语义了）。
+
 ## [0.2.1] - 2026-11-16
 
 ### 修复

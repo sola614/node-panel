@@ -117,6 +117,22 @@ const ssInb = singbox.buildConfig([ssNode], USERS).inbounds[0];
 ok('ss method/password 直译且不写 network（默认双栈）',
   ssInb.type === 'shadowsocks' && ssInb.method === 'aes-256-gcm' && ssInb.password === 'ss-pass' && !('network' in ssInb));
 
+// 0.2.1：hy2 也由 sing-box 承载（kernel=singbox 时不再有 streamd 实例）
+const hy2Node = {
+  id: 'n-hy2', protocol: 'hysteria2', port: 8443, mode: 'standalone', kernel: 'singbox',
+  hy2: { obfs: 'salamander', obfsPassword: 'obfs-pass', upMbps: 100, downMbps: 200 },
+  certMode: 'content', certPem: 'HYCERT', keyPem: 'HYKEY',
+};
+const hy2Cfg = singbox.buildConfig([hy2Node], USERS);
+const hy2Inb = hy2Cfg.inbounds[0];
+ok('hysteria2 入站：users 密码 + obfs + 带宽 + TLS 无条件启用（v2ray_api users 也收录）',
+  hy2Inb.type === 'hysteria2' &&
+    hy2Inb.users[0].name === 'u' + USERS[0].id && hy2Inb.users[0].password === USERS[0].uuid &&
+    hy2Inb.obfs.type === 'salamander' && hy2Inb.up_mbps === 100 && hy2Inb.down_mbps === 200 &&
+    hy2Inb.tls.enabled === true && hy2Inb.tls.certificate_path && hy2Inb.tls.key_path &&
+    hy2Cfg.experimental.v2ray_api.stats.users.includes('u' + USERS[0].id),
+  JSON.stringify(hy2Inb.tls));
+
 ok('无节点时输出合法空配置（空 inbound、v2ray_api 空统计；嗅探与 BT 拦截规则恒在）',
   (() => {
     const empty = singbox.buildConfig([], []);

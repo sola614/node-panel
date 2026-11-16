@@ -286,13 +286,19 @@ function installScript(req, res, params, body, session, ctx) {
 
   const serverNodes = s.type === 'relay' ? [] : db.nodes.filter((n) => n.serverId === s.id);
   const relayOnly = s.type === 'relay';
-  const needHysteria = serverNodes.some((n) => n.protocol === 'hysteria2');
   // 节点内核（0.2.0）：xray 或 singbox，决定部署脚本装哪个二进制。
-  // 还没有节点的服务器也装内核：否则以后加第一个节点又要为「机器上没装」返工一次
+  // 还没有节点的服务器也装内核：否则以后加第一个节点又要为「机器上没装」返工一次。
+  // 0.2.1 起 sing-box 也承载 Hysteria2：kernel=singbox 时任何节点（含 hy2-only）
+  // 都需要 sing-box 本体；kernel=xray 时只有非 hy2 节点才需要 Xray，hy2 走独立 hysteria
   const kernel = kernelOf(s.kernel);
-  const kernelOnly = relayOnly ? false : serverNodes.length === 0 || serverNodes.some((n) => n.protocol !== 'hysteria2');
-  const needXray = kernelOnly && kernel === 'xray';
-  const needSingbox = kernelOnly && kernel === 'singbox';
+  const kernelNeeded =
+    relayOnly
+      ? false
+      : serverNodes.length === 0 ||
+        serverNodes.some((n) => kernel === 'singbox' || n.protocol !== 'hysteria2');
+  const needXray = kernelNeeded && kernel === 'xray';
+  const needSingbox = kernelNeeded && kernel === 'singbox';
+  const needHysteria = kernel === 'xray' && serverNodes.some((n) => n.protocol === 'hysteria2');
   const script = buildInstallScript({
     panelUrl: baseUrl(ctx.req),
     token: s.token,
@@ -356,9 +362,10 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
     panelUrl: baseUrl(ctx.req),
     token: node.token,
     label: `${node.name}（独立部署 · ${node.address}）`,
-    needHysteria: node.protocol === 'hysteria2',
+    // 0.2.1 起 sing-box 也承载 Hysteria2：hy2 节点选 sing-box 内核时不再装独立 hysteria
+    needHysteria: node.protocol === 'hysteria2' && kernelOf(node.kernel) === 'xray',
     needXray: node.protocol !== 'hysteria2' && kernelOf(node.kernel) === 'xray',
-    needSingbox: node.protocol !== 'hysteria2' && kernelOf(node.kernel) === 'singbox',
+    needSingbox: kernelOf(node.kernel) === 'singbox',
     kernel: kernelOf(node.kernel),
     // 独立节点同样统一伪装（见 installScript 的说明）
     stealth: true,

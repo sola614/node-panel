@@ -929,8 +929,8 @@ function bindNodeForm(mask) {
 
     $('#wrap-server', mask).classList.toggle('hidden', mode !== 'server');
     $('#wrap-address', mask).classList.toggle('hidden', mode !== 'standalone');
-    // 节点内核：只有独立部署才可选；Hysteria2 走独立实例，没有内核语义
-    $('#wrap-kernel', mask).classList.toggle('hidden', mode !== 'standalone' || isHy2);
+    // 节点内核：只有独立部署才可选（0.2.1 起 sing-box 也承载 Hysteria2，hy2 同样有内核语义）
+    $('#wrap-kernel', mask).classList.toggle('hidden', mode !== 'standalone');
     const nodeAuto = $('#n-ipmode button.on', mask).dataset.ipmode === 'auto';
     $('#wrap-address-input', mask).classList.toggle('hidden', mode !== 'standalone' || nodeAuto);
     $('#n-address-hint', mask).textContent = nodeAuto
@@ -1506,9 +1506,10 @@ function readNodeForm(mask) {
   const payload = {
     name: v('#n-name'),
     mode,
-    // 独立节点自选内核（hy2 强制 xray：走独立 hysteria 实例，没有内核语义）；
+    // 独立节点自选内核（0.2.1 起 sing-box 也承载 Hysteria2，hy2 选 sing-box 时
+    // 由 sing-box 入站承载，不再有 streamd 实例）；
     // server/imported 模式服务端忽略该字段（跟随宿主 / 无 agent）
-    kernel: mode === 'standalone' && protocol !== 'hysteria2' ? kernel : 'xray',
+    kernel: mode === 'standalone' ? kernel : 'xray',
     ipMode: $('#n-ipmode button.on', mask).dataset.ipmode,
     serverId: v('#n-server'),
     address: v('#n-address'),
