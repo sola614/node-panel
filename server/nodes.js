@@ -73,6 +73,23 @@ function kernelError(node) {
   return '';
 }
 
+/**
+ * hy2Via=singbox 的证书校验（0.2.5 实机部署暴露）：sing-box 的 hysteria2 入站
+ * 必须有证书文件——hysteria 原版对空证书自动生成自签兜底，sing-box 不会；
+ * certificate_path 为空字符串会让**整个 config**（含同机的 vless 入站）起不来。
+ * 仅拦「certMode=path 且两个路径都空」；ref/content/self/acme 都有内容或签发机制。
+ * 校验在保存层，编译层另有回退兜底（agent.js hyViaSingbox 的证书判断）。
+ */
+function hy2ViaCertError(node) {
+  if (node.protocol !== 'hysteria2' || node.hy2Via !== 'singbox') return '';
+  if (cert.hy2CertReady(node)) return '';
+  return (
+    '承载方式为 sing-box 入站时必须配置 TLS 证书（sing-box 不会像 hysteria 那样自动生成自签，' +
+    '空证书会让整机配置起不来）：请在「TLS 证书」里配置证书文件 / 引用证书 / 自签证书 / ACME，' +
+    '或改用独立 hysteria 实例承载'
+  );
+}
+
 function normalizeNode(body, prev = {}) {
   // 部分更新时必须沿用未指定的字段，否则一次小改动会把独立节点降级成服务器节点
   const protocol = PROTOCOLS.includes(body.protocol) ? body.protocol : prev.protocol || 'vless';
@@ -493,6 +510,8 @@ function createNode(req, res, params, body) {
   if (badCert) return sendJson(res, 400, { error: badCert });
   const badKernel = kernelError(data);
   if (badKernel) return sendJson(res, 400, { error: badKernel });
+  const badHyVia = hy2ViaCertError(data);
+  if (badHyVia) return sendJson(res, 400, { error: badHyVia });
   const db = store.db();
   if (nameTaken(db.nodes, data.name)) return sendJson(res, 409, { error: '已存在同名节点，换个名字' });
 
@@ -569,6 +588,8 @@ function updateNode(req, res, params, body) {
   if (badCert) return sendJson(res, 400, { error: badCert });
   const badKernel = kernelError(next);
   if (badKernel) return sendJson(res, 400, { error: badKernel });
+  const badHyVia = hy2ViaCertError(next);
+  if (badHyVia) return sendJson(res, 400, { error: badHyVia });
   const badHop = hopError(next, node.id);
   if (badHop) return sendJson(res, 400, { error: badHop });
   Object.assign(node, next);

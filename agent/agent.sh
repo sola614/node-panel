@@ -47,7 +47,7 @@
 
 # 版本号和面板 package.json 保持一致：部署脚本会把这一行替换成面板当前版本，
 # 面板据此判断「agent 是不是该重新部署了」，两边版本号必须同一处来源
-VERSION='0.2.5'
+VERSION='0.2.6'
 
 SELF_DIR=$(dirname "$0")
 # 自更新要原子替换「自己」，所以必须拿到绝对路径（cron 里 $0 常常是相对路径）
@@ -1579,7 +1579,10 @@ hy_ensure() {
   # 用旧配置服务（配置漂移，面板与机器对不上）。实测场景：升级后 FATAL
   # 「listen udp :24578: bind: address already in use」且节点还在跑（旧实例活着）。
   # 只清 hysteria 家族进程（streamd/hysteria），撞端口的别的服务不动、只记日志
-  _lport=$(sed -n 's/^listen:[[:space:]]*:\{0,1\}\([0-9][0-9]*\).*/\1/p' "$_cfg" 2>/dev/null | sed -n '1p')
+  # 端口提取用 grep -oE 而不是 sed：js-yaml 对「:24578」这种冒号开头的值会加引号
+  # （实测输出 listen: ":24578"），0.2.4 的 sed 正则在引号处匹配失败、_lport 恒空、
+  # 预检静默跳过 —— grep '^listen:' 先锁行再抽数字段，对带引号 / 不带引号都鲁棒
+  _lport=$(grep '^listen:' "$_cfg" 2>/dev/null | grep -oE '[0-9]+' | head -n 1)
   if [ -n "$_lport" ]; then
     _holders=$(ss -lunp 2>/dev/null | grep ":$_lport " || netstat -lunp 2>/dev/null | grep ":$_lport " || true)
     for _hp in $(printf '%s\n' "$_holders" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
@@ -1642,11 +1645,12 @@ hy_sync() {
   [ "$_total" -gt 0 ] && RC_HY="$_ok/$_total"
 }
 
-# 本轮拉起的 Hysteria2 实例统一做一次存活核对（apply_services 里 sleep 1 之后才调用，
-# 给 hysteria 留出「启动即退出」的时间）。死进程的 pid 文件顺手清掉，免得下一轮
-# hy_ensure 误判「还活着」；真正的死因（实例日志里的 FATAL 行）带进 agent 日志与回执，
-# 否则面板上只有一个笼统的「端口未监听」，排查得登机器翻日志。
-verify_started_hy() {
+# 一轮存活核对：死进程的 pid 文件顺手清掉；死因（实例日志里的 FATAL 行）带进
+# agent 日志。端口被占（bind: address already in use）是特例 —— 占用者多半是
+# **升级残留的旧实例**（pid 文件在 RUN_DIR/agent.env 跨版本后断链，hy_stop/hy_ensure
+# 都管不到它），按端口清掉这个家族进程后当轮重拉一次，不再等下一轮 60s；
+# 重拉仍失败才进回执失败。其余死因照旧直接报。
+verify_hy_round() {
   for _inst in ${NP_STARTED_HY:-}; do
     _pidfile=$(hy_pidfile "$_inst")
     _pid=$(cat "$_pidfile" 2>/dev/null)
@@ -1661,10 +1665,45 @@ verify_started_hy() {
       log "! Hysteria2 实例 $_inst 启动后立即退出（$LOG_DIR/$_inst.log 未见 FATAL 记录）"
     fi
     log "  完整日志：tail -50 $LOG_DIR/$_inst.log"
+    case "$_why" in
+      *"address already in use"*)
+        _lport=$(printf '%s' "$_why" | sed -n 's/.*listen udp :\([0-9][0-9]*\).*/\1/p')
+        if [ -n "$_lport" ]; then
+          _holders=$(ss -lunp 2>/dev/null | grep ":$_lport " || netstat -lunp 2>/dev/null | grep ":$_lport " || true)
+          for _hp in $(printf '%s\n' "$_holders" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+            [ -n "$_hp" ] || continue
+            _hn=$(ps -p "$_hp" -o comm= 2>/dev/null || true)
+            case "$_hn" in
+              hysteria | streamd | *hysteria*)
+                kill "$_hp" 2>/dev/null && log "  · 清理占用 $_lport/udp 的旧 hysteria 进程（pid=$_hp）"
+                ;;
+              *)
+                [ -n "$_hn" ] && log "  · $_lport/udp 被其他进程占用（$_hn pid=$_hp），不自动处理"
+                ;;
+            esac
+          done
+          # 第一遍：清完占用者就重拉一轮再核对，不急着进回执失败
+          if [ "${1:-1}" = '1' ]; then
+            NP_HY_REBIND="${NP_HY_REBIND:-} $_inst"
+            continue
+          fi
+        fi
+        ;;
+    esac
     RC_HY_FAIL="${RC_HY_FAIL:-}${RC_HY_FAIL:+、}${_inst}"
     RC_ERR="${RC_ERR}${RC_ERR:+；}Hysteria2 启动即退出：${_inst}${_why:+（$_why）}"
     RC_OK=0
   done
+}
+
+verify_started_hy() {
+  NP_HY_REBIND=''
+  verify_hy_round 1
+  if [ -n "$NP_HY_REBIND" ]; then
+    for _inst in $NP_HY_REBIND; do hy_ensure "$_inst"; done
+    verify_hy_round 2
+    NP_HY_REBIND=''
+  fi
   NP_STARTED_HY=''
 }
 

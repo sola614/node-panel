@@ -199,12 +199,22 @@ function buildAgentPayload(scope) {
   // hy2 承载方式（0.2.3）：节点级 hy2Via —— 'hysteria'（默认，独立 streamd 实例）
   // 或 'singbox'（sing-box 入站承载，0.2.2 的强制并入改回节点级可选、默认独立实例）。
   // 选 singbox 的前提是生效内核是 sing-box：xray 内核机器没有 sing-box 进程，
-  // hy2Via 静默归 hysteria（不引第二个内核进程）。两种承载可以同机共存
+  // hy2Via 静默归 hysteria（不引第二个内核进程）。两种承载可以同机共存。
+  // 0.2.7：hyViaSingbox 还要求证书就绪（cert.hy2CertReady）—— sing-box 的 hy2 入站
+  // 必须有证书文件（hysteria 原版对空证书自动自签，sing-box 不会），空证书让整个
+  // config FATAL（0.2.5 实机：vless 入站陪葬）。未就绪的节点回退独立实例并进
+  // hyCertBlocked 名单（bundle 提示进 agent 日志）
   const kernel = scope.kernel === 'singbox' ? 'singbox' : 'xray';
   const hyViaSingbox = (n) =>
-    kernel === 'singbox' && n.protocol === 'hysteria2' && n.hy2Via === 'singbox';
+    kernel === 'singbox' &&
+    n.protocol === 'hysteria2' &&
+    n.hy2Via === 'singbox' &&
+    cert.hy2CertReady(n);
   const kernelNodes = nodes.filter((n) => n.protocol !== 'hysteria2' || hyViaSingbox(n));
   const hyNodes = nodes.filter((n) => n.protocol === 'hysteria2' && !hyViaSingbox(n));
+  const hyCertBlocked = nodes
+    .filter((n) => n.protocol === 'hysteria2' && n.hy2Via === 'singbox' && !hyViaSingbox(n))
+    .map((n) => n.name);
 
   // 同一作用域内统一分配统计端口，避免节点间碰撞导致流量串号
   const statsPorts = hysteria.allocateStatsPorts(hyNodes);
@@ -331,6 +341,9 @@ function buildAgentPayload(scope) {
     hysteria: hysteriaList,
     // 端口跳跃清单（内核无关）：bundle 据此建「端口段 → 监听口」的 nft 转发规则
     hops,
+    // 承载方式选了 sing-box 入站但 TLS 证书未配置的节点名：bundle 里提示，
+    // 机器回退独立 hysteria 实例（hysteria 对空证书自动自签，不断服务）
+    hyCertBlocked,
     certs,
     runtime,
   };

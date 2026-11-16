@@ -194,8 +194,13 @@ ok('hy2 默认由独立 hysteria 实例承载（hy2Via 缺省，sing-box 配置�
     (hyDefault.singbox.inbounds || []).every((i) => i.type !== 'hysteria2'));
 
 db.nodes.find((n) => n.id === 'n-hy2').hy2Via = 'singbox';
+// hyViaSingbox 还要求证书就绪：sing-box 的 hy2 入站必须有证书（hysteria 会自动
+// 自签，sing-box 不会）—— certMode=content 走 certs 下发链路，路径非空即就绪
+db.nodes.find((n) => n.id === 'n-hy2').certMode = 'content';
+db.nodes.find((n) => n.id === 'n-hy2').certPem = 'HYCERT';
+db.nodes.find((n) => n.id === 'n-hy2').keyPem = 'HYKEY';
 const hySb = agent.buildAgentPayload(hyScope());
-ok('hy2Via=singbox 时并入 sing-box 配置、不再有 streamd 实例',
+ok('hy2Via=singbox（证书就绪）时并入 sing-box 配置、不再有 streamd 实例',
   hySb.hysteria.length === 0 &&
     hySb.singbox.inbounds.some((i) => i.type === 'hysteria2'));
 
@@ -210,6 +215,17 @@ const hyHop2 = agent.buildAgentPayload(hyScope());
 ok('hops 清单与承载无关（sing-box 承载的 hy2 也有跳跃）',
   hyHop2.hops.some((h) => h.nodeId === 'n-hy2' && h.hop === '40000-40099') &&
     hyHop2.hysteria.length === 0);
+// 证书未就绪（0.2.5 实机根因）：hy2Via=singbox 但 certMode=path 且证书路径为空
+// —— sing-box 的 hy2 入站必须有证书（hysteria 会自动自签，sing-box 不会），
+// 空证书让整个 config FATAL（vless 入站陪葬）。回退独立实例兜底 + hyCertBlocked 名单
+db.nodes.find((n) => n.id === 'n-hy2').certMode = 'path';
+db.nodes.find((n) => n.id === 'n-hy2').certFile = '';
+db.nodes.find((n) => n.id === 'n-hy2').keyFile = '';
+const hyNoCert = agent.buildAgentPayload(hyScope());
+ok('证书未就绪的 hy2Via=singbox 回退独立实例（sing-box 空证书会 FATAL 整机）',
+  hyNoCert.hysteria.length === 1 && (hyNoCert.singbox.inbounds || []).every((i) => i.type !== 'hysteria2'));
+ok('回退节点进 hyCertBlocked 名单（bundle 提示进 agent 日志）',
+  Array.isArray(hyNoCert.hyCertBlocked) && hyNoCert.hyCertBlocked.includes('sb-hy2'));
 // xray 内核机器上 hy2Via=singbox 静默归 hysteria（不引第二个内核进程）
 const hyXraySrv = Object.assign({}, hySrv, { kernel: 'xray' });
 const hyXray = agent.buildAgentPayload(agent.scopeOfServer(hyXraySrv));

@@ -3,6 +3,32 @@
 版本号只有一处来源：`package.json` 的 `version`。本项目走 `0.1.x` 版本线，
 每次发布递增末位（`0.1.0` → `0.1.1` → …），镜像 tag、侧栏版本号、`/api/health` 都跟着它走。
 
+## [0.2.6] - 2026-11-16
+
+### 修复
+
+- **hy2Via=singbox 且未配置证书时整机配置起不来**（实机部署暴露：vless 入站陪葬，
+  tcp/udp 全部未监听）——sing-box 的 hysteria2 入站必须有证书文件，而 hysteria 原版
+  对空证书会**自动生成自签兜底**（老方案 hy2 不配证书也能跑的原因），sing-box 不会；
+  编译输出里空的 `certificate_path` 让整个 config FATAL。三层防线：
+  1. **保存校验**（cert.hy2CertReady）：hy2 节点承载方式选 sing-box 入站且
+     certMode=path 且两个证书路径都空 → 400 并提示（ref/content/self/acme 都有内容或机制）；
+  2. **编译回退**：已存的非法节点在 payload 侧回退独立 hysteria 实例（hysteria
+     自动自签兜底，不断服务），节点名进 `hyCertBlocked`，bundle 里提示
+     「配置证书后重新保存即可恢复 sing-box 承载」；
+  3. lib/singbox.js 注释留档：hy2 入站的证书就绪是硬要求。
+- **hy_ensure 端口预检的引号兼容**（0.2.4 预检未拦住的实机根因，VM58235 确诊：
+  24578/udp 被 streamd pid=1816652 占用、节点还在跑）：js-yaml 对冒号开头的字符串
+  值会加引号（实际输出 `listen: ":24578"`），0.2.4 的 sed 正则在引号处匹配失败、
+  `_lport` 恒空、预检静默跳过。端口提取改用 grep -oE（对带引号/不带引号都鲁棒），
+  实测带引号的 yaml 行正确提取端口。
+- **hy2 实例 bind 失败的当轮闭环**（同一实机反馈的运行期兜底）：存活核对检测到
+  `address already in use` 时不再只报错等下一轮 —— 按端口找到占用 pid，确认是
+  hysteria 家族进程（升级残留的旧实例）就清掉，**当轮重拉并二次核对**；两轮都失败
+  才进回执失败。清理范围仍只限 hysteria 家族（streamd/hysteria），撞端口的其他服务
+  不动、只记日志。占用者身份待实机 `ss -lunp`/`lsof` 输出确认（怀疑升级/目录迁移
+  断链的旧实例或同机其他 hysteria 残留）。
+
 ## [0.2.5] - 2026-11-16
 
 ### 修复

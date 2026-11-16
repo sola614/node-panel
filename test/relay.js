@@ -118,11 +118,12 @@ ok(
   // 运行期配置，落地机也需要备用地址。形状变化会改 hash，让所有 agent 重拉一次包，
   // 这正是「改完设置立刻下发」需要的行为 —— 所以这里的期望跟着一起更新。
   // 0.2.0 起字段集合加入 kernel + singbox（sing-box 配置互斥产出，Xray 机器上恒 null）；
-  // 0.2.1 起加入 hops（端口跳跃清单，内核无关）；两次都是预期内的 hash 变化
-  // （与 APP_VERSION 升级同轮触发全量重下发），之后回到零变化约束
-  '落地机 payload 字段集合（含 runtime / kernel / singbox / hops）',
+  // 0.2.1 起加入 hops（端口跳跃清单，内核无关）；0.2.7 起加入 hyCertBlocked
+  // （承载方式选了 sing-box 入站但证书未配置的节点名单，bundle 提示 + 回退独立实例）。
+  // 都是预期内的 hash 变化（与 APP_VERSION 升级同轮触发全量重下发），之后回到零变化约束
+  '落地机 payload 字段集合（含 runtime / kernel / singbox / hops / hyCertBlocked）',
   JSON.stringify(Object.keys(nodePayload).sort()) ===
-    JSON.stringify(['agentVersion', 'certs', 'disabled', 'hash', 'hops', 'hysteria', 'kernel', 'nodes', 'ok', 'runtime', 'scope', 'singbox', 'userCount', 'xray']),
+    JSON.stringify(['agentVersion', 'certs', 'disabled', 'hash', 'hops', 'hyCertBlocked', 'hysteria', 'kernel', 'nodes', 'ok', 'runtime', 'scope', 'singbox', 'userCount', 'xray']),
   `(${Object.keys(nodePayload).sort().join(',')})`,
 );
 ok('Xray 机器 payload.kernel 恒为 xray 且 singbox 为 null',
