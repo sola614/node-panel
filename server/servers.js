@@ -288,17 +288,19 @@ function installScript(req, res, params, body, session, ctx) {
   const relayOnly = s.type === 'relay';
   // 节点内核（0.2.0）：xray 或 singbox，决定部署脚本装哪个二进制。
   // 还没有节点的服务器也装内核：否则以后加第一个节点又要为「机器上没装」返工一次。
-  // 0.2.1 起 sing-box 也承载 Hysteria2：kernel=singbox 时任何节点（含 hy2-only）
-  // 都需要 sing-box 本体；kernel=xray 时只有非 hy2 节点才需要 Xray，hy2 走独立 hysteria
+  // 0.2.3 起 hy2 的承载方式是节点级 hy2Via（默认 hysteria 独立实例，可选 sing-box
+  // 入站，前提机器内核是 sing-box）—— 两种承载可同机共存：
+  //   sing-box 本体：kernel=singbox 恒装（机器属性，与哪些节点走它无关）
+  //   Xray 本体：kernel=xray 且有非 hy2 节点（或还没有节点）
+  //   hysteria 本体：有 hy2Via≠singbox 的 hy2 节点（kernel 无关，sing-box 机器也装）
   const kernel = kernelOf(s.kernel);
   const kernelNeeded =
-    relayOnly
-      ? false
-      : serverNodes.length === 0 ||
-        serverNodes.some((n) => kernel === 'singbox' || n.protocol !== 'hysteria2');
+    relayOnly ? false : serverNodes.length === 0 || serverNodes.some((n) => n.protocol !== 'hysteria2');
   const needXray = kernelNeeded && kernel === 'xray';
-  const needSingbox = kernelNeeded && kernel === 'singbox';
-  const needHysteria = kernel === 'xray' && serverNodes.some((n) => n.protocol === 'hysteria2');
+  const needSingbox = kernel === 'singbox';
+  const needHysteria = serverNodes.some(
+    (n) => n.protocol === 'hysteria2' && (n.hy2Via || 'hysteria') !== 'singbox',
+  );
   const script = buildInstallScript({
     panelUrl: baseUrl(ctx.req),
     token: s.token,
@@ -362,8 +364,9 @@ function nodeInstallScript(req, res, params, body, session, ctx) {
     panelUrl: baseUrl(ctx.req),
     token: node.token,
     label: `${node.name}（独立部署 · ${node.address}）`,
-    // 0.2.1 起 sing-box 也承载 Hysteria2：hy2 节点选 sing-box 内核时不再装独立 hysteria
-    needHysteria: node.protocol === 'hysteria2' && kernelOf(node.kernel) === 'xray',
+    // 0.2.3 起 hy2 承载方式是节点级 hy2Via：默认 hysteria 独立实例；选 sing-box
+    // 入站（前提内核 sing-box）时不再装 streamd
+    needHysteria: node.protocol === 'hysteria2' && (node.hy2Via || 'hysteria') !== 'singbox',
     needXray: node.protocol !== 'hysteria2' && kernelOf(node.kernel) === 'xray',
     needSingbox: kernelOf(node.kernel) === 'singbox',
     kernel: kernelOf(node.kernel),

@@ -196,14 +196,15 @@ function buildAgentPayload(scope) {
   // 而不是只让面板别管它。agent 留着的意义是低频轮询何时被重新启用。
   const nodes = scope.enabled === false ? [] : scope.nodes;
 
-  // 节点内核（0.2.0）：xray / singbox 二选一，配置互斥产出 —— 另一边恒为 null，
-  // 且 null 也进 hash 与字段集合，让「这台机器跑什么内核」成为配置包的一部分。
-  // 0.2.1 起 sing-box 也承载 Hysteria2（不再有 streamd 实例）—— kernel=singbox 时
-  // 全部节点（含 hy2）由 sing-box 编译；kernel=xray 时 hy2 仍走独立 hysteria 实例
+  // hy2 承载方式（0.2.3）：节点级 hy2Via —— 'hysteria'（默认，独立 streamd 实例）
+  // 或 'singbox'（sing-box 入站承载，0.2.2 的强制并入改回节点级可选、默认独立实例）。
+  // 选 singbox 的前提是生效内核是 sing-box：xray 内核机器没有 sing-box 进程，
+  // hy2Via 静默归 hysteria（不引第二个内核进程）。两种承载可以同机共存
   const kernel = scope.kernel === 'singbox' ? 'singbox' : 'xray';
-  const kernelNodes =
-    kernel === 'singbox' ? nodes : nodes.filter((n) => n.protocol !== 'hysteria2');
-  const hyNodes = kernel === 'singbox' ? [] : nodes.filter((n) => n.protocol === 'hysteria2');
+  const hyViaSingbox = (n) =>
+    kernel === 'singbox' && n.protocol === 'hysteria2' && n.hy2Via === 'singbox';
+  const kernelNodes = nodes.filter((n) => n.protocol !== 'hysteria2' || hyViaSingbox(n));
+  const hyNodes = nodes.filter((n) => n.protocol === 'hysteria2' && !hyViaSingbox(n));
 
   // 同一作用域内统一分配统计端口，避免节点间碰撞导致流量串号
   const statsPorts = hysteria.allocateStatsPorts(hyNodes);
@@ -287,11 +288,11 @@ function buildAgentPayload(scope) {
   // hop 同理 —— 它不在 yaml 里（跳跃是 NAT 层的事），漏掉就会出现
   // 「面板上改了范围、agent 那边规则一直没变」这种查不出来的不同步
   // 端口跳跃清单与 hysteria 配置解耦（0.2.1）：跳跃是 nft 层规则，目标端口 = 节点
-  // 监听口，与内核无关 —— kernel=singbox 时 hysteriaList 为空（hy2 由 sing-box 承载），
-  // 但跳跃规则仍要照常下发。hop 同理进 hash：漏掉就会出现「面板上改了范围、agent
-  // 那边规则一直没变」这种查不出来的不同步
-  const hopSource =
-    kernel === 'singbox' ? kernelNodes.filter((n) => n.protocol === 'hysteria2') : hyNodes;
+  // 监听口，与内核无关。0.2.3 起与承载方式也无关：无论 hy2 走独立实例还是 sing-box
+  // 入站，跳跃规则都照常下发（数据源是全部 hy2 节点，不再按内核 / 承载分叉）。
+  // hop 同理进 hash：漏掉就会出现「面板上改了范围、agent 那边规则一直没变」这种
+  // 查不出来的不同步
+  const hopSource = nodes.filter((n) => n.protocol === 'hysteria2');
   const hops = hopSource
     .map((n) => {
       const hop = hysteria.hopOf(n);

@@ -1,0 +1,11 @@
+'use strict';
+const { spawnSync } = require('child_process');
+process.env.PANEL_ADMIN_PASSWORD = 'np-smoke-pass-2026';
+const r = spawnSync('node', ['test/smoke.js'], { encoding: 'utf8', cwd: process.cwd(), timeout: 540000 });
+const lines = (r.stdout || '').split(/\r?\n/);
+const idx = lines.findIndex((x) => x.includes('panel-manual-'));
+if (idx >= 0) console.log(lines.slice(Math.max(0, idx - 3), idx + 22).join('\n'));
+console.log('---CROSS---');
+console.log(lines.filter((x) => x.includes('\u2717')).join('\n') || '(none)');
+console.log('---STAT---');
+console.log(lines.filter((x) => x.includes('项通过')).join('\n'));

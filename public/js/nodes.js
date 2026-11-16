@@ -757,6 +757,18 @@ ${lockMode ? '只填一条：保存后会覆盖本节点的地址、端口与凭
     <div id="hy2-box" class="hidden">
       <div class="section-title">Hysteria2</div>
       <p class="hint" style="margin:0 0 12px">Hysteria2 必须启用 TLS，证书与 SNI 在上方「TLS 证书」中统一配置。</p>
+      <div class="field">
+        <label>承载方式</label>
+        <div class="seg" id="h-via">
+          <button type="button" data-via="hysteria" class="${(n.hy2Via || 'hysteria') !== 'singbox' ? 'on' : ''}">独立 hysteria 实例</button>
+          <button type="button" data-via="singbox" class="${n.hy2Via === 'singbox' ? 'on' : ''}">sing-box 入站</button>
+        </div>
+        <div class="hint" id="h-via-hint">
+          默认用独立 hysteria 实例（功能全）。选 <b>sing-box 入站</b>的前提是机器内核是
+          sing-box，且以下两项不可用：<b>伪装站点</b>与<b>出站强制 IPv4</b>（sing-box 无对应能力）；
+          流量计量改走 v2ray_api。宿主是 Xray 内核的机器此选项无效（保存后按独立实例部署）。
+        </div>
+      </div>
       <div class="form-row">
         <div class="field">
           <label>混淆 obfs</label>
@@ -1032,6 +1044,30 @@ function bindNodeForm(mask) {
   // 跳跃范围与中转入口互斥：边输边提示，不用等点保存才报错
   const hopInput = $('#h-hop', mask);
   if (hopInput) hopInput.addEventListener('input', syncHopGate);
+
+  // hy2 承载方式切换（0.2.3）：sing-box 入站不支持伪装站点与 forceV4 ——
+  // 选中时禁用这两项输入（payload 侧 maskUrl 直接清空），切回独立实例时恢复
+  const applyHyVia = () => {
+    const on = $('#h-via button.on', mask);
+    const sbVia = !!(on && on.dataset.via === 'singbox');
+    const maskEl = $('#h-mask', mask);
+    if (maskEl) maskEl.disabled = sbVia;
+    const fv = $('#n-force-v4', mask);
+    if (fv) fv.disabled = sbVia;
+    const hint = $('#h-via-hint', mask);
+    if (hint) {
+      hint.innerHTML = sbVia
+        ? '已选 <b>sing-box 入站</b>承载：伪装站点与出站强制 IPv4 不可用（相关输入已禁用，伪装站点保存时清空），流量计量走 v2ray_api。前提是机器内核是 sing-box —— Xray 内核的机器保存后会回落到独立实例。'
+        : '默认用独立 hysteria 实例（功能全）。选 <b>sing-box 入站</b>的前提是机器内核是 sing-box，且伪装站点与出站强制 IPv4 不可用；流量计量改走 v2ray_api。宿主是 Xray 内核的机器此选项无效（保存后按独立实例部署）。';
+    }
+  };
+  applyHyVia();
+  $('#h-via', mask).addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-via]');
+    if (!btn) return;
+    $$('#h-via button', mask).forEach((b) => b.classList.toggle('on', b === btn));
+    applyHyVia();
+  });
 
   $('#n-ipmode', mask).addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-ipmode]');
@@ -1548,12 +1584,18 @@ function readNodeForm(mask) {
       network: 'tcp',
       security: 'tls',
       sni: v('#n-sni'),
+      // 承载方式（0.2.3）：hysteria（默认，独立 streamd 实例）| singbox（sing-box 入站，
+      // 不支持伪装站点与 forceV4）。机器内核是 xray 时服务端会静默归 hysteria
+      // （编译层 hyViaSingbox 的前提判断——一台机器只跑一个节点内核）
+      hy2Via: ($('#h-via button.on', mask) || {}).dataset &&
+              $('#h-via button.on', mask).dataset.via === 'singbox' ? 'singbox' : 'hysteria',
       hy2: {
         obfs: v('#h-obfs'),
         obfsPassword: v('#h-obfs-pass'),
         upMbps: Number(v('#h-up')) || 100,
         downMbps: Number(v('#h-down')) || 200,
-        maskUrl: v('#h-mask'),
+        // sing-box 入站承载时不支持伪装站点（输入已被禁用，这里直接清空）
+        maskUrl: $('#h-mask', mask).disabled ? '' : v('#h-mask'),
         // 端口跳跃：空字符串 = 关闭。合法性由服务端统一校验（hopError），
         // 这里不拦，让用户看到具体报错而不是「保存没反应」
         hop: v('#h-hop'),

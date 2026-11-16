@@ -174,6 +174,48 @@ db.nodes.find((n) => n.id === 'n-sb').port = 8443;
 const sbHash2 = agent.buildAgentPayload(sbScope).hash;
 ok('hash 随 sing-box 配置变化', sbHash1 !== sbHash2);
 
+/* --------------------- 2.5 hy2 承载方式（0.2.3 hy2Via） --------------------- */
+
+console.log('\nhy2 承载方式');
+// 0.2.3 起 hy2 的承载是节点级 hy2Via：默认 hysteria 独立实例（streamd），可选
+// sing-box 入站（前提机器内核 sing-box）—— 0.2.2 的强制并入改回可选，两种承载可同机共存
+db.nodes.push({
+  id: 'n-hy2', serverId: 'srv-sb', name: 'sb-hy2', mode: 'server', protocol: 'hysteria2',
+  kernel: 'xray', hy2Via: 'hysteria', port: 8443,
+  hy2: { obfs: '', obfsPassword: '', upMbps: 100, downMbps: 200, hop: '', hopInterval: 30 },
+  enabled: true, planIds: [],
+});
+const hySrv = db.servers.find((s) => s.id === 'srv-sb');
+const hyScope = () => agent.scopeOfServer(hySrv);
+
+const hyDefault = agent.buildAgentPayload(hyScope());
+ok('hy2 默认由独立 hysteria 实例承载（hy2Via 缺省，sing-box 配置不含它）',
+  hyDefault.hysteria.length === 1 &&
+    (hyDefault.singbox.inbounds || []).every((i) => i.type !== 'hysteria2'));
+
+db.nodes.find((n) => n.id === 'n-hy2').hy2Via = 'singbox';
+const hySb = agent.buildAgentPayload(hyScope());
+ok('hy2Via=singbox 时并入 sing-box 配置、不再有 streamd 实例',
+  hySb.hysteria.length === 0 &&
+    hySb.singbox.inbounds.some((i) => i.type === 'hysteria2'));
+
+// 跳跃规则与承载方式无关：两种承载的 hy2 节点都要有 hop 清单（nft 层规则）
+db.nodes.find((n) => n.id === 'n-hy2').hy2.hop = '40000-40099';
+db.nodes.find((n) => n.id === 'n-hy2').hy2Via = 'hysteria';
+const hyHop1 = agent.buildAgentPayload(hyScope());
+ok('hops 清单与承载无关（hysteria 承载的 hy2 也有跳跃）',
+  hyHop1.hops.some((h) => h.nodeId === 'n-hy2' && h.hop === '40000-40099'));
+db.nodes.find((n) => n.id === 'n-hy2').hy2Via = 'singbox';
+const hyHop2 = agent.buildAgentPayload(hyScope());
+ok('hops 清单与承载无关（sing-box 承载的 hy2 也有跳跃）',
+  hyHop2.hops.some((h) => h.nodeId === 'n-hy2' && h.hop === '40000-40099') &&
+    hyHop2.hysteria.length === 0);
+// xray 内核机器上 hy2Via=singbox 静默归 hysteria（不引第二个内核进程）
+const hyXraySrv = Object.assign({}, hySrv, { kernel: 'xray' });
+const hyXray = agent.buildAgentPayload(agent.scopeOfServer(hyXraySrv));
+ok('xray 内核机器上 hy2Via=singbox 静默归 hysteria',
+  hyXray.hysteria.length === 1 && hyXray.singbox === null);
+
 /* --------------------------- 3. bundle 与部署脚本 --------------------------- */
 
 console.log('\nbundle 与部署脚本');

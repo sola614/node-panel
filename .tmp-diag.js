@@ -1,0 +1,16 @@
+'use strict';
+const { DatabaseSync } = require('node:sqlite');
+const fs = require('fs');
+const glob = fs.readdirSync('C:/Users/SOLA/AppData/Local/Temp').filter((d) => d.startsWith('np-smoke-clean-'));
+const dir = 'C:/Users/SOLA/AppData/Local/Temp/' + glob[0] + '/';
+const db = new DatabaseSync(dir + 'panel.db', { readOnly: true });
+const meta = db.prepare('SELECT key, value FROM meta').all();
+console.log('meta:', JSON.stringify(meta));
+const users = db.prepare('SELECT COUNT(*) c FROM users').get().c;
+const nodes = db.prepare('SELECT COUNT(*) c FROM nodes').get().c;
+const servers = db.prepare('SELECT COUNT(*) c FROM servers').get().c;
+const backups = db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE type='table' AND name IN ('users','nodes','servers','settings','meta')").get().c;
+console.log('users:', users, 'nodes:', nodes, 'servers:', servers, '核心表数:', backups);
+const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((t) => t.name);
+console.log('tables:', tables.join(','));
+db.close();
